@@ -1,0 +1,32 @@
+[Unit]
+Description=XLStatus Agent
+After=network.target
+
+[Service]
+Type=simple
+User=xlstatus-agent
+Group=xlstatus-agent
+WorkingDirectory=/opt/xlstatus-agent
+ExecStart=/usr/local/bin/xlstatus-agent
+Restart=on-failure
+RestartSec=5s
+
+# Environment
+Environment="SERVER_URL=http://localhost:8080"
+Environment="AGENT_NAME=auto"
+Environment="RUST_LOG=info"
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/xlstatus-agent
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=xlstatus-agent
+
+[Install]
+WantedBy=multi-user.target
