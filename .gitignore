@@ -1,31 +1,17 @@
 # Rust
-target/
-Cargo.lock
+/target/
 **/*.rs.bk
 *.pdb
+Cargo.lock
 
-# SQLite
+# Development databases
 *.db
 *.db-shm
 *.db-wal
-
-# Agent keys
-*.key
-agent.yaml
-
-# Next.js
-web/.next/
-web/out/
-web/node_modules/
-web/.pnpm-store/
-web/.env*.local
+dev.db*
 
 # Logs
 *.log
-
-# OS
-.DS_Store
-Thumbs.db
 
 # IDE
 .vscode/
@@ -34,13 +20,31 @@ Thumbs.db
 *.swo
 *~
 
-# Build artifacts
-dist/
-build/
+# OS
+.DS_Store
+Thumbs.db
 
-# Test coverage
-coverage/
+# Node
+node_modules/
+.next/
+out/
+dist/
+*.tsbuildinfo
+next-env.d.ts
 
 # Environment
 .env
 .env.local
+.env.*.local
+
+# Build artifacts
+/data/
+/logs/
+
+# Progress and status reports (development artifacts)
+M*-PROGRESS.md
+M*-STATUS-REPORT.md
+M*-IMPLEMENTATION-PROGRESS.md
+M*-SUMMARY.md
+M*-FINAL-STATUS.md
+M*-FILES-CREATED.md
