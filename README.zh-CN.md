@@ -42,12 +42,19 @@ docker compose -f docker-compose.pg.yml up -d
 
 ### 使用安装脚本
 
+**注意**：暂无预编译二进制文件，需要先从源码构建。
+
 ```bash
+# 从源码构建
+git clone https://github.com/lbyxiaolizi/XLStatus.git
+cd XLStatus
+cargo build --release
+
 # 安装服务器
-curl -fsSL https://install.xlstatus.io | bash
+sudo BINARY_PATH=target/release/xlstatus-server bash deploy/install.sh
 
 # 在被监控服务器上安装 Agent
-curl -fsSL https://install.xlstatus.io/agent | bash
+sudo BINARY_PATH=target/release/xlstatus-agent bash deploy/install-agent.sh
 ```
 
 ## 📚 文档

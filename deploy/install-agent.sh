@@ -2,11 +2,12 @@
 set -e
 
 # XLStatus Agent Installation Script
-# Usage: curl -fsSL https://install.xlstatus.io/agent | bash
+# Usage: bash install-agent.sh
 
-VERSION="${VERSION:-latest}"
+VERSION="${VERSION:-v1.0.0}"
 SERVER_URL="${SERVER_URL:-http://localhost:8080}"
 AGENT_NAME="${AGENT_NAME:-$(hostname)}"
+BINARY_PATH="${BINARY_PATH:-}"  # User can provide compiled binary path
 
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║                                                              ║"
@@ -48,16 +49,37 @@ if ! id -u xlstatus-agent &> /dev/null; then
   useradd --system --shell /bin/false xlstatus-agent
 fi
 
-# Download agent
+# Install agent binary
 echo ""
-echo "⬇️  Downloading XLStatus Agent..."
-DOWNLOAD_URL="https://github.com/yourusername/xlstatus/releases/download/${VERSION}/xlstatus-agent-linux-x86_64"
-curl -fsSL "$DOWNLOAD_URL" -o /usr/local/bin/xlstatus-agent || {
-  echo "❌ Failed to download agent"
-  exit 1
-}
+echo "📥 Installing XLStatus Agent binary..."
 
-chmod +x /usr/local/bin/xlstatus-agent
+if [ -n "$BINARY_PATH" ] && [ -f "$BINARY_PATH" ]; then
+  # User provided a binary
+  cp "$BINARY_PATH" /usr/local/bin/xlstatus-agent
+  chmod +x /usr/local/bin/xlstatus-agent
+  echo "✓ Binary installed from: $BINARY_PATH"
+else
+  # Try to download from GitHub releases
+  DOWNLOAD_URL="https://github.com/lbyxiaolizi/XLStatus/releases/download/${VERSION}/xlstatus-agent-linux-x86_64"
+  echo "   Trying to download from: $DOWNLOAD_URL"
+
+  if curl -fsSL "$DOWNLOAD_URL" -o /usr/local/bin/xlstatus-agent 2>/dev/null; then
+    chmod +x /usr/local/bin/xlstatus-agent
+    echo "✓ Binary downloaded and installed"
+  else
+    echo "❌ Failed to download agent binary from GitHub releases"
+    echo ""
+    echo "Please either:"
+    echo "  1. Build from source:"
+    echo "     cd /path/to/xlstatus"
+    echo "     cargo build --release --bin xlstatus-agent"
+    echo "     BINARY_PATH=target/release/xlstatus-agent bash deploy/install-agent.sh"
+    echo ""
+    echo "  2. Or use Docker:"
+    echo "     docker compose up -d"
+    exit 1
+  fi
+fi
 
 # Create config directory
 mkdir -p /etc/xlstatus-agent

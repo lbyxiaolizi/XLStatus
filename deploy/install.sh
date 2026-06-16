@@ -2,11 +2,12 @@
 set -e
 
 # XLStatus Installation Script
-# Usage: curl -fsSL https://install.xlstatus.io | bash
+# Usage: bash install.sh
 
-VERSION="${VERSION:-latest}"
+VERSION="${VERSION:-v1.0.0}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/xlstatus}"
 DATA_DIR="${DATA_DIR:-/var/lib/xlstatus}"
+BINARY_PATH="${BINARY_PATH:-}"  # User can provide compiled binary path
 
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║                                                              ║"
@@ -67,19 +68,39 @@ mkdir -p "$DATA_DIR"
 chown xlstatus:xlstatus "$DATA_DIR"
 echo "✓ Directories created"
 
-# Download binary
+# Install binary
 echo ""
-echo "⬇️  Downloading XLStatus Server..."
-DOWNLOAD_URL="https://github.com/yourusername/xlstatus/releases/download/${VERSION}/xlstatus-server-linux-x86_64"
-curl -fsSL "$DOWNLOAD_URL" -o "$INSTALL_DIR/xlstatus-server" || {
-  echo "❌ Failed to download binary"
-  echo "   Please check the release URL or build from source"
-  exit 1
-}
+echo "📥 Installing XLStatus Server binary..."
 
-chmod +x "$INSTALL_DIR/xlstatus-server"
-ln -sf "$INSTALL_DIR/xlstatus-server" /usr/local/bin/xlstatus-server
-echo "✓ Binary installed"
+if [ -n "$BINARY_PATH" ] && [ -f "$BINARY_PATH" ]; then
+  # User provided a binary
+  cp "$BINARY_PATH" "$INSTALL_DIR/xlstatus-server"
+  chmod +x "$INSTALL_DIR/xlstatus-server"
+  ln -sf "$INSTALL_DIR/xlstatus-server" /usr/local/bin/xlstatus-server
+  echo "✓ Binary installed from: $BINARY_PATH"
+else
+  # Try to download from GitHub releases
+  DOWNLOAD_URL="https://github.com/lbyxiaolizi/XLStatus/releases/download/${VERSION}/xlstatus-server-linux-x86_64"
+  echo "   Trying to download from: $DOWNLOAD_URL"
+
+  if curl -fsSL "$DOWNLOAD_URL" -o "$INSTALL_DIR/xlstatus-server" 2>/dev/null; then
+    chmod +x "$INSTALL_DIR/xlstatus-server"
+    ln -sf "$INSTALL_DIR/xlstatus-server" /usr/local/bin/xlstatus-server
+    echo "✓ Binary downloaded and installed"
+  else
+    echo "❌ Failed to download binary from GitHub releases"
+    echo ""
+    echo "Please either:"
+    echo "  1. Build from source:"
+    echo "     cd /path/to/xlstatus"
+    echo "     cargo build --release --bin xlstatus-server"
+    echo "     BINARY_PATH=target/release/xlstatus-server bash deploy/install.sh"
+    echo ""
+    echo "  2. Or use Docker:"
+    echo "     docker compose up -d"
+    exit 1
+  fi
+fi
 
 # Create config
 echo ""

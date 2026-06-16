@@ -42,12 +42,19 @@ Default credentials: `admin` / `admin123`
 
 ### Using Install Script
 
-```bash
-# Install server
-curl -fsSL https://install.xlstatus.io | bash
+**Note**: Pre-built binaries are not yet available. Build from source first.
 
-# Install agent on monitored server
-curl -fsSL https://install.xlstatus.io/agent | bash
+```bash
+# Build from source
+git clone https://github.com/lbyxiaolizi/XLStatus.git
+cd XLStatus
+cargo build --release
+
+# Install server
+sudo BINARY_PATH=target/release/xlstatus-server bash deploy/install.sh
+
+# Install agent on monitored servers
+sudo BINARY_PATH=target/release/xlstatus-agent bash deploy/install-agent.sh
 ```
 
 ## 📚 Documentation
