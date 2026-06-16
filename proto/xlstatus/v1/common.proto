@@ -1,0 +1,72 @@
+syntax = "proto3";
+
+package xlstatus.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Common types shared across services
+
+message HostInfo {
+  string hostname = 1;
+  string os = 2;
+  string platform = 3;
+  string platform_version = 4;
+  string kernel_version = 5;
+  string arch = 6;
+  uint32 cpu_cores = 7;
+  uint64 total_memory = 8;
+  uint64 total_swap = 9;
+  repeated DiskInfo disks = 10;
+}
+
+message DiskInfo {
+  string device = 1;
+  string mount_point = 2;
+  string fs_type = 3;
+  uint64 total = 4;
+}
+
+message HostState {
+  double cpu_percent = 1;
+  uint64 memory_used = 2;
+  uint64 memory_total = 3;
+  uint64 swap_used = 4;
+  uint64 swap_total = 5;
+  repeated DiskState disks = 6;
+  repeated NetStat net_io = 7;
+  double load_1 = 8;
+  double load_5 = 9;
+  double load_15 = 10;
+  uint32 tcp_connections = 11;
+  uint32 udp_connections = 12;
+  uint32 process_count = 13;
+  repeated TempSensor temperatures = 14;
+  repeated GpuState gpus = 15;
+  google.protobuf.Timestamp timestamp = 16;
+}
+
+message DiskState {
+  string mount_point = 1;
+  uint64 used = 2;
+  uint64 total = 3;
+}
+
+message NetStat {
+  string interface = 1;
+  uint64 bytes_sent = 2;
+  uint64 bytes_recv = 3;
+}
+
+message TempSensor {
+  string label = 1;
+  double temperature = 2;
+}
+
+message GpuState {
+  uint32 index = 1;
+  string name = 2;
+  double utilization = 3;
+  uint64 memory_used = 4;
+  uint64 memory_total = 5;
+  double temperature = 6;
+}

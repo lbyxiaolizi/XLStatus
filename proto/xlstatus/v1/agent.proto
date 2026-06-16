@@ -1,0 +1,319 @@
+syntax = "proto3";
+
+package xlstatus.v1;
+
+import "xlstatus/v1/common.proto";
+import "google/protobuf/timestamp.proto";
+
+// Agent gRPC service
+service AgentService {
+  // Bidirectional streaming session for control messages
+  rpc Session(stream AgentMessage) returns (stream ServerMessage);
+
+  // Bidirectional streaming for IO operations (terminal, file transfer)
+  rpc IoStream(stream IoFrame) returns (stream IoFrame);
+}
+
+// Messages from Agent to Server
+message AgentMessage {
+  oneof payload {
+    Heartbeat heartbeat = 1;
+    HostState host_state = 2;
+    TaskResult task_result = 3;
+    HostInfoUpdate host_info_update = 4;
+    GeoIpReport geo_ip_report = 5;
+  }
+}
+
+// Messages from Server to Agent
+message ServerMessage {
+  oneof payload {
+    ServerTask task = 1;
+    ForceDisconnect force_disconnect = 2;
+    ConfigUpdate config_update = 3;
+    ForceUpdate force_update = 4;
+  }
+}
+
+// Heartbeat
+message Heartbeat {
+  int64 timestamp = 1;
+}
+
+// Host info update
+message HostInfoUpdate {
+  HostInfo host_info = 1;
+}
+
+// GeoIP report
+message GeoIpReport {
+  string ipv4 = 1;
+  string ipv6 = 2;
+}
+
+// Task from server
+message ServerTask {
+  string task_id = 1;
+  TaskType task_type = 2;
+  oneof spec {
+    ShellCommandTask shell_command = 10;
+    HttpGetTask http_get = 11;
+    IcmpPingTask icmp_ping = 12;
+    TcpPingTask tcp_ping = 13;
+    TerminalTask terminal = 14;
+    FileListTask file_list = 15;
+    FileReadTask file_read = 16;
+    FileWriteTask file_write = 17;
+    FileDeleteTask file_delete = 18;
+    FileTransferTask file_transfer = 19;
+  }
+}
+
+enum TaskType {
+  TASK_TYPE_UNSPECIFIED = 0;
+  TASK_TYPE_SHELL_COMMAND = 1;
+  TASK_TYPE_HTTP_GET = 2;
+  TASK_TYPE_ICMP_PING = 3;
+  TASK_TYPE_TCP_PING = 4;
+  TASK_TYPE_TERMINAL = 5;
+  TASK_TYPE_FILE_LIST = 6;
+  TASK_TYPE_FILE_READ = 7;
+  TASK_TYPE_FILE_WRITE = 8;
+  TASK_TYPE_FILE_DELETE = 9;
+  TASK_TYPE_FILE_TRANSFER = 10;
+}
+
+// Shell command task
+message ShellCommandTask {
+  string command = 1;
+  string working_dir = 2;
+  map<string, string> env = 3;
+  uint32 timeout_seconds = 4;
+  uint64 max_output_bytes = 5;
+}
+
+// HTTP GET task
+message HttpGetTask {
+  string url = 1;
+  uint32 timeout_seconds = 2;
+  bool verify_tls = 3;
+  map<string, string> headers = 4;
+}
+
+// ICMP ping task
+message IcmpPingTask {
+  string host = 1;
+  uint32 count = 2;
+  uint32 timeout_seconds = 3;
+}
+
+// TCP ping task
+message TcpPingTask {
+  string host = 1;
+  uint32 port = 2;
+  uint32 timeout_seconds = 3;
+}
+
+// Terminal task
+message TerminalTask {
+  string session_id = 1;
+  TerminalAction action = 2;
+  bytes data = 3;
+  uint32 cols = 4;
+  uint32 rows = 5;
+}
+
+enum TerminalAction {
+  TERMINAL_ACTION_UNSPECIFIED = 0;
+  TERMINAL_ACTION_OPEN = 1;
+  TERMINAL_ACTION_INPUT = 2;
+  TERMINAL_ACTION_RESIZE = 3;
+  TERMINAL_ACTION_CLOSE = 4;
+}
+
+// File list task
+message FileListTask {
+  string path = 1;
+}
+
+// File read task
+message FileReadTask {
+  string path = 1;
+  uint64 offset = 2;
+  uint64 length = 3;
+}
+
+// File write task
+message FileWriteTask {
+  string path = 1;
+  bytes data = 2;
+  uint32 mode = 3;
+  bool create_dirs = 4;
+}
+
+// File delete task
+message FileDeleteTask {
+  string path = 1;
+  bool recursive = 2;
+}
+
+// File transfer task (for large files via IoStream)
+message FileTransferTask {
+  string stream_id = 1;
+  TransferDirection direction = 2;
+  string path = 3;
+  uint64 size = 4;
+}
+
+enum TransferDirection {
+  TRANSFER_DIRECTION_UNSPECIFIED = 0;
+  TRANSFER_DIRECTION_UPLOAD = 1;   // Server -> Agent
+  TRANSFER_DIRECTION_DOWNLOAD = 2; // Agent -> Server
+}
+
+// Task result from agent
+message TaskResult {
+  string task_id = 1;
+  bool success = 2;
+  oneof result {
+    ShellCommandResult shell_command = 10;
+    HttpGetResult http_get = 11;
+    IcmpPingResult icmp_ping = 12;
+    TcpPingResult tcp_ping = 13;
+    TerminalResult terminal = 14;
+    FileListResult file_list = 15;
+    FileReadResult file_read = 16;
+    FileWriteResult file_write = 17;
+    FileDeleteResult file_delete = 18;
+    FileTransferResult file_transfer = 19;
+    TaskError error = 20;
+  }
+}
+
+// Shell command result
+message ShellCommandResult {
+  int32 exit_code = 1;
+  bytes stdout = 2;
+  bytes stderr = 3;
+  bool output_truncated = 4;
+  uint64 execution_time_ms = 5;
+}
+
+// HTTP GET result
+message HttpGetResult {
+  uint32 status_code = 1;
+  uint64 latency_ms = 2;
+  bytes body = 3;
+  string cert_fingerprint = 4;
+  google.protobuf.Timestamp cert_not_after = 5;
+}
+
+// ICMP ping result
+message IcmpPingResult {
+  uint32 packets_sent = 1;
+  uint32 packets_received = 2;
+  double avg_latency_ms = 3;
+  double min_latency_ms = 4;
+  double max_latency_ms = 5;
+}
+
+// TCP ping result
+message TcpPingResult {
+  uint64 latency_ms = 1;
+}
+
+// Terminal result
+message TerminalResult {
+  string session_id = 1;
+  bytes data = 2;
+}
+
+// File list result
+message FileListResult {
+  repeated FileEntry entries = 1;
+}
+
+message FileEntry {
+  string name = 1;
+  FileType file_type = 2;
+  uint64 size = 3;
+  uint32 mode = 4;
+  google.protobuf.Timestamp modified_at = 5;
+  string symlink_target = 6;
+}
+
+enum FileType {
+  FILE_TYPE_UNSPECIFIED = 0;
+  FILE_TYPE_FILE = 1;
+  FILE_TYPE_DIR = 2;
+  FILE_TYPE_SYMLINK = 3;
+}
+
+// File read result
+message FileReadResult {
+  bytes data = 1;
+  uint64 bytes_read = 2;
+}
+
+// File write result
+message FileWriteResult {
+  uint64 bytes_written = 1;
+}
+
+// File delete result
+message FileDeleteResult {
+  bool deleted = 1;
+}
+
+// File transfer result
+message FileTransferResult {
+  string stream_id = 1;
+  uint64 bytes_transferred = 2;
+}
+
+// Task error
+message TaskError {
+  string code = 1;
+  string message = 2;
+}
+
+// Config update
+message ConfigUpdate {
+  bytes config_yaml = 1;
+}
+
+// Force update
+message ForceUpdate {
+  string version = 1;
+  string download_url = 2;
+  string checksum = 3;
+}
+
+// Force disconnect
+message ForceDisconnect {
+  string reason = 1;
+}
+
+// IO Stream frames (for terminal and file transfer)
+message IoFrame {
+  string stream_id = 1;
+  uint64 sequence = 2;
+  oneof payload {
+    IoData data = 3;
+    IoClose close = 4;
+    IoError error = 5;
+  }
+}
+
+message IoData {
+  bytes data = 1;
+}
+
+message IoClose {
+  string reason = 1;
+}
+
+message IoError {
+  string code = 1;
+  string message = 2;
+}

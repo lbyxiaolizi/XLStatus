@@ -1,0 +1,55 @@
+version: '3.8'
+
+services:
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    container_name: xlstatus-server
+    ports:
+      - "8080:8080"
+      - "50051:50051"
+    volumes:
+      - ./data:/data
+    environment:
+      - DATABASE_URL=sqlite:///data/xlstatus.db
+      - RUST_LOG=info
+      - BIND_ADDRESS=0.0.0.0:8080
+      - GRPC_ADDRESS=0.0.0.0:50051
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    container_name: xlstatus-web
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8080
+    depends_on:
+      - server
+    restart: unless-stopped
+
+  agent-demo:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    container_name: xlstatus-agent-demo
+    environment:
+      - SERVER_URL=http://server:8080
+      - AGENT_NAME=demo-agent
+      - RUST_LOG=info
+    depends_on:
+      - server
+    restart: unless-stopped
+
+volumes:
+  data:
+    driver: local

@@ -1,0 +1,17 @@
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
+
+    tonic_build::configure()
+        .build_server(true)
+        .build_client(true)
+        .file_descriptor_set_path(out_dir.join("xlstatus_descriptor.bin"))
+        .compile_protos(
+            &[
+                "../../proto/xlstatus/v1/common.proto",
+                "../../proto/xlstatus/v1/agent.proto",
+                "../../proto/xlstatus/v1/nat.proto",
+            ],
+            &["../../proto"],
+        )?;
+    Ok(())
+}

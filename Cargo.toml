@@ -1,0 +1,76 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/shared",
+    "crates/proto-gen",
+    "crates/tsdb",
+    "crates/server",
+    "crates/agent",
+    "crates/xtask",
+]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Web framework
+axum = { version = "0.7", features = ["ws", "macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors", "compression-br", "compression-gzip", "set-header"] }
+
+# gRPC
+tonic = { version = "0.12", features = ["transport", "tls"] }
+tonic-build = "0.12"
+tonic-reflection = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "postgres", "uuid", "chrono", "json"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# IDs and Time
+uuid = { version = "1", features = ["v7", "serde"] }
+chrono = { version = "0.4", features = ["serde", "clock"] }
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Cryptography
+argon2 = "0.5"
+jsonwebtoken = "9"
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
+sha2 = "0.10"
+subtle = "2"
+zeroize = "1"
+rand = "0.8"
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+
+# OpenAPI
+utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
+
+# Scheduling
+cron = "0.12"
+
+# Concurrent collections
+dashmap = "6"
+parking_lot = "0.12"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

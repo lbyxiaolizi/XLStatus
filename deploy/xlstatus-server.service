@@ -1,0 +1,33 @@
+[Unit]
+Description=XLStatus Server
+After=network.target
+
+[Service]
+Type=simple
+User=xlstatus
+Group=xlstatus
+WorkingDirectory=/opt/xlstatus
+ExecStart=/usr/local/bin/xlstatus-server
+Restart=on-failure
+RestartSec=5s
+
+# Environment
+Environment="DATABASE_URL=sqlite:///var/lib/xlstatus/xlstatus.db"
+Environment="RUST_LOG=info"
+Environment="BIND_ADDRESS=0.0.0.0:8080"
+Environment="GRPC_ADDRESS=0.0.0.0:50051"
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/xlstatus
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=xlstatus-server
+
+[Install]
+WantedBy=multi-user.target

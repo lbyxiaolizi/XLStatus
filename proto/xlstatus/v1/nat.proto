@@ -1,0 +1,49 @@
+syntax = "proto3";
+
+package xlstatus.v1;
+
+// NAT tunnel service for port forwarding
+service NatTunnel {
+  // Establish a bidirectional tunnel for port forwarding
+  rpc CreateTunnel(stream TunnelData) returns (stream TunnelData);
+
+  // Request agent to connect to local service
+  rpc RequestConnection(ConnectionRequest) returns (ConnectionResponse);
+}
+
+// Tunnel data frame
+message TunnelData {
+  string tunnel_id = 1;     // Unique tunnel identifier
+  bytes data = 2;           // Raw data payload
+  bool is_close = 3;        // Close signal
+  string error = 4;         // Error message if any
+}
+
+// Request to establish connection to local service
+message ConnectionRequest {
+  string tunnel_id = 1;     // Tunnel identifier
+  string local_host = 2;    // Local host (e.g., "127.0.0.1")
+  uint32 local_port = 3;    // Local port
+  string protocol = 4;      // "tcp" or "udp"
+}
+
+// Response to connection request
+message ConnectionResponse {
+  bool success = 1;
+  string error = 2;
+  string tunnel_id = 3;
+}
+
+// NAT mapping configuration
+message NatMapping {
+  string id = 1;
+  string agent_id = 2;
+  string local_host = 3;
+  uint32 local_port = 4;
+  uint32 public_port = 5;
+  string protocol = 6;      // "tcp" or "udp"
+  bool enabled = 7;
+  string created_at = 8;
+  string updated_at = 9;
+  string description = 10;
+}
