@@ -4,7 +4,7 @@ set -e
 # XLStatus Agent Installation Script
 # Usage: bash install-agent.sh
 
-VERSION="${VERSION:-v0.1.0-alpha.1}"
+VERSION="${VERSION:-v0.1.0-alpha.2}"
 SERVER_URL="${SERVER_URL:-http://localhost:8080}"
 GRPC_SERVER="${GRPC_SERVER:-}"
 AGENT_NAME="${AGENT_NAME:-$(hostname)}"
@@ -83,6 +83,22 @@ else
     exit 1
   fi
 fi
+
+echo ""
+echo "🔎 Validating agent binary..."
+if ! BINARY_CHECK_OUTPUT="$(/usr/local/bin/xlstatus-agent --help 2>&1 >/dev/null)"; then
+  echo "❌ Installed agent binary cannot run on this system"
+  if [ -n "$BINARY_CHECK_OUTPUT" ]; then
+    echo "$BINARY_CHECK_OUTPUT"
+  fi
+  echo ""
+  echo "This usually means the release binary requires a newer glibc than this Linux distribution provides."
+  echo "Try a newer XLStatus release or build the agent from source on this host:"
+  echo "  cargo build --release --bin xlstatus-agent"
+  echo "  BINARY_PATH=target/release/xlstatus-agent bash deploy/install-agent.sh"
+  exit 1
+fi
+echo "✓ Binary is runnable"
 
 # Create config directory
 mkdir -p "$(dirname "$CONFIG_FILE")"

@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler sqlite3
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler sqlite3 binutils
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Check formatting
@@ -56,7 +56,7 @@ jobs:
 
   linux-x86-64:
     name: Linux x86_64 release binaries
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     needs:
       - rust
     steps:
@@ -67,6 +67,19 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Build release binaries
         run: cargo build --release --bin xlstatus-server --bin xlstatus-agent
+      - name: Verify glibc compatibility
+        run: |
+          set -euo pipefail
+          max_allowed="2.36"
+          for bin in target/release/xlstatus-server target/release/xlstatus-agent; do
+            versions="$(readelf --version-info "$bin" | grep -Eo 'GLIBC_[0-9]+(\.[0-9]+)+' | sed 's/GLIBC_//' | sort -Vu || true)"
+            max_seen="$(printf '%s\n' "$versions" | tail -n1)"
+            echo "$bin max GLIBC version: ${max_seen:-none}"
+            if [ -n "$max_seen" ] && [ "$(printf '%s\n%s\n' "$max_allowed" "$max_seen" | sort -V | tail -n1)" != "$max_allowed" ]; then
+              echo "::error::$bin requires GLIBC_$max_seen, higher than GLIBC_$max_allowed"
+              exit 1
+            fi
+          done
       - name: Package artifacts
         run: |
           mkdir -p dist

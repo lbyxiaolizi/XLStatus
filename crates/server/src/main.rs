@@ -65,7 +65,7 @@ use auth::middleware::session_middleware;
 use xlstatus_shared::UserRole;
 
 const GRPC_MESSAGE_LIMIT: usize = 256 * 1024 * 1024;
-const DEFAULT_AGENT_INSTALL_VERSION: &str = "v0.1.0-alpha.1";
+const DEFAULT_AGENT_INSTALL_VERSION: &str = "v0.1.0-alpha.2";
 
 // M4: the alert engine is started in main() and then needs to be
 // reachable from the gRPC `Session` task so HostState updates are

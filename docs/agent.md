@@ -77,7 +77,7 @@ curl -fsSL 'http://dashboard.example.com:8080/api/v1/agents/install.sh?...' | su
 这个链接由 Server 负责注入参数，真正执行的安装脚本来自 GitHub Release：
 
 ```text
-https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.1/install-agent.sh
+https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.2/install-agent.sh
 ```
 
 生成链接时会包含 enrollment token；这个 token 建议设置短有效期，并只发给受信任主机。
