@@ -169,6 +169,38 @@ curl -i \
 - 修改 CORS 后重启 Server。
 - 确认前端构建时设置了正确的 `NEXT_PUBLIC_API_URL`。
 
+远端 Docker Compose 常见误区：
+
+- `CORS_ALLOWED_ORIGINS` 只决定后端是否放行浏览器来源。
+- `NEXT_PUBLIC_API_URL` 决定浏览器实际请求哪个 API 地址，而且会写入 Web 构建产物。
+- 如果浏览器开发者工具里看到请求 `http://localhost:8080/...`，说明 Web 镜像是用错误 API 地址构建的。
+
+修复示例：
+
+```bash
+cp .env.example .env
+```
+
+`.env`：
+
+```env
+XLSTATUS_PUBLIC_API_URL=http://example.com:8080
+XLSTATUS_CORS_ALLOWED_ORIGINS=http://example.com:3000,http://localhost:3000,http://127.0.0.1:3000
+```
+
+重新构建并启动：
+
+```bash
+docker compose up -d --build
+```
+
+如果已经有旧镜像仍不生效，可以强制重建 Web：
+
+```bash
+docker compose build --no-cache web
+docker compose up -d web
+```
+
 ## Docker Compose
 
 查看渲染配置：

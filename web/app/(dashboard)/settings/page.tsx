@@ -14,15 +14,15 @@ import {
   responseError,
   textareaClass,
 } from "@/app/components/M7Primitives";
-import { API_BASE_URL, apiClient } from "@/lib/api";
+import { apiClient, getApiBaseUrl } from "@/lib/api";
 
 export default function SettingsPage() {
   const [name, setName] = useState("");
   const [scopes, setScopes] = useState("server:read service:read task:* nat:* ddns:*");
   const [tokens, setTokens] = useState<unknown[]>([]);
   const [createdToken, setCreatedToken] = useState("");
-  const [agentServerUrl, setAgentServerUrl] = useState(API_BASE_URL);
-  const [agentGrpcUrl, setAgentGrpcUrl] = useState(defaultGrpcUrl(API_BASE_URL));
+  const [agentServerUrl, setAgentServerUrl] = useState(() => getApiBaseUrl());
+  const [agentGrpcUrl, setAgentGrpcUrl] = useState(() => defaultGrpcUrl(getApiBaseUrl()));
   const [agentName, setAgentName] = useState("$(hostname)");
   const [agentVersion, setAgentVersion] = useState("v1.0.0");
   const [enrollmentHours, setEnrollmentHours] = useState("24");

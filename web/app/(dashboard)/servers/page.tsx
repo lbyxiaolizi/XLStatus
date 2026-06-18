@@ -18,7 +18,7 @@ import {
   tdClass,
   thClass,
 } from "@/app/components/M7Primitives";
-import { apiClient } from "@/lib/api";
+import { apiClient, buildWebSocketUrl } from "@/lib/api";
 
 interface Server {
   id: string;
@@ -240,7 +240,5 @@ function hasBrowserSessionSignal(): boolean {
 }
 
 function buildWsUrl(): string {
-  const apiBase = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
-  const url = new URL(apiBase);
-  return `${url.protocol === "https:" ? "wss" : "ws"}://${url.host}/ws/servers`;
+  return buildWebSocketUrl("/ws/servers");
 }

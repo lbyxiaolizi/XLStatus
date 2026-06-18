@@ -17,7 +17,7 @@ import {
   responseError,
   selectClass,
 } from "@/app/components/M7Primitives";
-import { apiClient } from "@/lib/api";
+import { apiClient, buildWebSocketUrl } from "@/lib/api";
 
 interface Server {
   id: string;
@@ -272,9 +272,7 @@ export default function TerminalPage() {
 }
 
 function buildTerminalWsUrl(sessionId: string): string {
-  const apiBase = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
-  const url = new URL(apiBase);
-  return `${url.protocol === "https:" ? "wss" : "ws"}://${url.host}/ws/terminal/${encodeURIComponent(sessionId)}`;
+  return buildWebSocketUrl(`/ws/terminal/${encodeURIComponent(sessionId)}`);
 }
 
 function terminalStatusLabel(status: TerminalStatus): string {

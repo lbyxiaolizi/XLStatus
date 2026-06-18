@@ -1,7 +1,32 @@
 // API client for XLStatus backend
 import { t } from "@/lib/i18n";
 
-export const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
+const DEFAULT_API_PORT = "8080";
+
+function trimTrailingSlash(value: string): string {
+  return value.replace(/\/+$/, "");
+}
+
+export function getApiBaseUrl(): string {
+  const configured = process.env.NEXT_PUBLIC_API_URL?.trim();
+  if (configured) return trimTrailingSlash(configured);
+
+  if (typeof window !== "undefined") {
+    const currentOrigin = new URL(window.location.origin);
+    currentOrigin.port = DEFAULT_API_PORT;
+    return currentOrigin.origin;
+  }
+
+  return `http://localhost:${DEFAULT_API_PORT}`;
+}
+
+export function buildWebSocketUrl(path: string): string {
+  const url = new URL(getApiBaseUrl());
+  const protocol = url.protocol === "https:" ? "wss" : "ws";
+  return `${protocol}://${url.host}${path}`;
+}
+
+export const API_BASE_URL = getApiBaseUrl();
 
 export interface ApiResponse<T> {
   success: boolean;

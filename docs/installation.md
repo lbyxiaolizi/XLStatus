@@ -30,6 +30,30 @@ curl -fsS http://localhost:8080/healthz
 - API: `http://localhost:8080`
 - Public Status: `http://localhost:3000/status`
 
+远端 Docker Compose 部署时，前端页面运行在用户浏览器里，不能让浏览器请求
+`localhost:8080`。复制环境变量示例并填入浏览器可访问的公网地址：
+
+```bash
+cp .env.example .env
+```
+
+`.env` 示例：
+
+```env
+XLSTATUS_PUBLIC_API_URL=http://example.com:8080
+XLSTATUS_CORS_ALLOWED_ORIGINS=http://example.com:3000,http://localhost:3000,http://127.0.0.1:3000
+```
+
+然后重新构建 Web 镜像：
+
+```bash
+docker compose up -d --build
+curl -fsS http://example.com:8080/healthz
+```
+
+`XLSTATUS_PUBLIC_API_URL` 会作为 `NEXT_PUBLIC_API_URL` 写入 Next.js 浏览器 bundle。
+如果之前已经用错误地址构建过，必须重新 build，单纯重启容器不会修改前端 bundle。
+
 ## 从源码构建
 
 ```bash
@@ -43,7 +67,7 @@ NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm build
 cd ..
 ```
 
-前端构建时的 `NEXT_PUBLIC_API_URL` 会进入浏览器 bundle。生产环境请设置为用户浏览器能访问的 API 地址。
+前端构建时的 `NEXT_PUBLIC_API_URL` 会进入浏览器 bundle。生产环境请设置为用户浏览器能访问的 API 地址；远端访问时通常不是 `localhost`。
 
 ## GitHub Actions 自动构建
 
@@ -200,6 +224,11 @@ cd web
 NEXT_PUBLIC_API_URL=https://api.example.com pnpm build
 NEXT_PUBLIC_API_URL=https://api.example.com pnpm start
 ```
+
+如果不设置 `NEXT_PUBLIC_API_URL`，浏览器端默认使用当前页面主机名和 `8080`
+端口，例如打开 `http://example.com:3000` 时会请求
+`http://example.com:8080`。有反向代理、HTTPS 或 API 独立域名时，请显式设置
+`NEXT_PUBLIC_API_URL` 并重新构建。
 
 如果 Web UI 是 `https://status.example.com`，后端 CORS 必须包含这个精确来源：
 

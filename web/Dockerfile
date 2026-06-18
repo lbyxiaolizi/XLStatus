@@ -12,6 +12,9 @@ RUN corepack enable pnpm && corepack prepare pnpm@10.23.0 --activate && pnpm ins
 FROM base AS builder
 WORKDIR /app
 
+ARG NEXT_PUBLIC_API_URL=
+ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
+
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
@@ -21,7 +24,9 @@ RUN corepack enable pnpm && corepack prepare pnpm@10.23.0 --activate && pnpm run
 FROM base AS runner
 WORKDIR /app
 
+ARG NEXT_PUBLIC_API_URL=
 ENV NODE_ENV=production
+ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
 
 RUN addgroup --system --gid 1001 nodejs
 RUN adduser --system --uid 1001 nextjs
@@ -34,7 +39,7 @@ USER nextjs
 
 EXPOSE 3000
 
-ENV PORT 3000
-ENV HOSTNAME "0.0.0.0"
+ENV PORT=3000
+ENV HOSTNAME=0.0.0.0
 
 CMD ["node", "server.js"]

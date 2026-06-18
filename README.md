@@ -111,6 +111,21 @@ cd web
 NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm dev
 ```
 
+For remote Docker Compose deployment, copy `.env.example` to `.env`:
+
+```env
+XLSTATUS_PUBLIC_API_URL=http://example.com:8080
+XLSTATUS_CORS_ALLOWED_ORIGINS=http://example.com:3000,http://localhost:3000,http://127.0.0.1:3000
+```
+
+Then rebuild the Web image:
+
+```bash
+docker compose up -d --build
+```
+
+`NEXT_PUBLIC_API_URL` is written into the browser bundle. Rebuild the Web image after changing the public API URL.
+
 See [docs/configuration.md](./docs/configuration.md) for the full matrix, including SQLite creation behavior and PostgreSQL new-site initialization.
 
 ## 🛠️ Development

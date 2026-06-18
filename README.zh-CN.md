@@ -112,6 +112,21 @@ cd web
 NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm dev
 ```
 
+远端 Docker Compose 部署时，推荐复制 `.env.example` 为 `.env`：
+
+```env
+XLSTATUS_PUBLIC_API_URL=http://example.com:8080
+XLSTATUS_CORS_ALLOWED_ORIGINS=http://example.com:3000,http://localhost:3000,http://127.0.0.1:3000
+```
+
+然后执行：
+
+```bash
+docker compose up -d --build
+```
+
+`NEXT_PUBLIC_API_URL` 会写入前端构建产物；如果改了 API 地址，必须重新 build Web 镜像。
+
 完整配置矩阵、SQLite 新建数据库行为和 PostgreSQL 新站初始化见 [docs/configuration.md](./docs/configuration.md)。
 
 ## 🛠️ 开发

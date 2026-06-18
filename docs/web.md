@@ -47,6 +47,39 @@ NEXT_PUBLIC_API_URL=https://api.example.com pnpm start
 
 `NEXT_PUBLIC_API_URL` 会写入浏览器 bundle。修改后需要重新构建。
 
+如果没有设置 `NEXT_PUBLIC_API_URL`，浏览器端会按当前页面主机名推导 API：
+
+```text
+http://<当前页面主机名>:8080
+```
+
+例如访问 `http://example.com:3000/status` 时，默认 API 是
+`http://example.com:8080`。如果 API 使用其他域名、HTTPS 或反向代理路径，请显式设置
+`NEXT_PUBLIC_API_URL`。
+
+## Docker Compose 远端部署
+
+Compose 会把 `XLSTATUS_PUBLIC_API_URL` 作为 Web 镜像的 build arg 传入：
+
+```bash
+cp .env.example .env
+```
+
+`.env`：
+
+```env
+XLSTATUS_PUBLIC_API_URL=http://example.com:8080
+XLSTATUS_CORS_ALLOWED_ORIGINS=http://example.com:3000,http://localhost:3000,http://127.0.0.1:3000
+```
+
+启动或修改后重新构建：
+
+```bash
+docker compose up -d --build
+```
+
+只改 `environment:` 或只重启容器不会更新已经构建好的浏览器 bundle。
+
 ## CORS 配合
 
 如果用户浏览器打开的是：

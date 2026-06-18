@@ -165,6 +165,20 @@ NEXT_PUBLIC_API_URL=http://localhost:8080
 
 这个值会进入浏览器 bundle。它不等于后端 CORS：前端要知道 API 地址，后端也要允许 Web UI 的浏览器来源。
 
+如果不设置 `NEXT_PUBLIC_API_URL`，浏览器端会默认请求当前页面主机名的 `8080`
+端口。Docker Compose 使用下面两个变量生成 Web 构建参数和后端 CORS：
+
+```env
+XLSTATUS_PUBLIC_API_URL=http://example.com:8080
+XLSTATUS_CORS_ALLOWED_ORIGINS=http://example.com:3000,http://localhost:3000,http://127.0.0.1:3000
+```
+
+修改后需要重新构建 Web 镜像：
+
+```bash
+docker compose up -d --build
+```
+
 ## i18n
 
 Web UI 国际化配置位于 `web/lib/i18n.ts`。

@@ -36,6 +36,27 @@ CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
 
 因此默认 Web UI 可以访问 API。SQLite Compose 会创建 `./data/xlstatus.db`；PostgreSQL Compose 会在空 volume 上创建数据库用户和库，然后由 XLStatus 执行应用迁移。
 
+远端服务器上运行 Docker Compose 时，先设置浏览器可访问的地址：
+
+```bash
+cp .env.example .env
+```
+
+编辑 `.env`：
+
+```env
+XLSTATUS_PUBLIC_API_URL=http://example.com:8080
+XLSTATUS_CORS_ALLOWED_ORIGINS=http://example.com:3000,http://localhost:3000,http://127.0.0.1:3000
+```
+
+然后重新构建并启动：
+
+```bash
+docker compose up -d --build
+```
+
+如果页面显示 `Failed to fetch`，先确认浏览器实际请求的不是 `localhost:8080`。`NEXT_PUBLIC_API_URL` 会写进前端构建产物，改 `.env` 后需要重新 build Web 镜像。
+
 ## 从源码构建
 
 ```bash
@@ -122,6 +143,10 @@ NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm start
 ```bash
 CORS_ALLOWED_ORIGINS=http://localhost:3001,http://127.0.0.1:3001
 ```
+
+远端部署如果没有显式设置 `NEXT_PUBLIC_API_URL`，浏览器端会默认请求当前主机的
+`8080` 端口。例如打开 `http://example.com:3000` 时，API 默认是
+`http://example.com:8080`。
 
 ## PostgreSQL 新站
 
