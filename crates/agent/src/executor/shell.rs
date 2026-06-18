@@ -183,7 +183,7 @@ mod tests {
             if cfg!(target_os = "windows") {
                 "for /L %i in (1,1,1000) do @echo This is a long line of text"
             } else {
-                "for i in {1..1000}; do echo 'This is a long line of text'; done"
+                "i=0; while [ $i -lt 1000 ]; do echo 'This is a long line of text'; i=$((i + 1)); done"
             },
             None,
             &[],
