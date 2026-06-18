@@ -1,10 +1,13 @@
+#![allow(dead_code)]
+#![allow(unused_imports)]
+
 use anyhow::{bail, Context, Result};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// File entry information
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct FileEntry {
     pub name: String,
@@ -15,6 +18,7 @@ pub struct FileEntry {
     pub symlink_target: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub enum FileType {
     File,
@@ -23,6 +27,7 @@ pub enum FileType {
 }
 
 /// List files in a directory
+#[allow(dead_code)]
 pub async fn list_files(path: &str) -> Result<Vec<FileEntry>> {
     let path = Path::new(path);
 
@@ -39,9 +44,15 @@ pub async fn list_files(path: &str) -> Result<Vec<FileEntry>> {
     }
 
     let mut entries = Vec::new();
-    let mut read_dir = fs::read_dir(path).await.context("Failed to read directory")?;
+    let mut read_dir = fs::read_dir(path)
+        .await
+        .context("Failed to read directory")?;
 
-    while let Some(entry) = read_dir.next_entry().await.context("Failed to read entry")? {
+    while let Some(entry) = read_dir
+        .next_entry()
+        .await
+        .context("Failed to read entry")?
+    {
         let metadata = entry.metadata().await.context("Failed to read metadata")?;
         let file_name = entry.file_name().to_string_lossy().to_string();
 
@@ -92,6 +103,7 @@ pub async fn list_files(path: &str) -> Result<Vec<FileEntry>> {
 }
 
 /// Read file content
+#[allow(dead_code)]
 pub async fn read_file(path: &str, offset: u64, length: u64) -> Result<Vec<u8>> {
     let path = Path::new(path);
 
@@ -133,6 +145,7 @@ pub async fn read_file(path: &str, offset: u64, length: u64) -> Result<Vec<u8>> 
 }
 
 /// Write file content
+#[allow(dead_code)]
 pub async fn write_file(
     path: &str,
     data: &[u8],
@@ -153,12 +166,12 @@ pub async fn write_file(
         }
     }
 
-    let mut file = fs::File::create(path).await.context("Failed to create file")?;
+    let mut file = fs::File::create(path)
+        .await
+        .context("Failed to create file")?;
 
     use tokio::io::AsyncWriteExt;
-    file.write_all(data)
-        .await
-        .context("Failed to write file")?;
+    file.write_all(data).await.context("Failed to write file")?;
 
     file.flush().await.context("Failed to flush file")?;
 
@@ -176,6 +189,7 @@ pub async fn write_file(
 }
 
 /// Delete file or directory
+#[allow(dead_code)]
 pub async fn delete_path(path: &str, recursive: bool) -> Result<()> {
     let path = Path::new(path);
 

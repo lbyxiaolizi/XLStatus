@@ -1,0 +1,18 @@
+# XLStatus server configuration example
+# Copy this file to config.toml and customize it for your environment.
+
+[database]
+# SQLite example:
+url = "sqlite:///var/lib/xlstatus/xlstatus.db?mode=rwc"
+# PostgreSQL example:
+# url = "postgres://xlstatus:xlstatus_password@localhost:5432/xlstatus"
+
+[server]
+http_bind = "0.0.0.0:8080"
+grpc_bind = "0.0.0.0:50051"
+
+[security]
+# Generate a production secret with:
+# openssl rand -base64 32
+session_secret = "replace-with-a-long-random-secret"
+session_ttl_hours = 24

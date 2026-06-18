@@ -1,3 +1,6 @@
+#![allow(dead_code)]
+#![allow(unused_imports)]
+
 use anyhow::{bail, Context, Result};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -7,6 +10,7 @@ use tokio::time::timeout;
 
 /// Shell command execution result
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct ShellResult {
     pub exit_code: i32,
     pub stdout: Vec<u8>,
@@ -123,15 +127,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_simple_command() {
-        let result = execute_shell_command(
-            "echo hello",
-            None,
-            &[],
-            5,
-            1024 * 1024,
-        )
-        .await
-        .unwrap();
+        let result = execute_shell_command("echo hello", None, &[], 5, 1024 * 1024)
+            .await
+            .unwrap();
 
         assert_eq!(result.exit_code, 0);
         assert!(String::from_utf8_lossy(&result.stdout).contains("hello"));

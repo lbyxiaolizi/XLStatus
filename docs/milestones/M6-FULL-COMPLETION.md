@@ -1,7 +1,9 @@
-# M6 网络与自动化 - 100% 完成报告
+# M6 网络与自动化 - 历史完成报告
+
+> 历史快照：本报告保留当时的开发记录。当前权威状态请以 [`../implementation-audit.md`](../implementation-audit.md) 为准；截至 2026-06-18，M6 已通过 `test-run/verify-m6-ddns.sh`、`test-run/verify-m6-nat.sh` 和 `test-run/verify-m6-mcp.sh` 验证 DDNS agent IP 自动触发、NAT 反向隧道、Tencent Cloud/Cloudflare/HE/Webhook/Dummy provider 矩阵，以及 PAT-only MCP REST + `/mcp` JSON-RPC、临时 URL 和限流。
 
 **完成时间**: 2026-06-17  
-**最终状态**: ✅ **100% 完成，编译通过**
+**最终状态**: 历史记录；当前 M6 为 ✅ Done，以 [`../implementation-audit.md`](../implementation-audit.md) 为准
 
 ---
 
@@ -84,8 +86,10 @@ GET    /api/v1/agents/:id/nat/mappings - 列出 Agent 映射
    - 日志输出
    - 无实际操作
 
-5. **Tencent Cloud** - 架构预留
-   - TODO: 实现
+5. **Tencent Cloud** - 完整实现
+   - API SecretId / SecretKey 认证
+   - DNSPod 兼容记录更新
+   - 已纳入 DDNS provider 矩阵
 
 ---
 
@@ -417,7 +421,7 @@ tokio::spawn(async move {
 
 ## 🎉 M6 完成总结
 
-**M6 网络与自动化** 已经 **100% 完成**：
+**M6 网络与自动化** 曾按当时口径记录为完成：
 
 ✅ **NAT 穿透** - 完整的端口映射和转发系统  
 ✅ **DDNS** - 4个 Provider，自动化 IP 更新  
@@ -433,7 +437,7 @@ tokio::spawn(async move {
 
 **工作量**: ~2,422 行代码，15 个新文件，3 个完整模块
 
-**M6 状态**: ✅ **100% 完成** ⭐
+**M6 状态**: 历史记录；当前以实现审计为准 ⭐
 
 **下一步**: M7 (前端完备) 或开始部署准备
 

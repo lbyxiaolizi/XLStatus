@@ -2,6 +2,8 @@
 
 import { useState, FormEvent } from "react";
 import { useRouter } from "next/navigation";
+import { apiClient } from "@/lib/api";
+import { responseError } from "@/app/components/M7Primitives";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -16,27 +18,23 @@ export default function LoginPage() {
     setLoading(true);
 
     try {
-      const response = await fetch("http://localhost:8080/api/v1/auth/login", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ username, password }),
-      });
+      const response = await apiClient.login(username, password);
 
-      const data = await response.json();
-
-      if (data.success) {
+      if (response.success && response.data) {
+        const data = response.data as {
+          session_token?: string;
+          user?: unknown;
+        };
         // Store session token
-        localStorage.setItem("session_token", data.data.session_token);
-        localStorage.setItem("user", JSON.stringify(data.data.user));
+        localStorage.setItem("session_token", data.session_token || "");
+        localStorage.setItem("user", JSON.stringify(data.user));
 
         // Redirect to dashboard
         router.push("/dashboard");
       } else {
-        setError(data.error || "Login failed");
+        setError(responseError(response));
       }
-    } catch (err) {
+    } catch {
       setError("Network error. Please try again.");
     } finally {
       setLoading(false);

@@ -12,10 +12,10 @@ Restart=on-failure
 RestartSec=5s
 
 # Environment
-Environment="DATABASE_URL=sqlite:///var/lib/xlstatus/xlstatus.db"
+Environment="CONFIG_FILE=/etc/xlstatus/server.toml"
 Environment="RUST_LOG=info"
-Environment="BIND_ADDRESS=0.0.0.0:8080"
-Environment="GRPC_ADDRESS=0.0.0.0:50051"
+Environment="HTTP_BIND=0.0.0.0:8080"
+Environment="GRPC_BIND=0.0.0.0:50051"
 
 # Security
 NoNewPrivileges=true

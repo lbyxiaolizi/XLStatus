@@ -1,11 +1,15 @@
 pub mod agent;
 pub mod agent_jwt;
+pub mod alerts;
 pub mod auth;
+pub mod ddns;
 pub mod mcp;
 pub mod nat;
 pub mod pat;
+pub mod server_ops;
+pub mod servers;
 pub mod service_history;
 pub mod services;
 pub mod tasks;
-
-pub use auth::AppState;
+pub mod terminal;
+pub mod transfers;

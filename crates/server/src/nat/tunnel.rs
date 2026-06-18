@@ -1,13 +1,15 @@
 use crate::db::repository::NatMappingRepository;
 use crate::db::Db;
-use anyhow::{Context, Result};
+use crate::grpc::IoRegistry;
+use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
-use xlstatus_shared::nat::*;
+use xlstatus_proto_gen::xlstatus::v1::{io_frame, IoClose, IoData, IoError, IoFrame};
+use xlstatus_shared::nat::{NatMapping, NatTunnelControlMessage, Protocol, TunnelStats};
 
 /// Active tunnel connection
 #[derive(Debug)]
@@ -23,16 +25,16 @@ struct ActiveTunnel {
 /// NAT tunnel manager
 pub struct NatTunnelManager {
     db: Db,
-    // Map of public_port -> listener
+    io_registry: IoRegistry,
     listeners: Arc<RwLock<HashMap<u16, Arc<TcpListener>>>>,
-    // Map of tunnel_id -> tunnel info
     active_tunnels: Arc<RwLock<HashMap<String, ActiveTunnel>>>,
 }
 
 impl NatTunnelManager {
-    pub fn new(db: Db) -> Self {
+    pub fn new(db: Db, io_registry: IoRegistry) -> Self {
         Self {
             db,
+            io_registry,
             listeners: Arc::new(RwLock::new(HashMap::new())),
             active_tunnels: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -41,27 +43,49 @@ impl NatTunnelManager {
     /// Start NAT tunnel manager
     pub async fn start(self: Arc<Self>) -> Result<()> {
         info!("Starting NAT tunnel manager");
+        self.reload().await?;
 
-        // Load all enabled NAT mappings and start listeners
+        info!(
+            "NAT tunnel manager started with {} mappings",
+            self.listeners.read().await.len()
+        );
+        Ok(())
+    }
+
+    pub async fn reload(&self) -> Result<()> {
         let mappings = NatMappingRepository::list_enabled(&self.db)
             .await
             .context("Failed to load NAT mappings")?;
+        let desired_ports: std::collections::HashSet<u16> =
+            mappings.iter().map(|mapping| mapping.public_port).collect();
+
+        {
+            let mut listeners = self.listeners.write().await;
+            listeners.retain(|port, _| desired_ports.contains(port));
+        }
 
         for mapping in mappings {
+            if self
+                .listeners
+                .read()
+                .await
+                .contains_key(&mapping.public_port)
+            {
+                continue;
+            }
             if let Err(e) = self.start_listener(mapping).await {
                 error!("Failed to start listener: {}", e);
             }
         }
-
-        info!("NAT tunnel manager started with {} mappings", self.listeners.read().await.len());
         Ok(())
     }
 
-    /// Start listener for a NAT mapping
     async fn start_listener(&self, mapping: NatMapping) -> Result<()> {
-        // Only support TCP for now
         if !matches!(mapping.protocol, Protocol::Tcp) {
-            warn!("UDP tunnels not yet supported, skipping mapping {}", mapping.id);
+            warn!(
+                "UDP tunnels not yet supported, skipping mapping {}",
+                mapping.id
+            );
             return Ok(());
         }
 
@@ -71,8 +95,8 @@ impl NatTunnelManager {
             .context(format!("Failed to bind to {}", addr))?;
 
         info!(
-            "NAT listener started on port {} -> {}:{}",
-            mapping.public_port, mapping.local_host, mapping.local_port
+            "NAT listener started on port {} -> {}:{} via agent {}",
+            mapping.public_port, mapping.local_host, mapping.local_port, mapping.agent_id
         );
 
         let listener = Arc::new(listener);
@@ -81,7 +105,6 @@ impl NatTunnelManager {
             .await
             .insert(mapping.public_port, listener.clone());
 
-        // Spawn accept loop
         let manager = Arc::new(self.clone());
         let mapping_clone = mapping.clone();
         tokio::spawn(async move {
@@ -93,7 +116,6 @@ impl NatTunnelManager {
         Ok(())
     }
 
-    /// Accept incoming connections
     async fn accept_loop(
         self: Arc<Self>,
         listener: Arc<TcpListener>,
@@ -103,7 +125,7 @@ impl NatTunnelManager {
             match listener.accept().await {
                 Ok((stream, peer_addr)) => {
                     info!(
-                        "New connection on port {} from {}",
+                        "New NAT connection on port {} from {}",
                         mapping.public_port, peer_addr
                     );
 
@@ -111,7 +133,7 @@ impl NatTunnelManager {
                     let mapping_clone = mapping.clone();
                     tokio::spawn(async move {
                         if let Err(e) = manager.handle_connection(stream, mapping_clone).await {
-                            error!("Connection handling error: {}", e);
+                            error!("NAT connection handling error: {}", e);
                         }
                     });
                 }
@@ -123,30 +145,24 @@ impl NatTunnelManager {
         }
     }
 
-    /// Handle a single connection
-    async fn handle_connection(&self, mut public_stream: TcpStream, mapping: NatMapping) -> Result<()> {
+    async fn handle_connection(&self, public_stream: TcpStream, mapping: NatMapping) -> Result<()> {
         let tunnel_id = uuid::Uuid::now_v7().to_string();
+        let agent_uuid = uuid::Uuid::parse_str(&mapping.agent_id)
+            .map_err(|_| anyhow!("invalid agent id on mapping {}", mapping.id))?;
+        let agent_id = xlstatus_shared::AgentId(agent_uuid);
 
         info!(
-            "Creating tunnel {} for mapping {} -> {}:{}",
+            "Creating NAT tunnel {} for mapping {} -> {}:{}",
             tunnel_id, mapping.id, mapping.local_host, mapping.local_port
         );
 
-        // TODO: Send tunnel request to agent via gRPC
-        // For now, we'll try to connect directly to the local service
-        // This is a simplified implementation for demonstration
-        let local_addr = format!("{}:{}", mapping.local_host, mapping.local_port);
-        let mut local_stream = match TcpStream::connect(&local_addr).await {
-            Ok(stream) => stream,
-            Err(e) => {
-                error!("Failed to connect to local service {}: {}", local_addr, e);
-                return Err(e.into());
-            }
-        };
+        if !self.io_registry.is_agent_online(&agent_id).await {
+            return Err(anyhow!(
+                "agent {} has no active IO stream",
+                mapping.agent_id
+            ));
+        }
 
-        info!("Connected to local service {}", local_addr);
-
-        // Track tunnel
         let tunnel = ActiveTunnel {
             tunnel_id: tunnel_id.clone(),
             mapping_id: mapping.id.clone(),
@@ -155,122 +171,199 @@ impl NatTunnelManager {
             bytes_sent: Arc::new(RwLock::new(0)),
             bytes_received: Arc::new(RwLock::new(0)),
         };
-
         self.active_tunnels
             .write()
             .await
             .insert(tunnel_id.clone(), tunnel);
 
-        // Bidirectional copy
-        let bytes_sent = self.active_tunnels.read().await
+        let mut inbound = self.io_registry.subscribe_stream(tunnel_id.clone()).await;
+        self.io_registry
+            .send_to_agent(
+                &agent_id,
+                IoFrame {
+                    stream_id: tunnel_id.clone(),
+                    sequence: 1,
+                    agent_id: mapping.agent_id.clone(),
+                    payload: Some(io_frame::Payload::Data(IoData {
+                        data: serde_json::to_vec(&NatTunnelControlMessage::Open {
+                            local_host: mapping.local_host.clone(),
+                            local_port: mapping.local_port,
+                        })
+                        .unwrap_or_default(),
+                    })),
+                },
+            )
+            .await
+            .map_err(|e| anyhow!("failed to send NAT open request: {}", e))?;
+
+        let bytes_sent = self
+            .active_tunnels
+            .read()
+            .await
             .get(&tunnel_id)
-            .unwrap()
+            .expect("active tunnel missing")
             .bytes_sent
             .clone();
-        let bytes_received = self.active_tunnels.read().await
+        let bytes_received = self
+            .active_tunnels
+            .read()
+            .await
             .get(&tunnel_id)
-            .unwrap()
+            .expect("active tunnel missing")
             .bytes_received
             .clone();
 
-        let result = tokio::select! {
-            res = Self::copy_bidirectional(&mut public_stream, &mut local_stream, bytes_sent, bytes_received) => res,
-            _ = tokio::signal::ctrl_c() => {
-                info!("Shutting down tunnel {}", tunnel_id);
-                Ok((0, 0))
-            }
-        };
+        let result = Self::bridge_over_iostream(
+            public_stream,
+            agent_id,
+            mapping.agent_id.clone(),
+            tunnel_id.clone(),
+            self.io_registry.clone(),
+            &mut inbound,
+            bytes_sent,
+            bytes_received,
+        )
+        .await;
 
-        // Clean up
+        self.io_registry.unsubscribe_stream(&tunnel_id).await;
         self.active_tunnels.write().await.remove(&tunnel_id);
 
-        match result {
+        match &result {
             Ok((sent, received)) => {
                 info!(
-                    "Tunnel {} closed: {} bytes sent, {} bytes received",
+                    "NAT tunnel {} closed: {} bytes sent, {} bytes received",
                     tunnel_id, sent, received
                 );
             }
             Err(e) => {
-                error!("Tunnel {} error: {}", tunnel_id, e);
+                error!("NAT tunnel {} error: {}", tunnel_id, e);
             }
         }
-
-        Ok(())
+        result.map(|_| ())
     }
 
-    /// Bidirectional copy between two streams
-    async fn copy_bidirectional(
-        stream_a: &mut TcpStream,
-        stream_b: &mut TcpStream,
+    async fn bridge_over_iostream(
+        mut public_stream: TcpStream,
+        agent_id: xlstatus_shared::AgentId,
+        agent_id_str: String,
+        tunnel_id: String,
+        io_registry: IoRegistry,
+        inbound: &mut tokio::sync::mpsc::Receiver<IoFrame>,
         bytes_sent: Arc<RwLock<u64>>,
         bytes_received: Arc<RwLock<u64>>,
     ) -> Result<(u64, u64)> {
-        let (mut a_read, mut a_write) = stream_a.split();
-        let (mut b_read, mut b_write) = stream_b.split();
+        let (mut public_read, mut public_write) = public_stream.split();
 
-        let a_to_b = async {
-            let mut buf = vec![0u8; 8192];
-            let mut total = 0u64;
+        let to_agent = async {
+            let mut sequence = 2_u64;
+            let mut total = 0_u64;
+            let mut buf = [0_u8; 8192];
             loop {
-                let n = a_read.read(&mut buf).await?;
+                let n = public_read.read(&mut buf).await?;
                 if n == 0 {
+                    io_registry
+                        .send_to_agent(
+                            &agent_id,
+                            IoFrame {
+                                stream_id: tunnel_id.clone(),
+                                sequence,
+                                agent_id: agent_id_str.clone(),
+                                payload: Some(io_frame::Payload::Close(IoClose {
+                                    reason: "public stream closed".to_string(),
+                                })),
+                            },
+                        )
+                        .await
+                        .map_err(|e| anyhow!(e))?;
                     break;
                 }
-                b_write.write_all(&buf[..n]).await?;
+                io_registry
+                    .send_to_agent(
+                        &agent_id,
+                        IoFrame {
+                            stream_id: tunnel_id.clone(),
+                            sequence,
+                            agent_id: agent_id_str.clone(),
+                            payload: Some(io_frame::Payload::Data(IoData {
+                                data: buf[..n].to_vec(),
+                            })),
+                        },
+                    )
+                    .await
+                    .map_err(|e| anyhow!(e))?;
                 total += n as u64;
                 *bytes_sent.write().await += n as u64;
+                sequence = sequence.saturating_add(1);
             }
-            Ok::<_, std::io::Error>(total)
+            Ok::<u64, anyhow::Error>(total)
         };
 
-        let b_to_a = async {
-            let mut buf = vec![0u8; 8192];
-            let mut total = 0u64;
-            loop {
-                let n = b_read.read(&mut buf).await?;
-                if n == 0 {
-                    break;
+        let from_agent = async {
+            let mut total = 0_u64;
+            let mut saw_ready = false;
+            while let Some(frame) = inbound.recv().await {
+                match frame.payload {
+                    Some(io_frame::Payload::Data(data)) => {
+                        if !saw_ready {
+                            if let Ok(control) =
+                                serde_json::from_slice::<NatTunnelControlMessage>(&data.data)
+                            {
+                                match control {
+                                    NatTunnelControlMessage::Ready => {
+                                        saw_ready = true;
+                                        continue;
+                                    }
+                                    NatTunnelControlMessage::Open { .. } => continue,
+                                }
+                            } else {
+                                saw_ready = true;
+                            }
+                        }
+                        public_write.write_all(&data.data).await?;
+                        total += data.data.len() as u64;
+                        *bytes_received.write().await += data.data.len() as u64;
+                    }
+                    Some(io_frame::Payload::Close(close)) => {
+                        info!("agent closed NAT tunnel {}: {}", tunnel_id, close.reason);
+                        break;
+                    }
+                    Some(io_frame::Payload::Error(IoError { message, .. })) => {
+                        return Err(anyhow!("agent NAT tunnel error: {}", message));
+                    }
+                    None => {}
                 }
-                a_write.write_all(&buf[..n]).await?;
-                total += n as u64;
-                *bytes_received.write().await += n as u64;
             }
-            Ok::<_, std::io::Error>(total)
+            Ok::<u64, anyhow::Error>(total)
         };
 
-        tokio::try_join!(a_to_b, b_to_a).map_err(|e| e.into())
+        tokio::try_join!(to_agent, from_agent)
     }
 
-    /// Get active tunnel count
     pub async fn active_tunnel_count(&self) -> usize {
         self.active_tunnels.read().await.len()
     }
 
-    /// Get statistics for all active tunnels
     pub async fn get_statistics(&self) -> Vec<TunnelStats> {
         let tunnels = self.active_tunnels.read().await;
         let mut stats = Vec::new();
-
         for tunnel in tunnels.values() {
             stats.push(TunnelStats {
                 tunnel_id: tunnel.tunnel_id.clone(),
                 bytes_sent: *tunnel.bytes_sent.read().await,
                 bytes_received: *tunnel.bytes_received.read().await,
-                connections: 1, // Each tunnel is one connection for now
+                connections: 1,
                 last_activity: tunnel.created_at.to_rfc3339(),
             });
         }
-
         stats
     }
 }
 
-// Implement Clone manually for testing
 impl Clone for NatTunnelManager {
     fn clone(&self) -> Self {
         Self {
             db: self.db.clone(),
+            io_registry: self.io_registry.clone(),
             listeners: self.listeners.clone(),
             active_tunnels: self.active_tunnels.clone(),
         }
@@ -283,7 +376,6 @@ mod tests {
 
     #[test]
     fn test_tunnel_manager_creation() {
-        // This is a placeholder test
-        // Real tests would require a database connection
+        // Placeholder: integration covered by verify scripts.
     }
 }

@@ -171,23 +171,29 @@ enum TransferDirection {
   TRANSFER_DIRECTION_DOWNLOAD = 2; // Agent -> Server
 }
 
-// Task result from agent
+// Outcome status of a completed task.
+enum TaskOutcome {
+  TASK_OUTCOME_UNSPECIFIED = 0;
+  TASK_OUTCOME_SUCCESS = 1;
+  TASK_OUTCOME_FAILURE = 2;
+  TASK_OUTCOME_TIMEOUT = 3;
+}
+
+// Task result from agent. M5 fields are flat scalars so the
+// server's run_task handler can persist a task_runs row without
+// unpacking the oneof. The oneof stays for richer payloads
+// (file/transfer results) that land in M5+.
 message TaskResult {
   string task_id = 1;
-  bool success = 2;
-  oneof result {
-    ShellCommandResult shell_command = 10;
-    HttpGetResult http_get = 11;
-    IcmpPingResult icmp_ping = 12;
-    TcpPingResult tcp_ping = 13;
-    TerminalResult terminal = 14;
-    FileListResult file_list = 15;
-    FileReadResult file_read = 16;
-    FileWriteResult file_write = 17;
-    FileDeleteResult file_delete = 18;
-    FileTransferResult file_transfer = 19;
-    TaskError error = 20;
-  }
+  // M5: scalar fields populated by the agent.
+  TaskOutcome status = 2;
+  int32 exit_code = 3;
+  string stdout = 4;
+  string stderr = 5;
+  string error = 6;
+  int64 started_at = 7;
+  int64 finished_at = 8;
+  string agent_id = 9;
 }
 
 // Shell command result
@@ -298,6 +304,7 @@ message ForceDisconnect {
 message IoFrame {
   string stream_id = 1;
   uint64 sequence = 2;
+  string agent_id = 6;
   oneof payload {
     IoData data = 3;
     IoClose close = 4;

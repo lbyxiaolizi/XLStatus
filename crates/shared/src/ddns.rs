@@ -18,9 +18,9 @@ pub struct DdnsProvider {
 pub enum ProviderType {
     Cloudflare,
     TencentCloud,
-    He,        // Hurricane Electric
+    He, // Hurricane Electric
     Webhook,
-    Dummy,     // For testing
+    Dummy, // For testing
 }
 
 impl ProviderType {
@@ -64,6 +64,7 @@ pub struct TencentCloudConfig {
     pub secret_key: String,
     pub domain: String,
     pub subdomain: String,
+    pub record_id: Option<u64>,
     pub record_type: String,
     pub record_line: String, // "默认"
     pub ttl: u32,
@@ -80,8 +81,8 @@ pub struct HeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebhookConfig {
     pub url: String,
-    pub method: String, // "GET" or "POST"
-    pub headers: Option<String>, // JSON string
+    pub method: String,                // "GET" or "POST"
+    pub headers: Option<String>,       // JSON string
     pub body_template: Option<String>, // Template with {{ip}} placeholder
 }
 
@@ -150,4 +151,16 @@ mod tests {
         assert_eq!(config.api_token, deserialized.api_token);
         assert_eq!(config.zone_id, deserialized.zone_id);
     }
+}
+
+/// A single historical DDNS update record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DdnsHistoryEntry {
+    pub id: String,
+    pub config_id: String,
+    pub old_ip: Option<String>,
+    pub new_ip: String,
+    pub success: bool,
+    pub error: Option<String>,
+    pub applied_at: String,
 }

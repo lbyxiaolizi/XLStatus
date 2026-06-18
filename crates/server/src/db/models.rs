@@ -1,5 +1,8 @@
+#![allow(dead_code)]
+#![allow(unused)]
+
 use chrono::{DateTime, Utc};
-use xlstatus_shared::{AgentId, ServerId, UserId, UserRole};
+use xlstatus_shared::{AgentId, UserId, UserRole};
 
 #[derive(Debug, Clone)]
 pub struct User {
@@ -96,4 +99,15 @@ pub struct CreateAgentInput {
     pub name: String,
     pub public_key: String,
     pub owner_user_id: UserId,
+}
+
+/// M3: read-side view of an agent with the most recent HostState
+/// and HostInfo JSON columns. Used by the `/api/v1/servers` list and
+/// detail endpoints so the rest of the codebase doesn't have to
+/// grow a wider `Agent` struct just to expose two extra columns.
+#[derive(Debug, Clone)]
+pub struct AgentWithState {
+    pub agent: Agent,
+    pub last_state_json: Option<String>,
+    pub last_info_json: Option<String>,
 }

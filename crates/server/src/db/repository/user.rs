@@ -1,3 +1,6 @@
+#![allow(dead_code)]
+#![allow(unused)]
+
 use crate::db::{models::*, DatabaseBackend};
 use anyhow::Result;
 use argon2::{
@@ -77,17 +80,23 @@ impl UserRepository {
                 .fetch_optional(pool)
                 .await?;
 
-                Ok(row.map(|(id, username, password_hash, role, token_version, created_at, updated_at)| {
-                    User {
-                        id: UserId(uuid::Uuid::parse_str(&id).unwrap()),
-                        username,
-                        password_hash,
-                        role: role.parse().unwrap(),
-                        token_version,
-                        created_at: DateTime::parse_from_rfc3339(&created_at).unwrap().with_timezone(&Utc),
-                        updated_at: DateTime::parse_from_rfc3339(&updated_at).unwrap().with_timezone(&Utc),
-                    }
-                }))
+                Ok(row.map(
+                    |(id, username, password_hash, role, token_version, created_at, updated_at)| {
+                        User {
+                            id: UserId(uuid::Uuid::parse_str(&id).unwrap()),
+                            username,
+                            password_hash,
+                            role: role.parse().unwrap(),
+                            token_version,
+                            created_at: DateTime::parse_from_rfc3339(&created_at)
+                                .unwrap()
+                                .with_timezone(&Utc),
+                            updated_at: DateTime::parse_from_rfc3339(&updated_at)
+                                .unwrap()
+                                .with_timezone(&Utc),
+                        }
+                    },
+                ))
             }
             DatabaseBackend::Postgres(pool) => {
                 let row = sqlx::query_as::<_, (uuid::Uuid, String, String, String, i32, DateTime<Utc>, DateTime<Utc>)>(
@@ -97,17 +106,72 @@ impl UserRepository {
                 .fetch_optional(pool)
                 .await?;
 
-                Ok(row.map(|(id, username, password_hash, role, token_version, created_at, updated_at)| {
-                    User {
-                        id: UserId(id),
-                        username,
-                        password_hash,
-                        role: role.parse().unwrap(),
-                        token_version,
-                        created_at,
-                        updated_at,
-                    }
-                }))
+                Ok(row.map(
+                    |(id, username, password_hash, role, token_version, created_at, updated_at)| {
+                        User {
+                            id: UserId(id),
+                            username,
+                            password_hash,
+                            role: role.parse().unwrap(),
+                            token_version,
+                            created_at,
+                            updated_at,
+                        }
+                    },
+                ))
+            }
+        }
+    }
+
+    pub async fn find_by_id(&self, user_id: UserId) -> Result<Option<User>> {
+        match &self.db {
+            DatabaseBackend::Sqlite(pool) => {
+                let row = sqlx::query_as::<_, (String, String, String, String, i32, String, String)>(
+                    "SELECT id, username, password_hash, role, token_version, created_at, updated_at FROM users WHERE id = ?",
+                )
+                .bind(user_id.0.to_string())
+                .fetch_optional(pool)
+                .await?;
+
+                Ok(row.map(
+                    |(id, username, password_hash, role, token_version, created_at, updated_at)| {
+                        User {
+                            id: UserId(uuid::Uuid::parse_str(&id).unwrap()),
+                            username,
+                            password_hash,
+                            role: role.parse().unwrap(),
+                            token_version,
+                            created_at: DateTime::parse_from_rfc3339(&created_at)
+                                .unwrap()
+                                .with_timezone(&Utc),
+                            updated_at: DateTime::parse_from_rfc3339(&updated_at)
+                                .unwrap()
+                                .with_timezone(&Utc),
+                        }
+                    },
+                ))
+            }
+            DatabaseBackend::Postgres(pool) => {
+                let row = sqlx::query_as::<_, (uuid::Uuid, String, String, String, i32, DateTime<Utc>, DateTime<Utc>)>(
+                    "SELECT id, username, password_hash, role, token_version, created_at, updated_at FROM users WHERE id = $1",
+                )
+                .bind(user_id.0)
+                .fetch_optional(pool)
+                .await?;
+
+                Ok(row.map(
+                    |(id, username, password_hash, role, token_version, created_at, updated_at)| {
+                        User {
+                            id: UserId(id),
+                            username,
+                            password_hash,
+                            role: role.parse().unwrap(),
+                            token_version,
+                            created_at,
+                            updated_at,
+                        }
+                    },
+                ))
             }
         }
     }

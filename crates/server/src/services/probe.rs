@@ -1,8 +1,22 @@
-use anyhow::Result;
+#![allow(dead_code)]
+#![allow(unused_imports)]
+
+use crate::security::validate_outbound_url;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::{DigitallySignedStruct, SignatureScheme};
+use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
+use sha2::{Digest, Sha256};
+use std::fmt;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
+use x509_parser::prelude::{FromDer, X509Certificate};
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ServiceProbe {
     pub id: String,
     pub service_id: String,
@@ -10,6 +24,8 @@ pub struct ServiceProbe {
     pub latency_ms: Option<i32>,
     pub status_code: Option<i32>,
     pub error: Option<String>,
+    pub cert_fingerprint: Option<String>,
+    pub cert_not_after: Option<DateTime<Utc>>,
     pub checked_at: DateTime<Utc>,
 }
 
@@ -33,14 +49,28 @@ impl ProbeType {
 
 pub async fn probe_http(url: &str, timeout_secs: u64) -> Result<ServiceProbe> {
     let start = Instant::now();
+    let parsed = validate_outbound_url(url, "HTTP monitor").await?;
+    let cert = if parsed.scheme() == "https" {
+        match probe_tls_certificate(&parsed, timeout_secs).await {
+            Ok(cert) => Some(cert),
+            Err(e) => {
+                tracing::warn!("failed to inspect TLS certificate for {}: {}", url, e);
+                None
+            }
+        }
+    } else {
+        None
+    };
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
+        .redirect(reqwest::redirect::Policy::none())
         .build()?;
 
-    match client.get(url).send().await {
+    match client.get(parsed.clone()).send().await {
         Ok(response) => {
             let status = response.status();
             let latency_ms = start.elapsed().as_millis() as i32;
+            let (cert_fingerprint, cert_not_after) = cert_fields(cert);
 
             Ok(ServiceProbe {
                 id: uuid::Uuid::now_v7().to_string(),
@@ -53,11 +83,14 @@ pub async fn probe_http(url: &str, timeout_secs: u64) -> Result<ServiceProbe> {
                 } else {
                     Some(format!("HTTP {}", status.as_u16()))
                 },
+                cert_fingerprint,
+                cert_not_after,
                 checked_at: Utc::now(),
             })
         }
         Err(e) => {
             let latency_ms = start.elapsed().as_millis() as i32;
+            let (cert_fingerprint, cert_not_after) = cert_fields(cert);
             Ok(ServiceProbe {
                 id: uuid::Uuid::now_v7().to_string(),
                 service_id: String::new(),
@@ -65,6 +98,8 @@ pub async fn probe_http(url: &str, timeout_secs: u64) -> Result<ServiceProbe> {
                 latency_ms: Some(latency_ms),
                 status_code: None,
                 error: Some(e.to_string()),
+                cert_fingerprint,
+                cert_not_after,
                 checked_at: Utc::now(),
             })
         }
@@ -90,6 +125,8 @@ pub async fn probe_tcp(host: &str, port: u16, timeout_secs: u64) -> Result<Servi
                 latency_ms: Some(latency_ms),
                 status_code: None,
                 error: None,
+                cert_fingerprint: None,
+                cert_not_after: None,
                 checked_at: Utc::now(),
             })
         }
@@ -102,6 +139,8 @@ pub async fn probe_tcp(host: &str, port: u16, timeout_secs: u64) -> Result<Servi
                 latency_ms: Some(latency_ms),
                 status_code: None,
                 error: Some(e.to_string()),
+                cert_fingerprint: None,
+                cert_not_after: None,
                 checked_at: Utc::now(),
             })
         }
@@ -114,6 +153,8 @@ pub async fn probe_tcp(host: &str, port: u16, timeout_secs: u64) -> Result<Servi
                 latency_ms: Some(latency_ms),
                 status_code: None,
                 error: Some("Connection timeout".to_string()),
+                cert_fingerprint: None,
+                cert_not_after: None,
                 checked_at: Utc::now(),
             })
         }
@@ -121,6 +162,7 @@ pub async fn probe_tcp(host: &str, port: u16, timeout_secs: u64) -> Result<Servi
 }
 
 /// ICMP ping probe (requires system ping command)
+#[allow(dead_code)]
 pub async fn probe_icmp(host: &str, timeout_secs: u64) -> Result<ServiceProbe> {
     let start = Instant::now();
 
@@ -150,6 +192,8 @@ pub async fn probe_icmp(host: &str, timeout_secs: u64) -> Result<ServiceProbe> {
             latency_ms: Some(avg_latency),
             status_code: None,
             error: None,
+            cert_fingerprint: None,
+            cert_not_after: None,
             checked_at: Utc::now(),
         })
     } else {
@@ -161,11 +205,125 @@ pub async fn probe_icmp(host: &str, timeout_secs: u64) -> Result<ServiceProbe> {
             latency_ms: Some(latency_ms),
             status_code: None,
             error: Some(format!("Ping failed: {}", stderr)),
+            cert_fingerprint: None,
+            cert_not_after: None,
             checked_at: Utc::now(),
         })
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct CertificateStatus {
+    pub fingerprint: String,
+    pub not_after: DateTime<Utc>,
+}
+
+fn cert_fields(cert: Option<CertificateStatus>) -> (Option<String>, Option<DateTime<Utc>>) {
+    match cert {
+        Some(cert) => (Some(cert.fingerprint), Some(cert.not_after)),
+        None => (None, None),
+    }
+}
+
+async fn probe_tls_certificate(url: &reqwest::Url, timeout_secs: u64) -> Result<CertificateStatus> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let host = url
+        .host_str()
+        .context("HTTPS URL must include a host for TLS probing")?
+        .to_string();
+    let port = url.port_or_known_default().unwrap_or(443);
+    let addr = format!("{host}:{port}");
+    let stream = tokio::time::timeout(Duration::from_secs(timeout_secs), TcpStream::connect(&addr))
+        .await
+        .context("TLS TCP connect timed out")??;
+
+    let config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(config));
+    let server_name = ServerName::try_from(host.clone())
+        .with_context(|| format!("invalid TLS server name: {host}"))?;
+    let tls_stream = tokio::time::timeout(
+        Duration::from_secs(timeout_secs),
+        connector.connect(server_name, stream),
+    )
+    .await
+    .context("TLS handshake timed out")??;
+
+    let (_, session) = tls_stream.get_ref();
+    let certs = session
+        .peer_certificates()
+        .context("TLS peer did not present a certificate")?;
+    let leaf = certs
+        .first()
+        .context("TLS peer certificate chain is empty")?;
+    parse_certificate_status(leaf)
+}
+
+fn parse_certificate_status(leaf: &CertificateDer<'_>) -> Result<CertificateStatus> {
+    let fingerprint = hex::encode(Sha256::digest(leaf.as_ref()));
+    let (_, cert) =
+        X509Certificate::from_der(leaf.as_ref()).context("failed to parse TLS certificate")?;
+    let not_after = cert.validity().not_after.to_datetime();
+    let not_after =
+        DateTime::<Utc>::from_timestamp(not_after.unix_timestamp(), not_after.nanosecond())
+            .context("certificate not_after is outside supported timestamp range")?;
+    Ok(CertificateStatus {
+        fingerprint,
+        not_after,
+    })
+}
+
+#[derive(Debug)]
+struct NoCertificateVerification;
+
+impl ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::ED25519,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+        ]
+    }
+}
+
+#[allow(dead_code)]
 fn parse_ping_latency(output: &str) -> Option<i32> {
     // Try to extract average latency from ping output
     for line in output.lines() {
