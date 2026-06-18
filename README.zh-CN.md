@@ -88,7 +88,7 @@ sudo BINARY_PATH=target/release/xlstatus-agent bash deploy/install-agent.sh
 ### 前置要求
 
 - Rust 1.75+
-- Node.js 20+
+- Node.js 20+，并启用 Corepack/pnpm
 - PostgreSQL 15+ 或 SQLite 3.40+
 
 ### 从源码构建
@@ -105,9 +105,10 @@ cargo build --release --bin xlstatus-server
 cargo build --release --bin xlstatus-agent
 
 # 构建 Web 界面
+corepack enable
 cd web
-npm install
-npm run build
+pnpm install --frozen-lockfile
+NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm build
 ```
 
 ### 开发模式运行
@@ -118,10 +119,19 @@ cargo run --bin xlstatus-server
 
 # 终端 2: 启动 Web 界面
 cd web
-npm run dev
+corepack enable
+pnpm install --frozen-lockfile
+NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm dev
 
 # 终端 3: 启动 Agent
 cargo run --bin xlstatus-agent
+```
+
+如果要用源码方式运行接近生产的前端，先启动 Rust Server，再执行：
+
+```bash
+cd web
+NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm start
 ```
 
 ## 📦 技术栈

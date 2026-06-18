@@ -88,7 +88,7 @@ sudo BINARY_PATH=target/release/xlstatus-agent bash deploy/install-agent.sh
 ### Prerequisites
 
 - Rust 1.75+
-- Node.js 20+
+- Node.js 20+ with Corepack/pnpm
 - PostgreSQL 15+ or SQLite 3.40+
 
 ### Build from Source
@@ -105,9 +105,10 @@ cargo build --release --bin xlstatus-server
 cargo build --release --bin xlstatus-agent
 
 # Build web interface
+corepack enable
 cd web
-npm install
-npm run build
+pnpm install --frozen-lockfile
+NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm build
 ```
 
 ### Run in Development
@@ -118,10 +119,19 @@ cargo run --bin xlstatus-server
 
 # Terminal 2: Start web interface
 cd web
-npm run dev
+corepack enable
+pnpm install --frozen-lockfile
+NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm dev
 
 # Terminal 3: Start agent
 cargo run --bin xlstatus-agent
+```
+
+For a production-style source run, start the Rust server first, then run:
+
+```bash
+cd web
+NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm start
 ```
 
 ## 📦 Tech Stack

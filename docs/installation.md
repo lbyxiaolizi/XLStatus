@@ -7,7 +7,7 @@ This guide reflects the current M9 release-stability artifacts in this repositor
 - Linux x86_64 for systemd installs
 - Docker 20.10+ and Docker Compose v2 for container installs
 - Rust toolchain when building binaries from source
-- Node.js 20+ only when building the web image or running the frontend from source
+- Node.js 20+ with Corepack/pnpm when building the web image or running the frontend from source
 
 ## Docker Compose
 
@@ -54,6 +54,11 @@ XLSTATUS_SEED_ADMIN_PASSWORD=admin123
 ```bash
 cargo build --release --bin xlstatus-server
 cargo build --release --bin xlstatus-agent
+corepack enable
+cd web
+pnpm install --frozen-lockfile
+NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm build
+cd ..
 ```
 
 Run a local server with SQLite:
@@ -103,6 +108,22 @@ XLSTATUS_SEED_ADMIN_PASSWORD="admin123" \
 ```
 
 XLStatus creates application tables through embedded migrations. Do not pre-load unrelated tables into a fresh XLStatus database.
+
+Run the web dashboard from source after the server is healthy:
+
+```bash
+cd web
+NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm dev
+```
+
+For a production-style source run after `pnpm build`:
+
+```bash
+cd web
+NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm start
+```
+
+Open the dashboard at `http://localhost:3000`; the frontend calls the server API configured by `NEXT_PUBLIC_API_URL`.
 
 The server also supports `CONFIG_FILE=/path/to/server.toml`:
 

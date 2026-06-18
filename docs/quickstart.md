@@ -30,6 +30,11 @@ The PostgreSQL Compose file creates the `xlstatus` role and database on an empty
 ```bash
 cargo build --release --bin xlstatus-server
 cargo build --release --bin xlstatus-agent
+corepack enable
+cd web
+pnpm install --frozen-lockfile
+NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm build
+cd ..
 ```
 
 Run the server:
@@ -65,6 +70,20 @@ XLSTATUS_SEED_ADMIN_PASSWORD="admin123" \
 ```
 
 The first startup runs embedded application migrations. See [configuration.md](./configuration.md) for all configuration options.
+
+Run the Web UI from source in another terminal:
+
+```bash
+cd web
+NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm dev
+```
+
+For a production-style local run after `pnpm build`:
+
+```bash
+cd web
+NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm start
+```
 
 Enroll and run an agent:
 
