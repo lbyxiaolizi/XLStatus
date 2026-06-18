@@ -19,6 +19,8 @@
 | `POST` | `/api/v1/agents/enroll` | Agent 注册 |
 | `POST` | `/api/v1/agents/jwt/challenge` | Agent JWT challenge |
 | `POST` | `/api/v1/agents/jwt` | Agent JWT 签发 |
+| `GET` | `/install-agent.sh` | 带参数 Agent 安装 bootstrap |
+| `GET` | `/api/v1/agents/install.sh` | 带参数 Agent 安装 bootstrap |
 | `GET` | `/api/v1/transfers/temp/download` | 临时下载 |
 | `PUT` | `/api/v1/transfers/temp/upload` | 临时上传 |
 
@@ -126,6 +128,29 @@ Agent gRPC 服务定义在 `proto/xlstatus/v1/agent.proto`，生成代码在 `cr
 2. Agent 建立 gRPC session。
 3. Server 通过 session 下发任务、IO、配置和操作。
 4. Agent 持续上报主机状态和任务结果。
+
+## Agent 安装链接
+
+`GET /api/v1/agents/install.sh` 接收查询参数并返回一个很小的 bootstrap shell 脚本。真正的 `install-agent.sh` 放在 GitHub Release 资产中，bootstrap 只负责导出参数并下载执行 GitHub 脚本。
+
+支持的参数：
+
+| 参数 | 说明 |
+|---|---|
+| `server_url` | Dashboard HTTP API 地址 |
+| `grpc_server` | Agent gRPC 地址 |
+| `enrollment_token` | enrollment token |
+| `agent_name` | Agent 名称；默认 `$(hostname)` |
+| `version` | GitHub Release 版本，默认 `v1.0.0` |
+| `script_url` | 可选，自定义 GitHub 脚本地址 |
+
+示例：
+
+```bash
+curl -fsSL 'http://dashboard.example.com:8080/api/v1/agents/install.sh?server_url=http%3A%2F%2Fdashboard.example.com%3A8080&grpc_server=http%3A%2F%2Fdashboard.example.com%3A50051&enrollment_token=xle_...&agent_name=%24(hostname)&version=v1.0.0' | sudo bash
+```
+
+`enrollment_token` 会进入 URL，建议使用短有效期 token。
 
 ## CORS 和 Cookie
 

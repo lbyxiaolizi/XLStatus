@@ -27,6 +27,15 @@ cargo build --release --bin xlstatus-agent
 test-run/verify-m9-install.sh
 ```
 
+GitHub Actions 会在 `main` 和 PR 上运行 Rust/Web 检查，并在 tag `v*` 时发布这些 Release 资产：
+
+- `xlstatus-server-linux-x86_64`
+- `xlstatus-agent-linux-x86_64`
+- `install-server.sh`
+- `install-agent.sh`
+
+Server 后台生成的 Agent 一键安装链接会从 GitHub Release 下载 `install-agent.sh`。
+
 Linux x86_64 smoke：
 
 ```bash
@@ -59,6 +68,7 @@ timeout 8s env \
 - 文档没有引用已删除的历史归档、旧里程碑报告或过期命令。
 - 从源码构建包含后端、Agent 和前端步骤。
 - CORS、`config.toml`、SQLite 创建行为、PostgreSQL 新站初始化均有说明。
+- Agent 安装说明包含后台带参数链接和 GitHub Release 脚本来源。
 
 ## 安全
 

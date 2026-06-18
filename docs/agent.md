@@ -66,6 +66,22 @@ sudo systemctl status xlstatus-agent
 sudo journalctl -u xlstatus-agent -n 100 --no-pager
 ```
 
+## 后台一键安装
+
+Dashboard 的“设置”页可以生成 Agent enrollment token，并给出带参数的一键安装命令。命令形态如下：
+
+```bash
+curl -fsSL 'http://dashboard.example.com:8080/api/v1/agents/install.sh?...' | sudo bash
+```
+
+这个链接由 Server 负责注入参数，真正执行的安装脚本来自 GitHub Release：
+
+```text
+https://github.com/lbyxiaolizi/XLStatus/releases/download/v1.0.0/install-agent.sh
+```
+
+生成链接时会包含 enrollment token；这个 token 建议设置短有效期，并只发给受信任主机。
+
 ## 地址说明
 
 - `--server` 是 Dashboard HTTP API 地址，例如 `http://dashboard.example.com:8080`。

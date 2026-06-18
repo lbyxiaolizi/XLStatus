@@ -45,6 +45,29 @@ cd ..
 
 前端构建时的 `NEXT_PUBLIC_API_URL` 会进入浏览器 bundle。生产环境请设置为用户浏览器能访问的 API 地址。
 
+## GitHub Actions 自动构建
+
+仓库包含 GitHub Actions workflow：
+
+- PR 和 `main` push：运行 Rust 格式、workspace check/test、Web lint/build。
+- tag `v*`：构建 Linux x86_64 release 二进制，并发布 GitHub Release 资产。
+
+Release 资产名称：
+
+```text
+xlstatus-server-linux-x86_64
+xlstatus-agent-linux-x86_64
+install-server.sh
+install-agent.sh
+```
+
+安装脚本默认从下面路径下载二进制：
+
+```text
+https://github.com/lbyxiaolizi/XLStatus/releases/download/<VERSION>/xlstatus-server-linux-x86_64
+https://github.com/lbyxiaolizi/XLStatus/releases/download/<VERSION>/xlstatus-agent-linux-x86_64
+```
+
 ## systemd 安装 Server
 
 当前没有预编译 release 二进制，先构建再安装：
@@ -55,6 +78,26 @@ sudo BINARY_PATH=target/release/xlstatus-server \
   ADMIN_USERNAME=admin \
   ADMIN_PASSWORD='admin123' \
   CORS_ALLOWED_ORIGINS='http://localhost:3000,http://127.0.0.1:3000' \
+  bash deploy/install.sh
+```
+
+如果直接运行：
+
+```bash
+sudo bash deploy/install.sh
+```
+
+脚本会进入交互式配置流程，依次询问安装目录、端口、数据库、CORS、管理员初始化和是否启动服务。无人值守安装时使用环境变量，并设置 `INTERACTIVE=false` 跳过提示：
+
+```bash
+sudo INTERACTIVE=false \
+  VERSION=v1.0.0 \
+  HTTP_BIND=0.0.0.0:8080 \
+  GRPC_BIND=0.0.0.0:50051 \
+  DATABASE_URL=sqlite:///var/lib/xlstatus/xlstatus.db?mode=rwc \
+  DATABASE_CREATE_IF_MISSING=true \
+  CORS_ALLOWED_ORIGINS=https://status.example.com \
+  ADMIN_PASSWORD='admin123' \
   bash deploy/install.sh
 ```
 
@@ -185,6 +228,29 @@ sudo BINARY_PATH=target/release/xlstatus-agent \
 sudo systemctl status xlstatus-agent
 sudo journalctl -u xlstatus-agent -n 100 --no-pager
 ```
+
+后台“设置”页可以生成 enrollment token，并给出完整安装命令。真正的 Agent 安装脚本放在 GitHub Release 中，Server 只生成带参数的 bootstrap 链接，把 `SERVER_URL`、`GRPC_SERVER`、`ENROLLMENT_TOKEN`、`AGENT_NAME` 和 `VERSION` 注入后再拉取 GitHub 脚本。
+
+Server 提供的带参数入口：
+
+```text
+GET /install-agent.sh
+GET /api/v1/agents/install.sh
+```
+
+手动使用带参数链接：
+
+```bash
+curl -fsSL 'http://dashboard.example.com:8080/api/v1/agents/install.sh?server_url=http%3A%2F%2Fdashboard.example.com%3A8080&grpc_server=http%3A%2F%2Fdashboard.example.com%3A50051&enrollment_token=xle_...&agent_name=%24(hostname)&version=v1.0.0' | sudo bash
+```
+
+这个 bootstrap 会下载并执行：
+
+```text
+https://github.com/lbyxiaolizi/XLStatus/releases/download/v1.0.0/install-agent.sh
+```
+
+`enrollment_token` 会出现在安装链接里，应只给受信任的主机使用；令牌过期或使用后需要重新生成。
 
 ## 远端 Linux x86_64 验证
 

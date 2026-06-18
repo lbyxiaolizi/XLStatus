@@ -1,7 +1,7 @@
 // API client for XLStatus backend
 import { t } from "@/lib/i18n";
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
+export const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
 
 export interface ApiResponse<T> {
   success: boolean;
@@ -113,6 +113,11 @@ export interface CreatePatResponse {
   token: string;
   scopes: string[];
   created_at: string;
+}
+
+export interface CreateEnrollmentTokenResponse {
+  token: string;
+  expires_at: string;
 }
 
 export type JsonObject = Record<string, unknown>;
@@ -247,6 +252,20 @@ class ApiClient {
   async revokePat(id: string): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(`/api/v1/tokens/${encodeURIComponent(id)}`, {
       method: "DELETE",
+    });
+  }
+
+  getAgentInstallScriptUrl(params: Record<string, string>): string {
+    const query = new URLSearchParams(params);
+    return `${this.baseUrl}/api/v1/agents/install.sh?${query.toString()}`;
+  }
+
+  async createEnrollmentToken(
+    expiresInHours = 24,
+  ): Promise<ApiResponse<CreateEnrollmentTokenResponse>> {
+    return this.request<CreateEnrollmentTokenResponse>("/api/v1/enrollment-tokens", {
+      method: "POST",
+      body: JSON.stringify({ expires_in_hours: expiresInHours }),
     });
   }
 

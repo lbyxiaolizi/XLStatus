@@ -17,6 +17,9 @@ CORS_ALLOWED_ORIGINS="${CORS_ALLOWED_ORIGINS:-http://localhost:3000,http://127.0
 SESSION_SECRET="${SESSION_SECRET:-}"
 ADMIN_USERNAME="${ADMIN_USERNAME:-admin}"
 ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"
+INSTALL_DEPS="${INSTALL_DEPS:-true}"
+START_SERVICE="${START_SERVICE:-true}"
+INTERACTIVE="${INTERACTIVE:-auto}"
 
 trim() {
   local value="$*"
@@ -75,6 +78,152 @@ warn_if_port_busy() {
   fi
 }
 
+is_truthy_value() {
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|y|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_interactive() {
+  case "$(printf '%s' "$INTERACTIVE" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|y|on) return 0 ;;
+    0|false|no|n|off) return 1 ;;
+  esac
+
+  [ -t 0 ] || [ -r /dev/tty ]
+}
+
+prompt_read() {
+  local prompt="$1"
+  local silent="${2:-false}"
+
+  if [ -r /dev/tty ]; then
+    if [ "$silent" = "true" ]; then
+      read -r -s -p "$prompt" PROMPT_REPLY </dev/tty
+      echo >/dev/tty
+    else
+      read -r -p "$prompt" PROMPT_REPLY </dev/tty
+    fi
+  else
+    if [ "$silent" = "true" ]; then
+      read -r -s -p "$prompt" PROMPT_REPLY
+      echo
+    else
+      read -r -p "$prompt" PROMPT_REPLY
+    fi
+  fi
+}
+
+prompt_value() {
+  local var_name="$1"
+  local label="$2"
+  local current="${!var_name}"
+
+  prompt_read "$label [$current]: "
+  if [ -n "$PROMPT_REPLY" ]; then
+    printf -v "$var_name" '%s' "$PROMPT_REPLY"
+  fi
+}
+
+prompt_secret() {
+  local var_name="$1"
+  local label="$2"
+
+  prompt_read "$label: " true
+  if [ -n "$PROMPT_REPLY" ]; then
+    printf -v "$var_name" '%s' "$PROMPT_REPLY"
+  fi
+}
+
+prompt_bool() {
+  local var_name="$1"
+  local label="$2"
+  local current="${!var_name}"
+  local hint="[y/N]"
+
+  if is_truthy_value "$current"; then
+    hint="[Y/n]"
+  fi
+
+  prompt_read "$label $hint: "
+  case "$(printf '%s' "$PROMPT_REPLY" | tr '[:upper:]' '[:lower:]')" in
+    y|yes|1|true|on) printf -v "$var_name" 'true' ;;
+    n|no|0|false|off) printf -v "$var_name" 'false' ;;
+  esac
+}
+
+configure_interactively() {
+  if ! is_interactive; then
+    return
+  fi
+
+  echo ""
+  echo "🧭 Interactive configuration"
+  echo "   Press Enter to keep the value shown in brackets."
+  echo "   Set INTERACTIVE=false to skip prompts for unattended installs."
+  echo ""
+
+  prompt_value VERSION "Release version to download"
+  prompt_value BINARY_PATH "Local server binary path; leave empty to download from GitHub Releases"
+  prompt_value INSTALL_DIR "Install directory"
+  prompt_value DATA_DIR "Data directory"
+  prompt_value CONFIG_FILE "Config file path"
+  prompt_value HTTP_BIND "HTTP bind address"
+  prompt_value GRPC_BIND "gRPC bind address"
+
+  local db_backend="sqlite"
+  if [[ "$DATABASE_URL" == postgres://* || "$DATABASE_URL" == postgresql://* ]]; then
+    db_backend="postgres"
+  fi
+
+  prompt_read "Database backend (sqlite/postgres) [$db_backend]: "
+  if [ -n "$PROMPT_REPLY" ]; then
+    db_backend="$(printf '%s' "$PROMPT_REPLY" | tr '[:upper:]' '[:lower:]')"
+  fi
+
+  case "$db_backend" in
+    postgres|postgresql|pg)
+      if [[ "$DATABASE_URL" != postgres://* && "$DATABASE_URL" != postgresql://* ]]; then
+        DATABASE_URL="postgresql://xlstatus:change-this-password@localhost:5432/xlstatus"
+      fi
+      prompt_value DATABASE_URL "PostgreSQL DATABASE_URL"
+      DATABASE_CREATE_IF_MISSING=false
+      ;;
+    sqlite|"")
+      local sqlite_path="$DATA_DIR/xlstatus.db"
+      prompt_read "SQLite database file [$sqlite_path]: "
+      if [ -n "$PROMPT_REPLY" ]; then
+        sqlite_path="$PROMPT_REPLY"
+      fi
+      DATABASE_URL="sqlite://$sqlite_path?mode=rwc"
+      prompt_bool DATABASE_CREATE_IF_MISSING "Create SQLite database if missing"
+      ;;
+    *)
+      echo "❌ Unsupported database backend: $db_backend"
+      exit 1
+      ;;
+  esac
+
+  prompt_value CORS_ALLOWED_ORIGINS "Web UI CORS allowed origins"
+
+  if [ -z "$SESSION_SECRET" ]; then
+    prompt_secret SESSION_SECRET "Session secret; leave empty to generate one"
+  else
+    prompt_secret SESSION_SECRET "Session secret; leave empty to keep current value"
+  fi
+
+  prompt_value ADMIN_USERNAME "Seed admin username"
+  if [ -z "$ADMIN_PASSWORD" ]; then
+    prompt_secret ADMIN_PASSWORD "Seed admin password; leave empty to skip admin bootstrap"
+  else
+    prompt_secret ADMIN_PASSWORD "Seed admin password; leave empty to keep current value"
+  fi
+
+  prompt_bool INSTALL_DEPS "Install OS dependencies"
+  prompt_bool START_SERVICE "Start xlstatus service after install"
+}
+
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║                                                              ║"
 echo "║   Installing XLStatus Server                                 ║"
@@ -103,17 +252,23 @@ fi
 
 echo "✓ Detected: Linux x86_64"
 
+configure_interactively
+
 # Install dependencies
 echo ""
-echo "📦 Installing dependencies..."
-if command -v apt-get &> /dev/null; then
-  apt-get update
-  apt-get install -y curl ca-certificates sqlite3
-elif command -v yum &> /dev/null; then
-  yum install -y curl ca-certificates sqlite
+if is_truthy_value "$INSTALL_DEPS"; then
+  echo "📦 Installing dependencies..."
+  if command -v apt-get &> /dev/null; then
+    apt-get update
+    apt-get install -y curl ca-certificates sqlite3
+  elif command -v yum &> /dev/null; then
+    yum install -y curl ca-certificates sqlite
+  else
+    echo "❌ Unsupported package manager"
+    exit 1
+  fi
 else
-  echo "❌ Unsupported package manager"
-  exit 1
+  echo "📦 Skipping dependency installation"
 fi
 
 # Create user
@@ -235,27 +390,31 @@ echo "✓ Systemd service installed"
 
 # Start service
 echo ""
-echo "🚀 Starting XLStatus..."
-warn_if_port_busy "HTTP" "$HTTP_BIND"
-warn_if_port_busy "gRPC" "$GRPC_BIND"
-systemctl start xlstatus
+if is_truthy_value "$START_SERVICE"; then
+  echo "🚀 Starting XLStatus..."
+  warn_if_port_busy "HTTP" "$HTTP_BIND"
+  warn_if_port_busy "gRPC" "$GRPC_BIND"
+  systemctl start xlstatus
 
-# Wait for service to be ready
-sleep 3
+  # Wait for service to be ready
+  sleep 3
 
-if systemctl is-active --quiet xlstatus; then
-  echo "✓ XLStatus is running"
+  if systemctl is-active --quiet xlstatus; then
+    echo "✓ XLStatus is running"
+  else
+    echo "❌ Failed to start XLStatus"
+    echo ""
+    systemctl status xlstatus --no-pager || true
+    echo ""
+    journalctl -u xlstatus -n 80 --no-pager || true
+    exit 1
+  fi
 else
-  echo "❌ Failed to start XLStatus"
-  echo ""
-  systemctl status xlstatus --no-pager || true
-  echo ""
-  journalctl -u xlstatus -n 80 --no-pager || true
-  exit 1
+  echo "🚀 Skipping service start"
 fi
 
 HTTP_PORT="$(bind_port "$HTTP_BIND")"
-if command -v curl >/dev/null 2>&1; then
+if is_truthy_value "$START_SERVICE" && command -v curl >/dev/null 2>&1; then
   if curl -fsS "http://127.0.0.1:${HTTP_PORT}/healthz" >/dev/null; then
     echo "✓ Health check passed"
   else

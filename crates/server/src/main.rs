@@ -1,7 +1,9 @@
 use anyhow::Context;
 use axum::{
+    extract::Query,
     http::{header, HeaderName, HeaderValue, Method},
     middleware,
+    response::IntoResponse,
     routing::{delete, get, post},
     Router,
 };
@@ -63,6 +65,7 @@ use auth::middleware::session_middleware;
 use xlstatus_shared::UserRole;
 
 const GRPC_MESSAGE_LIMIT: usize = 256 * 1024 * 1024;
+const DEFAULT_AGENT_INSTALL_VERSION: &str = "v1.0.0";
 
 // M4: the alert engine is started in main() and then needs to be
 // reachable from the gRPC `Session` task so HostState updates are
@@ -311,6 +314,8 @@ async fn main() -> anyhow::Result<()> {
 
             let app = Router::new()
                 .route("/healthz", get(healthz))
+                .route("/install-agent.sh", get(install_agent_script))
+                .route("/api/v1/agents/install.sh", get(install_agent_script))
                 .route("/api/v1/auth/login", post(login))
                 .route("/api/v1/public/status", get(api::v1::public::public_status))
                 .route("/api/v1/agents/enroll", post(enroll))
@@ -433,6 +438,101 @@ async fn main() -> anyhow::Result<()> {
 
 async fn healthz() -> &'static str {
     "OK"
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct AgentInstallQuery {
+    server_url: Option<String>,
+    grpc_server: Option<String>,
+    enrollment_token: Option<String>,
+    agent_name: Option<String>,
+    version: Option<String>,
+    script_url: Option<String>,
+}
+
+async fn install_agent_script(Query(query): Query<AgentInstallQuery>) -> impl IntoResponse {
+    let version = query
+        .version
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(DEFAULT_AGENT_INSTALL_VERSION);
+    let script_url = query
+        .script_url
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| {
+            format!(
+                "https://github.com/lbyxiaolizi/XLStatus/releases/download/{version}/install-agent.sh"
+            )
+        });
+    let server_url = query
+        .server_url
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("http://localhost:8080");
+    let grpc_server = query
+        .grpc_server
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("http://localhost:50051");
+    let enrollment_token = query
+        .enrollment_token
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("");
+    let agent_name = query
+        .agent_name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("$(hostname)");
+    let agent_name_line = if agent_name == "$(hostname)" {
+        r#"export AGENT_NAME="$(hostname)""#.to_string()
+    } else {
+        format!("export AGENT_NAME={}", shell_quote(agent_name))
+    };
+    let body = format!(
+        r#"#!/bin/bash
+set -e
+
+export VERSION={version}
+export SERVER_URL={server_url}
+export GRPC_SERVER={grpc_server}
+export ENROLLMENT_TOKEN={enrollment_token}
+{agent_name_line}
+
+if ! command -v curl >/dev/null 2>&1; then
+  echo "curl is required to download the XLStatus Agent installer" >&2
+  exit 1
+fi
+
+curl -fsSL {script_url} | bash
+"#,
+        version = shell_quote(version),
+        server_url = shell_quote(server_url),
+        grpc_server = shell_quote(grpc_server),
+        enrollment_token = shell_quote(enrollment_token),
+        agent_name_line = agent_name_line,
+        script_url = shell_quote(&script_url),
+    );
+
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/x-shellscript; charset=utf-8"),
+            ),
+            (
+                header::CONTENT_DISPOSITION,
+                HeaderValue::from_static("attachment; filename=\"install-agent.sh\""),
+            ),
+        ],
+        body,
+    )
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn build_cors_layer(allowed_origins: &[String]) -> anyhow::Result<CorsLayer> {
