@@ -16,6 +16,9 @@ pub struct ServerConfig {
 
     #[serde(default = "default_grpc_bind")]
     pub grpc_bind: String,
+
+    #[serde(default = "default_cors_allowed_origins")]
+    pub cors_allowed_origins: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -43,6 +46,10 @@ impl Config {
                 server: ServerConfig {
                     http_bind: std::env::var("HTTP_BIND").unwrap_or_else(|_| default_http_bind()),
                     grpc_bind: std::env::var("GRPC_BIND").unwrap_or_else(|_| default_grpc_bind()),
+                    cors_allowed_origins: std::env::var("CORS_ALLOWED_ORIGINS")
+                        .ok()
+                        .map(|value| parse_csv_env(&value))
+                        .unwrap_or_else(default_cors_allowed_origins),
                 },
                 database: DatabaseConfig {
                     url: database_url,
@@ -82,6 +89,7 @@ impl Default for Config {
             server: ServerConfig {
                 http_bind: default_http_bind(),
                 grpc_bind: default_grpc_bind(),
+                cors_allowed_origins: default_cors_allowed_origins(),
             },
             database: DatabaseConfig {
                 url: "sqlite://dev.db".to_string(),
@@ -103,6 +111,14 @@ fn default_grpc_bind() -> String {
     "0.0.0.0:50051".to_string()
 }
 
+fn default_cors_allowed_origins() -> Vec<String> {
+    vec![
+        "http://localhost:3000".to_string(),
+        "http://127.0.0.1:3000".to_string(),
+        "http://[::1]:3000".to_string(),
+    ]
+}
+
 fn default_session_secret() -> String {
     "CHANGE_ME_IN_PRODUCTION".to_string()
 }
@@ -118,9 +134,18 @@ fn parse_bool_env(value: &str) -> bool {
     )
 }
 
+fn parse_csv_env(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_bool_env;
+    use super::{parse_bool_env, parse_csv_env};
 
     #[test]
     fn parses_truthy_database_create_flag() {
@@ -134,5 +159,16 @@ mod tests {
         for value in ["0", "false", "no", "off", ""] {
             assert!(!parse_bool_env(value));
         }
+    }
+
+    #[test]
+    fn parses_comma_separated_origins() {
+        assert_eq!(
+            parse_csv_env("http://localhost:3000, https://status.example.com,"),
+            vec![
+                "http://localhost:3000".to_string(),
+                "https://status.example.com".to_string(),
+            ]
+        );
     }
 }

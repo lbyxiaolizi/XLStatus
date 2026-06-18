@@ -1,4 +1,5 @@
 use axum::{
+    http::{header, HeaderName, HeaderValue, Method},
     middleware,
     routing::{delete, get, post},
     Router,
@@ -7,6 +8,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tonic::transport::Server as TonicServer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use xlstatus_proto_gen::xlstatus::v1::agent_service_server::AgentServiceServer;
 
 mod alerts;
@@ -216,6 +218,7 @@ async fn main() -> anyhow::Result<()> {
     let http_bind = config.server.http_bind.clone();
     let http_handle = tokio::spawn(async move {
         async fn run_http_server(bind: String, state: AppState) -> anyhow::Result<()> {
+            let cors = build_cors_layer(&state.config.server.cors_allowed_origins)?;
             let protected = Router::new()
                 .route("/api/v1/auth/logout", post(logout))
                 .route("/api/v1/users", post(create_user))
@@ -320,7 +323,8 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .route("/api/v1/agents/jwt", post(get_agent_jwt))
                 .merge(protected)
-                .with_state(state);
+                .with_state(state)
+                .layer(cors);
 
             let addr: SocketAddr = bind.parse()?;
             tracing::info!("HTTP server listening on {}", addr);
@@ -416,6 +420,40 @@ async fn main() -> anyhow::Result<()> {
 
 async fn healthz() -> &'static str {
     "OK"
+}
+
+fn build_cors_layer(allowed_origins: &[String]) -> anyhow::Result<CorsLayer> {
+    let origins = allowed_origins
+        .iter()
+        .map(|origin| {
+            if origin == "*" {
+                return Err(anyhow::anyhow!(
+                    "CORS wildcard origins are not supported because cookie credentials are enabled"
+                ));
+            }
+            HeaderValue::from_str(origin)
+                .map_err(|e| anyhow::anyhow!("Invalid CORS origin '{}': {}", origin, e))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    tracing::info!("CORS allowed origins: {}", allowed_origins.join(", "));
+
+    Ok(CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::AUTHORIZATION,
+            HeaderName::from_static("x-csrf-token"),
+        ])
+        .allow_credentials(true))
 }
 
 async fn seed_admin_user(db: &DatabaseBackend) -> anyhow::Result<()> {

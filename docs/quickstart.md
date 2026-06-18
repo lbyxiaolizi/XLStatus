@@ -47,6 +47,7 @@ DATABASE_URL="sqlite://$(pwd)/data/xlstatus.db?mode=rwc" \
 DATABASE_CREATE_IF_MISSING=true \
 HTTP_BIND="0.0.0.0:8080" \
 GRPC_BIND="0.0.0.0:50051" \
+CORS_ALLOWED_ORIGINS="http://localhost:3000,http://127.0.0.1:3000" \
 SESSION_SECRET="replace-me" \
 XLSTATUS_SEED_ADMIN_USERNAME="admin" \
 XLSTATUS_SEED_ADMIN_PASSWORD="admin123" \
@@ -81,6 +82,7 @@ NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm dev
 ```
 
 Open `http://localhost:3000/status` before login to confirm the public status API is reachable. After login, use the navigation theme switch to choose the BOLD. light or dark palette.
+If you run the Web UI on a different port, add that exact origin to `CORS_ALLOWED_ORIGINS` before starting the server.
 
 For a production-style local run after `pnpm build`:
 

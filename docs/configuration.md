@@ -19,6 +19,7 @@ DATABASE_URL=sqlite:///var/lib/xlstatus/xlstatus.db?mode=rwc
 DATABASE_CREATE_IF_MISSING=true
 HTTP_BIND=0.0.0.0:8080
 GRPC_BIND=0.0.0.0:50051
+CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
 SESSION_SECRET=replace-with-a-long-random-secret
 SESSION_TTL_HOURS=24
 XLSTATUS_SEED_ADMIN_USERNAME=admin
@@ -39,6 +40,10 @@ create_if_missing = true
 [server]
 http_bind = "0.0.0.0:8080"
 grpc_bind = "0.0.0.0:50051"
+cors_allowed_origins = [
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+]
 
 [security]
 session_secret = "replace-with-a-long-random-secret"
@@ -52,6 +57,14 @@ CONFIG_FILE=/etc/xlstatus/server.toml /usr/local/bin/xlstatus-server
 ```
 
 The server currently has no `--config`, `--validate`, or `--version` CLI flags.
+
+## Web UI CORS
+
+When the Web UI and API run on different origins, for example `http://localhost:3000` and `http://localhost:8080`, the API must allow the browser origin. Configure exact origins with `CORS_ALLOWED_ORIGINS` or `server.cors_allowed_origins`.
+
+Use the same hostname style for both URLs during local testing. For example, pair `http://localhost:3000` with `http://localhost:8080`, or pair `http://127.0.0.1:3000` with `http://127.0.0.1:8080`, so cookie sessions and CSRF checks behave consistently.
+
+Wildcard CORS origins are not supported because XLStatus uses cookie credentials for the dashboard.
 
 ## SQLite
 

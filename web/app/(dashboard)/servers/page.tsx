@@ -48,7 +48,7 @@ export default function ServersPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
-  const [conn, setConn] = useState<ConnectionState>("connecting");
+  const [conn, setConn] = useState<ConnectionState>("closed");
   const wsRef = useRef<WebSocket | null>(null);
 
   const loadServers = useCallback(async () => {
@@ -71,7 +71,7 @@ export default function ServersPage() {
   }, [loadServers]);
 
   useEffect(() => {
-    if (typeof window === "undefined" || !getCookie("xlstatus_session")) return;
+    if (typeof window === "undefined" || !hasBrowserSessionSignal()) return;
     let cancelled = false;
     let backoff = 1000;
 
@@ -212,6 +212,10 @@ function memoryLabel(server: Server): string {
 
 function getCookie(name: string): string | null {
   return document.cookie.split("; ").find((row) => row.startsWith(`${name}=`))?.split("=")[1] ?? null;
+}
+
+function hasBrowserSessionSignal(): boolean {
+  return Boolean(getCookie("xlstatus_csrf") || window.localStorage.getItem("session_token"));
 }
 
 function buildWsUrl(): string {

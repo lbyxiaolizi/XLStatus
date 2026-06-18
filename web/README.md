@@ -24,6 +24,8 @@ Start the Rust server first, then run:
 NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm dev
 ```
 
+The API server must allow the Web UI origin through `CORS_ALLOWED_ORIGINS` or `server.cors_allowed_origins`. The default local origin is `http://localhost:3000`; if Next.js uses another port, add that exact origin before starting the server.
+
 Open `http://localhost:3000`.
 Open `http://localhost:3000/status` before login to verify the public status endpoint.
 

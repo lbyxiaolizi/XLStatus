@@ -118,7 +118,7 @@ NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm build
 
 ```bash
 # Terminal 1: Start server
-cargo run --bin xlstatus-server
+CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000 cargo run --bin xlstatus-server
 
 # Terminal 2: Start web interface
 cd web
@@ -129,6 +129,8 @@ NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm dev
 # Terminal 3: Start agent
 cargo run --bin xlstatus-agent
 ```
+
+If the Web UI uses a different port, add that exact origin to `CORS_ALLOWED_ORIGINS` before starting the server.
 
 For a production-style source run, start the Rust server first, then run:
 
