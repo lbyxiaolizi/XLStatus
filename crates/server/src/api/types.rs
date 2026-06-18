@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use xlstatus_shared::UserId;
 
 // Request types
 #[derive(Debug, Deserialize)]

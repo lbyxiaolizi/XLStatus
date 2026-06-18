@@ -62,6 +62,22 @@ pub struct TunnelStats {
     pub last_activity: String,
 }
 
+/// Initial open request sent over AgentService::IoStream for a NAT
+/// reverse-tunnel connection. Subsequent `IoFrame::data` payloads on
+/// the same `stream_id` are raw bytes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NatTunnelOpenRequest {
+    pub local_host: String,
+    pub local_port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum NatTunnelControlMessage {
+    Open { local_host: String, local_port: u16 },
+    Ready,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

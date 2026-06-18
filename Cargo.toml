@@ -68,6 +68,7 @@ cron = "0.12"
 # Concurrent collections
 dashmap = "6"
 parking_lot = "0.12"
+sysinfo = { version = "0.32", default-features = false, features = ["system", "disk", "network", "component"] }
 
 [profile.release]
 opt-level = 3

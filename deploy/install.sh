@@ -8,6 +8,13 @@ VERSION="${VERSION:-v1.0.0}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/xlstatus}"
 DATA_DIR="${DATA_DIR:-/var/lib/xlstatus}"
 BINARY_PATH="${BINARY_PATH:-}"  # User can provide compiled binary path
+CONFIG_FILE="${CONFIG_FILE:-/etc/xlstatus/server.toml}"
+HTTP_BIND="${HTTP_BIND:-0.0.0.0:8080}"
+GRPC_BIND="${GRPC_BIND:-0.0.0.0:50051}"
+DATABASE_URL="${DATABASE_URL:-sqlite://$DATA_DIR/xlstatus.db?mode=rwc}"
+SESSION_SECRET="${SESSION_SECRET:-}"
+ADMIN_USERNAME="${ADMIN_USERNAME:-admin}"
+ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"
 
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║                                                              ║"
@@ -65,6 +72,7 @@ echo ""
 echo "📁 Creating directories..."
 mkdir -p "$INSTALL_DIR"
 mkdir -p "$DATA_DIR"
+mkdir -p "$(dirname "$CONFIG_FILE")"
 chown xlstatus:xlstatus "$DATA_DIR"
 echo "✓ Directories created"
 
@@ -105,26 +113,35 @@ fi
 # Create config
 echo ""
 echo "⚙️  Creating configuration..."
-cat > /etc/xlstatus.toml << EOF
+if [ -z "$SESSION_SECRET" ]; then
+  if command -v openssl >/dev/null 2>&1; then
+    SESSION_SECRET="$(openssl rand -hex 32)"
+  else
+    SESSION_SECRET="$(date +%s)-$(hostname)-change-me"
+  fi
+fi
+
+cat > "$CONFIG_FILE" << EOF
 [database]
-url = "sqlite://$DATA_DIR/xlstatus.db"
+url = "$DATABASE_URL"
 
 [server]
-bind_address = "0.0.0.0:8080"
-grpc_address = "0.0.0.0:50051"
+http_bind = "$HTTP_BIND"
+grpc_bind = "$GRPC_BIND"
 
-[logging]
-level = "info"
+[security]
+session_secret = "$SESSION_SECRET"
+session_ttl_hours = 24
 EOF
 
-chown xlstatus:xlstatus /etc/xlstatus.toml
-chmod 600 /etc/xlstatus.toml
+chown xlstatus:xlstatus "$CONFIG_FILE"
+chmod 600 "$CONFIG_FILE"
 echo "✓ Configuration created"
 
 # Install systemd service
 echo ""
 echo "🔧 Installing systemd service..."
-cat > /etc/systemd/system/xlstatus.service << 'EOF'
+cat > /etc/systemd/system/xlstatus.service << EOF
 [Unit]
 Description=XLStatus Server
 After=network.target
@@ -133,13 +150,15 @@ After=network.target
 Type=simple
 User=xlstatus
 Group=xlstatus
-WorkingDirectory=/opt/xlstatus
+WorkingDirectory=/var/lib/xlstatus
 ExecStart=/usr/local/bin/xlstatus-server
 Restart=on-failure
 RestartSec=5s
 
-Environment="DATABASE_URL=sqlite:///var/lib/xlstatus/xlstatus.db"
+Environment="CONFIG_FILE=/etc/xlstatus/server.toml"
 Environment="RUST_LOG=info"
+Environment="XLSTATUS_SEED_ADMIN_USERNAME=admin"
+$(if [ -n "$ADMIN_PASSWORD" ]; then printf 'Environment="XLSTATUS_SEED_ADMIN_PASSWORD=%s"\n' "$ADMIN_PASSWORD"; fi)
 
 StandardOutput=journal
 StandardError=journal
@@ -147,6 +166,8 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 EOF
+sed -i.bak "s|CONFIG_FILE=/etc/xlstatus/server.toml|CONFIG_FILE=$CONFIG_FILE|" /etc/systemd/system/xlstatus.service
+sed -i.bak "s|XLSTATUS_SEED_ADMIN_USERNAME=admin|XLSTATUS_SEED_ADMIN_USERNAME=$ADMIN_USERNAME|" /etc/systemd/system/xlstatus.service
 
 systemctl daemon-reload
 systemctl enable xlstatus
@@ -168,11 +189,14 @@ else
   exit 1
 fi
 
-# Create default admin user
 echo ""
-echo "👤 Creating default admin user..."
-echo "   Username: admin"
-echo "   Password: admin123 (please change this!)"
+echo "👤 Admin bootstrap:"
+echo "   Username: $ADMIN_USERNAME"
+if [ -n "$ADMIN_PASSWORD" ]; then
+  echo "   Password: provided through ADMIN_PASSWORD"
+else
+  echo "   Password: not seeded; set ADMIN_PASSWORD before first start to auto-create an admin"
+fi
 
 # Get server info
 echo ""
@@ -183,7 +207,7 @@ echo "║                                                              ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo ""
 echo "📍 Dashboard URL: http://$(hostname -I | awk '{print $1}'):8080"
-echo "🔑 Default login: admin / admin123"
+echo "🔑 Admin user: $ADMIN_USERNAME"
 echo ""
 echo "📝 Useful commands:"
 echo "   - Start:   systemctl start xlstatus"

@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   server:
     build:
@@ -12,13 +10,16 @@ services:
     volumes:
       - ./data:/data
     environment:
-      - DATABASE_URL=sqlite:///data/xlstatus.db
+      - DATABASE_URL=sqlite:///data/xlstatus.db?mode=rwc
       - RUST_LOG=info
-      - BIND_ADDRESS=0.0.0.0:8080
-      - GRPC_ADDRESS=0.0.0.0:50051
+      - HTTP_BIND=0.0.0.0:8080
+      - GRPC_BIND=0.0.0.0:50051
+      - SESSION_SECRET=change-me-in-production
+      - XLSTATUS_SEED_ADMIN_USERNAME=admin
+      - XLSTATUS_SEED_ADMIN_PASSWORD=admin123
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -34,22 +35,25 @@ services:
     environment:
       - NEXT_PUBLIC_API_URL=http://localhost:8080
     depends_on:
-      - server
+      server:
+        condition: service_healthy
     restart: unless-stopped
 
   agent-demo:
+    profiles: ["agent-demo"]
     build:
       context: .
       dockerfile: Dockerfile.agent
     container_name: xlstatus-agent-demo
     environment:
       - SERVER_URL=http://server:8080
+      - GRPC_SERVER=http://server:50051
       - AGENT_NAME=demo-agent
       - RUST_LOG=info
+    volumes:
+      - ./data/agent-demo:/etc/xlstatus-agent:ro
+    command: ["xlstatus-agent", "run", "--config", "/etc/xlstatus-agent/agent.json"]
     depends_on:
-      - server
+      server:
+        condition: service_healthy
     restart: unless-stopped
-
-volumes:
-  data:
-    driver: local

@@ -1,6 +1,9 @@
+#![allow(dead_code)]
+#![allow(unused)]
+
 use crate::db::{CreateSessionInput, DatabaseBackend, Session};
 use anyhow::Result;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use xlstatus_shared::UserId;
 
 pub struct SessionRepository {
@@ -35,13 +38,15 @@ impl SessionRepository {
                 .await?;
             }
             DatabaseBackend::Postgres(pool) => {
+                let pg_id = uuid::Uuid::parse_str(&id)
+                    .map_err(|e| anyhow::anyhow!("session id must be uuid: {}", e))?;
                 sqlx::query(
                     r#"
                     INSERT INTO sessions (id, user_id, token_hash, ip, user_agent, expires_at, created_at)
                     VALUES ($1, $2, $3, $4, $5, $6, $7)
                     "#,
                 )
-                .bind(&id)
+                .bind(pg_id)
                 .bind(input.user_id.0)
                 .bind(&token_hash)
                 .bind(&input.ip)
@@ -77,17 +82,21 @@ impl SessionRepository {
                 .fetch_optional(pool)
                 .await?;
 
-                Ok(row.map(|(id, user_id, token_hash, ip, user_agent, expires_at, created_at)| {
-                    Session {
+                Ok(row.map(
+                    |(id, user_id, token_hash, ip, user_agent, expires_at, created_at)| Session {
                         id,
                         user_id: UserId(uuid::Uuid::parse_str(&user_id).unwrap()),
                         token_hash,
                         ip,
                         user_agent,
-                        expires_at: DateTime::parse_from_rfc3339(&expires_at).unwrap().with_timezone(&Utc),
-                        created_at: DateTime::parse_from_rfc3339(&created_at).unwrap().with_timezone(&Utc),
-                    }
-                }))
+                        expires_at: DateTime::parse_from_rfc3339(&expires_at)
+                            .unwrap()
+                            .with_timezone(&Utc),
+                        created_at: DateTime::parse_from_rfc3339(&created_at)
+                            .unwrap()
+                            .with_timezone(&Utc),
+                    },
+                ))
             }
             DatabaseBackend::Postgres(pool) => {
                 let row = sqlx::query_as::<_, (String, uuid::Uuid, String, Option<String>, Option<String>, DateTime<Utc>, DateTime<Utc>)>(
@@ -98,8 +107,8 @@ impl SessionRepository {
                 .fetch_optional(pool)
                 .await?;
 
-                Ok(row.map(|(id, user_id, token_hash, ip, user_agent, expires_at, created_at)| {
-                    Session {
+                Ok(row.map(
+                    |(id, user_id, token_hash, ip, user_agent, expires_at, created_at)| Session {
                         id,
                         user_id: UserId(user_id),
                         token_hash,
@@ -107,8 +116,8 @@ impl SessionRepository {
                         user_agent,
                         expires_at,
                         created_at,
-                    }
-                }))
+                    },
+                ))
             }
         }
     }

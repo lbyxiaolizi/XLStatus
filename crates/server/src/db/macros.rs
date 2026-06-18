@@ -1,3 +1,6 @@
+#![allow(dead_code)]
+#![allow(unused)]
+
 /// Macro to execute queries on both SQLite and PostgreSQL
 /// Usage: db_execute!(db, query_builder)
 #[macro_export]

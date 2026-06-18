@@ -1,8 +1,10 @@
-# ✅ M5 任务执行 - 完成确认
+# ✅ M5 任务执行 - 历史完成报告
+
+> 历史快照：本报告保留当时的开发记录。当前权威状态请以 [`../implementation-audit.md`](../implementation-audit.md) 为准；截至 2026-06-18，M5 已通过 `test-run/verify-m5-task.sh`、`test-run/verify-m5-scheduler.sh`、`test-run/verify-m5-terminal.sh` 和 `test-run/verify-m5-files.sh` 验证真实 agent 任务下发、定时调度、Web Terminal、文件读写删、远程配置/更新 UI/API 以及禁用命令策略。
 
 **日期**: 2026-06-17  
 **里程碑**: M5 (Task Execution)  
-**状态**: ✅ **100% 完成（完整实现）**
+**状态**: 历史记录；当前 M5 为 ✅ Done，以 [`../implementation-audit.md`](../implementation-audit.md) 为准
 
 ---
 

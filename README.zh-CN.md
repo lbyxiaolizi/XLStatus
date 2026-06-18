@@ -7,22 +7,30 @@
 
 使用 Rust 编写的自托管服务器监控和运维系统。XLStatus 提供实时监控、服务健康检查、任务调度和自动化功能。
 
+## 当前状态
+
+XLStatus 仍处于开发中。当前 workspace 已通过 `cargo check --workspace`、`cargo test --workspace`、`cd web && pnpm lint` 和 `cd web && pnpm build`。M0-M9 已有 `test-run/` 下的可重复验收覆盖；真实 24 小时长稳测试仍需在目标部署环境执行。
+
+部署或继续开发前，请先阅读当前实现审计：[docs/implementation-audit.md](./docs/implementation-audit.md)。
+
 ## ✨ 功能特性
 
-- **实时服务器监控** - CPU、内存、磁盘、网络、负载、连接数、温度、GPU
-- **服务监控** - HTTP、TCP、ICMP 健康检查，支持 SSL 证书跟踪
-- **告警规则** - 灵活的告警条件和多种通知渠道
-- **任务调度** - 基于 Cron 和按需执行的任务系统
-- **NAT 穿透** - 通过端口转发访问内网服务
-- **DDNS 集成** - 自动 DNS 更新（Cloudflare、HE、Webhook）
-- **MCP 集成** - Model Context Protocol，支持 LLM 自动化
-- **Web 管理面板** - 基于 React 的现代化管理界面
-- **公开状态页** - 与用户分享系统状态
-- **多用户 RBAC** - 基于角色的访问控制和服务器所有权
+- **实时服务器监控** - Agent 上报 CPU、内存、磁盘、网络、负载、连接数和温度数据
+- **服务监控** - HTTP、TCP、ICMP 健康检查，并跟踪 HTTPS 证书指纹和过期时间
+- **告警规则** - 资源、离线、服务状态、延迟、恢复和 webhook 通知流程
+- **任务调度** - Cron 和按需任务通过在线 Agent 执行
+- **NAT 穿透** - 通过反向隧道访问内网服务
+- **DDNS 集成** - 支持 Cloudflare、腾讯云、HE、Webhook 和 Dummy Provider
+- **MCP 集成** - 支持 MCP REST 兼容接口与 `/mcp` JSON-RPC 工具
+- **Web 管理面板** - Next.js 管理服务器、服务、告警、任务、DDNS、NAT、Terminal 和设置
+- **公开状态页** - 展示可公开资源的状态概览
+- **多用户 RBAC** - 角色、PAT scope、CSRF 和服务器 allowlist
 
 ## 🚀 快速开始
 
 ### 使用 Docker Compose（推荐）
+
+Dockerfile 和 Compose 文件已由 M9 smoke 脚本做配置校验。建议先用于本地开发和测试，生产前仍需执行目标环境的 24 小时长稳验证。
 
 ```bash
 # 克隆仓库
@@ -59,6 +67,8 @@ sudo BINARY_PATH=target/release/xlstatus-agent bash deploy/install-agent.sh
 
 ## 📚 文档
 
+- [当前实现审计](./docs/implementation-audit.md)
+- [文档索引](./docs/README.md)
 - [架构设计](./plan/02-architecture.md)
 - [安装指南](./docs/installation.md)
 - [配置说明](./docs/configuration.md)
@@ -153,10 +163,10 @@ XLStatus/
 
 ## 📊 性能
 
-- 支持 100+ Agent，3 秒上报间隔
-- 1000+ 服务监控，30 秒检查周期
-- 查询响应时间：30 天数据 P95 < 500ms
-- 通过 24 小时稳定性测试
+- 已验证 dry-run 负载计划：100 Agent，3 秒上报间隔，24 小时时间窗口
+- 计划目标：支持 1000+ 服务监控，30 秒检查周期
+- 计划目标：30 天数据查询 P95 < 500ms
+- 真实 wall-clock 24 小时稳定性仍需在目标部署环境执行
 
 ## 🤝 贡献
 
@@ -180,9 +190,7 @@ XLStatus/
 
 ## 🗺️ 路线图
 
-- [x] M0-M7：核心功能和 Web 界面
-- [ ] M8：高性能优化
-- [ ] M9：生产部署和文档
+- [x] M0-M9：脚手架、基础平台、Agent 接入、实时监控、服务监控与告警、运维、DDNS/NAT/MCP、前端、高性能工具和发布 smoke 均有可重复验收脚本覆盖
 - [ ] 多节点 Dashboard 集群
 - [ ] Windows 和 macOS Agent 支持
 - [ ] 移动应用

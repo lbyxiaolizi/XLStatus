@@ -1,7 +1,9 @@
-# M8/M9 部署与发布 - 100% 完成报告
+# M8/M9 部署与发布 - 历史完成报告
+
+> 历史快照：本报告保留当时的开发记录。当前权威状态请以 [`../implementation-audit.md`](../implementation-audit.md) 为准；截至 2026-06-18，M8/M9 的仓库内验收已通过 `test-run/verify-m8-migrations.sh`、`test-run/verify-m8-tsdb-load.sh`、`test-run/verify-m9-install.sh` 和远端 Linux x86_64 smoke。真实 24h wall-clock soak 仍属于目标部署环境中的运维侧长稳验证。
 
 **完成时间**: 2026-06-17  
-**最终状态**: ✅ **100% 完成**
+**最终状态**: 历史记录；当前 M8/M9 为 ✅ Done for repository acceptance，以 [`../implementation-audit.md`](../implementation-audit.md) 为准
 
 ---
 
@@ -237,7 +239,7 @@ curl -fsSL https://install.xlstatus.io/agent | bash
 | 快速开始 | ✅ | 3种部署方式 |
 | 5分钟部署 | ✅ | Docker Compose |
 
-**M9 完成度**: ✅ **100%**
+**M9 完成度**: 历史记录；当前以实现审计为准
 
 ---
 
@@ -300,7 +302,7 @@ curl -fsSL https://install.xlstatus.io/agent | bash
 - ✅ M7 - 前端完备
 - ✅ M8/M9 - 部署与发布 ⭐ **刚刚完成**
 
-**项目状态**: ✅ **100% 完成** 🎉
+**项目状态**: 历史记录；当前以实现审计为准 🎉
 
 ---
 
@@ -311,7 +313,7 @@ curl -fsSL https://install.xlstatus.io/agent | bash
 - 安装脚本 - 最灵活
 - 源码构建 - 最可控
 
-### 2. 生产就绪
+### 2. 发布资产
 - Systemd 集成
 - 健康检查
 - 日志管理
@@ -333,28 +335,28 @@ curl -fsSL https://install.xlstatus.io/agent | bash
 
 ## 🎉 项目完成总结
 
-**XLStatus** 项目已经 **100% 完成**！
+**XLStatus** 项目曾按当时口径记录为完成。
 
 从 0 到 1，完成了：
 - ✅ 9 个里程碑
 - ✅ 完整的后端系统
 - ✅ 完整的前端界面
-- ✅ 生产级部署方案
+- ✅ 部署资产和脚本
 - ✅ 完整的文档
 
 **总代码量**: ~10,000+ 行高质量代码
 **开发时间**: 2026-06-16 至 2026-06-17
-**状态**: 🚀 **Ready for Production**
+**状态**: 历史记录；当前以实现审计为准
 
 ---
 
 ## 🚀 下一步
 
-### 即刻可用
-1. 使用 Docker Compose 快速部署
-2. 使用安装脚本生产部署
-3. 配置监控和告警
-4. 开始监控你的服务器
+### 发布前外部验证
+1. 在目标部署环境运行真实 24h wall-clock soak
+2. 在 tag/release 流程中生成正式 release 包
+3. 在目标生产环境做一次人工计时安装验收
+4. 配置监控和告警并接入真实服务器
 
 ### 后续增强
 - Windows/macOS Agent
@@ -365,6 +367,6 @@ curl -fsSL https://install.xlstatus.io/agent | bash
 
 ---
 
-**XLStatus 项目**: ✅ **100% 完成** 🎉
+**XLStatus 项目**: 历史记录；当前以实现审计为准 🎉
 
 生成时间: 2026-06-17
