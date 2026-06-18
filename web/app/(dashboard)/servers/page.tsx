@@ -149,32 +149,32 @@ export default function ServersPage() {
       <Navigation />
       <PageShell>
         <PageHeader
-          eyebrow={`ws: ${conn}`}
-          title="Servers"
+          eyebrow={`ws: ${connectionLabel(conn)}`}
+          title="服务器"
           detail="接入的 Agent、实时主机状态和远程运维入口。"
-          actions={<button type="button" onClick={() => void loadServers()} className={buttonClass("secondary")}>Refresh</button>}
+          actions={<button type="button" onClick={() => void loadServers()} className={buttonClass("secondary")}>刷新</button>}
         />
         <InlineError message={error} />
         <div className="mt-5 mb-5">
-          <input value={query} onChange={(event) => setQuery(event.target.value)} className={inputClass} placeholder="Search servers" />
+          <input value={query} onChange={(event) => setQuery(event.target.value)} className={inputClass} placeholder="搜索服务器" />
         </div>
 
         {loading ? (
-          <BrutalCard>Loading servers...</BrutalCard>
+          <BrutalCard>正在加载服务器...</BrutalCard>
         ) : filtered.length === 0 ? (
-          <EmptyState title="No servers found" detail="Servers will appear here once agents connect." />
+          <EmptyState title="暂无服务器" detail="Agent 连接后会显示在这里。" />
         ) : (
           <div className="overflow-x-auto border-2 border-black bg-[var(--bg-card)] shadow-[var(--shadow-brutal)]">
             <table className="w-full">
               <thead>
                 <tr>
-                  <th className={thClass}>Name</th>
-                  <th className={thClass}>Status</th>
+                  <th className={thClass}>名称</th>
+                  <th className={thClass}>状态</th>
                   <th className={thClass}>CPU</th>
-                  <th className={thClass}>Memory</th>
-                  <th className={thClass}>Load</th>
-                  <th className={thClass}>Last Event</th>
-                  <th className={thClass}>Action</th>
+                  <th className={thClass}>内存</th>
+                  <th className={thClass}>负载</th>
+                  <th className={thClass}>最后事件</th>
+                  <th className={thClass}>操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -184,14 +184,14 @@ export default function ServersPage() {
                       <div className="font-black">{server.name}</div>
                       <div className="text-xs text-[var(--text-muted)]">{server.id}</div>
                     </td>
-                    <td className={tdClass}><StatusBadge tone={server.status === "online" ? "green" : "red"}>{server.status}</StatusBadge></td>
+                    <td className={tdClass}><StatusBadge tone={server.status === "online" ? "green" : "red"}>{serverStatusLabel(server.status)}</StatusBadge></td>
                     <td className={tdClass}>{formatPercent(server.cpu_percent)}</td>
                     <td className={tdClass}>{memoryLabel(server)}</td>
                     <td className={tdClass}>{server.load_1 === undefined ? "N/A" : server.load_1.toFixed(2)}</td>
                     <td className={tdClass}>{formatDate(server.last_event_at || server.last_seen_at)}</td>
                     <td className={tdClass}>
                       <Link className={buttonClass("primary")} href={`/servers/${encodeURIComponent(server.id)}`}>
-                        Open
+                        打开
                       </Link>
                     </td>
                   </tr>
@@ -208,6 +208,27 @@ export default function ServersPage() {
 function memoryLabel(server: Server): string {
   if (!server.memory_used || !server.memory_total) return "N/A";
   return `${((server.memory_used / server.memory_total) * 100).toFixed(1)}%`;
+}
+
+function connectionLabel(conn: ConnectionState): string {
+  const labels: Record<ConnectionState, string> = {
+    connecting: "连接中",
+    open: "已连接",
+    closed: "已关闭",
+    error: "错误",
+  };
+  return labels[conn];
+}
+
+function serverStatusLabel(status: string): string {
+  const labels: Record<string, string> = {
+    online: "在线",
+    offline: "离线",
+    revoked: "已撤销",
+    down: "异常",
+    degraded: "降级",
+  };
+  return labels[status] || status;
 }
 
 function getCookie(name: string): string | null {

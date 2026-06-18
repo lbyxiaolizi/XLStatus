@@ -45,7 +45,7 @@ export default function SettingsPage() {
     });
     if (response.success && response.data) {
       setCreatedToken(response.data.token);
-      setNotice("Personal access token created.");
+      setNotice("个人访问令牌已创建。");
       setName("");
       await loadTokens();
     } else {
@@ -58,9 +58,9 @@ export default function SettingsPage() {
       <Navigation />
       <PageShell>
         <PageHeader
-          eyebrow="Control Plane"
-          title="Settings"
-          detail="Personal access tokens and local admin helpers."
+          eyebrow="控制面"
+          title="设置"
+          detail="个人访问令牌和本地管理员辅助工具。"
         />
         <div className="mb-5 space-y-3">
           <InlineError message={error} />
@@ -69,11 +69,11 @@ export default function SettingsPage() {
 
         <div className="grid gap-6 lg:grid-cols-2">
           <BrutalCard accent>
-            <h2 className="mb-4 text-xl font-black uppercase">Create PAT</h2>
+            <h2 className="mb-4 text-xl font-black uppercase">创建 PAT</h2>
             <form onSubmit={createToken} className="space-y-4">
-              <Field label="Name"><input className={inputClass} value={name} onChange={(e) => setName(e.target.value)} required /></Field>
-              <Field label="Scopes"><textarea className={`${textareaClass} min-h-24`} value={scopes} onChange={(e) => setScopes(e.target.value)} /></Field>
-              <button className={buttonClass("primary")}>Create Token</button>
+              <Field label="名称"><input className={inputClass} value={name} onChange={(e) => setName(e.target.value)} required /></Field>
+              <Field label="Scope"><textarea className={`${textareaClass} min-h-24`} value={scopes} onChange={(e) => setScopes(e.target.value)} /></Field>
+              <button className={buttonClass("primary")}>创建令牌</button>
             </form>
             {createdToken ? (
               <div className="mt-5 border-2 border-black bg-black p-3 font-mono text-xs text-green-300">
@@ -83,10 +83,10 @@ export default function SettingsPage() {
           </BrutalCard>
 
           <BrutalCard>
-            <h2 className="mb-4 text-xl font-black uppercase">Existing Tokens</h2>
+            <h2 className="mb-4 text-xl font-black uppercase">已有令牌</h2>
             <div className="grid gap-3">
               {tokens.length === 0 ? (
-                <p className="text-sm font-bold text-[var(--text-muted)]">No tokens returned.</p>
+                <p className="text-sm font-bold text-[var(--text-muted)]">暂无令牌。</p>
               ) : (
                 tokens.map((token, index) => (
                   <div key={index} className="border-2 border-black bg-[var(--accent-bg)] p-3 text-sm font-bold">

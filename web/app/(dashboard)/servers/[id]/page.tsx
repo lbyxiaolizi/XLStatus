@@ -124,7 +124,7 @@ export default function ServerDetailPage({ params }: PageProps) {
       setFileContent(response.data.content);
       setWritePath(nextPath);
       setWriteContent(response.data.content);
-      setNotice(`Read ${response.data.bytes} bytes from ${nextPath}.`);
+      setNotice(`已从 ${nextPath} 读取 ${response.data.bytes} 字节。`);
     } else {
       setError(responseError(response));
     }
@@ -133,7 +133,7 @@ export default function ServerDetailPage({ params }: PageProps) {
   async function writeFile(event: FormEvent) {
     event.preventDefault();
     if (!writePath.trim()) {
-      setError("Write path is required.");
+      setError("请填写写入路径。");
       return;
     }
     setSaving(true);
@@ -145,7 +145,7 @@ export default function ServerDetailPage({ params }: PageProps) {
     });
     setSaving(false);
     if (response.success) {
-      setNotice(`Wrote ${writePath.trim()}.`);
+      setNotice(`已写入 ${writePath.trim()}。`);
       await loadFiles(path);
     } else {
       setError(responseError(response));
@@ -153,10 +153,10 @@ export default function ServerDetailPage({ params }: PageProps) {
   }
 
   async function deleteEntry(entryPath: string, recursive: boolean) {
-    if (!confirm(`Delete ${entryPath}?`)) return;
+    if (!confirm(`确定删除 ${entryPath}？`)) return;
     const response = await apiClient.deleteServerFile(serverId, { path: entryPath, recursive });
     if (response.success) {
-      setNotice(`Deleted ${entryPath}.`);
+      setNotice(`已删除 ${entryPath}。`);
       await loadFiles(path);
     } else {
       setError(responseError(response));
@@ -166,7 +166,7 @@ export default function ServerDetailPage({ params }: PageProps) {
   async function createTempUrl(kind: "download" | "upload") {
     const target = kind === "download" ? selectedPath || writePath : writePath;
     if (!target.trim()) {
-      setError("Select or enter a file path first.");
+      setError("请先选择或输入文件路径。");
       return;
     }
     const response =
@@ -195,7 +195,7 @@ export default function ServerDetailPage({ params }: PageProps) {
     const response = await apiClient.applyServerConfig(serverId, config);
     setSaving(false);
     if (response.success) {
-      setNotice("Config patch sent to agent.");
+      setNotice("配置补丁已发送到 Agent。");
       await loadServer();
     } else {
       setError(responseError(response));
@@ -212,7 +212,7 @@ export default function ServerDetailPage({ params }: PageProps) {
     });
     setSaving(false);
     if (response.success) {
-      setNotice("Force update request sent.");
+      setNotice("强制更新请求已发送。");
       setUpdateForm({ version: "", download_url: "", checksum: "" });
     } else {
       setError(responseError(response));
@@ -224,13 +224,13 @@ export default function ServerDetailPage({ params }: PageProps) {
       <Navigation />
       <PageShell>
         <PageHeader
-          eyebrow="Server Detail"
+          eyebrow="服务器详情"
           title={server?.name || compactId(serverId)}
-          detail={`Last seen ${formatDate(server?.last_seen_at)}`}
+          detail={`最后在线 ${formatDate(server?.last_seen_at)}`}
           actions={
             <>
-              <Link href="/servers" className={buttonClass("secondary")}>Back</Link>
-              {server ? <StatusBadge tone={statusTone}>{server.status}</StatusBadge> : null}
+              <Link href="/servers" className={buttonClass("secondary")}>返回</Link>
+              {server ? <StatusBadge tone={statusTone}>{serverStatusLabel(server.status)}</StatusBadge> : null}
             </>
           }
         />
@@ -239,33 +239,33 @@ export default function ServerDetailPage({ params }: PageProps) {
           {notice ? <InlineNotice tone="green">{notice}</InlineNotice> : null}
         </div>
 
-        {loading && !server ? <EmptyState title="Loading server" /> : null}
+        {loading && !server ? <EmptyState title="正在加载服务器" /> : null}
 
         <div className="grid gap-6 xl:grid-cols-[minmax(0,1.15fr)_minmax(320px,0.85fr)]">
           <BrutalCard>
             <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
               <div>
-                <h2 className="text-xl font-black uppercase">Files</h2>
+                <h2 className="text-xl font-black uppercase">文件</h2>
                 <p className="text-sm font-bold text-[var(--text-muted)]">{path}</p>
               </div>
               <div className="flex flex-wrap gap-2">
-                <button className={buttonClass("secondary")} onClick={() => void loadFiles(currentDir)}>Up</button>
-                <button className={buttonClass("secondary")} onClick={() => void loadFiles(path)}>Refresh</button>
+                <button className={buttonClass("secondary")} onClick={() => void loadFiles(currentDir)}>上级</button>
+                <button className={buttonClass("secondary")} onClick={() => void loadFiles(path)}>刷新</button>
               </div>
             </div>
             {filesLoading ? (
-              <p className="font-bold">Loading files...</p>
+              <p className="font-bold">正在加载文件...</p>
             ) : files.length === 0 ? (
-              <EmptyState title="No files returned" detail="The agent may not expose this path." />
+              <EmptyState title="没有返回文件" detail="Agent 可能没有暴露这个路径。" />
             ) : (
               <div className="overflow-x-auto">
                 <table className="w-full">
                   <thead>
                     <tr>
-                      <th className={thClass}>Name</th>
-                      <th className={thClass}>Type</th>
-                      <th className={thClass}>Size</th>
-                      <th className={thClass}>Action</th>
+                      <th className={thClass}>名称</th>
+                      <th className={thClass}>类型</th>
+                      <th className={thClass}>大小</th>
+                      <th className={thClass}>操作</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -278,11 +278,11 @@ export default function ServerDetailPage({ params }: PageProps) {
                           <td className={tdClass}>{formatBytes(entry.size)}</td>
                           <td className={`${tdClass} flex flex-wrap gap-2`}>
                             {entry.file_type === "dir" ? (
-                              <button className={buttonClass("secondary")} onClick={() => void loadFiles(nextPath)}>Open</button>
+                              <button className={buttonClass("secondary")} onClick={() => void loadFiles(nextPath)}>打开</button>
                             ) : (
-                              <button className={buttonClass("primary")} onClick={() => void readSelectedFile(nextPath)}>Read</button>
+                              <button className={buttonClass("primary")} onClick={() => void readSelectedFile(nextPath)}>读取</button>
                             )}
-                            <button className={buttonClass("danger")} onClick={() => void deleteEntry(nextPath, entry.file_type === "dir")}>Delete</button>
+                            <button className={buttonClass("danger")} onClick={() => void deleteEntry(nextPath, entry.file_type === "dir")}>删除</button>
                           </td>
                         </tr>
                       );
@@ -295,30 +295,30 @@ export default function ServerDetailPage({ params }: PageProps) {
 
           <div className="grid gap-6">
             <BrutalCard accent>
-              <h2 className="mb-4 text-xl font-black uppercase">Write File</h2>
+              <h2 className="mb-4 text-xl font-black uppercase">写入文件</h2>
               <form onSubmit={writeFile} className="space-y-4">
-                <Field label="Path">
+                <Field label="路径">
                   <input className={inputClass} value={writePath} onChange={(event) => setWritePath(event.target.value)} placeholder="/tmp/xlstatus.txt" />
                 </Field>
-                <Field label="Content">
+                <Field label="内容">
                   <textarea className={`${textareaClass} min-h-40`} value={writeContent || fileContent} onChange={(event) => setWriteContent(event.target.value)} />
                 </Field>
                 <div className="flex flex-wrap gap-2">
-                  <button disabled={saving} className={buttonClass("primary")}>Write File</button>
-                  <button type="button" className={buttonClass("secondary")} onClick={() => void createTempUrl("download")}>Download URL</button>
-                  <button type="button" className={buttonClass("secondary")} onClick={() => void createTempUrl("upload")}>Upload URL</button>
+                  <button disabled={saving} className={buttonClass("primary")}>写入文件</button>
+                  <button type="button" className={buttonClass("secondary")} onClick={() => void createTempUrl("download")}>下载 URL</button>
+                  <button type="button" className={buttonClass("secondary")} onClick={() => void createTempUrl("upload")}>上传 URL</button>
                 </div>
               </form>
             </BrutalCard>
 
             <BrutalCard>
-              <h2 className="mb-4 text-xl font-black uppercase">Apply Config</h2>
+              <h2 className="mb-4 text-xl font-black uppercase">应用配置</h2>
               <form onSubmit={applyConfig} className="space-y-4">
                 <div className="grid gap-3 sm:grid-cols-2">
-                  <Field label="Report interval">
+                  <Field label="上报间隔">
                     <input className={inputClass} value={configForm.report_interval_seconds} onChange={(e) => setConfigForm((f) => ({ ...f, report_interval_seconds: e.target.value }))} />
                   </Field>
-                  <Field label="IP report interval">
+                  <Field label="IP 上报间隔">
                     <input className={inputClass} value={configForm.ip_report_interval_seconds} onChange={(e) => setConfigForm((f) => ({ ...f, ip_report_interval_seconds: e.target.value }))} />
                   </Field>
                 </div>
@@ -326,27 +326,27 @@ export default function ServerDetailPage({ params }: PageProps) {
                   {(["disable_auto_update", "disable_force_update", "disable_command_execute", "disable_nat", "disable_send_query"] as const).map((key) => (
                     <label key={key} className="flex items-center gap-2 text-sm font-black">
                       <input type="checkbox" checked={configForm[key]} onChange={(e) => setConfigForm((f) => ({ ...f, [key]: e.target.checked }))} />
-                      {key}
+                      {configFlagLabel(key)}
                     </label>
                   ))}
                 </div>
-                <button disabled={saving} className={buttonClass("primary")}>Apply Config</button>
+                <button disabled={saving} className={buttonClass("primary")}>应用配置</button>
               </form>
             </BrutalCard>
 
             <BrutalCard>
-              <h2 className="mb-4 text-xl font-black uppercase">Send Update</h2>
+              <h2 className="mb-4 text-xl font-black uppercase">发送更新</h2>
               <form onSubmit={forceUpdate} className="space-y-4">
-                <Field label="Version">
+                <Field label="版本">
                   <input className={inputClass} value={updateForm.version} onChange={(e) => setUpdateForm((f) => ({ ...f, version: e.target.value }))} />
                 </Field>
-                <Field label="Download URL">
+                <Field label="下载 URL">
                   <input className={inputClass} value={updateForm.download_url} onChange={(e) => setUpdateForm((f) => ({ ...f, download_url: e.target.value }))} />
                 </Field>
-                <Field label="Checksum">
+                <Field label="校验和">
                   <input className={inputClass} value={updateForm.checksum} onChange={(e) => setUpdateForm((f) => ({ ...f, checksum: e.target.value }))} />
                 </Field>
-                <button disabled={saving} className={buttonClass("danger")}>Send Update</button>
+                <button disabled={saving} className={buttonClass("danger")}>发送更新</button>
               </form>
             </BrutalCard>
           </div>
@@ -366,4 +366,26 @@ function parentPath(value: string): string {
   const trimmed = value.replace(/\/$/, "");
   const index = trimmed.lastIndexOf("/");
   return index <= 0 ? "/" : trimmed.slice(0, index);
+}
+
+function serverStatusLabel(status: string): string {
+  const labels: Record<string, string> = {
+    online: "在线",
+    offline: "离线",
+    revoked: "已撤销",
+    down: "异常",
+    degraded: "降级",
+  };
+  return labels[status] || status;
+}
+
+function configFlagLabel(key: keyof typeof blankConfig): string {
+  const labels: Partial<Record<keyof typeof blankConfig, string>> = {
+    disable_auto_update: "禁用自动更新",
+    disable_force_update: "禁用强制更新",
+    disable_command_execute: "禁用命令执行",
+    disable_nat: "禁用 NAT",
+    disable_send_query: "禁用查询上报",
+  };
+  return labels[key] || key;
 }

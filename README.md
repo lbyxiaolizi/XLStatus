@@ -55,6 +55,7 @@ Default credentials: `admin` / `admin123`
 The public status page is available before login at `http://localhost:3000/status`. The dashboard theme uses the BOLD. palette; switch between light and dark modes from the navigation bar.
 
 SQLite Compose creates `./data/xlstatus.db` on first startup. PostgreSQL Compose creates the `xlstatus` role and database on an empty volume, then XLStatus applies application migrations.
+Compose sets `CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000` so the Web UI can call the API at `http://localhost:8080`.
 
 When running SQLite from source, keep `?mode=rwc` or set `DATABASE_CREATE_IF_MISSING=true`. If the database file is missing and auto-create is not enabled, interactive runs ask whether to create it and non-interactive runs exit with a clear error. PostgreSQL new-site setup is covered in the [Installation Guide](./docs/installation.md#postgresql-new-site).
 
@@ -85,6 +86,30 @@ sudo BINARY_PATH=target/release/xlstatus-agent bash deploy/install-agent.sh
 - [API Documentation](./docs/api.md)
 - [Agent Setup](./docs/agent-setup.md)
 - [Troubleshooting](./docs/troubleshooting.md)
+
+## ⚙️ Configuration Essentials
+
+XLStatus supports two server configuration modes:
+
+- Environment variables: set `DATABASE_URL`, then provide values such as `HTTP_BIND`, `GRPC_BIND`, `CORS_ALLOWED_ORIGINS`, and `SESSION_SECRET`.
+- TOML file: copy [config.example.toml](./config.example.toml) to `config.toml` or `/etc/xlstatus/server.toml`, then start with `CONFIG_FILE=/path/to/server.toml`.
+
+Do not set `DATABASE_URL` when using `CONFIG_FILE`; `DATABASE_URL` selects environment-variable mode.
+
+When the Web UI and API run on different origins, the API must allow the Web UI origin:
+
+```bash
+CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
+```
+
+The Web UI uses `NEXT_PUBLIC_API_URL` to know where the API is:
+
+```bash
+cd web
+NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm dev
+```
+
+See [docs/configuration.md](./docs/configuration.md) for the full matrix, including SQLite creation behavior and PostgreSQL new-site initialization.
 
 ## 🛠️ Development
 

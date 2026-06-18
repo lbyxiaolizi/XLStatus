@@ -87,39 +87,39 @@ export default function DashboardPage() {
       <Navigation />
       <PageShell>
         <PageHeader
-          eyebrow="Operations"
-          title="Dashboard"
+          eyebrow="运维总览"
+          title="总览"
           detail="服务器、服务和告警的实时工作台。"
         />
         <InlineError message={error} />
 
         <div className="mt-5 grid gap-4 md:grid-cols-4">
-          <Kpi label="Servers" value={String(servers.length)} detail={`${summary.onlineServers} online`} />
-          <Kpi label="Services" value={String(services.length)} detail={`${summary.onlineServices} healthy`} />
-          <Kpi label="Alerts" value={String(summary.activeAlerts)} detail="active events" />
-          <Kpi label="Mode" value={loading ? "..." : "Live"} detail="API connected" />
+          <Kpi label="服务器" value={String(servers.length)} detail={`${summary.onlineServers} 台在线`} />
+          <Kpi label="服务" value={String(services.length)} detail={`${summary.onlineServices} 个正常`} />
+          <Kpi label="告警" value={String(summary.activeAlerts)} detail="活跃事件" />
+          <Kpi label="模式" value={loading ? "..." : "实时"} detail="API 已连接" />
         </div>
 
         <div className="mt-6 grid gap-6 lg:grid-cols-2">
           <BrutalCard>
-            <h2 className="mb-4 text-xl font-black uppercase">Servers</h2>
+            <h2 className="mb-4 text-xl font-black uppercase">服务器</h2>
             {servers.length === 0 ? (
-              <EmptyState title="No servers found" detail="Agents will appear here after enrollment." />
+              <EmptyState title="暂无服务器" detail="Agent 注册并上线后会显示在这里。" />
             ) : (
               <div className="overflow-x-auto">
                 <table className="w-full">
                   <thead>
                     <tr>
-                      <th className={thClass}>Name</th>
-                      <th className={thClass}>Status</th>
-                      <th className={thClass}>Last Seen</th>
+                      <th className={thClass}>名称</th>
+                      <th className={thClass}>状态</th>
+                      <th className={thClass}>最后在线</th>
                     </tr>
                   </thead>
                   <tbody>
                     {servers.slice(0, 8).map((server) => (
                       <tr key={server.id}>
                         <td className={tdClass}>{server.name}</td>
-                        <td className={tdClass}><StatusBadge tone={server.status === "online" ? "green" : "red"}>{server.status}</StatusBadge></td>
+                        <td className={tdClass}><StatusBadge tone={server.status === "online" ? "green" : "red"}>{serverStatusLabel(server.status)}</StatusBadge></td>
                         <td className={tdClass}>{formatDate(server.last_seen_at)}</td>
                       </tr>
                     ))}
@@ -130,15 +130,15 @@ export default function DashboardPage() {
           </BrutalCard>
 
           <BrutalCard>
-            <h2 className="mb-4 text-xl font-black uppercase">Recent Alerts</h2>
+            <h2 className="mb-4 text-xl font-black uppercase">最近告警</h2>
             {alerts.length === 0 ? (
-              <EmptyState title="No alert events" detail="Alert history will appear here once rules fire or recover." />
+              <EmptyState title="暂无告警事件" detail="规则触发或恢复后，告警历史会显示在这里。" />
             ) : (
               <div className="grid gap-3">
                 {alerts.map((alert, index) => (
                   <div key={alert.id || index} className="border-2 border-black bg-[var(--accent-bg)] p-3">
-                    <div className="font-black">{alert.rule_name || "Alert"}</div>
-                    <div className="mt-1 text-sm font-bold text-[var(--text-muted)]">{alert.message || alert.status || "Event"}</div>
+                    <div className="font-black">{alert.rule_name || "告警"}</div>
+                    <div className="mt-1 text-sm font-bold text-[var(--text-muted)]">{alert.message || alert.status || "事件"}</div>
                     <div className="mt-2 text-xs font-black uppercase">{formatDate(alert.created_at)}</div>
                   </div>
                 ))}
@@ -159,4 +159,15 @@ function Kpi({ label, value, detail }: { label: string; value: string; detail: s
       <div className="mt-1 text-sm font-bold text-[var(--text-muted)]">{detail}</div>
     </BrutalCard>
   );
+}
+
+function serverStatusLabel(status: string): string {
+  const labels: Record<string, string> = {
+    online: "在线",
+    offline: "离线",
+    revoked: "已撤销",
+    down: "异常",
+    degraded: "降级",
+  };
+  return labels[status] || status;
 }

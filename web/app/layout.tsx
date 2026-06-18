@@ -1,10 +1,11 @@
 import type { Metadata } from "next";
 import Script from "next/script";
+import { defaultLocale, t } from "@/lib/i18n";
 import "./globals.css";
 
 export const metadata: Metadata = {
   title: "XLStatus",
-  description: "Self-hosted server monitoring and operations system",
+  description: t.appDescription,
 };
 
 export default function RootLayout({
@@ -13,7 +14,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" className="h-full antialiased" suppressHydrationWarning>
+    <html lang={defaultLocale} className="h-full antialiased" suppressHydrationWarning>
       <head>
         <meta name="color-scheme" id="color-scheme-meta" content="light" />
       </head>

@@ -4,22 +4,23 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useState } from "react";
 import { apiClient } from "@/lib/api";
+import { t } from "@/lib/i18n";
 import { isAdmin, useBoldTheme, useStoredUser } from "./M7Primitives";
 
 const navigation = [
-  { name: "Dashboard", href: "/dashboard" },
-  { name: "Servers", href: "/servers" },
-  { name: "Services", href: "/services" },
-  { name: "Tasks", href: "/tasks" },
-  { name: "Terminal", href: "/terminal" },
-  { name: "Alerts", href: "/alerts" },
-  { name: "NAT", href: "/nat" },
-  { name: "DDNS", href: "/ddns", adminOnly: true },
-  { name: "Settings", href: "/settings" },
-  { name: "Status", href: "/status" },
+  { name: t.nav.dashboard, href: "/dashboard" },
+  { name: t.nav.servers, href: "/servers" },
+  { name: t.nav.services, href: "/services" },
+  { name: t.nav.tasks, href: "/tasks" },
+  { name: t.nav.terminal, href: "/terminal" },
+  { name: t.nav.alerts, href: "/alerts" },
+  { name: t.nav.nat, href: "/nat" },
+  { name: t.nav.ddns, href: "/ddns", adminOnly: true },
+  { name: t.nav.settings, href: "/settings" },
+  { name: t.nav.status, href: "/status" },
 ];
 
-const publicNavigation = [{ name: "Status", href: "/status" }];
+const publicNavigation = [{ name: t.nav.status, href: "/status" }];
 
 export default function Navigation() {
   const pathname = usePathname();
@@ -74,14 +75,14 @@ export default function Navigation() {
                 onClick={handleLogout}
                 className="border-2 border-black bg-black px-3 py-2 text-xs font-black uppercase text-white shadow-[var(--shadow-brutal-sm)]"
               >
-                Logout
+                {t.common.logout}
               </button>
             ) : (
               <Link
                 href="/login"
                 className="border-2 border-black bg-black px-3 py-2 text-xs font-black uppercase text-white shadow-[var(--shadow-brutal-sm)]"
               >
-                Login
+                {t.common.login}
               </Link>
             )}
           </div>
@@ -90,9 +91,9 @@ export default function Navigation() {
             type="button"
             onClick={() => setOpen((value) => !value)}
             className="border-2 border-black bg-[var(--bg-card)] px-3 py-2 text-sm font-black uppercase shadow-[var(--shadow-brutal-sm)] md:hidden"
-            aria-label="Toggle navigation"
+            aria-label="切换导航"
           >
-            Menu
+            {t.common.menu}
           </button>
         </div>
       </div>
@@ -122,7 +123,7 @@ export default function Navigation() {
                 onClick={handleLogout}
                 className="border-2 border-black bg-black px-3 py-2 text-left text-xs font-black uppercase text-white"
               >
-                Logout
+                {t.common.logout}
               </button>
             ) : (
               <Link
@@ -130,7 +131,7 @@ export default function Navigation() {
                 onClick={() => setOpen(false)}
                 className="border-2 border-black bg-black px-3 py-2 text-xs font-black uppercase text-white"
               >
-                Login
+                {t.common.login}
               </Link>
             )}
           </div>
@@ -161,7 +162,7 @@ function ThemeSegment({
           }`}
           aria-pressed={theme === mode}
         >
-          {mode}
+          {mode === "light" ? t.common.light : t.common.dark}
         </button>
       ))}
     </div>

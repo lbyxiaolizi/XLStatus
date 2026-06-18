@@ -28,6 +28,18 @@ XLSTATUS_SEED_ADMIN_PASSWORD=admin123
 
 `XLSTATUS_SEED_ADMIN_PASSWORD` is only used to seed an admin user when one does not already exist.
 
+| Variable | Required | Description |
+|---|---:|---|
+| `DATABASE_URL` | Yes for env mode | SQLite or PostgreSQL connection URL. Setting this enables environment-variable configuration mode. |
+| `DATABASE_CREATE_IF_MISSING` | No | SQLite-only convenience flag. Truthy values are `1`, `true`, `yes`, `y`, and `on`. |
+| `HTTP_BIND` | No | HTTP API bind address. Default: `0.0.0.0:8080`. |
+| `GRPC_BIND` | No | Agent gRPC bind address. Default: `0.0.0.0:50051`. |
+| `CORS_ALLOWED_ORIGINS` | No | Comma-separated exact browser origins that may call the API. Default allows local Next.js on port `3000`. |
+| `SESSION_SECRET` | Production: yes | Secret used for sessions and agent JWT signing. Generate a long random value for real deployments. |
+| `SESSION_TTL_HOURS` | No | Cookie session lifetime. Default: `24`. |
+| `XLSTATUS_SEED_ADMIN_USERNAME` | No | Optional first admin username. |
+| `XLSTATUS_SEED_ADMIN_PASSWORD` | No | Optional first admin password. Used only when that user does not already exist. |
+
 ## TOML File
 
 Copy [../config.example.toml](../config.example.toml) to your target path and edit it:
@@ -58,6 +70,13 @@ CONFIG_FILE=/etc/xlstatus/server.toml /usr/local/bin/xlstatus-server
 
 The server currently has no `--config`, `--validate`, or `--version` CLI flags.
 
+Important loading behavior:
+
+- If `DATABASE_URL` is set, XLStatus reads environment variables and ignores `CONFIG_FILE`.
+- If `DATABASE_URL` is not set and `CONFIG_FILE` points to an existing file, XLStatus reads that TOML file.
+- If neither is present, development defaults are used.
+- Do not set both `DATABASE_URL` and `CONFIG_FILE` expecting a merge; choose one mode per process.
+
 ## Web UI CORS
 
 When the Web UI and API run on different origins, for example `http://localhost:3000` and `http://localhost:8080`, the API must allow the browser origin. Configure exact origins with `CORS_ALLOWED_ORIGINS` or `server.cors_allowed_origins`.
@@ -65,6 +84,42 @@ When the Web UI and API run on different origins, for example `http://localhost:
 Use the same hostname style for both URLs during local testing. For example, pair `http://localhost:3000` with `http://localhost:8080`, or pair `http://127.0.0.1:3000` with `http://127.0.0.1:8080`, so cookie sessions and CSRF checks behave consistently.
 
 Wildcard CORS origins are not supported because XLStatus uses cookie credentials for the dashboard.
+
+Common examples:
+
+```bash
+# Next.js dev server on the default port
+CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
+
+# Custom frontend port
+CORS_ALLOWED_ORIGINS=http://localhost:3001,http://127.0.0.1:3001
+
+# Public reverse-proxy origin
+CORS_ALLOWED_ORIGINS=https://status.example.com
+```
+
+`NEXT_PUBLIC_API_URL` is a Web UI build/runtime setting. It tells browser code where the API lives:
+
+```bash
+cd web
+NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm dev
+```
+
+The API origin in `NEXT_PUBLIC_API_URL` and the browser origin used to open the Web UI must both be planned together. If the browser opens `http://localhost:3000`, the API server must include `http://localhost:3000` in CORS. If the browser opens `https://status.example.com`, include `https://status.example.com`.
+
+## Web UI i18n
+
+The Web UI locale configuration is implemented in [../web/lib/i18n.ts](../web/lib/i18n.ts).
+
+Current settings:
+
+- Default locale: `zh-CN`
+- Supported locales: `zh-CN`
+- App Router i18n configuration is exported from `web/lib/i18n.ts`; `web/next.config.ts` intentionally does not use the legacy Pages Router `i18n` field
+- Shared user-visible strings should be added to `zhCN` in `web/lib/i18n.ts`
+- Backend protocol values, enum values, and scope strings such as `server:read` should stay unchanged
+
+The root layout sets `<html lang="zh-CN">`, and dates are formatted with the `zh-CN` locale.
 
 ## SQLite
 

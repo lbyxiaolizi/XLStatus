@@ -45,7 +45,7 @@ export default function TerminalPage() {
   const [opening, setOpening] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lines, setLines] = useState<TerminalLine[]>([
-    { id: 1, direction: "system", text: "Select an agent and open a terminal session." },
+    { id: 1, direction: "system", text: "请选择 Agent 并打开终端会话。" },
   ]);
   const wsRef = useRef<WebSocket | null>(null);
   const lineIdRef = useRef(2);
@@ -92,7 +92,7 @@ export default function TerminalPage() {
   async function openTerminal(event?: FormEvent) {
     event?.preventDefault();
     if (!agentId) {
-      setError("Select an agent before opening a terminal.");
+      setError("打开终端前请选择 Agent。");
       return;
     }
 
@@ -100,7 +100,7 @@ export default function TerminalPage() {
     setError(null);
     setOpening(true);
     setStatus("connecting");
-    setLines([{ id: lineIdRef.current++, direction: "system", text: `Opening ${selectedAgent?.name || compactId(agentId)} (${cols}x${rows})...` }]);
+    setLines([{ id: lineIdRef.current++, direction: "system", text: `正在打开 ${selectedAgent?.name || compactId(agentId)} (${cols}x${rows})...` }]);
 
     const response = await apiClient.createTerminalSession(agentId, cols, rows);
     if (!response.success) {
@@ -115,7 +115,7 @@ export default function TerminalPage() {
     if (!nextSessionId) {
       setOpening(false);
       setStatus("error");
-      setError("Terminal session response did not include a session id.");
+      setError("终端会话响应缺少 session id。");
       return;
     }
 
@@ -130,19 +130,19 @@ export default function TerminalPage() {
     ws.onopen = () => {
       setOpening(false);
       setStatus("open");
-      appendLine("system", `Connected to session ${compactId(nextSessionId)}.`);
+      appendLine("system", `已连接到会话 ${compactId(nextSessionId)}。`);
       sendFrame({ type: "terminal.resize", cols, rows });
     };
     ws.onmessage = (event) => void handleTerminalMessage(event.data);
     ws.onerror = () => {
       setOpening(false);
       setStatus("error");
-      appendLine("error", "WebSocket error.");
+      appendLine("error", "WebSocket 错误。");
     };
     ws.onclose = () => {
       setOpening(false);
       setStatus((current) => (current === "error" ? "error" : "closed"));
-      appendLine("system", "Terminal closed.");
+      appendLine("system", "终端已关闭。");
       wsRef.current = null;
     };
   }
@@ -162,12 +162,12 @@ export default function TerminalPage() {
         return;
       }
       if (type === "terminal.closed" || type === "closed") {
-        appendLine("system", String(msg.reason || "Terminal closed by server."));
+        appendLine("system", String(msg.reason || "服务端已关闭终端。"));
         closeSocket();
         return;
       }
       if (type === "terminal.error" || type === "error") {
-        appendLine("error", String(msg.error || msg.message || "Terminal error."));
+        appendLine("error", String(msg.error || msg.message || "终端错误。"));
         return;
       }
       appendLine("system", data);
@@ -187,7 +187,7 @@ export default function TerminalPage() {
   function resizeTerminal() {
     if (status !== "open") return;
     sendFrame({ type: "terminal.resize", cols, rows });
-    appendLine("system", `Resized to ${cols}x${rows}.`);
+    appendLine("system", `已调整为 ${cols}x${rows}。`);
   }
 
   function sendFrame(frame: Record<string, unknown>) {
@@ -208,43 +208,43 @@ export default function TerminalPage() {
       <Navigation />
       <PageShell>
         <PageHeader
-          eyebrow="Remote Shell"
-          title="Terminal"
+          eyebrow="远程 Shell"
+          title="终端"
           detail="通过后端 WebSocket 建立 agent 终端会话。"
-          actions={<StatusBadge tone={status === "open" ? "green" : status === "error" ? "red" : "gray"}>{status}</StatusBadge>}
+          actions={<StatusBadge tone={status === "open" ? "green" : status === "error" ? "red" : "gray"}>{terminalStatusLabel(status)}</StatusBadge>}
         />
         <InlineError message={error} />
 
         <div className="mt-5 grid gap-6 lg:grid-cols-[360px_minmax(0,1fr)]">
           <BrutalCard>
             <form onSubmit={openTerminal} className="space-y-4">
-              <Field label="Agent">
+                <Field label="Agent">
                 <select className={selectClass} value={agentId} onChange={(e) => setAgentId(e.target.value)}>
                   {servers.map((server) => (
-                    <option key={server.id} value={server.id}>{server.name} ({server.status || "unknown"})</option>
+                    <option key={server.id} value={server.id}>{server.name} ({server.status || "未知"})</option>
                   ))}
                 </select>
               </Field>
               <div className="grid grid-cols-2 gap-3">
-                <Field label="Cols">
+                <Field label="列数">
                   <input className={inputClass} value={cols} onChange={(e) => setCols(Number(e.target.value) || 100)} />
                 </Field>
-                <Field label="Rows">
+                <Field label="行数">
                   <input className={inputClass} value={rows} onChange={(e) => setRows(Number(e.target.value) || 30)} />
                 </Field>
               </div>
               <div className="flex flex-wrap gap-2">
-                <button disabled={opening || loading} className={buttonClass("primary")}>Open Session</button>
-                <button type="button" onClick={resizeTerminal} className={buttonClass("secondary")}>Resize</button>
-                <button type="button" onClick={closeSocket} className={buttonClass("danger")}>Close</button>
+                <button disabled={opening || loading} className={buttonClass("primary")}>打开会话</button>
+                <button type="button" onClick={resizeTerminal} className={buttonClass("secondary")}>调整大小</button>
+                <button type="button" onClick={closeSocket} className={buttonClass("danger")}>关闭</button>
               </div>
-              {sessionId ? <InlineNotice tone="pink">Session {compactId(sessionId)}</InlineNotice> : null}
+              {sessionId ? <InlineNotice tone="pink">会话 {compactId(sessionId)}</InlineNotice> : null}
             </form>
           </BrutalCard>
 
           <BrutalCard className="p-0">
             <div ref={outputRef} className="h-[520px] overflow-auto bg-black p-4 font-mono text-sm text-green-300">
-              {lines.length === 0 ? <EmptyState title="No terminal output" /> : null}
+              {lines.length === 0 ? <EmptyState title="暂无终端输出" /> : null}
               {lines.map((line) => (
                 <div key={line.id} className={line.direction === "error" ? "text-red-300" : line.direction === "input" ? "text-pink-300" : ""}>
                   {line.text}
@@ -258,10 +258,10 @@ export default function TerminalPage() {
                 onKeyDown={onInputKeyDown}
                 disabled={status !== "open"}
                 className="min-w-0 flex-1 bg-[var(--bg-card)] px-4 py-3 font-mono text-sm font-bold outline-none"
-                placeholder={status === "open" ? "type command and press Enter" : "open terminal first"}
+                placeholder={status === "open" ? "输入命令并按 Enter" : "请先打开终端"}
               />
               <button type="button" onClick={sendInput} disabled={status !== "open"} className="border-l-4 border-black bg-[var(--accent-color)] px-5 font-black uppercase text-white">
-                Send
+                发送
               </button>
             </div>
           </BrutalCard>
@@ -275,4 +275,15 @@ function buildTerminalWsUrl(sessionId: string): string {
   const apiBase = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
   const url = new URL(apiBase);
   return `${url.protocol === "https:" ? "wss" : "ws"}://${url.host}/ws/terminal/${encodeURIComponent(sessionId)}`;
+}
+
+function terminalStatusLabel(status: TerminalStatus): string {
+  const labels: Record<TerminalStatus, string> = {
+    idle: "空闲",
+    connecting: "连接中",
+    open: "已连接",
+    closed: "已关闭",
+    error: "错误",
+  };
+  return labels[status];
 }

@@ -36,12 +36,12 @@ export default function LoginPage() {
     <main className="flex min-h-screen items-center justify-center px-4 py-10">
       <div className="w-full max-w-md">
         <Link href="/status" className="mb-6 inline-block border-2 border-black bg-[var(--bg-card)] px-3 py-2 text-xs font-black uppercase shadow-[var(--shadow-brutal-sm)]">
-          Back to status
+          返回状态页
         </Link>
         <BrutalCard className="p-6 sm:p-8" accent>
           <div className="mb-8">
             <p className="mb-2 inline-block border-2 border-black bg-white px-3 py-1 text-xs font-black uppercase shadow-[var(--shadow-brutal-sm)]">
-              Admin Access
+              管理员入口
             </p>
             <h1 className="text-5xl font-black uppercase tracking-tight">XLStatus</h1>
             <p className="mt-2 text-sm font-bold text-[var(--text-muted)]">
@@ -51,7 +51,7 @@ export default function LoginPage() {
 
           <form onSubmit={handleSubmit} className="space-y-5">
             <InlineError message={error} />
-            <Field label="Username">
+            <Field label="用户名">
               <input
                 value={username}
                 onChange={(event) => setUsername(event.target.value)}
@@ -61,7 +61,7 @@ export default function LoginPage() {
                 placeholder="admin"
               />
             </Field>
-            <Field label="Password">
+            <Field label="密码">
               <input
                 type="password"
                 value={password}
@@ -73,7 +73,7 @@ export default function LoginPage() {
               />
             </Field>
             <button type="submit" disabled={loading} className={`${buttonClass("primary")} w-full`}>
-              {loading ? "Signing in..." : "Sign In"}
+              {loading ? "正在登录..." : "登录"}
             </button>
           </form>
         </BrutalCard>

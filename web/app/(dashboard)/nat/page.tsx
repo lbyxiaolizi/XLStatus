@@ -78,7 +78,7 @@ export default function NatPage() {
     };
     const response = await apiClient.createNatMapping(payload);
     if (response.success) {
-      setNotice("NAT mapping created.");
+      setNotice("NAT 映射已创建。");
       setModal(false);
       await load();
     } else {
@@ -87,10 +87,10 @@ export default function NatPage() {
   }
 
   async function deleteMapping(mapping: NatMapping) {
-    if (!confirm(`Delete NAT mapping "${mapping.description || mapping.id}"?`)) return;
+    if (!confirm(`确定删除 NAT 映射「${mapping.description || mapping.id}」？`)) return;
     const response = await apiClient.deleteNatMapping(mapping.id);
     if (response.success) {
-      setNotice("NAT mapping deleted.");
+      setNotice("NAT 映射已删除。");
       await load();
     } else {
       setError(responseError(response));
@@ -102,10 +102,10 @@ export default function NatPage() {
       <Navigation />
       <PageShell>
         <PageHeader
-          eyebrow="Network"
+          eyebrow="网络"
           title="NAT"
           detail="Agent 端口映射与远程访问配置。"
-          actions={<button className={buttonClass("primary")} onClick={() => setModal(true)}>Add Mapping</button>}
+          actions={<button className={buttonClass("primary")} onClick={() => setModal(true)}>新增映射</button>}
         />
         <div className="mb-5 space-y-3">
           <InlineError message={error} />
@@ -113,12 +113,12 @@ export default function NatPage() {
         </div>
 
         {mappings.length === 0 ? (
-          <EmptyState title="No NAT mappings" detail="Create a mapping to expose an agent-side target through the tunnel." />
+          <EmptyState title="暂无 NAT 映射" detail="创建映射后即可通过隧道暴露 Agent 侧目标。" />
         ) : (
           <div className="overflow-x-auto border-2 border-black bg-[var(--bg-card)] shadow-[var(--shadow-brutal)]">
             <table className="w-full">
               <thead>
-                <tr><th className={thClass}>Description</th><th className={thClass}>Agent</th><th className={thClass}>Public</th><th className={thClass}>Local</th><th className={thClass}>Status</th><th className={thClass}>Action</th></tr>
+                <tr><th className={thClass}>描述</th><th className={thClass}>Agent</th><th className={thClass}>公网</th><th className={thClass}>本地</th><th className={thClass}>状态</th><th className={thClass}>操作</th></tr>
               </thead>
               <tbody>
                 {mappings.map((mapping) => (
@@ -127,8 +127,8 @@ export default function NatPage() {
                     <td className={tdClass}>{mapping.agent_id}</td>
                     <td className={tdClass}>{mapping.protocol || "tcp"}://:{mapping.public_port}</td>
                     <td className={tdClass}>{mapping.local_host}:{mapping.local_port}</td>
-                    <td className={tdClass}><StatusBadge tone={mapping.enabled === false ? "gray" : "green"}>{mapping.enabled === false ? "disabled" : "enabled"}</StatusBadge></td>
-                    <td className={tdClass}><button className={buttonClass("danger")} onClick={() => void deleteMapping(mapping)}>Delete</button></td>
+                    <td className={tdClass}><StatusBadge tone={mapping.enabled === false ? "gray" : "green"}>{mapping.enabled === false ? "停用" : "启用"}</StatusBadge></td>
+                    <td className={tdClass}><button className={buttonClass("danger")} onClick={() => void deleteMapping(mapping)}>删除</button></td>
                   </tr>
                 ))}
               </tbody>
@@ -137,19 +137,19 @@ export default function NatPage() {
         )}
 
         {modal ? (
-          <Modal title="Add NAT Mapping" onClose={() => setModal(false)}>
+          <Modal title="新增 NAT 映射" onClose={() => setModal(false)}>
             <form onSubmit={submit} className="space-y-4">
               <div className="grid gap-4 sm:grid-cols-2">
                 <Field label="Agent"><select className={selectClass} value={form.agent_id} onChange={(e) => setForm((f) => ({ ...f, agent_id: e.target.value }))}>{servers.map((server) => <option key={server.id} value={server.id}>{server.name}</option>)}</select></Field>
-                <Field label="Description"><input className={inputClass} value={form.description} onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))} /></Field>
+                <Field label="描述"><input className={inputClass} value={form.description} onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))} /></Field>
               </div>
               <div className="grid gap-4 sm:grid-cols-3">
-                <Field label="Protocol"><select className={selectClass} value={form.protocol} onChange={(e) => setForm((f) => ({ ...f, protocol: e.target.value }))}><option value="tcp">tcp</option><option value="udp">udp</option></select></Field>
-                <Field label="Public port"><input className={inputClass} value={form.public_port} onChange={(e) => setForm((f) => ({ ...f, public_port: e.target.value }))} /></Field>
-                <Field label="Local host"><input className={inputClass} value={form.local_host} onChange={(e) => setForm((f) => ({ ...f, local_host: e.target.value }))} /></Field>
+                <Field label="协议"><select className={selectClass} value={form.protocol} onChange={(e) => setForm((f) => ({ ...f, protocol: e.target.value }))}><option value="tcp">tcp</option><option value="udp">udp</option></select></Field>
+                <Field label="公网端口"><input className={inputClass} value={form.public_port} onChange={(e) => setForm((f) => ({ ...f, public_port: e.target.value }))} /></Field>
+                <Field label="本地主机"><input className={inputClass} value={form.local_host} onChange={(e) => setForm((f) => ({ ...f, local_host: e.target.value }))} /></Field>
               </div>
-              <Field label="Local port"><input className={inputClass} value={form.local_port} onChange={(e) => setForm((f) => ({ ...f, local_port: e.target.value }))} /></Field>
-              <button className={buttonClass("primary")}>Save Mapping</button>
+              <Field label="本地端口"><input className={inputClass} value={form.local_port} onChange={(e) => setForm((f) => ({ ...f, local_port: e.target.value }))} /></Field>
+              <button className={buttonClass("primary")}>保存映射</button>
             </form>
           </Modal>
         ) : null}

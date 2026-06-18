@@ -175,7 +175,7 @@ export default function TasksPage() {
     setSaving(false);
     if (response.success) {
       setModal(null);
-      setNotice(modal === "edit" ? "Task updated." : "Task created.");
+      setNotice(modal === "edit" ? "任务已更新。" : "任务已创建。");
       await loadTasks();
     } else {
       setError(responseError(response));
@@ -183,12 +183,12 @@ export default function TasksPage() {
   }
 
   async function runTask(task: Task) {
-    if (!confirm(`Run task "${task.name}" now?`)) return;
+    if (!confirm(`现在运行任务「${task.name}」？`)) return;
     setRunningTaskId(task.id);
     const response = await apiClient.runTask(task.id);
     setRunningTaskId(null);
     if (response.success) {
-      setNotice("Task run requested.");
+      setNotice("任务运行请求已发送。");
       await loadTasks();
     } else {
       setError(responseError(response));
@@ -196,10 +196,10 @@ export default function TasksPage() {
   }
 
   async function deleteTask(task: Task) {
-    if (!confirm(`Delete task "${task.name}"?`)) return;
+    if (!confirm(`确定删除任务「${task.name}」？`)) return;
     const response = await apiClient.deleteTask(task.id);
     if (response.success) {
-      setNotice("Task deleted.");
+      setNotice("任务已删除。");
       await loadTasks();
     } else {
       setError(responseError(response));
@@ -211,31 +211,31 @@ export default function TasksPage() {
       <Navigation />
       <PageShell>
         <PageHeader
-          eyebrow="Automation"
-          title="Tasks"
+          eyebrow="自动化"
+          title="任务"
           detail="下发命令、调度任务并查看执行记录。"
-          actions={<button type="button" onClick={openCreate} className={buttonClass("primary")}>Add Task</button>}
+          actions={<button type="button" onClick={openCreate} className={buttonClass("primary")}>新增任务</button>}
         />
         <div className="mb-5 space-y-3">
-          <input className={inputClass} value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search tasks" />
+          <input className={inputClass} value={query} onChange={(e) => setQuery(e.target.value)} placeholder="搜索任务" />
           <InlineError message={error} />
           {notice ? <InlineNotice tone="green">{notice}</InlineNotice> : null}
         </div>
 
         {loading ? (
-          <BrutalCard>Loading tasks...</BrutalCard>
+          <BrutalCard>正在加载任务...</BrutalCard>
         ) : filtered.length === 0 ? (
-          <EmptyState title="No tasks configured" detail="Create a task to run shell commands against selected agents." />
+          <EmptyState title="暂无任务配置" detail="创建任务后即可向选定 Agent 下发命令。" />
         ) : (
           <div className="overflow-x-auto border-2 border-black bg-[var(--bg-card)] shadow-[var(--shadow-brutal)]">
             <table className="w-full">
               <thead>
                 <tr>
-                  <th className={thClass}>Name</th>
-                  <th className={thClass}>Type</th>
-                  <th className={thClass}>Schedule</th>
-                  <th className={thClass}>Result</th>
-                  <th className={thClass}>Actions</th>
+                  <th className={thClass}>名称</th>
+                  <th className={thClass}>类型</th>
+                  <th className={thClass}>调度</th>
+                  <th className={thClass}>结果</th>
+                  <th className={thClass}>操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -243,13 +243,13 @@ export default function TasksPage() {
                   <tr key={task.id}>
                     <td className={tdClass}>{task.name}</td>
                     <td className={tdClass}>{task.task_type}</td>
-                    <td className={tdClass}>{task.schedule || "manual"}</td>
-                    <td className={tdClass}><StatusBadge tone={task.last_result === "success" ? "green" : task.last_result ? "red" : "gray"}>{task.last_result || "never"}</StatusBadge></td>
+                    <td className={tdClass}>{task.schedule || "手动"}</td>
+                    <td className={tdClass}><StatusBadge tone={task.last_result === "success" ? "green" : task.last_result ? "red" : "gray"}>{resultLabel(task.last_result)}</StatusBadge></td>
                     <td className={`${tdClass} flex flex-wrap gap-2`}>
-                      <button className={buttonClass("good")} disabled={runningTaskId === task.id} onClick={() => void runTask(task)}>Run</button>
-                      <button className={buttonClass("secondary")} onClick={() => openEdit(task)}>Edit</button>
-                      <button className={buttonClass("secondary")} onClick={() => void openRuns(task)}>Runs</button>
-                      <button className={buttonClass("danger")} onClick={() => void deleteTask(task)}>Delete</button>
+                      <button className={buttonClass("good")} disabled={runningTaskId === task.id} onClick={() => void runTask(task)}>运行</button>
+                      <button className={buttonClass("secondary")} onClick={() => openEdit(task)}>编辑</button>
+                      <button className={buttonClass("secondary")} onClick={() => void openRuns(task)}>记录</button>
+                      <button className={buttonClass("danger")} onClick={() => void deleteTask(task)}>删除</button>
                     </td>
                   </tr>
                 ))}
@@ -259,24 +259,24 @@ export default function TasksPage() {
         )}
 
         {modal === "create" || modal === "edit" ? (
-          <Modal title={modal === "edit" ? "Edit Task" : "Add Task"} onClose={() => setModal(null)}>
+          <Modal title={modal === "edit" ? "编辑任务" : "新增任务"} onClose={() => setModal(null)}>
             <TaskFormView form={form} setForm={setForm} servers={servers} saving={saving} onSubmit={submitForm} />
           </Modal>
         ) : null}
 
         {modal === "runs" ? (
-          <Modal title={`Runs: ${editing?.name || ""}`} onClose={() => setModal(null)}>
+          <Modal title={`运行记录：${editing?.name || ""}`} onClose={() => setModal(null)}>
             {runs.length === 0 ? (
-              <EmptyState title="No runs" />
+              <EmptyState title="暂无运行记录" />
             ) : (
               <div className="grid gap-3">
                 {runs.map((run) => (
                   <BrutalCard key={run.id}>
                     <div className="flex flex-wrap items-center justify-between gap-2">
-                      <StatusBadge tone={run.status === "success" ? "green" : "red"}>{run.status}</StatusBadge>
+                      <StatusBadge tone={run.status === "success" ? "green" : "red"}>{resultLabel(run.status)}</StatusBadge>
                       <span className="text-sm font-black">{formatDate(run.created_at)} / {formatMs(run.delay_ms)}</span>
                     </div>
-                    <p className="mt-2 text-xs font-bold text-[var(--text-muted)]">Server {compactId(run.server_id)}</p>
+                    <p className="mt-2 text-xs font-bold text-[var(--text-muted)]">服务器 {compactId(run.server_id)}</p>
                     <pre className="mt-3 max-h-40 overflow-auto border-2 border-black bg-black p-3 text-xs text-green-300">{run.output || run.error || ""}</pre>
                   </BrutalCard>
                 ))}
@@ -305,10 +305,10 @@ function TaskFormView({
   return (
     <form onSubmit={onSubmit} className="space-y-4">
       <div className="grid gap-4 sm:grid-cols-2">
-        <Field label="Name">
+        <Field label="名称">
           <input className={inputClass} value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} required />
         </Field>
-        <Field label="Type">
+        <Field label="类型">
           <select className={selectClass} value={form.task_type} onChange={(e) => setForm((f) => ({ ...f, task_type: e.target.value as TaskType }))}>
             <option value="shell">shell</option>
             <option value="http_get">http_get</option>
@@ -317,24 +317,24 @@ function TaskFormView({
           </select>
         </Field>
       </div>
-      <Field label="Schedule">
-        <input className={inputClass} value={form.schedule} onChange={(e) => setForm((f) => ({ ...f, schedule: e.target.value }))} placeholder="cron or empty for manual" />
+      <Field label="调度">
+        <input className={inputClass} value={form.schedule} onChange={(e) => setForm((f) => ({ ...f, schedule: e.target.value }))} placeholder="填写 cron，留空则手动运行" />
       </Field>
-      <Field label="Command">
+      <Field label="命令">
         <textarea className={`${textareaClass} min-h-28`} value={form.command} onChange={(e) => setForm((f) => ({ ...f, command: e.target.value }))} />
       </Field>
-      <Field label="Payload JSON">
+      <Field label="载荷 JSON">
         <textarea className={`${textareaClass} min-h-24`} value={form.payload_json} onChange={(e) => setForm((f) => ({ ...f, payload_json: e.target.value }))} />
       </Field>
       <div className="grid gap-4 sm:grid-cols-2">
-        <Field label="Cover mode">
+        <Field label="覆盖模式">
           <select className={selectClass} value={form.cover_mode} onChange={(e) => setForm((f) => ({ ...f, cover_mode: e.target.value as CoverMode }))}>
             <option value="specific">specific</option>
             <option value="all">all</option>
             <option value="any">any</option>
           </select>
         </Field>
-        <Field label="Servers">
+        <Field label="服务器">
           <select
             multiple
             className={`${selectClass} min-h-32`}
@@ -348,10 +348,10 @@ function TaskFormView({
         </Field>
       </div>
       <div className="flex flex-wrap gap-4 text-sm font-black">
-        <label><input type="checkbox" checked={form.push_successful} onChange={(e) => setForm((f) => ({ ...f, push_successful: e.target.checked }))} /> Push successful</label>
-        <label><input type="checkbox" checked={form.enabled} onChange={(e) => setForm((f) => ({ ...f, enabled: e.target.checked }))} /> Enabled</label>
+        <label><input type="checkbox" checked={form.push_successful} onChange={(e) => setForm((f) => ({ ...f, push_successful: e.target.checked }))} /> 推送成功结果</label>
+        <label><input type="checkbox" checked={form.enabled} onChange={(e) => setForm((f) => ({ ...f, enabled: e.target.checked }))} /> 启用</label>
       </div>
-      <button disabled={saving} className={buttonClass("primary")}>{saving ? "Saving..." : "Save Task"}</button>
+      <button disabled={saving} className={buttonClass("primary")}>{saving ? "保存中..." : "保存任务"}</button>
     </form>
   );
 }
@@ -377,4 +377,15 @@ function formToPayload(form: TaskForm): JsonObject {
     push_successful: form.push_successful,
     enabled: form.enabled,
   };
+}
+
+function resultLabel(value?: string | null): string {
+  if (!value) return "从未";
+  const labels: Record<string, string> = {
+    success: "成功",
+    failure: "失败",
+    error: "错误",
+    timeout: "超时",
+  };
+  return labels[value] || value;
 }

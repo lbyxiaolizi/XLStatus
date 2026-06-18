@@ -88,7 +88,7 @@ export default function AlertsPage() {
     };
     const response = await apiClient.createAlertRule(payload);
     if (response.success) {
-      setNotice("Alert rule created.");
+      setNotice("告警规则已创建。");
       setModal(false);
       await load();
     } else {
@@ -97,10 +97,10 @@ export default function AlertsPage() {
   }
 
   async function deleteRule(rule: AlertRule) {
-    if (!confirm(`Delete alert rule "${rule.name}"?`)) return;
+    if (!confirm(`确定删除告警规则「${rule.name}」？`)) return;
     const response = await apiClient.deleteAlertRule(rule.id);
     if (response.success) {
-      setNotice("Alert rule deleted.");
+      setNotice("告警规则已删除。");
       await load();
     } else {
       setError(responseError(response));
@@ -112,10 +112,10 @@ export default function AlertsPage() {
       <Navigation />
       <PageShell>
         <PageHeader
-          eyebrow="Incident Rules"
-          title="Alerts"
+          eyebrow="事件规则"
+          title="告警"
           detail="资源、服务和恢复通知的规则管理。"
-          actions={<button className={buttonClass("primary")} onClick={() => setModal(true)}>Add Rule</button>}
+          actions={<button className={buttonClass("primary")} onClick={() => setModal(true)}>新增规则</button>}
         />
         <div className="mb-5 space-y-3">
           <InlineError message={error} />
@@ -124,22 +124,22 @@ export default function AlertsPage() {
 
         <div className="grid gap-6 lg:grid-cols-2">
           <section>
-            <h2 className="mb-3 text-xl font-black uppercase">Rules</h2>
+            <h2 className="mb-3 text-xl font-black uppercase">规则</h2>
             {rules.length === 0 ? (
-              <EmptyState title="No alert rules" />
+              <EmptyState title="暂无告警规则" />
             ) : (
               <div className="overflow-x-auto border-2 border-black bg-[var(--bg-card)] shadow-[var(--shadow-brutal)]">
                 <table className="w-full">
                   <thead>
-                    <tr><th className={thClass}>Name</th><th className={thClass}>Condition</th><th className={thClass}>Status</th><th className={thClass}>Action</th></tr>
+                    <tr><th className={thClass}>名称</th><th className={thClass}>条件</th><th className={thClass}>状态</th><th className={thClass}>操作</th></tr>
                   </thead>
                   <tbody>
                     {rules.map((rule) => (
                       <tr key={rule.id}>
                         <td className={tdClass}>{rule.name}</td>
                         <td className={tdClass}>{formatConditions(rule.conditions)}</td>
-                        <td className={tdClass}><StatusBadge tone={rule.enabled === false ? "gray" : "green"}>{rule.enabled === false ? "disabled" : "enabled"}</StatusBadge></td>
-                        <td className={tdClass}><button className={buttonClass("danger")} onClick={() => void deleteRule(rule)}>Delete</button></td>
+                        <td className={tdClass}><StatusBadge tone={rule.enabled === false ? "gray" : "green"}>{rule.enabled === false ? "停用" : "启用"}</StatusBadge></td>
+                        <td className={tdClass}><button className={buttonClass("danger")} onClick={() => void deleteRule(rule)}>删除</button></td>
                       </tr>
                     ))}
                   </tbody>
@@ -149,11 +149,11 @@ export default function AlertsPage() {
           </section>
 
           <section>
-            <h2 className="mb-3 text-xl font-black uppercase">Events</h2>
+            <h2 className="mb-3 text-xl font-black uppercase">事件</h2>
             <div className="grid gap-3">
-              {events.length === 0 ? <EmptyState title="No alert events" /> : events.map((event, index) => (
+              {events.length === 0 ? <EmptyState title="暂无告警事件" /> : events.map((event, index) => (
                 <div key={event.id || index} className="border-2 border-black bg-[var(--bg-card)] p-4 shadow-[var(--shadow-brutal-sm)]">
-                  <div className="font-black">{event.kind || "Alert"}</div>
+                  <div className="font-black">{event.kind || "告警"}</div>
                   <p className="text-sm font-bold text-[var(--text-muted)]">{formatPayload(event.payload)}</p>
                   <p className="mt-2 text-xs font-black uppercase">{formatDate(event.fired_at)}</p>
                 </div>
@@ -163,39 +163,39 @@ export default function AlertsPage() {
         </div>
 
         {modal ? (
-          <Modal title="Add Alert Rule" onClose={() => setModal(false)}>
+          <Modal title="新增告警规则" onClose={() => setModal(false)}>
             <form onSubmit={submit} className="space-y-4">
-              <Field label="Name"><input className={inputClass} value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} required /></Field>
+              <Field label="名称"><input className={inputClass} value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} required /></Field>
               <div className="grid gap-4 sm:grid-cols-2">
-                <Field label="Trigger"><select className={selectClass} value={form.trigger} onChange={(e) => setForm((f) => ({ ...f, trigger: e.target.value }))}><option value="once">once</option><option value="always">always</option></select></Field>
-                <Field label="Condition type"><select className={selectClass} value={form.condition_type} onChange={(e) => setForm((f) => ({ ...f, condition_type: e.target.value }))}><option value="server_resource">server_resource</option><option value="server_offline">server_offline</option><option value="service_down">service_down</option><option value="service_latency">service_latency</option></select></Field>
+                <Field label="触发方式"><select className={selectClass} value={form.trigger} onChange={(e) => setForm((f) => ({ ...f, trigger: e.target.value }))}><option value="once">once</option><option value="always">always</option></select></Field>
+                <Field label="条件类型"><select className={selectClass} value={form.condition_type} onChange={(e) => setForm((f) => ({ ...f, condition_type: e.target.value }))}><option value="server_resource">server_resource</option><option value="server_offline">server_offline</option><option value="service_down">service_down</option><option value="service_latency">service_latency</option></select></Field>
               </div>
               {form.condition_type.startsWith("server") ? (
                 <Field label="Agent ID"><input className={inputClass} value={form.agent_id} onChange={(e) => setForm((f) => ({ ...f, agent_id: e.target.value }))} required /></Field>
               ) : (
-                <Field label="Service ID"><input className={inputClass} value={form.service_id} onChange={(e) => setForm((f) => ({ ...f, service_id: e.target.value }))} required /></Field>
+                <Field label="服务 ID"><input className={inputClass} value={form.service_id} onChange={(e) => setForm((f) => ({ ...f, service_id: e.target.value }))} required /></Field>
               )}
               {form.condition_type === "server_resource" ? (
                 <div className="grid gap-4 sm:grid-cols-4">
-                  <Field label="Resource"><select className={selectClass} value={form.resource} onChange={(e) => setForm((f) => ({ ...f, resource: e.target.value }))}><option value="cpu">cpu</option><option value="memory">memory</option><option value="disk">disk</option><option value="network">network</option><option value="load">load</option></select></Field>
-                  <Field label="Operator"><select className={selectClass} value={form.operator} onChange={(e) => setForm((f) => ({ ...f, operator: e.target.value }))}><option value="gt">gt</option><option value="gte">gte</option><option value="lt">lt</option><option value="lte">lte</option></select></Field>
-                  <Field label="Threshold"><input className={inputClass} value={form.threshold} onChange={(e) => setForm((f) => ({ ...f, threshold: e.target.value }))} /></Field>
-                  <Field label="Duration seconds"><input className={inputClass} value={form.duration_seconds} onChange={(e) => setForm((f) => ({ ...f, duration_seconds: e.target.value }))} /></Field>
+                  <Field label="资源"><select className={selectClass} value={form.resource} onChange={(e) => setForm((f) => ({ ...f, resource: e.target.value }))}><option value="cpu">cpu</option><option value="memory">memory</option><option value="disk">disk</option><option value="network">network</option><option value="load">load</option></select></Field>
+                  <Field label="操作符"><select className={selectClass} value={form.operator} onChange={(e) => setForm((f) => ({ ...f, operator: e.target.value }))}><option value="gt">gt</option><option value="gte">gte</option><option value="lt">lt</option><option value="lte">lte</option></select></Field>
+                  <Field label="阈值"><input className={inputClass} value={form.threshold} onChange={(e) => setForm((f) => ({ ...f, threshold: e.target.value }))} /></Field>
+                  <Field label="持续秒数"><input className={inputClass} value={form.duration_seconds} onChange={(e) => setForm((f) => ({ ...f, duration_seconds: e.target.value }))} /></Field>
                 </div>
               ) : null}
               {form.condition_type === "server_offline" ? (
-                <Field label="Offline seconds"><input className={inputClass} value={form.offline_seconds} onChange={(e) => setForm((f) => ({ ...f, offline_seconds: e.target.value }))} /></Field>
+                <Field label="离线秒数"><input className={inputClass} value={form.offline_seconds} onChange={(e) => setForm((f) => ({ ...f, offline_seconds: e.target.value }))} /></Field>
               ) : null}
               {form.condition_type === "service_down" ? (
-                <Field label="Consecutive failures"><input className={inputClass} value={form.consecutive_failures} onChange={(e) => setForm((f) => ({ ...f, consecutive_failures: e.target.value }))} /></Field>
+                <Field label="连续失败次数"><input className={inputClass} value={form.consecutive_failures} onChange={(e) => setForm((f) => ({ ...f, consecutive_failures: e.target.value }))} /></Field>
               ) : null}
               {form.condition_type === "service_latency" ? (
-                <Field label="Max latency ms"><input className={inputClass} value={form.max_latency_ms} onChange={(e) => setForm((f) => ({ ...f, max_latency_ms: e.target.value }))} /></Field>
+                <Field label="最大延迟 ms"><input className={inputClass} value={form.max_latency_ms} onChange={(e) => setForm((f) => ({ ...f, max_latency_ms: e.target.value }))} /></Field>
               ) : null}
-              <Field label="Notification group ID">
+              <Field label="通知组 ID">
                 <input className={inputClass} value={form.notification_group_id} onChange={(e) => setForm((f) => ({ ...f, notification_group_id: e.target.value }))} />
               </Field>
-              <button className={buttonClass("primary")}>Save Rule</button>
+              <button className={buttonClass("primary")}>保存规则</button>
             </form>
           </Modal>
         ) : null}
@@ -255,20 +255,20 @@ function formatConditions(conditions?: JsonObject[]): string {
       if (type === "server_resource") {
         return `${condition.agent_id}:${condition.resource} ${condition.operator} ${condition.threshold}`;
       }
-      if (type === "server_offline") return `${condition.agent_id} offline ${condition.offline_seconds}s`;
-      if (type === "service_down") return `${condition.service_id} down x${condition.consecutive_failures}`;
-      if (type === "service_latency") return `${condition.service_id} latency > ${condition.max_latency_ms}ms`;
+      if (type === "server_offline") return `${condition.agent_id} 离线 ${condition.offline_seconds}s`;
+      if (type === "service_down") return `${condition.service_id} 异常 x${condition.consecutive_failures}`;
+      if (type === "service_latency") return `${condition.service_id} 延迟 > ${condition.max_latency_ms}ms`;
       return type;
     })
     .join(", ");
 }
 
 function formatPayload(payload: unknown): string {
-  if (!payload) return "Event";
+  if (!payload) return "事件";
   if (typeof payload === "string") return payload;
   try {
     return JSON.stringify(payload);
   } catch {
-    return "Event";
+    return "事件";
   }
 }

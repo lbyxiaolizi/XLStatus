@@ -20,6 +20,7 @@ curl -fsS http://localhost:8080/healthz
 ```
 
 The first SQLite startup creates `./data/xlstatus.db` because Compose sets `DATABASE_CREATE_IF_MISSING=true` and uses `?mode=rwc`.
+The full Compose stacks also set `CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000` for the bundled Web UI.
 
 PostgreSQL stack:
 
@@ -44,6 +45,7 @@ DATABASE_URL=sqlite:///data/xlstatus.db?mode=rwc
 DATABASE_CREATE_IF_MISSING=true
 HTTP_BIND=0.0.0.0:8080
 GRPC_BIND=0.0.0.0:50051
+CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
 SESSION_SECRET=change-me-in-production
 XLSTATUS_SEED_ADMIN_USERNAME=admin
 XLSTATUS_SEED_ADMIN_PASSWORD=admin123
@@ -69,6 +71,7 @@ DATABASE_URL="sqlite://$(pwd)/data/xlstatus.db?mode=rwc" \
 DATABASE_CREATE_IF_MISSING=true \
 HTTP_BIND="0.0.0.0:8080" \
 GRPC_BIND="0.0.0.0:50051" \
+CORS_ALLOWED_ORIGINS="http://localhost:3000,http://127.0.0.1:3000" \
 SESSION_SECRET="replace-me" \
 XLSTATUS_SEED_ADMIN_USERNAME="admin" \
 XLSTATUS_SEED_ADMIN_PASSWORD="admin123" \
@@ -76,6 +79,15 @@ XLSTATUS_SEED_ADMIN_PASSWORD="admin123" \
 ```
 
 If you omit both `?mode=rwc` and `DATABASE_CREATE_IF_MISSING=true`, an interactive terminal asks whether to create the SQLite file. Non-interactive starts fail with a clear message so systemd or Docker do not silently create data in the wrong place.
+
+You can use a TOML file instead of environment variables:
+
+```bash
+cp config.example.toml ./config.toml
+CONFIG_FILE=./config.toml ./target/release/xlstatus-server
+```
+
+Do not set `DATABASE_URL` when using `CONFIG_FILE`; `DATABASE_URL` selects environment-variable configuration mode.
 
 ### PostgreSQL New Site
 
@@ -101,6 +113,7 @@ Start XLStatus against that database:
 DATABASE_URL='postgresql://xlstatus:change-this-password@localhost:5432/xlstatus' \
 HTTP_BIND="0.0.0.0:8080" \
 GRPC_BIND="0.0.0.0:50051" \
+CORS_ALLOWED_ORIGINS="http://localhost:3000,http://127.0.0.1:3000" \
 SESSION_SECRET="$(openssl rand -hex 32)" \
 XLSTATUS_SEED_ADMIN_USERNAME="admin" \
 XLSTATUS_SEED_ADMIN_PASSWORD="admin123" \
@@ -126,6 +139,7 @@ NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm start
 Open the dashboard at `http://localhost:3000`; the frontend calls the server API configured by `NEXT_PUBLIC_API_URL`.
 The unauthenticated public status page is `http://localhost:3000/status` and reads `GET /api/v1/public/status`.
 The management dashboard uses the BOLD. neo-brutalist palette; the navigation bar exposes explicit light/dark choices and stores the preference in `localStorage.darkMode`.
+If the Web UI runs on a different host, scheme, or port, add that exact browser origin to `CORS_ALLOWED_ORIGINS` or `server.cors_allowed_origins` before starting the API server.
 
 The server also supports `CONFIG_FILE=/path/to/server.toml`:
 
@@ -137,6 +151,10 @@ create_if_missing = true
 [server]
 http_bind = "0.0.0.0:8080"
 grpc_bind = "0.0.0.0:50051"
+cors_allowed_origins = [
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+]
 
 [security]
 session_secret = "replace-me-with-a-long-random-secret"

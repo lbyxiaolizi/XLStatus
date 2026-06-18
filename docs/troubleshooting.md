@@ -89,6 +89,49 @@ docker compose -f docker-compose.pg.yml down -v
 docker compose -f docker-compose.pg.yml up -d
 ```
 
+## Web UI And CORS
+
+Symptom: `/status` or the dashboard shows `Failed to fetch`, login does not redirect, or the browser console mentions CORS/preflight.
+
+Check the API directly:
+
+```bash
+curl -i http://localhost:8080/api/v1/public/status
+```
+
+Check CORS headers for the exact browser origin:
+
+```bash
+curl -i \
+  -H 'Origin: http://localhost:3000' \
+  http://localhost:8080/api/v1/public/status
+```
+
+The response should include:
+
+```http
+access-control-allow-origin: http://localhost:3000
+access-control-allow-credentials: true
+```
+
+Check login preflight:
+
+```bash
+curl -i \
+  -X OPTIONS \
+  -H 'Origin: http://localhost:3000' \
+  -H 'Access-Control-Request-Method: POST' \
+  -H 'Access-Control-Request-Headers: content-type' \
+  http://localhost:8080/api/v1/auth/login
+```
+
+Fixes:
+
+- Add the exact Web UI origin to `CORS_ALLOWED_ORIGINS` or `server.cors_allowed_origins`.
+- Use matching hostname styles locally: `localhost` with `localhost`, or `127.0.0.1` with `127.0.0.1`.
+- Confirm the Web UI was started with the intended `NEXT_PUBLIC_API_URL`.
+- Restart the API server after changing CORS settings.
+
 ## Agent
 
 Check service state:

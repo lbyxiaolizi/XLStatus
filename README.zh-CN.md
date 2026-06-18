@@ -23,7 +23,9 @@ XLStatus 仍处于开发中。当前 workspace 已通过 `cargo check --workspac
 - **DDNS 集成** - 支持 Cloudflare、腾讯云、HE、Webhook 和 Dummy Provider
 - **MCP 集成** - 支持 MCP REST 兼容接口与 `/mcp` JSON-RPC 工具
 - **Web 管理面板** - Next.js 管理服务器、服务、告警、任务、DDNS、NAT、Terminal 和设置
-- **公开状态页** - 展示可公开资源的状态概览
+- **公开状态页** - 未登录即可访问 `/status`，数据来自 `/api/v1/public/status`
+- **BOLD 主题 UI** - BOLD. 风格新粗野主义配色，支持显式浅色/深色切换
+- **简体中文界面** - Web UI 默认 `zh-CN`，i18n 配置集中在 `web/lib/i18n.ts`
 - **多用户 RBAC** - 角色、PAT scope、CSRF 和服务器 allowlist
 
 ## 🚀 快速开始
@@ -51,7 +53,10 @@ docker compose -f docker-compose.pg.yml up -d
 
 默认账号：`admin` / `admin123`
 
+公开状态页登录前即可访问：`http://localhost:3000/status`。
+
 SQLite Compose 首次启动会创建 `./data/xlstatus.db`。PostgreSQL Compose 会在空 volume 上创建 `xlstatus` 用户和数据库，应用表由 XLStatus 自动迁移。
+Compose 已设置 `CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000`，因此 Web UI 可以访问 `http://localhost:8080` 上的 API。
 
 从源码直接运行 SQLite 时，推荐保留 `?mode=rwc` 或设置 `DATABASE_CREATE_IF_MISSING=true`；如果数据库文件不存在且未允许自动创建，交互式运行会询问是否新建，非交互运行会报错退出。PostgreSQL 新站初始化步骤见 [安装指南](./docs/installation.md#postgresql-new-site)。
 
@@ -82,6 +87,30 @@ sudo BINARY_PATH=target/release/xlstatus-agent bash deploy/install-agent.sh
 - [API 文档](./docs/api.md)
 - [Agent 设置](./docs/agent-setup.md)
 - [故障排除](./docs/troubleshooting.md)
+
+## ⚙️ 配置要点
+
+服务端支持两种配置模式：
+
+- 环境变量模式：设置 `DATABASE_URL` 后，再设置 `HTTP_BIND`、`GRPC_BIND`、`CORS_ALLOWED_ORIGINS`、`SESSION_SECRET` 等变量。
+- TOML 文件模式：复制 [config.example.toml](./config.example.toml) 为 `config.toml` 或 `/etc/xlstatus/server.toml`，然后使用 `CONFIG_FILE=/path/to/server.toml` 启动。
+
+使用 `CONFIG_FILE` 时不要同时设置 `DATABASE_URL`；一旦设置 `DATABASE_URL`，服务端会进入环境变量模式并忽略 TOML 文件。
+
+当 Web UI 和 API 不同源时，API 必须允许 Web UI 的浏览器源：
+
+```bash
+CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
+```
+
+Web UI 通过 `NEXT_PUBLIC_API_URL` 知道 API 地址：
+
+```bash
+cd web
+NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm dev
+```
+
+完整配置矩阵、SQLite 新建数据库行为和 PostgreSQL 新站初始化见 [docs/configuration.zh-CN.md](./docs/configuration.zh-CN.md)。
 
 ## 🛠️ 开发
 
@@ -115,7 +144,7 @@ NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm build
 
 ```bash
 # 终端 1: 启动服务器
-cargo run --bin xlstatus-server
+CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000 cargo run --bin xlstatus-server
 
 # 终端 2: 启动 Web 界面
 cd web
@@ -126,6 +155,8 @@ NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm dev
 # 终端 3: 启动 Agent
 cargo run --bin xlstatus-agent
 ```
+
+如果 Web UI 使用其他端口，请在启动服务端前把精确来源加入 `CORS_ALLOWED_ORIGINS`。
 
 如果要用源码方式运行接近生产的前端，先启动 Rust Server，再执行：
 
@@ -144,7 +175,7 @@ NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm start
 - **SQLx** - 数据库工具包（SQLite/PostgreSQL）
 
 ### 前端
-- **Next.js 14** - React 框架
+- **Next.js 16** - React 框架
 - **TypeScript** - 类型安全
 - **Tailwind CSS** - 实用优先的 CSS 框架
 

@@ -1,4 +1,6 @@
 // API client for XLStatus backend
+import { t } from "@/lib/i18n";
+
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
 
 export interface ApiResponse<T> {
@@ -176,7 +178,7 @@ class ApiClient {
     } catch (error) {
       return {
         success: false,
-        error: error instanceof Error ? error.message : "Network error",
+        error: error instanceof Error ? error.message : t.common.networkError,
       };
     }
   }
@@ -203,7 +205,7 @@ class ApiClient {
       }
     }
 
-    return last ?? { success: false, error: "No request attempted" };
+    return last ?? { success: false, error: t.common.noRequestAttempted };
   }
 
   // Auth
@@ -673,7 +675,7 @@ function normalizeEnvelope<T>(payload: unknown, status: number): ApiResponse<T> 
         ? String(
             (errorValue as Record<string, unknown>).message ??
               (errorValue as Record<string, unknown>).code ??
-              "Request failed",
+              t.common.requestFailed,
           )
         : undefined;
 
