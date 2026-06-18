@@ -115,7 +115,7 @@ sudo bash deploy/install.sh
 
 ```bash
 sudo INTERACTIVE=false \
-  VERSION=v1.0.0 \
+  VERSION=v0.1.0-alpha.1 \
   HTTP_BIND=0.0.0.0:8080 \
   GRPC_BIND=0.0.0.0:50051 \
   DATABASE_URL=sqlite:///var/lib/xlstatus/xlstatus.db?mode=rwc \
@@ -147,7 +147,7 @@ curl -fsS http://localhost:8080/healthz
 常用变量：
 
 ```bash
-VERSION=v1.0.0
+VERSION=v0.1.0-alpha.1
 INSTALL_DIR=/opt/xlstatus
 DATA_DIR=/var/lib/xlstatus
 BINARY_PATH=target/release/xlstatus-server
@@ -270,13 +270,13 @@ GET /api/v1/agents/install.sh
 手动使用带参数链接：
 
 ```bash
-curl -fsSL 'http://dashboard.example.com:8080/api/v1/agents/install.sh?server_url=http%3A%2F%2Fdashboard.example.com%3A8080&grpc_server=http%3A%2F%2Fdashboard.example.com%3A50051&enrollment_token=xle_...&agent_name=%24(hostname)&version=v1.0.0' | sudo bash
+curl -fsSL 'http://dashboard.example.com:8080/api/v1/agents/install.sh?server_url=http%3A%2F%2Fdashboard.example.com%3A8080&grpc_server=http%3A%2F%2Fdashboard.example.com%3A50051&enrollment_token=xle_...&agent_name=%24(hostname)&version=v0.1.0-alpha.1' | sudo bash
 ```
 
 这个 bootstrap 会下载并执行：
 
 ```text
-https://github.com/lbyxiaolizi/XLStatus/releases/download/v1.0.0/install-agent.sh
+https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.1/install-agent.sh
 ```
 
 `enrollment_token` 会出现在安装链接里，应只给受信任的主机使用；令牌过期或使用后需要重新生成。

@@ -24,7 +24,7 @@ export default function SettingsPage() {
   const [agentServerUrl, setAgentServerUrl] = useState(() => getApiBaseUrl());
   const [agentGrpcUrl, setAgentGrpcUrl] = useState(() => defaultGrpcUrl(getApiBaseUrl()));
   const [agentName, setAgentName] = useState("$(hostname)");
-  const [agentVersion, setAgentVersion] = useState("v1.0.0");
+  const [agentVersion, setAgentVersion] = useState("v0.1.0-alpha.1");
   const [enrollmentHours, setEnrollmentHours] = useState("24");
   const [enrollmentToken, setEnrollmentToken] = useState("");
   const [enrollmentExpiresAt, setEnrollmentExpiresAt] = useState("");
