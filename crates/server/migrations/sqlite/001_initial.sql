@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS users (
     updated_at TEXT NOT NULL
 );
 
-CREATE INDEX idx_users_username ON users(username);
+CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
 
 -- Sessions for cookie-based authentication
 CREATE TABLE IF NOT EXISTS sessions (
@@ -25,9 +25,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_sessions_user_id ON sessions(user_id);
-CREATE INDEX idx_sessions_expires_at ON sessions(expires_at);
-CREATE UNIQUE INDEX idx_sessions_token_hash ON sessions(token_hash);
+CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_token_hash ON sessions(token_hash);
 
 -- Personal Access Tokens
 CREATE TABLE IF NOT EXISTS personal_access_tokens (
@@ -45,8 +45,8 @@ CREATE TABLE IF NOT EXISTS personal_access_tokens (
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_pat_user_id ON personal_access_tokens(user_id);
-CREATE INDEX idx_pat_token_hash ON personal_access_tokens(token_hash);
+CREATE INDEX IF NOT EXISTS idx_pat_user_id ON personal_access_tokens(user_id);
+CREATE INDEX IF NOT EXISTS idx_pat_token_hash ON personal_access_tokens(token_hash);
 
 -- Servers (minimal for M1)
 CREATE TABLE IF NOT EXISTS servers (
@@ -59,4 +59,4 @@ CREATE TABLE IF NOT EXISTS servers (
     FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_servers_owner ON servers(owner_user_id);
+CREATE INDEX IF NOT EXISTS idx_servers_owner ON servers(owner_user_id);

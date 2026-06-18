@@ -11,7 +11,7 @@ pub use repository::*;
 
 use anyhow::Context;
 use sqlx::sqlite::SqliteConnectOptions;
-use sqlx::{ConnectOptions, Pool, Postgres, Sqlite};
+use sqlx::{ConnectOptions, Pool, Postgres, Row, Sqlite};
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::str::FromStr;
@@ -74,6 +74,16 @@ impl DatabaseBackend {
                 sqlx::query(include_str!("../../migrations/sqlite/002_agents.sql"))
                     .execute(pool)
                     .await?;
+                sqlite_add_column_if_missing(
+                    pool,
+                    "servers",
+                    "agent_id",
+                    "agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL",
+                )
+                .await?;
+                sqlx::query("CREATE INDEX IF NOT EXISTS idx_servers_agent ON servers(agent_id)")
+                    .execute(pool)
+                    .await?;
                 sqlx::query(include_str!("../../migrations/sqlite/003_services.sql"))
                     .execute(pool)
                     .await?;
@@ -83,10 +93,24 @@ impl DatabaseBackend {
                 sqlx::query(include_str!("../../migrations/sqlite/005_tasks.sql"))
                     .execute(pool)
                     .await?;
-                // 006 uses ALTER TABLE which is a no-op on subsequent boots.
-                let _ = sqlx::query(include_str!("../../migrations/sqlite/006_agent_state.sql"))
-                    .execute(pool)
-                    .await;
+                sqlite_add_column_if_missing(
+                    pool,
+                    "agents",
+                    "last_state_json",
+                    "last_state_json TEXT",
+                )
+                .await?;
+                sqlite_add_column_if_missing(pool, "agents", "last_state_at", "last_state_at TEXT")
+                    .await?;
+                sqlite_add_column_if_missing(
+                    pool,
+                    "agents",
+                    "last_info_json",
+                    "last_info_json TEXT",
+                )
+                .await?;
+                sqlite_add_column_if_missing(pool, "agents", "last_info_at", "last_info_at TEXT")
+                    .await?;
                 sqlx::query(include_str!("../../migrations/sqlite/007_m4_m6.sql"))
                     .execute(pool)
                     .await?;
@@ -121,6 +145,27 @@ impl DatabaseBackend {
             }
         }
     }
+}
+
+async fn sqlite_add_column_if_missing(
+    pool: &Pool<Sqlite>,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> anyhow::Result<()> {
+    let pragma = format!("PRAGMA table_info({table})");
+    let rows = sqlx::query(&pragma).fetch_all(pool).await?;
+    let exists = rows
+        .iter()
+        .filter_map(|row| row.try_get::<String, _>("name").ok())
+        .any(|name| name == column);
+
+    if !exists {
+        let sql = format!("ALTER TABLE {table} ADD COLUMN {definition}");
+        sqlx::query(&sql).execute(pool).await?;
+    }
+
+    Ok(())
 }
 
 fn prepare_sqlite_options(
@@ -201,8 +246,9 @@ fn confirm_create_sqlite_database(path: &Path) -> anyhow::Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_special_sqlite_path, sqlite_url_has_create_mode};
+    use super::{is_special_sqlite_path, sqlite_url_has_create_mode, DatabaseBackend};
     use std::path::Path;
+    use uuid::Uuid;
 
     #[test]
     fn detects_sqlite_create_mode() {
@@ -225,5 +271,19 @@ mod tests {
         assert!(!is_special_sqlite_path(Path::new(
             "/var/lib/xlstatus/xlstatus.db"
         )));
+    }
+
+    #[tokio::test]
+    async fn sqlite_migrations_are_idempotent_for_existing_file() {
+        let db_path =
+            std::env::temp_dir().join(format!("xlstatus-migrations-{}.db", Uuid::now_v7()));
+        let url = format!("sqlite://{}?mode=rwc", db_path.to_string_lossy());
+
+        let db = DatabaseBackend::connect(&url, true).await.unwrap();
+        db.run_migrations().await.unwrap();
+        db.run_migrations().await.unwrap();
+        drop(db);
+
+        let _ = std::fs::remove_file(&db_path);
     }
 }

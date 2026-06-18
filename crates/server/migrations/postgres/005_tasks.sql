@@ -1,7 +1,7 @@
 -- Tasks and execution system for M5
 
 -- Notification channels
-CREATE TABLE notifications (
+CREATE TABLE IF NOT EXISTS notifications (
     id TEXT PRIMARY KEY,
     owner_user_id UUID NOT NULL,
     name TEXT NOT NULL,
@@ -17,10 +17,10 @@ CREATE TABLE notifications (
     FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_notifications_owner ON notifications(owner_user_id);
+CREATE INDEX IF NOT EXISTS idx_notifications_owner ON notifications(owner_user_id);
 
 -- Notification groups
-CREATE TABLE notification_groups (
+CREATE TABLE IF NOT EXISTS notification_groups (
     id TEXT PRIMARY KEY,
     owner_user_id UUID NOT NULL,
     name TEXT NOT NULL,
@@ -29,10 +29,10 @@ CREATE TABLE notification_groups (
     FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_notification_groups_owner ON notification_groups(owner_user_id);
+CREATE INDEX IF NOT EXISTS idx_notification_groups_owner ON notification_groups(owner_user_id);
 
 -- Notification group members
-CREATE TABLE notification_group_members (
+CREATE TABLE IF NOT EXISTS notification_group_members (
     group_id TEXT NOT NULL,
     notification_id TEXT NOT NULL,
     PRIMARY KEY (group_id, notification_id),
@@ -41,7 +41,7 @@ CREATE TABLE notification_group_members (
 );
 
 -- Alert rules
-CREATE TABLE alert_rules (
+CREATE TABLE IF NOT EXISTS alert_rules (
     id TEXT PRIMARY KEY,
     owner_user_id UUID NOT NULL,
     name TEXT NOT NULL,
@@ -57,11 +57,11 @@ CREATE TABLE alert_rules (
     FOREIGN KEY (notification_group_id) REFERENCES notification_groups(id) ON DELETE SET NULL
 );
 
-CREATE INDEX idx_alert_rules_owner ON alert_rules(owner_user_id);
-CREATE INDEX idx_alert_rules_enabled ON alert_rules(enabled) WHERE enabled = true;
+CREATE INDEX IF NOT EXISTS idx_alert_rules_owner ON alert_rules(owner_user_id);
+CREATE INDEX IF NOT EXISTS idx_alert_rules_enabled ON alert_rules(enabled) WHERE enabled = true;
 
 -- Tasks
-CREATE TABLE tasks (
+CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY,
     owner_user_id UUID NOT NULL,
     name TEXT NOT NULL,
@@ -82,12 +82,12 @@ CREATE TABLE tasks (
     FOREIGN KEY (notification_group_id) REFERENCES notification_groups(id) ON DELETE SET NULL
 );
 
-CREATE INDEX idx_tasks_owner ON tasks(owner_user_id);
-CREATE INDEX idx_tasks_enabled ON tasks(enabled) WHERE enabled = true;
-CREATE INDEX idx_tasks_schedule ON tasks(schedule) WHERE schedule IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_tasks_owner ON tasks(owner_user_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_enabled ON tasks(enabled) WHERE enabled = true;
+CREATE INDEX IF NOT EXISTS idx_tasks_schedule ON tasks(schedule) WHERE schedule IS NOT NULL;
 
 -- Task runs (execution history) - partitioned by created_at
-CREATE TABLE task_runs (
+CREATE TABLE IF NOT EXISTS task_runs (
     id TEXT NOT NULL,
     task_id TEXT NOT NULL,
     server_id UUID NOT NULL,
@@ -103,12 +103,12 @@ CREATE TABLE task_runs (
 );
 -- Note: monthly partitioning deferred to M8 (high-IO performance) per plan/08-roadmap.md.
 
-CREATE INDEX idx_task_runs_task ON task_runs(task_id, created_at DESC);
-CREATE INDEX idx_task_runs_server ON task_runs(server_id, created_at DESC);
-CREATE INDEX idx_task_runs_status ON task_runs(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_task_runs_task ON task_runs(task_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_task_runs_server ON task_runs(server_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_task_runs_status ON task_runs(status, created_at DESC);
 
 -- File transfers - partitioned by created_at
-CREATE TABLE transfers (
+CREATE TABLE IF NOT EXISTS transfers (
     id TEXT NOT NULL,
     owner_user_id UUID NOT NULL,
     server_id UUID NOT NULL,
@@ -125,12 +125,12 @@ CREATE TABLE transfers (
 );
 -- Note: monthly partitioning deferred to M8 per plan/08-roadmap.md.
 
-CREATE INDEX idx_transfers_owner ON transfers(owner_user_id);
-CREATE INDEX idx_transfers_server ON transfers(server_id, created_at DESC);
-CREATE INDEX idx_transfers_status ON transfers(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_transfers_owner ON transfers(owner_user_id);
+CREATE INDEX IF NOT EXISTS idx_transfers_server ON transfers(server_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_transfers_status ON transfers(status, created_at DESC);
 
 -- Audit logs - partitioned by created_at
-CREATE TABLE audit_logs (
+CREATE TABLE IF NOT EXISTS audit_logs (
     id TEXT NOT NULL,
     user_id UUID,
     api_token_id UUID,
@@ -149,8 +149,8 @@ CREATE TABLE audit_logs (
 );
 -- Note: monthly partitioning deferred to M8 per plan/08-roadmap.md.
 
-CREATE INDEX idx_audit_logs_user ON audit_logs(user_id, created_at DESC);
-CREATE INDEX idx_audit_logs_token ON audit_logs(api_token_id, created_at DESC);
-CREATE INDEX idx_audit_logs_resource ON audit_logs(resource_type, resource_id, created_at DESC);
-CREATE INDEX idx_audit_logs_server ON audit_logs(server_id, created_at DESC);
-CREATE INDEX idx_audit_logs_action ON audit_logs(action, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_user ON audit_logs(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_token ON audit_logs(api_token_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_resource ON audit_logs(resource_type, resource_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_server ON audit_logs(server_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action, created_at DESC);

@@ -11,7 +11,7 @@
 --   * partition management functions that no-op unless a table is already
 --     a RANGE-partitioned parent on created_at
 --
--- Fresh high-scale deployments can change the parent CREATE TABLE shape
+-- Fresh high-scale deployments can change the parent table definition
 -- in 003/005 to `PARTITION BY RANGE (created_at)` before data lands; the
 -- `xlstatus_ensure_high_io_partitions` function below then creates the
 -- monthly child tables.

@@ -12,8 +12,8 @@ CREATE TABLE IF NOT EXISTS enrollment_tokens (
     FOREIGN KEY (created_by_user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_enrollment_tokens_hash ON enrollment_tokens(token_hash);
-CREATE INDEX idx_enrollment_tokens_expires ON enrollment_tokens(expires_at);
+CREATE INDEX IF NOT EXISTS idx_enrollment_tokens_hash ON enrollment_tokens(token_hash);
+CREATE INDEX IF NOT EXISTS idx_enrollment_tokens_expires ON enrollment_tokens(expires_at);
 
 -- Agents
 CREATE TABLE IF NOT EXISTS agents (
@@ -28,9 +28,10 @@ CREATE TABLE IF NOT EXISTS agents (
     FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_agents_owner ON agents(owner_user_id);
-CREATE INDEX idx_agents_revoked ON agents(revoked_at);
+CREATE INDEX IF NOT EXISTS idx_agents_owner ON agents(owner_user_id);
+CREATE INDEX IF NOT EXISTS idx_agents_revoked ON agents(revoked_at);
 
--- Update servers table to link to agents
-ALTER TABLE servers ADD COLUMN agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL;
-CREATE INDEX idx_servers_agent ON servers(agent_id);
+-- Update servers table to link to agents.
+-- SQLite does not support `ADD COLUMN IF NOT EXISTS`, so the column is
+-- added idempotently from `DatabaseBackend::run_migrations`, followed by
+-- the `idx_servers_agent` index.

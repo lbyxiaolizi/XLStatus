@@ -15,6 +15,6 @@ CREATE TABLE IF NOT EXISTS nat_mappings (
     FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_nat_mappings_agent ON nat_mappings(agent_id);
-CREATE INDEX idx_nat_mappings_public_port ON nat_mappings(public_port);
-CREATE INDEX idx_nat_mappings_enabled ON nat_mappings(enabled);
+CREATE INDEX IF NOT EXISTS idx_nat_mappings_agent ON nat_mappings(agent_id);
+CREATE INDEX IF NOT EXISTS idx_nat_mappings_public_port ON nat_mappings(public_port);
+CREATE INDEX IF NOT EXISTS idx_nat_mappings_enabled ON nat_mappings(enabled);
