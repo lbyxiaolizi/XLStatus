@@ -19,6 +19,12 @@ export interface ServiceListResponse {
   total?: number;
 }
 
+export interface PublicStatusResponse {
+  servers: unknown[];
+  services: unknown[];
+  updated_at?: string;
+}
+
 export interface TaskListResponse {
   tasks: unknown[];
   total?: number;
@@ -372,6 +378,12 @@ class ApiClient {
       `/api/v1/services?limit=${limit}&offset=${offset}`,
       { anonymous },
     );
+  }
+
+  async getPublicStatus(): Promise<ApiResponse<PublicStatusResponse>> {
+    return this.request<PublicStatusResponse>("/api/v1/public/status", {
+      anonymous: true,
+    });
   }
 
   async getService(id: string): Promise<ApiResponse<JsonObject>> {

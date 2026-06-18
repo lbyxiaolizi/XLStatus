@@ -3,11 +3,13 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import Navigation from "@/app/components/Navigation";
 import {
+  BrutalCard,
   EmptyState,
   Field,
   InlineError,
   InlineNotice,
   Modal,
+  PageHeader,
   PageShell,
   StatusBadge,
   buttonClass,
@@ -17,7 +19,9 @@ import {
   inputClass,
   responseError,
   selectClass,
+  tdClass,
   textareaClass,
+  thClass,
 } from "@/app/components/M7Primitives";
 import { apiClient, type JsonObject } from "@/lib/api";
 
@@ -40,21 +44,17 @@ interface Task {
   cover_mode: CoverMode;
   server_selector_json: string;
   push_successful: boolean;
-  notification_group_id?: string | null;
   enabled: boolean;
   last_executed_at?: string | null;
   last_result?: string | null;
-  created_at?: string;
 }
 
 interface TaskRun {
   id: string;
-  task_id: string;
   server_id: string;
   status: string;
   delay_ms?: number | null;
   output?: string | null;
-  output_truncated?: boolean;
   error?: string | null;
   created_at: string;
 }
@@ -95,30 +95,24 @@ export default function TasksPage() {
   const [modal, setModal] = useState<"create" | "edit" | "runs" | null>(null);
   const [editing, setEditing] = useState<Task | null>(null);
   const [form, setForm] = useState<TaskForm>(blankForm);
-  const [formErrors, setFormErrors] = useState<Partial<Record<keyof TaskForm, string>>>({});
   const [query, setQuery] = useState("");
 
   const loadTasks = useCallback(async () => {
+    setLoading(true);
     setError(null);
-    try {
-      setLoading(true);
-      const [tasksResponse, serversResponse] = await Promise.all([
-        apiClient.listTasks(),
-        apiClient.listServers(200, 0),
-      ]);
-
-      if (tasksResponse.success && tasksResponse.data) {
-        setTasks((tasksResponse.data.tasks as Task[]) ?? []);
-      } else {
-        setError(responseError(tasksResponse));
-      }
-
-      if (serversResponse.success && serversResponse.data) {
-        setServers((serversResponse.data.servers as Server[]) ?? []);
-      }
-    } finally {
-      setLoading(false);
+    const [tasksResponse, serversResponse] = await Promise.all([
+      apiClient.listTasks(200, 0),
+      apiClient.listServers(200, 0),
+    ]);
+    if (tasksResponse.success && tasksResponse.data) {
+      setTasks((tasksResponse.data.tasks as Task[]) ?? []);
+    } else {
+      setError(responseError(tasksResponse));
     }
+    if (serversResponse.success && serversResponse.data) {
+      setServers((serversResponse.data.servers as Server[]) ?? []);
+    }
+    setLoading(false);
   }, []);
 
   useEffect(() => {
@@ -130,20 +124,14 @@ export default function TasksPage() {
 
   const filtered = useMemo(() => {
     const needle = query.trim().toLowerCase();
-    if (!needle) {
-      return tasks;
-    }
-    return tasks.filter((task) =>
-      [task.name, task.task_type, task.schedule, task.last_result]
-        .filter(Boolean)
-        .some((value) => String(value).toLowerCase().includes(needle)),
-    );
+    return !needle
+      ? tasks
+      : tasks.filter((task) => [task.name, task.task_type, task.schedule, task.last_result].filter(Boolean).some((value) => String(value).toLowerCase().includes(needle)));
   }, [query, tasks]);
 
   function openCreate() {
     setEditing(null);
     setForm(blankForm);
-    setFormErrors({});
     setModal("create");
   }
 
@@ -161,7 +149,6 @@ export default function TasksPage() {
       push_successful: Boolean(task.push_successful),
       enabled: task.enabled,
     });
-    setFormErrors({});
     setModal("edit");
   }
 
@@ -179,21 +166,13 @@ export default function TasksPage() {
 
   async function submitForm(event: FormEvent) {
     event.preventDefault();
-    setNotice(null);
-    const validation = validateTaskForm(form);
-    setFormErrors(validation);
-    if (Object.keys(validation).length > 0) {
-      return;
-    }
-
     setSaving(true);
-    const payload = formToPayload(form, modal === "edit");
+    const payload = formToPayload(form);
     const response =
       modal === "edit" && editing
         ? await apiClient.updateTask(editing.id, payload)
         : await apiClient.createTask(payload);
     setSaving(false);
-
     if (response.success) {
       setModal(null);
       setNotice(modal === "edit" ? "Task updated." : "Task created.");
@@ -204,28 +183,12 @@ export default function TasksPage() {
   }
 
   async function runTask(task: Task) {
-    if (task.task_type !== "shell") {
-      setError("The current backend can dispatch shell tasks only.");
-      return;
-    }
-    if (!confirm(`Run task "${task.name}" now?`)) {
-      return;
-    }
-
+    if (!confirm(`Run task "${task.name}" now?`)) return;
     setRunningTaskId(task.id);
-    setNotice(null);
     const response = await apiClient.runTask(task.id);
     setRunningTaskId(null);
-
-    if (response.success && response.data) {
-      const summary = response.data.summary as
-        | { success?: number; failure?: number; offline?: number; timeout?: number; total?: number }
-        | undefined;
-      setNotice(
-        summary
-          ? `Run queued: ${summary.success ?? 0} success, ${summary.failure ?? 0} failure, ${summary.offline ?? 0} offline, ${summary.timeout ?? 0} timeout.`
-          : "Task run completed.",
-      );
+    if (response.success) {
+      setNotice("Task run requested.");
       await loadTasks();
     } else {
       setError(responseError(response));
@@ -233,10 +196,7 @@ export default function TasksPage() {
   }
 
   async function deleteTask(task: Task) {
-    if (!confirm(`Delete task "${task.name}" and its saved run history?`)) {
-      return;
-    }
-
+    if (!confirm(`Delete task "${task.name}"?`)) return;
     const response = await apiClient.deleteTask(task.id);
     if (response.success) {
       setNotice("Task deleted.");
@@ -247,334 +207,174 @@ export default function TasksPage() {
   }
 
   return (
-    <div className="min-h-screen bg-gray-100">
+    <div className="min-h-screen">
       <Navigation />
       <PageShell>
-        <div className="mb-6 flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
-          <div>
-            <h1 className="text-2xl font-bold text-gray-900">Tasks</h1>
-            <p className="mt-1 text-sm text-gray-500">Scheduled and manual operations.</p>
-          </div>
-          <button type="button" onClick={openCreate} className={buttonClass("primary")}>
-            Create Task
-          </button>
-        </div>
-
-        <div className="mb-4 grid gap-3 md:grid-cols-[minmax(0,1fr)_auto] md:items-center">
-          <input
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            placeholder="Search tasks"
-            className={inputClass}
-          />
-          <button type="button" onClick={() => void loadTasks()} className={buttonClass()}>
-            Refresh
-          </button>
-        </div>
-
-        <div className="mb-4 space-y-3">
+        <PageHeader
+          eyebrow="Automation"
+          title="Tasks"
+          detail="下发命令、调度任务并查看执行记录。"
+          actions={<button type="button" onClick={openCreate} className={buttonClass("primary")}>Add Task</button>}
+        />
+        <div className="mb-5 space-y-3">
+          <input className={inputClass} value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search tasks" />
           <InlineError message={error} />
-          {notice ? <InlineNotice>{notice}</InlineNotice> : null}
-          {servers.length === 0 ? (
-            <InlineNotice tone="yellow">No accessible servers were returned. Specific task runs need at least one target server.</InlineNotice>
-          ) : null}
+          {notice ? <InlineNotice tone="green">{notice}</InlineNotice> : null}
         </div>
 
         {loading ? (
-          <div className="rounded bg-white p-6 text-sm text-gray-600 shadow">Loading tasks...</div>
+          <BrutalCard>Loading tasks...</BrutalCard>
         ) : filtered.length === 0 ? (
-          <EmptyState title="No tasks configured" detail="Create a shell task to run commands on selected servers." />
+          <EmptyState title="No tasks configured" detail="Create a task to run shell commands against selected agents." />
         ) : (
-          <>
-            <div className="hidden overflow-hidden rounded-lg bg-white shadow md:block">
-              <table className="min-w-full divide-y divide-gray-200">
-                <thead className="bg-gray-50">
-                  <tr>
-                    {["Name", "Type", "Schedule", "Targets", "State", "Last Result", "Actions"].map((heading) => (
-                      <th key={heading} className="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">
-                        {heading}
-                      </th>
-                    ))}
+          <div className="overflow-x-auto border-2 border-black bg-[var(--bg-card)] shadow-[var(--shadow-brutal)]">
+            <table className="w-full">
+              <thead>
+                <tr>
+                  <th className={thClass}>Name</th>
+                  <th className={thClass}>Type</th>
+                  <th className={thClass}>Schedule</th>
+                  <th className={thClass}>Result</th>
+                  <th className={thClass}>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {filtered.map((task) => (
+                  <tr key={task.id}>
+                    <td className={tdClass}>{task.name}</td>
+                    <td className={tdClass}>{task.task_type}</td>
+                    <td className={tdClass}>{task.schedule || "manual"}</td>
+                    <td className={tdClass}><StatusBadge tone={task.last_result === "success" ? "green" : task.last_result ? "red" : "gray"}>{task.last_result || "never"}</StatusBadge></td>
+                    <td className={`${tdClass} flex flex-wrap gap-2`}>
+                      <button className={buttonClass("good")} disabled={runningTaskId === task.id} onClick={() => void runTask(task)}>Run</button>
+                      <button className={buttonClass("secondary")} onClick={() => openEdit(task)}>Edit</button>
+                      <button className={buttonClass("secondary")} onClick={() => void openRuns(task)}>Runs</button>
+                      <button className={buttonClass("danger")} onClick={() => void deleteTask(task)}>Delete</button>
+                    </td>
                   </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-200 bg-white">
-                  {filtered.map((task) => (
-                    <tr key={task.id} className="hover:bg-gray-50">
-                      <td className="px-6 py-4">
-                        <div className="text-sm font-medium text-gray-900">{task.name}</div>
-                        <div className="text-xs text-gray-500">{task.id}</div>
-                      </td>
-                      <td className="px-6 py-4 text-sm text-gray-500">{taskTypeLabel(task.task_type)}</td>
-                      <td className="px-6 py-4 text-sm text-gray-500">{task.schedule || "Manual"}</td>
-                      <td className="px-6 py-4 text-sm text-gray-500">{targetLabel(task, servers)}</td>
-                      <td className="px-6 py-4">{task.enabled ? <StatusBadge tone="green">Enabled</StatusBadge> : <StatusBadge tone="gray">Disabled</StatusBadge>}</td>
-                      <td className="px-6 py-4">{resultBadge(task.last_result)}</td>
-                      <td className="px-6 py-4 text-sm">
-                        <div className="flex flex-wrap gap-2">
-                          <button type="button" onClick={() => void runTask(task)} disabled={runningTaskId === task.id} className="text-green-700 hover:underline disabled:text-gray-400">
-                            {runningTaskId === task.id ? "Running" : "Run"}
-                          </button>
-                          <button type="button" onClick={() => void openRuns(task)} className="text-gray-700 hover:underline">
-                            Runs
-                          </button>
-                          <button type="button" onClick={() => openEdit(task)} className="text-blue-700 hover:underline">
-                            Edit
-                          </button>
-                          <button type="button" onClick={() => void deleteTask(task)} className="text-red-700 hover:underline">
-                            Delete
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-
-            <div className="grid gap-3 md:hidden">
-              {filtered.map((task) => (
-                <div key={task.id} className="rounded-lg bg-white p-4 shadow">
-                  <div className="flex items-start justify-between gap-3">
-                    <div>
-                      <h2 className="font-semibold text-gray-900">{task.name}</h2>
-                      <p className="mt-1 text-sm text-gray-500">{taskTypeLabel(task.task_type)} · {task.schedule || "Manual"}</p>
-                    </div>
-                    {resultBadge(task.last_result)}
-                  </div>
-                  <div className="mt-3 text-sm text-gray-600">{targetLabel(task, servers)}</div>
-                  <div className="mt-4 grid grid-cols-2 gap-2">
-                    <button type="button" onClick={() => void runTask(task)} disabled={runningTaskId === task.id} className={buttonClass()}>
-                      {runningTaskId === task.id ? "Running" : "Run"}
-                    </button>
-                    <button type="button" onClick={() => void openRuns(task)} className={buttonClass()}>
-                      Runs
-                    </button>
-                    <button type="button" onClick={() => openEdit(task)} className={buttonClass()}>
-                      Edit
-                    </button>
-                    <button type="button" onClick={() => void deleteTask(task)} className={buttonClass("danger")}>
-                      Delete
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
+
+        {modal === "create" || modal === "edit" ? (
+          <Modal title={modal === "edit" ? "Edit Task" : "Add Task"} onClose={() => setModal(null)}>
+            <TaskFormView form={form} setForm={setForm} servers={servers} saving={saving} onSubmit={submitForm} />
+          </Modal>
+        ) : null}
+
+        {modal === "runs" ? (
+          <Modal title={`Runs: ${editing?.name || ""}`} onClose={() => setModal(null)}>
+            {runs.length === 0 ? (
+              <EmptyState title="No runs" />
+            ) : (
+              <div className="grid gap-3">
+                {runs.map((run) => (
+                  <BrutalCard key={run.id}>
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <StatusBadge tone={run.status === "success" ? "green" : "red"}>{run.status}</StatusBadge>
+                      <span className="text-sm font-black">{formatDate(run.created_at)} / {formatMs(run.delay_ms)}</span>
+                    </div>
+                    <p className="mt-2 text-xs font-bold text-[var(--text-muted)]">Server {compactId(run.server_id)}</p>
+                    <pre className="mt-3 max-h-40 overflow-auto border-2 border-black bg-black p-3 text-xs text-green-300">{run.output || run.error || ""}</pre>
+                  </BrutalCard>
+                ))}
+              </div>
+            )}
+          </Modal>
+        ) : null}
       </PageShell>
-
-      {modal === "create" || modal === "edit" ? (
-        <Modal title={modal === "edit" ? "Edit Task" : "Create Task"} onClose={() => setModal(null)}>
-          <form onSubmit={submitForm} className="space-y-4">
-            <Field label="Name" error={formErrors.name}>
-              <input value={form.name} onChange={(event) => setForm((prev) => ({ ...prev, name: event.target.value }))} className={inputClass} />
-            </Field>
-
-            <div className="grid gap-4 md:grid-cols-2">
-              <Field label="Task Type" error={formErrors.task_type}>
-                <select value={form.task_type} onChange={(event) => setForm((prev) => ({ ...prev, task_type: event.target.value as TaskType }))} className={selectClass}>
-                  <option value="shell">Shell</option>
-                  <option value="http_get">HTTP GET</option>
-                  <option value="icmp_ping">ICMP Ping</option>
-                  <option value="tcp_ping">TCP Ping</option>
-                </select>
-              </Field>
-              <Field label="Schedule">
-                <input
-                  value={form.schedule}
-                  onChange={(event) => setForm((prev) => ({ ...prev, schedule: event.target.value }))}
-                  className={inputClass}
-                  placeholder="Optional cron expression"
-                />
-              </Field>
-            </div>
-
-            <Field label={form.task_type === "shell" ? "Command" : "Payload JSON"} error={form.task_type === "shell" ? formErrors.command : formErrors.payload_json}>
-              {form.task_type === "shell" ? (
-                <textarea value={form.command} onChange={(event) => setForm((prev) => ({ ...prev, command: event.target.value }))} className={textareaClass} rows={4} />
-              ) : (
-                <textarea value={form.payload_json} onChange={(event) => setForm((prev) => ({ ...prev, payload_json: event.target.value }))} className={textareaClass} rows={4} />
-              )}
-            </Field>
-
-            <div className="grid gap-4 md:grid-cols-2">
-              <Field label="Cover Mode" error={formErrors.cover_mode}>
-                <select value={form.cover_mode} onChange={(event) => setForm((prev) => ({ ...prev, cover_mode: event.target.value as CoverMode }))} className={selectClass}>
-                  <option value="specific">Specific servers</option>
-                  <option value="all">All selector matches</option>
-                  <option value="any">Any one match</option>
-                </select>
-              </Field>
-              <Field label="Target Servers" error={formErrors.selected_server_ids}>
-                <select
-                  multiple
-                  value={form.selected_server_ids}
-                  onChange={(event) =>
-                    setForm((prev) => ({
-                      ...prev,
-                      selected_server_ids: Array.from(event.target.selectedOptions).map((option) => option.value),
-                    }))
-                  }
-                  className={`${selectClass} min-h-32`}
-                >
-                  {servers.map((server) => (
-                    <option key={server.id} value={server.id}>
-                      {server.name} ({server.status})
-                    </option>
-                  ))}
-                </select>
-              </Field>
-            </div>
-
-            <div className="grid gap-3 sm:grid-cols-2">
-              <label className="flex items-center gap-2 text-sm text-gray-700">
-                <input
-                  type="checkbox"
-                  checked={form.enabled}
-                  onChange={(event) => setForm((prev) => ({ ...prev, enabled: event.target.checked }))}
-                  className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-                />
-                Enabled
-              </label>
-              <label className="flex items-center gap-2 text-sm text-gray-700">
-                <input
-                  type="checkbox"
-                  checked={form.push_successful}
-                  onChange={(event) => setForm((prev) => ({ ...prev, push_successful: event.target.checked }))}
-                  className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-                />
-                Notify on success
-              </label>
-            </div>
-
-            {form.task_type !== "shell" ? (
-              <InlineNotice tone="yellow">This backend stores this task type, but manual dispatch currently supports shell tasks only.</InlineNotice>
-            ) : null}
-
-            <div className="flex justify-end gap-2">
-              <button type="button" onClick={() => setModal(null)} className={buttonClass()}>
-                Cancel
-              </button>
-              <button type="submit" disabled={saving} className={buttonClass("primary")}>
-                {saving ? "Saving..." : modal === "edit" ? "Save Changes" : "Create Task"}
-              </button>
-            </div>
-          </form>
-        </Modal>
-      ) : null}
-
-      {modal === "runs" && editing ? (
-        <Modal title={`Runs: ${editing.name}`} onClose={() => setModal(null)}>
-          {runs.length === 0 ? (
-            <EmptyState title="No runs recorded" />
-          ) : (
-            <div className="space-y-3">
-              {runs.map((run) => (
-                <div key={run.id} className="rounded border border-gray-200 p-3">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div className="font-medium text-gray-900">{compactId(run.server_id)}</div>
-                    {resultBadge(run.status)}
-                  </div>
-                  <div className="mt-2 grid gap-2 text-sm text-gray-600 sm:grid-cols-3">
-                    <span>{formatDate(run.created_at)}</span>
-                    <span>{formatMs(run.delay_ms)}</span>
-                    <span>{run.output_truncated ? "Output truncated" : ""}</span>
-                  </div>
-                  {run.error ? <div className="mt-2 text-sm text-red-700">{run.error}</div> : null}
-                  {run.output ? <pre className="mt-2 max-h-40 overflow-auto rounded bg-gray-50 p-2 text-xs text-gray-800">{run.output}</pre> : null}
-                </div>
-              ))}
-            </div>
-          )}
-        </Modal>
-      ) : null}
     </div>
   );
 }
 
-function validateTaskForm(form: TaskForm): Partial<Record<keyof TaskForm, string>> {
-  const errors: Partial<Record<keyof TaskForm, string>> = {};
-  if (!form.name.trim()) {
-    errors.name = "Name is required";
-  }
-  if (form.task_type === "shell" && !form.command.trim()) {
-    errors.command = "Command is required";
-  }
-  if (form.task_type !== "shell" && form.payload_json.trim()) {
-    try {
-      JSON.parse(form.payload_json);
-    } catch {
-      errors.payload_json = "Payload must be valid JSON";
-    }
-  }
-  if (form.cover_mode === "specific" && form.selected_server_ids.length === 0) {
-    errors.selected_server_ids = "Select at least one server";
-  }
-  return errors;
-}
-
-function formToPayload(form: TaskForm, includeEnabled: boolean): JsonObject {
-  const selector = {
-    server_ids: form.selected_server_ids,
-    group_ids: [],
-    tags: {},
-  };
-  const payload: JsonObject = {
-    name: form.name.trim(),
-    task_type: form.task_type,
-    schedule: form.schedule.trim() || null,
-    command: form.task_type === "shell" ? form.command.trim() : null,
-    payload_json:
-      form.task_type === "shell" ? null : form.payload_json.trim() || "{}",
-    cover_mode: form.cover_mode,
-    server_selector_json: JSON.stringify(selector),
-    push_successful: form.push_successful,
-    notification_group_id: null,
-  };
-  if (includeEnabled) {
-    payload.enabled = form.enabled;
-  }
-  return payload;
+function TaskFormView({
+  form,
+  setForm,
+  servers,
+  saving,
+  onSubmit,
+}: {
+  form: TaskForm;
+  setForm: React.Dispatch<React.SetStateAction<TaskForm>>;
+  servers: Server[];
+  saving: boolean;
+  onSubmit: (event: FormEvent) => void;
+}) {
+  return (
+    <form onSubmit={onSubmit} className="space-y-4">
+      <div className="grid gap-4 sm:grid-cols-2">
+        <Field label="Name">
+          <input className={inputClass} value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} required />
+        </Field>
+        <Field label="Type">
+          <select className={selectClass} value={form.task_type} onChange={(e) => setForm((f) => ({ ...f, task_type: e.target.value as TaskType }))}>
+            <option value="shell">shell</option>
+            <option value="http_get">http_get</option>
+            <option value="icmp_ping">icmp_ping</option>
+            <option value="tcp_ping">tcp_ping</option>
+          </select>
+        </Field>
+      </div>
+      <Field label="Schedule">
+        <input className={inputClass} value={form.schedule} onChange={(e) => setForm((f) => ({ ...f, schedule: e.target.value }))} placeholder="cron or empty for manual" />
+      </Field>
+      <Field label="Command">
+        <textarea className={`${textareaClass} min-h-28`} value={form.command} onChange={(e) => setForm((f) => ({ ...f, command: e.target.value }))} />
+      </Field>
+      <Field label="Payload JSON">
+        <textarea className={`${textareaClass} min-h-24`} value={form.payload_json} onChange={(e) => setForm((f) => ({ ...f, payload_json: e.target.value }))} />
+      </Field>
+      <div className="grid gap-4 sm:grid-cols-2">
+        <Field label="Cover mode">
+          <select className={selectClass} value={form.cover_mode} onChange={(e) => setForm((f) => ({ ...f, cover_mode: e.target.value as CoverMode }))}>
+            <option value="specific">specific</option>
+            <option value="all">all</option>
+            <option value="any">any</option>
+          </select>
+        </Field>
+        <Field label="Servers">
+          <select
+            multiple
+            className={`${selectClass} min-h-32`}
+            value={form.selected_server_ids}
+            onChange={(e) => setForm((f) => ({ ...f, selected_server_ids: Array.from(e.target.selectedOptions).map((option) => option.value) }))}
+          >
+            {servers.map((server) => (
+              <option key={server.id} value={server.id}>{server.name} ({server.status})</option>
+            ))}
+          </select>
+        </Field>
+      </div>
+      <div className="flex flex-wrap gap-4 text-sm font-black">
+        <label><input type="checkbox" checked={form.push_successful} onChange={(e) => setForm((f) => ({ ...f, push_successful: e.target.checked }))} /> Push successful</label>
+        <label><input type="checkbox" checked={form.enabled} onChange={(e) => setForm((f) => ({ ...f, enabled: e.target.checked }))} /> Enabled</label>
+      </div>
+      <button disabled={saving} className={buttonClass("primary")}>{saving ? "Saving..." : "Save Task"}</button>
+    </form>
+  );
 }
 
 function parseSelector(value: string): { server_ids: string[] } {
   try {
-    const parsed = JSON.parse(value) as { server_ids?: unknown };
-    return {
-      server_ids: Array.isArray(parsed.server_ids)
-        ? parsed.server_ids.filter((id): id is string => typeof id === "string")
-        : [],
-    };
+    const parsed = JSON.parse(value) as { server_ids?: string[] };
+    return { server_ids: Array.isArray(parsed.server_ids) ? parsed.server_ids : [] };
   } catch {
     return { server_ids: [] };
   }
 }
 
-function targetLabel(task: Task, servers: Server[]): string {
-  const selector = parseSelector(task.server_selector_json);
-  if (selector.server_ids.length === 0) {
-    return task.cover_mode === "specific" ? "No servers selected" : task.cover_mode;
-  }
-  const names = selector.server_ids.map((id) => servers.find((server) => server.id === id)?.name || compactId(id));
-  return `${task.cover_mode}: ${names.join(", ")}`;
-}
-
-function resultBadge(result?: string | null) {
-  if (!result) {
-    return <StatusBadge tone="gray">Never Run</StatusBadge>;
-  }
-  if (result === "success") {
-    return <StatusBadge tone="green">Success</StatusBadge>;
-  }
-  if (result === "failure") {
-    return <StatusBadge tone="red">Failed</StatusBadge>;
-  }
-  if (result === "timeout" || result === "offline") {
-    return <StatusBadge tone="yellow">{result}</StatusBadge>;
-  }
-  return <StatusBadge tone="blue">{result}</StatusBadge>;
-}
-
-function taskTypeLabel(type: string): string {
-  return type.replace(/_/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+function formToPayload(form: TaskForm): JsonObject {
+  return {
+    name: form.name.trim(),
+    task_type: form.task_type,
+    schedule: form.schedule.trim() || null,
+    command: form.command,
+    payload_json: form.payload_json.trim() || null,
+    cover_mode: form.cover_mode,
+    server_selector_json: JSON.stringify({ server_ids: form.selected_server_ids }),
+    push_successful: form.push_successful,
+    enabled: form.enabled,
+  };
 }

@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useState } from "react";
 import Navigation from "@/app/components/Navigation";
 import {
   EmptyState,
@@ -8,454 +8,209 @@ import {
   InlineError,
   InlineNotice,
   Modal,
+  PageHeader,
   PageShell,
   StatusBadge,
   buttonClass,
-  compactId,
   formatDate,
   inputClass,
-  isAdmin,
   responseError,
   selectClass,
-  useStoredUser,
+  tdClass,
+  textareaClass,
+  thClass,
 } from "@/app/components/M7Primitives";
 import { apiClient, type JsonObject } from "@/lib/api";
-
-type Provider = "cloudflare" | "tencent_cloud" | "he" | "webhook" | "dummy";
-
-interface Server {
-  id: string;
-  name: string;
-  status: string;
-}
 
 interface DdnsConfig {
   id: string;
   agent_id?: string | null;
-  name: string;
-  provider: Provider | string;
-  domain: string;
-  record_id?: string | null;
-  zone_id?: string | null;
+  name?: string;
+  provider?: string;
+  domain?: string;
+  webhook_url?: string | null;
   current_ip?: string | null;
   last_applied_ip?: string | null;
-  last_applied_at?: string | null;
-  enabled: boolean;
-  created_at?: string;
+  enabled?: boolean;
   updated_at?: string;
 }
 
 interface DdnsHistory {
-  id: string;
-  old_ip?: string | null;
-  new_ip: string;
-  success: boolean;
-  error?: string | null;
-  applied_at: string;
+  id?: string;
+  success?: boolean;
+  message?: string;
+  created_at?: string;
 }
-
-interface DdnsForm {
-  name: string;
-  provider: Provider;
-  domain: string;
-  agent_id: string;
-  record_id: string;
-  zone_id: string;
-  api_token: string;
-  api_key: string;
-  api_secret: string;
-  webhook_url: string;
-  enabled: boolean;
-}
-
-const blankForm: DdnsForm = {
-  name: "",
-  provider: "dummy",
-  domain: "",
-  agent_id: "",
-  record_id: "",
-  zone_id: "",
-  api_token: "",
-  api_key: "",
-  api_secret: "",
-  webhook_url: "",
-  enabled: true,
-};
 
 export default function DdnsPage() {
-  const user = useStoredUser();
   const [configs, setConfigs] = useState<DdnsConfig[]>([]);
-  const [servers, setServers] = useState<Server[]>([]);
   const [history, setHistory] = useState<DdnsHistory[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [modal, setModal] = useState<"create" | "history" | null>(null);
-  const [selected, setSelected] = useState<DdnsConfig | null>(null);
-  const [form, setForm] = useState<DdnsForm>(blankForm);
-  const [formErrors, setFormErrors] = useState<Partial<Record<keyof DdnsForm, string>>>({});
-  const [query, setQuery] = useState("");
+  const [modal, setModal] = useState(false);
+  const [form, setForm] = useState({
+    agent_id: "",
+    name: "",
+    provider: "webhook",
+    domain: "",
+    record_id: "",
+    zone_id: "",
+    api_token: "",
+    api_key: "",
+    api_secret: "",
+    webhook_url: "",
+  });
 
-  const loadConfigs = useCallback(async () => {
-    setError(null);
-    try {
-      setLoading(true);
-      const [ddnsResponse, serversResponse] = await Promise.all([
-        apiClient.listDdnsConfigs(),
-        apiClient.listServers(200, 0),
-      ]);
-
-      if (ddnsResponse.success && ddnsResponse.data) {
-        setConfigs((ddnsResponse.data.configs as DdnsConfig[]) ?? []);
-      } else {
-        setError(responseError(ddnsResponse));
-      }
-
-      if (serversResponse.success && serversResponse.data) {
-        setServers((serversResponse.data.servers as Server[]) ?? []);
-      }
-    } finally {
-      setLoading(false);
+  const load = useCallback(async () => {
+    const response = await apiClient.listDdnsConfigs();
+    if (response.success && response.data) {
+      setConfigs((response.data.configs as DdnsConfig[]) ?? []);
+    } else {
+      setError(responseError(response));
     }
   }, []);
 
   useEffect(() => {
     const timeoutId = window.setTimeout(() => {
-      void loadConfigs();
+      void load();
     }, 0);
     return () => window.clearTimeout(timeoutId);
-  }, [loadConfigs]);
+  }, [load]);
 
-  const filtered = useMemo(() => {
-    const needle = query.trim().toLowerCase();
-    if (!needle) {
-      return configs;
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    const payload: JsonObject = {
+      name: form.name,
+      provider: form.provider,
+      domain: form.domain,
+      agent_id: form.agent_id.trim() || null,
+      record_id: form.record_id.trim() || null,
+      zone_id: form.zone_id.trim() || null,
+      api_token: form.api_token.trim() || null,
+      api_key: form.api_key.trim() || null,
+      api_secret: form.api_secret.trim() || null,
+      webhook_url: form.webhook_url.trim() || null,
+      enabled: true,
+    };
+    const response = await apiClient.createDdnsConfig(payload);
+    if (response.success) {
+      setNotice("DDNS config created.");
+      setModal(false);
+      await load();
+    } else {
+      setError(responseError(response));
     }
-    return configs.filter((config) =>
-      [config.name, config.provider, config.domain, config.last_applied_ip, config.current_ip]
-        .filter(Boolean)
-        .some((value) => String(value).toLowerCase().includes(needle)),
-    );
-  }, [configs, query]);
-
-  function openCreate() {
-    setForm({ ...blankForm, agent_id: servers[0]?.id ?? "" });
-    setFormErrors({});
-    setModal("create");
   }
 
-  async function submitForm(event: FormEvent) {
-    event.preventDefault();
-    setNotice(null);
-    const validation = validateForm(form);
-    setFormErrors(validation);
-    if (Object.keys(validation).length > 0) {
-      return;
-    }
+  async function reload() {
+    const response = await apiClient.reloadDdnsProviders();
+    if (response.success) setNotice("DDNS providers reloaded.");
+    else setError(responseError(response));
+  }
 
-    setSaving(true);
-    const response = await apiClient.createDdnsConfig(formToPayload(form));
-    setSaving(false);
-
-    if (response.success) {
-      setModal(null);
-      setNotice("DDNS profile created.");
-      await loadConfigs();
+  async function showHistory(config: DdnsConfig) {
+    const response = await apiClient.listDdnsHistory(config.id);
+    if (response.success && response.data) {
+      setHistory((response.data.history as DdnsHistory[]) ?? []);
+      setNotice(`History loaded for ${config.name || config.domain || config.id}.`);
     } else {
       setError(responseError(response));
     }
   }
 
   async function deleteConfig(config: DdnsConfig) {
-    if (!confirm(`Delete DDNS profile "${config.name}"? Saved provider credentials will be removed.`)) {
-      return;
-    }
+    if (!confirm(`Delete DDNS config "${config.name || config.domain || config.id}"?`)) return;
     const response = await apiClient.deleteDdnsConfig(config.id);
     if (response.success) {
-      setNotice("DDNS profile deleted.");
-      await loadConfigs();
-    } else {
-      setError(responseError(response));
-    }
-  }
-
-  async function openHistory(config: DdnsConfig) {
-    setSelected(config);
-    setHistory([]);
-    setModal("history");
-    const response = await apiClient.listDdnsHistory(config.id);
-    if (response.success && response.data) {
-      setHistory((response.data.history as DdnsHistory[]) ?? []);
-    } else {
-      setError(responseError(response));
-    }
-  }
-
-  async function reloadProviders() {
-    const response = await apiClient.reloadDdnsProviders();
-    if (response.success) {
-      setNotice("DDNS providers reloaded.");
+      setNotice("DDNS config deleted.");
+      await load();
     } else {
       setError(responseError(response));
     }
   }
 
   return (
-    <div className="min-h-screen bg-gray-100">
+    <div className="min-h-screen">
       <Navigation />
       <PageShell>
-        <div className="mb-6 flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
-          <div>
-            <h1 className="text-2xl font-bold text-gray-900">DDNS</h1>
-            <p className="mt-1 text-sm text-gray-500">Provider profiles for agent IP updates.</p>
-          </div>
-          <div className="flex gap-2">
-            <button type="button" onClick={() => void reloadProviders()} className={buttonClass()}>
-              Reload
-            </button>
-            <button type="button" onClick={openCreate} className={buttonClass("primary")}>
-              Add Profile
-            </button>
-          </div>
+        <PageHeader
+          eyebrow="DNS"
+          title="DDNS"
+          detail="动态 DNS 配置、重载和更新历史。"
+          actions={
+            <>
+              <button className={buttonClass("secondary")} onClick={() => void reload()}>Reload</button>
+              <button className={buttonClass("primary")} onClick={() => setModal(true)}>Add Config</button>
+            </>
+          }
+        />
+        <div className="mb-5 space-y-3">
+          <InlineError message={error} />
+          {notice ? <InlineNotice tone="green">{notice}</InlineNotice> : null}
         </div>
 
-        {!isAdmin(user) ? (
-          <div className="mb-4">
-            <InlineNotice tone="yellow">The current DDNS API requires an admin session.</InlineNotice>
+        {configs.length === 0 ? (
+          <EmptyState title="No DDNS configs" />
+        ) : (
+          <div className="overflow-x-auto border-2 border-black bg-[var(--bg-card)] shadow-[var(--shadow-brutal)]">
+            <table className="w-full">
+              <thead><tr><th className={thClass}>Name</th><th className={thClass}>Provider</th><th className={thClass}>Domain</th><th className={thClass}>IP</th><th className={thClass}>Status</th><th className={thClass}>Actions</th></tr></thead>
+              <tbody>
+                {configs.map((config) => (
+                  <tr key={config.id}>
+                    <td className={tdClass}>{config.name || config.id}</td>
+                    <td className={tdClass}>{config.provider || "webhook"}</td>
+                    <td className={tdClass}>{config.domain || "-"}</td>
+                    <td className={tdClass}>{config.last_applied_ip || config.current_ip || "-"}</td>
+                    <td className={tdClass}><StatusBadge tone={config.enabled === false ? "gray" : "green"}>{config.enabled === false ? "disabled" : "enabled"}</StatusBadge></td>
+                    <td className={`${tdClass} flex flex-wrap gap-2`}>
+                      <button className={buttonClass("secondary")} onClick={() => void showHistory(config)}>History</button>
+                      <button className={buttonClass("danger")} onClick={() => void deleteConfig(config)}>Delete</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
+        )}
+
+        {history.length > 0 ? (
+          <section className="mt-6">
+            <h2 className="mb-3 text-xl font-black uppercase">History</h2>
+            <div className="grid gap-3">
+              {history.map((item, index) => (
+                <div key={item.id || index} className="border-2 border-black bg-[var(--bg-card)] p-3 shadow-[var(--shadow-brutal-sm)]">
+                  <StatusBadge tone={item.success ? "green" : "red"}>{item.success ? "success" : "failure"}</StatusBadge>
+                  <span className="ml-3 text-sm font-black">{formatDate(item.created_at)}</span>
+                  <p className="mt-2 text-sm font-bold text-[var(--text-muted)]">{item.message || ""}</p>
+                </div>
+              ))}
+            </div>
+          </section>
         ) : null}
 
-        <div className="mb-4 grid gap-3 md:grid-cols-[minmax(0,1fr)_auto] md:items-center">
-          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search DDNS profiles" className={inputClass} />
-          <button type="button" onClick={() => void loadConfigs()} className={buttonClass()}>
-            Refresh
-          </button>
-        </div>
-
-        <div className="mb-4 space-y-3">
-          <InlineError message={error} />
-          {notice ? <InlineNotice>{notice}</InlineNotice> : null}
-        </div>
-
-        {loading ? (
-          <div className="rounded bg-white p-6 text-sm text-gray-600 shadow">Loading DDNS profiles...</div>
-        ) : filtered.length === 0 ? (
-          <EmptyState title="No DDNS profiles configured" detail="Create a provider profile and reload providers to apply it without restarting." />
-        ) : (
-          <>
-            <div className="hidden overflow-hidden rounded-lg bg-white shadow md:block">
-              <table className="min-w-full divide-y divide-gray-200">
-                <thead className="bg-gray-50">
-                  <tr>
-                    {["Name", "Provider", "Domain", "Agent", "Last IP", "State", "Actions"].map((heading) => (
-                      <th key={heading} className="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">
-                        {heading}
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-200 bg-white">
-                  {filtered.map((config) => (
-                    <tr key={config.id} className="hover:bg-gray-50">
-                      <td className="px-6 py-4">
-                        <div className="text-sm font-medium text-gray-900">{config.name}</div>
-                        <div className="text-xs text-gray-500">{config.id}</div>
-                      </td>
-                      <td className="px-6 py-4 text-sm text-gray-500">{providerLabel(config.provider)}</td>
-                      <td className="px-6 py-4 text-sm text-gray-500">{config.domain}</td>
-                      <td className="px-6 py-4 text-sm text-gray-500">{config.agent_id ? serverName(config.agent_id, servers) : "Any agent"}</td>
-                      <td className="px-6 py-4 text-sm text-gray-500">
-                        {config.last_applied_ip || config.current_ip || "-"}
-                        <div className="text-xs">{formatDate(config.last_applied_at)}</div>
-                      </td>
-                      <td className="px-6 py-4">{config.enabled ? <StatusBadge tone="green">Enabled</StatusBadge> : <StatusBadge tone="gray">Disabled</StatusBadge>}</td>
-                      <td className="px-6 py-4 text-sm">
-                        <div className="flex gap-2">
-                          <button type="button" onClick={() => void openHistory(config)} className="text-gray-700 hover:underline">
-                            History
-                          </button>
-                          <button type="button" onClick={() => setNotice("This backend build exposes create/delete/reload for DDNS, but not update.")} className="text-blue-700 hover:underline">
-                            Edit
-                          </button>
-                          <button type="button" onClick={() => void deleteConfig(config)} className="text-red-700 hover:underline">
-                            Delete
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-
-            <div className="grid gap-3 md:hidden">
-              {filtered.map((config) => (
-                <div key={config.id} className="rounded-lg bg-white p-4 shadow">
-                  <div className="flex items-start justify-between gap-3">
-                    <div>
-                      <h2 className="font-semibold text-gray-900">{config.name}</h2>
-                      <p className="mt-1 text-sm text-gray-500">{config.domain}</p>
-                    </div>
-                    {config.enabled ? <StatusBadge tone="green">Enabled</StatusBadge> : <StatusBadge tone="gray">Disabled</StatusBadge>}
-                  </div>
-                  <div className="mt-3 text-sm text-gray-600">{providerLabel(config.provider)} · {config.last_applied_ip || config.current_ip || "No IP yet"}</div>
-                  <div className="mt-4 grid grid-cols-2 gap-2">
-                    <button type="button" onClick={() => void openHistory(config)} className={buttonClass()}>
-                      History
-                    </button>
-                    <button type="button" onClick={() => void deleteConfig(config)} className={buttonClass("danger")}>
-                      Delete
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </>
-        )}
+        {modal ? (
+          <Modal title="Add DDNS Config" onClose={() => setModal(false)}>
+            <form onSubmit={submit} className="space-y-4">
+              <div className="grid gap-4 sm:grid-cols-2">
+                <Field label="Name"><input className={inputClass} value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} /></Field>
+                <Field label="Provider"><select className={selectClass} value={form.provider} onChange={(e) => setForm((f) => ({ ...f, provider: e.target.value }))}><option value="webhook">webhook</option><option value="cloudflare">cloudflare</option><option value="aliyun">aliyun</option></select></Field>
+              </div>
+              <Field label="Agent ID"><input className={inputClass} value={form.agent_id} onChange={(e) => setForm((f) => ({ ...f, agent_id: e.target.value }))} /></Field>
+              <Field label="Domain"><input className={inputClass} value={form.domain} onChange={(e) => setForm((f) => ({ ...f, domain: e.target.value }))} /></Field>
+              <Field label="Webhook URL"><textarea className={`${textareaClass} min-h-24`} value={form.webhook_url} onChange={(e) => setForm((f) => ({ ...f, webhook_url: e.target.value }))} placeholder="https://example.com/update?ip={{ip}}&hostname={{hostname}}" /></Field>
+              <div className="grid gap-4 sm:grid-cols-2">
+                <Field label="Record ID"><input className={inputClass} value={form.record_id} onChange={(e) => setForm((f) => ({ ...f, record_id: e.target.value }))} /></Field>
+                <Field label="Zone ID"><input className={inputClass} value={form.zone_id} onChange={(e) => setForm((f) => ({ ...f, zone_id: e.target.value }))} /></Field>
+                <Field label="API Token"><input className={inputClass} value={form.api_token} onChange={(e) => setForm((f) => ({ ...f, api_token: e.target.value }))} /></Field>
+                <Field label="API Key"><input className={inputClass} value={form.api_key} onChange={(e) => setForm((f) => ({ ...f, api_key: e.target.value }))} /></Field>
+              </div>
+              <Field label="API Secret"><input className={inputClass} value={form.api_secret} onChange={(e) => setForm((f) => ({ ...f, api_secret: e.target.value }))} /></Field>
+              <button className={buttonClass("primary")}>Save Config</button>
+            </form>
+          </Modal>
+        ) : null}
       </PageShell>
-
-      {modal === "create" ? (
-        <Modal title="Add DDNS Profile" onClose={() => setModal(null)}>
-          <form onSubmit={submitForm} className="space-y-4">
-            <div className="grid gap-4 md:grid-cols-2">
-              <Field label="Name" error={formErrors.name}>
-                <input value={form.name} onChange={(event) => setForm((prev) => ({ ...prev, name: event.target.value }))} className={inputClass} />
-              </Field>
-              <Field label="Provider">
-                <select value={form.provider} onChange={(event) => setForm((prev) => ({ ...prev, provider: event.target.value as Provider }))} className={selectClass}>
-                  <option value="dummy">Dummy</option>
-                  <option value="cloudflare">Cloudflare</option>
-                  <option value="tencent_cloud">Tencent Cloud</option>
-                  <option value="he">Hurricane Electric</option>
-                  <option value="webhook">Webhook</option>
-                </select>
-              </Field>
-            </div>
-
-            <div className="grid gap-4 md:grid-cols-2">
-              <Field label="Domain" error={formErrors.domain}>
-                <input value={form.domain} onChange={(event) => setForm((prev) => ({ ...prev, domain: event.target.value }))} className={inputClass} />
-              </Field>
-              <Field label="Agent">
-                <select value={form.agent_id} onChange={(event) => setForm((prev) => ({ ...prev, agent_id: event.target.value }))} className={selectClass}>
-                  <option value="">Any agent</option>
-                  {servers.map((server) => (
-                    <option key={server.id} value={server.id}>
-                      {server.name} ({server.status})
-                    </option>
-                  ))}
-                </select>
-              </Field>
-            </div>
-
-            <div className="grid gap-4 md:grid-cols-2">
-              <Field label="Record ID">
-                <input value={form.record_id} onChange={(event) => setForm((prev) => ({ ...prev, record_id: event.target.value }))} className={inputClass} />
-              </Field>
-              <Field label="Zone ID">
-                <input value={form.zone_id} onChange={(event) => setForm((prev) => ({ ...prev, zone_id: event.target.value }))} className={inputClass} />
-              </Field>
-            </div>
-
-            <div className="grid gap-4 md:grid-cols-2">
-              <Field label="API Token">
-                <input type="password" value={form.api_token} onChange={(event) => setForm((prev) => ({ ...prev, api_token: event.target.value }))} className={inputClass} />
-              </Field>
-              <Field label="Webhook URL" error={formErrors.webhook_url}>
-                <input value={form.webhook_url} onChange={(event) => setForm((prev) => ({ ...prev, webhook_url: event.target.value }))} className={inputClass} />
-              </Field>
-            </div>
-
-            <div className="grid gap-4 md:grid-cols-2">
-              <Field label="API Key">
-                <input type="password" value={form.api_key} onChange={(event) => setForm((prev) => ({ ...prev, api_key: event.target.value }))} className={inputClass} />
-              </Field>
-              <Field label="API Secret">
-                <input type="password" value={form.api_secret} onChange={(event) => setForm((prev) => ({ ...prev, api_secret: event.target.value }))} className={inputClass} />
-              </Field>
-            </div>
-
-            <label className="flex items-center gap-2 text-sm text-gray-700">
-              <input type="checkbox" checked={form.enabled} onChange={(event) => setForm((prev) => ({ ...prev, enabled: event.target.checked }))} className="rounded border-gray-300 text-blue-600 focus:ring-blue-500" />
-              Enabled
-            </label>
-
-            <div className="flex justify-end gap-2">
-              <button type="button" onClick={() => setModal(null)} className={buttonClass()}>
-                Cancel
-              </button>
-              <button type="submit" disabled={saving} className={buttonClass("primary")}>
-                {saving ? "Saving..." : "Create Profile"}
-              </button>
-            </div>
-          </form>
-        </Modal>
-      ) : null}
-
-      {modal === "history" && selected ? (
-        <Modal title={`DDNS History: ${selected.name}`} onClose={() => setModal(null)}>
-          {history.length === 0 ? (
-            <EmptyState title="No history recorded" />
-          ) : (
-            <div className="space-y-3">
-              {history.map((item) => (
-                <div key={item.id} className="rounded border border-gray-200 p-3">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div className="text-sm font-medium text-gray-900">
-                      <span>{item.old_ip || "-"}</span>
-                      <span className="px-1 text-gray-500">to</span>
-                      <span>{item.new_ip}</span>
-                    </div>
-                    {item.success ? <StatusBadge tone="green">Success</StatusBadge> : <StatusBadge tone="red">Failed</StatusBadge>}
-                  </div>
-                  <div className="mt-2 text-sm text-gray-500">{formatDate(item.applied_at)}</div>
-                  {item.error ? <div className="mt-2 text-sm text-red-700">{item.error}</div> : null}
-                </div>
-              ))}
-            </div>
-          )}
-        </Modal>
-      ) : null}
     </div>
   );
-}
-
-function validateForm(form: DdnsForm): Partial<Record<keyof DdnsForm, string>> {
-  const errors: Partial<Record<keyof DdnsForm, string>> = {};
-  if (!form.name.trim()) {
-    errors.name = "Name is required";
-  }
-  if (!form.domain.trim()) {
-    errors.domain = "Domain is required";
-  }
-  if (form.provider === "webhook" && !/^https?:\/\//i.test(form.webhook_url.trim())) {
-    errors.webhook_url = "Webhook URL must start with http:// or https://";
-  }
-  return errors;
-}
-
-function formToPayload(form: DdnsForm): JsonObject {
-  return {
-    name: form.name.trim(),
-    provider: form.provider,
-    domain: form.domain.trim(),
-    agent_id: form.agent_id || null,
-    record_id: form.record_id.trim() || null,
-    zone_id: form.zone_id.trim() || null,
-    api_token: form.api_token || null,
-    api_key: form.api_key || null,
-    api_secret: form.api_secret || null,
-    webhook_url: form.webhook_url.trim() || null,
-    enabled: form.enabled,
-  };
-}
-
-function providerLabel(value: string): string {
-  return value.replace(/_/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
-}
-
-function serverName(id: string, servers: Server[]): string {
-  const server = servers.find((item) => item.id === id);
-  return server ? `${server.name} (${server.status})` : compactId(id);
 }

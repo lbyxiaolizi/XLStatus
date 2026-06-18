@@ -307,6 +307,7 @@ async fn main() -> anyhow::Result<()> {
             let app = Router::new()
                 .route("/healthz", get(healthz))
                 .route("/api/v1/auth/login", post(login))
+                .route("/api/v1/public/status", get(api::v1::public::public_status))
                 .route("/api/v1/agents/enroll", post(enroll))
                 .route("/api/v1/transfers/temp/download", get(temp_download))
                 .route(

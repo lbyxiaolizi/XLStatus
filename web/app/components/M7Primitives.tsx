@@ -9,6 +9,12 @@ export interface StoredUser {
   role: string;
 }
 
+declare global {
+  interface Window {
+    applyBoldTheme?: () => void;
+  }
+}
+
 export function useStoredUser(): StoredUser | null {
   const [user, setUser] = useState<StoredUser | null>(null);
 
@@ -45,69 +51,92 @@ export function isAdmin(user: StoredUser | null): boolean {
 
 export function responseError(response: ApiResponse<unknown>): string {
   const suffix = response.request_id ? ` (${response.request_id})` : "";
-  if (response.status === 401) {
-    return `Authentication required${suffix}`;
-  }
-  if (response.status === 403) {
-    return `Permission denied${suffix}`;
-  }
-  if (response.status === 404) {
-    return `Backend route or resource not found${suffix}`;
-  }
+  if (response.status === 401) return `Authentication required${suffix}`;
+  if (response.status === 403) return `Permission denied${suffix}`;
+  if (response.status === 404) return `Backend route or resource not found${suffix}`;
   return `${response.error || "Request failed"}${suffix}`;
 }
 
-export function formatDate(value?: string | null): string {
-  if (!value) {
-    return "Never";
-  }
-
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return value;
-  }
+export function formatDate(value?: string | number | null): string {
+  if (!value) return "Never";
+  const date = typeof value === "number" ? new Date(value * 1000) : new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
   return date.toLocaleString();
 }
 
 export function formatPercent(value?: number | null): string {
-  if (value === undefined || value === null || Number.isNaN(value)) {
-    return "N/A";
-  }
+  if (value === undefined || value === null || Number.isNaN(value)) return "N/A";
   return `${value.toFixed(1)}%`;
 }
 
 export function formatMs(value?: number | null): string {
-  if (value === undefined || value === null || Number.isNaN(value)) {
-    return "N/A";
-  }
+  if (value === undefined || value === null || Number.isNaN(value)) return "N/A";
   return `${value} ms`;
 }
 
+export function formatBytes(value?: number | null): string {
+  if (value === undefined || value === null || Number.isNaN(value)) return "N/A";
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
+  return `${(value / 1024 / 1024 / 1024).toFixed(1)} GB`;
+}
+
 export function compactId(value?: string | null): string {
-  if (!value) {
-    return "-";
-  }
+  if (!value) return "-";
   return value.length > 13 ? `${value.slice(0, 8)}...${value.slice(-4)}` : value;
+}
+
+export function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+}
+
+export function asString(value: unknown, fallback = ""): string {
+  return typeof value === "string" ? value : fallback;
+}
+
+export function asNumber(value: unknown, fallback = 0): number {
+  return typeof value === "number" && !Number.isNaN(value) ? value : fallback;
+}
+
+export function useBoldTheme(): ["light" | "dark", (mode: "light" | "dark") => void] {
+  const [mode, setModeState] = useState<"light" | "dark">("light");
+
+  useEffect(() => {
+    const timeoutId = window.setTimeout(() => {
+      setModeState(localStorage.getItem("darkMode") === "true" ? "dark" : "light");
+    }, 0);
+    return () => window.clearTimeout(timeoutId);
+  }, []);
+
+  function setMode(nextMode: "light" | "dark") {
+    localStorage.setItem("darkMode", nextMode === "dark" ? "true" : "false");
+    window.applyBoldTheme?.();
+    setModeState(nextMode);
+  }
+
+  return [mode, setMode];
 }
 
 export function StatusBadge({
   tone,
   children,
 }: {
-  tone: "green" | "red" | "yellow" | "gray" | "blue";
+  tone: "green" | "red" | "yellow" | "gray" | "blue" | "pink";
   children: ReactNode;
 }) {
   const classes = {
-    green: "bg-green-100 text-green-800 border-green-200",
-    red: "bg-red-100 text-red-800 border-red-200",
-    yellow: "bg-yellow-100 text-yellow-800 border-yellow-200",
-    gray: "bg-gray-100 text-gray-800 border-gray-200",
-    blue: "bg-blue-100 text-blue-800 border-blue-200",
+    green: "bg-[var(--accent-color)] text-[var(--btn-text)]",
+    red: "bg-[var(--btn-bg)] text-[var(--btn-text)]",
+    yellow: "bg-[var(--accent-bg)] text-[var(--text-main)]",
+    gray: "bg-[var(--bg-card)] text-[var(--text-muted)]",
+    blue: "bg-[var(--btn-bg)] text-[var(--btn-text)]",
+    pink: "bg-[var(--accent-color)] text-[var(--btn-text)]",
   };
 
   return (
     <span
-      className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-semibold ${classes[tone]}`}
+      className={`inline-flex items-center border-2 border-black px-2.5 py-1 text-xs font-black uppercase tracking-wide shadow-[2px_2px_0_0_#000] ${classes[tone]}`}
     >
       {children}
     </span>
@@ -115,12 +144,9 @@ export function StatusBadge({
 }
 
 export function InlineError({ message }: { message: string | null }) {
-  if (!message) {
-    return null;
-  }
-
+  if (!message) return null;
   return (
-    <div className="rounded border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+    <div className="border-2 border-black bg-[var(--btn-bg)] px-4 py-3 text-sm font-bold text-[var(--btn-text)] shadow-[var(--shadow-brutal-sm)]">
       {message}
     </div>
   );
@@ -130,17 +156,18 @@ export function InlineNotice({
   tone = "blue",
   children,
 }: {
-  tone?: "blue" | "yellow" | "green";
+  tone?: "blue" | "yellow" | "green" | "pink";
   children: ReactNode;
 }) {
   const classes = {
-    blue: "border-blue-200 bg-blue-50 text-blue-800",
-    yellow: "border-yellow-200 bg-yellow-50 text-yellow-800",
-    green: "border-green-200 bg-green-50 text-green-800",
+    blue: "bg-[var(--btn-bg)] text-[var(--btn-text)]",
+    yellow: "bg-[var(--accent-bg)] text-[var(--text-main)]",
+    green: "bg-[var(--accent-color)] text-[var(--btn-text)]",
+    pink: "bg-[var(--accent-bg)] text-[var(--text-main)]",
   };
 
   return (
-    <div className={`rounded border px-4 py-3 text-sm ${classes[tone]}`}>
+    <div className={`border-2 border-black px-4 py-3 text-sm font-bold shadow-[var(--shadow-brutal-sm)] ${classes[tone]}`}>
       {children}
     </div>
   );
@@ -154,9 +181,9 @@ export function EmptyState({
   detail?: string;
 }) {
   return (
-    <div className="rounded-lg bg-white px-4 py-10 text-center shadow">
-      <p className="font-medium text-gray-700">{title}</p>
-      {detail ? <p className="mt-2 text-sm text-gray-500">{detail}</p> : null}
+    <div className="border-2 border-black bg-[var(--bg-card)] px-4 py-12 text-center shadow-[var(--shadow-brutal)]">
+      <p className="text-lg font-black uppercase text-[var(--text-main)]">{title}</p>
+      {detail ? <p className="mx-auto mt-2 max-w-2xl text-sm font-bold text-[var(--text-muted)]">{detail}</p> : null}
     </div>
   );
 }
@@ -172,9 +199,11 @@ export function Field({
 }) {
   return (
     <label className="block">
-      <span className="mb-1 block text-sm font-medium text-gray-700">{label}</span>
+      <span className="mb-1.5 block text-xs font-black uppercase tracking-wide text-[var(--text-main)]">
+        {label}
+      </span>
       {children}
-      {error ? <span className="mt-1 block text-xs text-red-600">{error}</span> : null}
+      {error ? <span className="mt-1 block text-xs font-bold text-[var(--accent-color)]">{error}</span> : null}
     </label>
   );
 }
@@ -189,15 +218,11 @@ export function Modal({
   onClose: () => void;
 }) {
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-gray-900/40 px-4 py-8">
-      <div className="w-full max-w-2xl rounded-lg bg-white shadow-xl">
-        <div className="flex items-center justify-between border-b border-gray-200 px-5 py-4">
-          <h2 className="text-lg font-semibold text-gray-900">{title}</h2>
-          <button
-            type="button"
-            onClick={onClose}
-            className="rounded px-2 py-1 text-sm text-gray-500 hover:bg-gray-100 hover:text-gray-900"
-          >
+    <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/50 px-4 py-8">
+      <div className="w-full max-w-3xl border-4 border-black bg-[var(--bg-card)] shadow-[10px_10px_0_0_#000]">
+        <div className="flex items-center justify-between border-b-4 border-black bg-[var(--accent-bg)] px-5 py-4">
+          <h2 className="text-xl font-black uppercase text-[var(--text-main)]">{title}</h2>
+          <button type="button" onClick={onClose} className={buttonClass("secondary")}>
             Close
           </button>
         </div>
@@ -209,27 +234,81 @@ export function Modal({
 
 export function PageShell({ children }: { children: ReactNode }) {
   return (
-    <div className="mx-auto max-w-7xl px-4 py-6 sm:px-6 lg:px-8 lg:py-8">
+    <main className="mx-auto w-full max-w-7xl px-4 py-6 sm:px-6 lg:px-8 lg:py-8">
+      {children}
+    </main>
+  );
+}
+
+export function PageHeader({
+  title,
+  eyebrow,
+  detail,
+  actions,
+}: {
+  title: string;
+  eyebrow?: string;
+  detail?: string;
+  actions?: ReactNode;
+}) {
+  return (
+    <div className="mb-6 grid gap-4 border-b-4 border-black pb-5 md:grid-cols-[minmax(0,1fr)_auto] md:items-end">
+      <div>
+        {eyebrow ? (
+          <p className="mb-2 inline-block border-2 border-black bg-[var(--accent-bg)] px-3 py-1 text-xs font-black uppercase tracking-wide shadow-[var(--shadow-brutal-sm)]">
+            {eyebrow}
+          </p>
+        ) : null}
+        <h1 className="text-3xl font-black uppercase tracking-tight text-[var(--text-main)] sm:text-5xl">
+          {title}
+        </h1>
+        {detail ? <p className="mt-2 max-w-3xl text-sm font-bold text-[var(--text-muted)]">{detail}</p> : null}
+      </div>
+      {actions ? <div className="flex flex-wrap gap-2">{actions}</div> : null}
+    </div>
+  );
+}
+
+export function BrutalCard({
+  children,
+  className = "",
+  accent = false,
+}: {
+  children: ReactNode;
+  className?: string;
+  accent?: boolean;
+}) {
+  return (
+    <div
+      className={`border-2 border-black ${accent ? "bg-[var(--accent-bg)]" : "bg-[var(--bg-card)]"} p-4 shadow-[var(--shadow-brutal)] ${className}`}
+    >
       {children}
     </div>
   );
 }
 
-export function buttonClass(variant: "primary" | "secondary" | "danger" = "secondary") {
-  if (variant === "primary") {
-    return "rounded bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50";
-  }
-  if (variant === "danger") {
-    return "rounded bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-50";
-  }
-  return "rounded border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50";
+export function buttonClass(variant: "primary" | "secondary" | "danger" | "good" = "secondary") {
+  const base =
+    "inline-flex min-h-10 items-center justify-center border-2 border-black px-4 py-2 text-sm font-black uppercase tracking-wide shadow-[var(--shadow-brutal-sm)] transition hover:-translate-x-0.5 hover:-translate-y-0.5 hover:shadow-[var(--shadow-brutal)] disabled:pointer-events-none disabled:opacity-50";
+  if (variant === "primary") return `${base} bg-black text-white`;
+  if (variant === "danger") return `${base} bg-[var(--btn-bg)] text-[var(--btn-text)]`;
+  if (variant === "good") return `${base} bg-[var(--accent-color)] text-[var(--btn-text)]`;
+  return `${base} bg-[var(--bg-card)] text-[var(--text-main)]`;
 }
 
 export const inputClass =
-  "mt-1 block w-full rounded border border-gray-300 px-3 py-2 text-sm text-gray-900 shadow-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500";
+  "mt-1 block w-full border-2 border-black bg-[var(--bg-card)] px-3 py-2 text-sm font-bold text-[var(--text-main)] shadow-[var(--shadow-brutal-sm)] outline-none placeholder:text-[var(--text-muted)] focus:-translate-x-0.5 focus:-translate-y-0.5 focus:shadow-[var(--shadow-brutal)]";
 
 export const selectClass =
-  "mt-1 block w-full rounded border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 shadow-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500";
+  "mt-1 block w-full border-2 border-black bg-[var(--bg-card)] px-3 py-2 text-sm font-bold text-[var(--text-main)] shadow-[var(--shadow-brutal-sm)] outline-none focus:-translate-x-0.5 focus:-translate-y-0.5 focus:shadow-[var(--shadow-brutal)]";
 
 export const textareaClass =
-  "mt-1 block w-full rounded border border-gray-300 px-3 py-2 text-sm text-gray-900 shadow-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500";
+  "mt-1 block w-full border-2 border-black bg-[var(--bg-card)] px-3 py-2 text-sm font-mono text-[var(--text-main)] shadow-[var(--shadow-brutal-sm)] outline-none placeholder:text-[var(--text-muted)] focus:-translate-x-0.5 focus:-translate-y-0.5 focus:shadow-[var(--shadow-brutal)]";
+
+export const tableWrapClass =
+  "overflow-x-auto border-2 border-black bg-[var(--bg-card)] shadow-[var(--shadow-brutal)]";
+
+export const thClass =
+  "border-b-2 border-black bg-[var(--accent-bg)] px-4 py-3 text-left text-xs font-black uppercase tracking-wide";
+
+export const tdClass = "border-b border-black/15 px-4 py-3 text-sm font-bold";

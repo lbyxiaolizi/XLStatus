@@ -28,6 +28,48 @@ The XLStatus API provides programmatic access to:
 
 ## Authentication
 
+### Public Status
+
+`GET /api/v1/public/status` is intentionally unauthenticated. It powers the public `/status` web page and returns a read-only snapshot of recent server state and enabled service checks.
+
+Example response:
+
+```json
+{
+  "success": true,
+  "data": {
+    "servers": [
+      {
+        "id": "agent-id",
+        "name": "web-01",
+        "status": "online",
+        "last_seen_at": "2026-06-18T12:00:00Z",
+        "cpu_percent": 12.3,
+        "memory_used": 123456789,
+        "memory_total": 987654321,
+        "load_1": 0.42
+      }
+    ],
+    "services": [
+      {
+        "id": "service-id",
+        "name": "Website",
+        "service_type": "http",
+        "kind": "http",
+        "type": "http",
+        "target": "https://example.com",
+        "last_status": "success",
+        "last_check_at": "2026-06-18T12:00:00Z"
+      }
+    ],
+    "updated_at": "2026-06-18T12:00:00Z"
+  },
+  "error": null
+}
+```
+
+All management endpoints under `/api/v1/servers`, `/api/v1/services`, `/api/v1/alert-rules`, `/api/v1/tasks`, `/api/v1/ddns`, `/api/v1/nat`, and `/api/v1/tokens` require an authenticated session or a PAT with the required scope.
+
 ### Session Cookies
 
 For web applications:

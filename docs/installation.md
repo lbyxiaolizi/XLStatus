@@ -124,6 +124,8 @@ NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm start
 ```
 
 Open the dashboard at `http://localhost:3000`; the frontend calls the server API configured by `NEXT_PUBLIC_API_URL`.
+The unauthenticated public status page is `http://localhost:3000/status` and reads `GET /api/v1/public/status`.
+The management dashboard uses the BOLD. neo-brutalist palette; the navigation bar exposes explicit light/dark choices and stores the preference in `localStorage.darkMode`.
 
 The server also supports `CONFIG_FILE=/path/to/server.toml`:
 

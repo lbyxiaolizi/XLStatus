@@ -23,7 +23,8 @@ Before deploying or extending the project, read the current implementation audit
 - **DDNS Integration** - DNS updates for Cloudflare, Tencent Cloud, HE, Webhook, and Dummy providers
 - **MCP Integration** - Model Context Protocol REST compatibility and `/mcp` JSON-RPC tools
 - **Web Dashboard** - Next.js management interface for servers, services, alerts, tasks, DDNS, NAT, terminal, and settings
-- **Public Status Page** - public status overview for exposed resources
+- **Public Status Page** - unauthenticated `/status` view backed by `/api/v1/public/status`
+- **BOLD Theme UI** - BOLD.-style neo-brutalist palette with explicit light/dark switching
 - **Multi-user RBAC** - role-based access control, PAT scopes, CSRF protection, and server allowlists
 
 ## 🚀 Quick Start
@@ -50,6 +51,8 @@ Open:
 - API: http://localhost:8080
 
 Default credentials: `admin` / `admin123`
+
+The public status page is available before login at `http://localhost:3000/status`. The dashboard theme uses the BOLD. palette; switch between light and dark modes from the navigation bar.
 
 SQLite Compose creates `./data/xlstatus.db` on first startup. PostgreSQL Compose creates the `xlstatus` role and database on an empty volume, then XLStatus applies application migrations.
 
@@ -144,7 +147,7 @@ NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm start
 - **SQLx** - Database toolkit (SQLite/PostgreSQL)
 
 ### Frontend
-- **Next.js 14** - React framework
+- **Next.js 16** - React framework
 - **TypeScript** - Type safety
 - **Tailwind CSS** - Utility-first CSS
 

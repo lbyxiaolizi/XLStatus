@@ -75,8 +75,7 @@ for token in [
 
 status = (root / "web/app/status/page.tsx").read_text(encoding="utf-8")
 for token in [
-    "listServers(100, 0, true)",
-    "listServices(100, 0, true)",
+    "getPublicStatus",
     "No public data",
 ]:
     assert token in status, f"public status view missing {token}"

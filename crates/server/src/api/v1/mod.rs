@@ -6,6 +6,7 @@ pub mod ddns;
 pub mod mcp;
 pub mod nat;
 pub mod pat;
+pub mod public;
 pub mod server_ops;
 pub mod servers;
 pub mod service_history;

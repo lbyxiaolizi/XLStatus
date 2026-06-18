@@ -12,9 +12,11 @@ docker compose ps
 
 - API: http://localhost:8080
 - Web UI: http://localhost:3000
+- Public status: http://localhost:3000/status
 
 默认 Compose 配置会为本地测试创建 `admin` / `admin123`。
 SQLite 模式会在首次启动时创建 `./data/xlstatus.db`。
+Web UI 使用 BOLD. 新粗野主义配色，并把显式的深色/浅色选择保存到 `localStorage.darkMode`。
 
 PostgreSQL 版本：
 
@@ -77,6 +79,8 @@ XLSTATUS_SEED_ADMIN_PASSWORD="admin123" \
 cd web
 NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm dev
 ```
+
+登录前先打开 `http://localhost:3000/status` 验证公共状态 API 是否可访问。登录后可在导航栏切换 BOLD. 浅色/深色配色。
 
 如果已经执行过 `pnpm build`，也可以用接近生产的方式本地运行：
 

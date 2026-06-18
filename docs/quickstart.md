@@ -12,9 +12,11 @@ Open:
 
 - API: http://localhost:8080
 - Web UI: http://localhost:3000
+- Public status: http://localhost:3000/status
 
 The default Compose file seeds `admin` / `admin123` for local testing.
 SQLite mode creates `./data/xlstatus.db` on first startup.
+The web UI uses the BOLD. neo-brutalist palette and stores the explicit light/dark choice in `localStorage.darkMode`.
 
 PostgreSQL variant:
 
@@ -77,6 +79,8 @@ Run the Web UI from source in another terminal:
 cd web
 NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm dev
 ```
+
+Open `http://localhost:3000/status` before login to confirm the public status API is reachable. After login, use the navigation theme switch to choose the BOLD. light or dark palette.
 
 For a production-style local run after `pnpm build`:
 

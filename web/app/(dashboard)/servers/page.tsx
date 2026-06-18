@@ -1,8 +1,24 @@
-'use client';
+"use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { apiClient } from '@/lib/api';
-import Navigation from '@/app/components/Navigation';
+import Link from "next/link";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import Navigation from "@/app/components/Navigation";
+import {
+  BrutalCard,
+  EmptyState,
+  InlineError,
+  PageHeader,
+  PageShell,
+  StatusBadge,
+  buttonClass,
+  formatDate,
+  formatPercent,
+  inputClass,
+  responseError,
+  tdClass,
+  thClass,
+} from "@/app/components/M7Primitives";
+import { apiClient } from "@/lib/api";
 
 interface Server {
   id: string;
@@ -24,286 +40,182 @@ interface LiveState {
   received_at: string;
 }
 
-type ConnectionState = 'connecting' | 'open' | 'closed' | 'error';
-
-function getCookie(name: string): string | null {
-  if (typeof document === 'undefined') return null;
-  const row = document.cookie
-    .split('; ')
-    .find((r) => r.startsWith(`${name}=`));
-  return row?.split('=')[1] ?? null;
-}
-
-function buildWsUrl(): string {
-  const apiBase =
-    process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
-  const u = new URL(apiBase);
-  const protocol = u.protocol === 'https:' ? 'wss' : 'ws';
-  return `${protocol}://${u.host}/ws/servers`;
-}
-
-function memPercent(state: LiveState | undefined): number | null {
-  if (!state?.memory_used || !state?.memory_total) return null;
-  return (state.memory_used / state.memory_total) * 100;
-}
+type ConnectionState = "connecting" | "open" | "closed" | "error";
 
 export default function ServersPage() {
   const [servers, setServers] = useState<Server[]>([]);
   const [live, setLive] = useState<Record<string, LiveState>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [conn, setConn] = useState<ConnectionState>('connecting');
+  const [query, setQuery] = useState("");
+  const [conn, setConn] = useState<ConnectionState>("connecting");
   const wsRef = useRef<WebSocket | null>(null);
 
   const loadServers = useCallback(async () => {
-    try {
-      setLoading(true);
-      const response = await apiClient.listServers();
-      if (response.success && response.data) {
-        setServers(response.data.servers as Server[]);
-      } else {
-        setError(response.error || 'Failed to load servers');
-      }
-    } catch {
-      setError('Network error');
-    } finally {
-      setLoading(false);
+    setLoading(true);
+    setError(null);
+    const response = await apiClient.listServers(200, 0);
+    setLoading(false);
+    if (response.success && response.data) {
+      setServers((response.data.servers as Server[]) ?? []);
+    } else {
+      setError(responseError(response));
     }
   }, []);
 
   useEffect(() => {
-    const id = window.setTimeout(() => {
+    const timeoutId = window.setTimeout(() => {
       void loadServers();
     }, 0);
-    return () => window.clearTimeout(id);
+    return () => window.clearTimeout(timeoutId);
   }, [loadServers]);
 
   useEffect(() => {
-    if (typeof window === 'undefined') return;
-    const session = getCookie('xlstatus_session');
-    if (!session) {
-      return;
-    }
+    if (typeof window === "undefined" || !getCookie("xlstatus_session")) return;
     let cancelled = false;
     let backoff = 1000;
 
     function connect() {
       if (cancelled) return;
-      setConn('connecting');
+      setConn("connecting");
       const ws = new WebSocket(buildWsUrl());
       wsRef.current = ws;
       ws.onopen = () => {
         if (cancelled) return;
-        setConn('open');
+        setConn("open");
         backoff = 1000;
       };
-      ws.onmessage = (ev) => {
+      ws.onmessage = (event) => {
         if (cancelled) return;
         try {
-          const msg = JSON.parse(ev.data as string);
-          if (msg.type === 'snapshot' && Array.isArray(msg.events)) {
-            setLive((prev) => {
-              const next = { ...prev };
-              for (const e of msg.events) {
-                if (e?.kind === 'host_state') {
-                  next[e.agent_id] = { ...e.payload, received_at: e.received_at };
-                }
+          const msg = JSON.parse(event.data as string) as Record<string, unknown>;
+          const events = msg.type === "snapshot" && Array.isArray(msg.events) ? msg.events : msg.type === "event" ? [msg.event] : [];
+          setLive((prev) => {
+            const next = { ...prev };
+            for (const raw of events) {
+              const item = raw as Record<string, unknown>;
+              if (item?.kind === "host_state" && typeof item.agent_id === "string") {
+                next[item.agent_id] = {
+                  ...((item.payload as Record<string, unknown>) ?? {}),
+                  received_at: String(item.received_at || new Date().toISOString()),
+                } as LiveState;
               }
-              return next;
-            });
-          } else if (msg.type === 'event' && msg.event) {
-            const e = msg.event;
-            if (e.kind === 'host_state') {
-              setLive((prev) => ({
-                ...prev,
-                [e.agent_id]: { ...e.payload, received_at: e.received_at },
-              }));
             }
-          }
+            return next;
+          });
         } catch {
-          // ignore malformed frames
+          // Ignore malformed live frames.
         }
       };
-      ws.onerror = () => {
-        if (cancelled) return;
-        setConn('error');
-      };
+      ws.onerror = () => setConn("error");
       ws.onclose = () => {
         if (cancelled) return;
-        setConn('closed');
-        const next = Math.min(backoff * 2, 15000);
-        backoff = next;
+        setConn("closed");
+        backoff = Math.min(backoff * 2, 15000);
         window.setTimeout(connect, backoff);
       };
     }
+
     connect();
     return () => {
       cancelled = true;
       wsRef.current?.close();
-      wsRef.current = null;
     };
   }, []);
 
   const merged = useMemo(
     () =>
-      servers.map((s) => {
-        const live_state = live[s.id];
+      servers.map((server) => {
+        const state = live[server.id];
         return {
-          ...s,
-          cpu_percent: live_state?.cpu_percent ?? s.cpu_percent,
-          memory_used: live_state?.memory_used ?? s.memory_used,
-          memory_total: live_state?.memory_total ?? s.memory_total,
-          load_1: live_state?.load_1 ?? s.load_1,
-          last_event_at: live_state?.received_at,
-        } as Server;
+          ...server,
+          cpu_percent: state?.cpu_percent ?? server.cpu_percent,
+          memory_used: state?.memory_used ?? server.memory_used,
+          memory_total: state?.memory_total ?? server.memory_total,
+          load_1: state?.load_1 ?? server.load_1,
+          last_event_at: state?.received_at ?? server.last_event_at,
+        };
       }),
-    [servers, live],
+    [live, servers],
   );
 
-  function connLabel(): { text: string; color: string } {
-    switch (conn) {
-      case 'open':
-        return { text: 'live', color: 'text-green-600' };
-      case 'connecting':
-        return { text: 'connecting…', color: 'text-yellow-600' };
-      case 'closed':
-        return { text: 'offline', color: 'text-gray-500' };
-      case 'error':
-        return { text: 'error', color: 'text-red-600' };
-    }
-  }
-
-  if (loading) {
-    return (
-      <div>
-        <Navigation />
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-          <p>Loading...</p>
-        </div>
-      </div>
-    );
-  }
-
-  if (error) {
-    return (
-      <div>
-        <Navigation />
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-          <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded">
-            {error}
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  const connInfo = connLabel();
+  const filtered = merged.filter((server) => {
+    const needle = query.trim().toLowerCase();
+    return !needle || [server.name, server.id, server.status].some((value) => value.toLowerCase().includes(needle));
+  });
 
   return (
-    <div>
+    <div className="min-h-screen">
       <Navigation />
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        <div className="mb-6 flex justify-between items-center">
-          <h1 className="text-2xl font-bold text-gray-900">Servers</h1>
-          <div className={`text-sm font-medium ${connInfo.color}`}>
-            ws: {connInfo.text}
-          </div>
+      <PageShell>
+        <PageHeader
+          eyebrow={`ws: ${conn}`}
+          title="Servers"
+          detail="接入的 Agent、实时主机状态和远程运维入口。"
+          actions={<button type="button" onClick={() => void loadServers()} className={buttonClass("secondary")}>Refresh</button>}
+        />
+        <InlineError message={error} />
+        <div className="mt-5 mb-5">
+          <input value={query} onChange={(event) => setQuery(event.target.value)} className={inputClass} placeholder="Search servers" />
         </div>
 
-        {merged.length === 0 ? (
-          <div className="text-center py-12">
-            <p className="text-gray-500">No servers found</p>
-            <p className="text-sm text-gray-400 mt-2">
-              Servers will appear here once agents connect
-            </p>
-          </div>
+        {loading ? (
+          <BrutalCard>Loading servers...</BrutalCard>
+        ) : filtered.length === 0 ? (
+          <EmptyState title="No servers found" detail="Servers will appear here once agents connect." />
         ) : (
-          <div className="bg-white shadow overflow-hidden sm:rounded-lg">
-            <table className="min-w-full divide-y divide-gray-200">
-              <thead className="bg-gray-50">
+          <div className="overflow-x-auto border-2 border-black bg-[var(--bg-card)] shadow-[var(--shadow-brutal)]">
+            <table className="w-full">
+              <thead>
                 <tr>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    Name
-                  </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    Status
-                  </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    CPU
-                  </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    Memory
-                  </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    Load (1m)
-                  </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    Last seen
-                  </th>
+                  <th className={thClass}>Name</th>
+                  <th className={thClass}>Status</th>
+                  <th className={thClass}>CPU</th>
+                  <th className={thClass}>Memory</th>
+                  <th className={thClass}>Load</th>
+                  <th className={thClass}>Last Event</th>
+                  <th className={thClass}>Action</th>
                 </tr>
               </thead>
-              <tbody className="bg-white divide-y divide-gray-200">
-                {merged.map((server) => {
-                  const memPct = memPercent(live[server.id]);
-                  return (
-                    <tr
-                      key={server.id}
-                      className="hover:bg-gray-50"
-                      data-testid={`server-row-${server.id}`}
-                    >
-                      <td className="px-6 py-4 whitespace-nowrap">
-                        <a
-                          href={`/servers/${server.id}`}
-                          className="text-sm font-medium text-blue-700 hover:underline"
-                        >
-                          {server.name}
-                        </a>
-                        <div className="text-sm text-gray-500">
-                          {server.id}
-                        </div>
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap">
-                        <span
-                          className={`text-sm font-medium ${
-                            server.status === 'online'
-                              ? 'text-green-600'
-                              : server.status === 'offline'
-                                ? 'text-red-600'
-                                : 'text-gray-600'
-                          }`}
-                        >
-                          {server.status}
-                        </span>
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                        {server.cpu_percent !== undefined
-                          ? `${server.cpu_percent.toFixed(1)}%`
-                          : 'N/A'}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                        {memPct !== null
-                          ? `${memPct.toFixed(1)}%`
-                          : server.memory_used !== undefined &&
-                              server.memory_total !== undefined
-                            ? `${(server.memory_used / 1e9).toFixed(1)} / ${(server.memory_total / 1e9).toFixed(1)} GB`
-                            : 'N/A'}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                        {server.load_1 !== undefined
-                          ? server.load_1.toFixed(2)
-                          : 'N/A'}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                        {server.last_seen_at || 'Never'}
-                      </td>
-                    </tr>
-                  );
-                })}
+              <tbody>
+                {filtered.map((server) => (
+                  <tr key={server.id}>
+                    <td className={tdClass}>
+                      <div className="font-black">{server.name}</div>
+                      <div className="text-xs text-[var(--text-muted)]">{server.id}</div>
+                    </td>
+                    <td className={tdClass}><StatusBadge tone={server.status === "online" ? "green" : "red"}>{server.status}</StatusBadge></td>
+                    <td className={tdClass}>{formatPercent(server.cpu_percent)}</td>
+                    <td className={tdClass}>{memoryLabel(server)}</td>
+                    <td className={tdClass}>{server.load_1 === undefined ? "N/A" : server.load_1.toFixed(2)}</td>
+                    <td className={tdClass}>{formatDate(server.last_event_at || server.last_seen_at)}</td>
+                    <td className={tdClass}>
+                      <Link className={buttonClass("primary")} href={`/servers/${encodeURIComponent(server.id)}`}>
+                        Open
+                      </Link>
+                    </td>
+                  </tr>
+                ))}
               </tbody>
             </table>
           </div>
         )}
-      </div>
+      </PageShell>
     </div>
   );
+}
+
+function memoryLabel(server: Server): string {
+  if (!server.memory_used || !server.memory_total) return "N/A";
+  return `${((server.memory_used / server.memory_total) * 100).toFixed(1)}%`;
+}
+
+function getCookie(name: string): string | null {
+  return document.cookie.split("; ").find((row) => row.startsWith(`${name}=`))?.split("=")[1] ?? null;
+}
+
+function buildWsUrl(): string {
+  const apiBase = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
+  const url = new URL(apiBase);
+  return `${url.protocol === "https:" ? "wss" : "ws"}://${url.host}/ws/servers`;
 }
