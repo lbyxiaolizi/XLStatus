@@ -21,6 +21,9 @@ pub struct ServerConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct DatabaseConfig {
     pub url: String,
+
+    #[serde(default)]
+    pub create_if_missing: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -41,7 +44,13 @@ impl Config {
                     http_bind: std::env::var("HTTP_BIND").unwrap_or_else(|_| default_http_bind()),
                     grpc_bind: std::env::var("GRPC_BIND").unwrap_or_else(|_| default_grpc_bind()),
                 },
-                database: DatabaseConfig { url: database_url },
+                database: DatabaseConfig {
+                    url: database_url,
+                    create_if_missing: std::env::var("DATABASE_CREATE_IF_MISSING")
+                        .ok()
+                        .map(|value| parse_bool_env(&value))
+                        .unwrap_or(false),
+                },
                 security: SecurityConfig {
                     session_secret: std::env::var("SESSION_SECRET")
                         .unwrap_or_else(|_| default_session_secret()),
@@ -76,6 +85,7 @@ impl Default for Config {
             },
             database: DatabaseConfig {
                 url: "sqlite://dev.db".to_string(),
+                create_if_missing: false,
             },
             security: SecurityConfig {
                 session_secret: default_session_secret(),
@@ -99,4 +109,30 @@ fn default_session_secret() -> String {
 
 fn default_session_ttl_hours() -> i64 {
     24
+}
+
+fn parse_bool_env(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "y" | "on"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_bool_env;
+
+    #[test]
+    fn parses_truthy_database_create_flag() {
+        for value in ["1", "true", "TRUE", "yes", "y", "on"] {
+            assert!(parse_bool_env(value));
+        }
+    }
+
+    #[test]
+    fn parses_falsey_database_create_flag() {
+        for value in ["0", "false", "no", "off", ""] {
+            assert!(!parse_bool_env(value));
+        }
+    }
 }

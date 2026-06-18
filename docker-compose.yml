@@ -11,6 +11,7 @@ services:
       - ./data:/data
     environment:
       - DATABASE_URL=sqlite:///data/xlstatus.db?mode=rwc
+      - DATABASE_CREATE_IF_MISSING=true
       - RUST_LOG=info
       - HTTP_BIND=0.0.0.0:8080
       - GRPC_BIND=0.0.0.0:50051

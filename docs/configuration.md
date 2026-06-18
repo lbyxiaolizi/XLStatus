@@ -2,7 +2,7 @@
 
 This document describes the configuration that is implemented in the current XLStatus binaries.
 
-## Server
+## Server Loading Order
 
 The server loads configuration in this order:
 
@@ -10,10 +10,13 @@ The server loads configuration in this order:
 2. TOML file pointed to by `CONFIG_FILE`.
 3. Development defaults.
 
-Environment variables:
+Environment variables override the TOML file only when `DATABASE_URL` is present. If you want file-based configuration, set only `CONFIG_FILE`.
+
+## Environment Variables
 
 ```env
 DATABASE_URL=sqlite:///var/lib/xlstatus/xlstatus.db?mode=rwc
+DATABASE_CREATE_IF_MISSING=true
 HTTP_BIND=0.0.0.0:8080
 GRPC_BIND=0.0.0.0:50051
 SESSION_SECRET=replace-with-a-long-random-secret
@@ -22,11 +25,16 @@ XLSTATUS_SEED_ADMIN_USERNAME=admin
 XLSTATUS_SEED_ADMIN_PASSWORD=admin123
 ```
 
-TOML file:
+`XLSTATUS_SEED_ADMIN_PASSWORD` is only used to seed an admin user when one does not already exist.
+
+## TOML File
+
+Copy [../config.example.toml](../config.example.toml) to your target path and edit it:
 
 ```toml
 [database]
 url = "sqlite:///var/lib/xlstatus/xlstatus.db?mode=rwc"
+create_if_missing = true
 
 [server]
 http_bind = "0.0.0.0:8080"
@@ -44,6 +52,74 @@ CONFIG_FILE=/etc/xlstatus/server.toml /usr/local/bin/xlstatus-server
 ```
 
 The server currently has no `--config`, `--validate`, or `--version` CLI flags.
+
+## SQLite
+
+SQLite is the simplest mode for a single-node install:
+
+```toml
+[database]
+url = "sqlite:///var/lib/xlstatus/xlstatus.db?mode=rwc"
+create_if_missing = true
+```
+
+Startup behavior when the database file is missing:
+
+- If the URL contains `?mode=rwc`, XLStatus creates the file.
+- If `create_if_missing = true` or `DATABASE_CREATE_IF_MISSING=true`, XLStatus creates the file.
+- If neither is set and the server is started from an interactive terminal, XLStatus asks whether to create the file.
+- If neither is set and the server runs non-interactively, startup fails with a clear message instead of silently creating data in the wrong place.
+
+The parent directory is created automatically when creation is allowed. For systemd installs, make sure the service user can write it:
+
+```bash
+sudo mkdir -p /var/lib/xlstatus
+sudo chown -R xlstatus:xlstatus /var/lib/xlstatus
+```
+
+Use `?mode=rw` when you intentionally want startup to fail if the file is missing:
+
+```toml
+[database]
+url = "sqlite:///var/lib/xlstatus/xlstatus.db?mode=rw"
+create_if_missing = false
+```
+
+## PostgreSQL
+
+PostgreSQL is recommended when the database is managed separately, backed up centrally, or shared with production operations tooling.
+
+XLStatus runs its own schema migrations after it connects, but it does not create the PostgreSQL role or database. Create them before first start:
+
+```bash
+sudo -u postgres psql <<'SQL'
+CREATE USER xlstatus WITH PASSWORD 'change-this-password';
+CREATE DATABASE xlstatus OWNER xlstatus;
+GRANT ALL PRIVILEGES ON DATABASE xlstatus TO xlstatus;
+SQL
+```
+
+Test the login:
+
+```bash
+psql 'postgresql://xlstatus:change-this-password@localhost:5432/xlstatus' -c 'select 1;'
+```
+
+Then configure XLStatus:
+
+```toml
+[database]
+url = "postgresql://xlstatus:change-this-password@localhost:5432/xlstatus"
+create_if_missing = false
+```
+
+Equivalent environment variable:
+
+```bash
+DATABASE_URL='postgresql://xlstatus:change-this-password@localhost:5432/xlstatus'
+```
+
+For a fresh site, the first XLStatus startup creates all application tables through embedded migrations. Keep the database empty before that first run unless you are restoring from a backup made by the same application version.
 
 ## Agent
 
@@ -87,5 +163,9 @@ The Compose files configure the server through environment variables. Render the
 docker compose config
 docker compose -f docker-compose.pg.yml config
 ```
+
+The SQLite Compose files set `DATABASE_CREATE_IF_MISSING=true` and use `?mode=rwc`, so a new local data volume starts cleanly.
+
+The PostgreSQL Compose file uses the official `postgres:15` image with `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `POSTGRES_DB`; the image creates the role and database on an empty volume, then XLStatus applies its application migrations.
 
 The demo agent service is behind the `agent-demo` profile because it needs a pre-enrolled config mounted at `/etc/xlstatus-agent/agent.json`.

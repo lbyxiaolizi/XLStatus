@@ -12,6 +12,7 @@ CONFIG_FILE="${CONFIG_FILE:-/etc/xlstatus/server.toml}"
 HTTP_BIND="${HTTP_BIND:-0.0.0.0:8080}"
 GRPC_BIND="${GRPC_BIND:-0.0.0.0:50051}"
 DATABASE_URL="${DATABASE_URL:-sqlite://$DATA_DIR/xlstatus.db?mode=rwc}"
+DATABASE_CREATE_IF_MISSING="${DATABASE_CREATE_IF_MISSING:-true}"
 SESSION_SECRET="${SESSION_SECRET:-}"
 ADMIN_USERNAME="${ADMIN_USERNAME:-admin}"
 ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"
@@ -124,6 +125,7 @@ fi
 cat > "$CONFIG_FILE" << EOF
 [database]
 url = "$DATABASE_URL"
+create_if_missing = $DATABASE_CREATE_IF_MISSING
 
 [server]
 http_bind = "$HTTP_BIND"

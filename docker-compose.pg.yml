@@ -26,7 +26,7 @@ services:
       - "8080:8080"
       - "50051:50051"
     environment:
-      - DATABASE_URL=postgres://xlstatus:xlstatus_password@postgres:5432/xlstatus
+      - DATABASE_URL=postgresql://xlstatus:xlstatus_password@postgres:5432/xlstatus
       - RUST_LOG=info
       - HTTP_BIND=0.0.0.0:8080
       - GRPC_BIND=0.0.0.0:50051

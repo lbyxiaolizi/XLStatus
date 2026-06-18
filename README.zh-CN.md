@@ -44,9 +44,16 @@ docker compose up -d
 docker compose -f docker-compose.pg.yml up -d
 ```
 
-访问控制面板：http://localhost:8080
+访问：
+
+- Web UI：http://localhost:3000
+- API：http://localhost:8080
 
 默认账号：`admin` / `admin123`
+
+SQLite Compose 首次启动会创建 `./data/xlstatus.db`。PostgreSQL Compose 会在空 volume 上创建 `xlstatus` 用户和数据库，应用表由 XLStatus 自动迁移。
+
+从源码直接运行 SQLite 时，推荐保留 `?mode=rwc` 或设置 `DATABASE_CREATE_IF_MISSING=true`；如果数据库文件不存在且未允许自动创建，交互式运行会询问是否新建，非交互运行会报错退出。PostgreSQL 新站初始化步骤见 [安装指南](./docs/installation.md#postgresql-new-site)。
 
 ### 使用安装脚本
 

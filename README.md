@@ -44,9 +44,16 @@ docker compose up -d
 docker compose -f docker-compose.pg.yml up -d
 ```
 
-Access the dashboard at http://localhost:8080
+Open:
+
+- Web UI: http://localhost:3000
+- API: http://localhost:8080
 
 Default credentials: `admin` / `admin123`
+
+SQLite Compose creates `./data/xlstatus.db` on first startup. PostgreSQL Compose creates the `xlstatus` role and database on an empty volume, then XLStatus applies application migrations.
+
+When running SQLite from source, keep `?mode=rwc` or set `DATABASE_CREATE_IF_MISSING=true`. If the database file is missing and auto-create is not enabled, interactive runs ask whether to create it and non-interactive runs exit with a clear error. PostgreSQL new-site setup is covered in the [Installation Guide](./docs/installation.md#postgresql-new-site).
 
 ### Using Install Script
 

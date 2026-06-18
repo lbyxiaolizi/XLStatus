@@ -23,9 +23,39 @@ Common causes:
 - Port conflict: `sudo ss -tlnp | grep -E '8080|50051'`
 - Bad config path: confirm `Environment="CONFIG_FILE=..."` in `/etc/systemd/system/xlstatus.service`
 - SQLite permissions: `sudo chown -R xlstatus:xlstatus /var/lib/xlstatus`
+- SQLite file missing: add `?mode=rwc`, set `create_if_missing = true`, or create the file intentionally before restart
 - PostgreSQL URL mismatch: test the exact `DATABASE_URL` with `psql`
+- PostgreSQL fresh site not initialized: create the role and database first, then let XLStatus run application migrations
 
 The server currently has no `--config`, `--validate`, or `--version` CLI flags. Use `CONFIG_FILE` or environment variables.
+
+## Database Startup
+
+SQLite auto-create is enabled by either URL or config:
+
+```toml
+[database]
+url = "sqlite:///var/lib/xlstatus/xlstatus.db?mode=rwc"
+create_if_missing = true
+```
+
+If the file is missing and auto-create is disabled, manual foreground runs prompt for confirmation. systemd and Docker runs fail fast with a message that names the missing file.
+
+For PostgreSQL, verify the database exists before starting XLStatus:
+
+```bash
+psql 'postgresql://xlstatus:change-this-password@localhost:5432/xlstatus' -c 'select 1;'
+```
+
+If that fails, create the fresh database:
+
+```bash
+sudo -u postgres psql <<'SQL'
+CREATE USER xlstatus WITH PASSWORD 'change-this-password';
+CREATE DATABASE xlstatus OWNER xlstatus;
+GRANT ALL PRIVILEGES ON DATABASE xlstatus TO xlstatus;
+SQL
+```
 
 ## Docker Compose
 
@@ -118,13 +148,13 @@ curl -fsS http://localhost:8080/healthz
 PostgreSQL backup:
 
 ```bash
-pg_dump 'postgres://xlstatus:xlstatus_password@localhost:5432/xlstatus' > xlstatus.sql
+pg_dump 'postgresql://xlstatus:xlstatus_password@localhost:5432/xlstatus' > xlstatus.sql
 ```
 
 PostgreSQL restore:
 
 ```bash
-psql 'postgres://xlstatus:xlstatus_password@localhost:5432/xlstatus' < xlstatus.sql
+psql 'postgresql://xlstatus:xlstatus_password@localhost:5432/xlstatus' < xlstatus.sql
 ```
 
 Restore into the same application version that created the backup unless a migration plan has been tested.

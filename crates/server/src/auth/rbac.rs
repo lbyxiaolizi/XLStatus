@@ -358,7 +358,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn has_scope_pat_admin_star_is_literal_match_only() {
         // admin:* is a literal scope name; it does NOT namespace-wildcard
         // into other domains. Issuance is gated separately by role in
