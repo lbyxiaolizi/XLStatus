@@ -19,6 +19,8 @@ docker compose ps
 curl -fsS http://localhost:8080/healthz
 ```
 
+The first SQLite startup creates `./data/xlstatus.db` because Compose sets `DATABASE_CREATE_IF_MISSING=true` and uses `?mode=rwc`.
+
 PostgreSQL stack:
 
 ```bash
@@ -26,6 +28,8 @@ docker compose -f docker-compose.pg.yml up -d
 docker compose -f docker-compose.pg.yml ps
 curl -fsS http://localhost:8080/healthz
 ```
+
+On a new Compose volume, the `postgres:15` image creates the `xlstatus` role and database from `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `POSTGRES_DB`; XLStatus then runs its embedded schema migrations on first server start.
 
 The Compose files build three images from the repository:
 
@@ -37,6 +41,7 @@ The server accepts these environment variables:
 
 ```env
 DATABASE_URL=sqlite:///data/xlstatus.db?mode=rwc
+DATABASE_CREATE_IF_MISSING=true
 HTTP_BIND=0.0.0.0:8080
 GRPC_BIND=0.0.0.0:50051
 SESSION_SECRET=change-me-in-production
@@ -54,7 +59,9 @@ cargo build --release --bin xlstatus-agent
 Run a local server with SQLite:
 
 ```bash
+mkdir -p ./data
 DATABASE_URL="sqlite://$(pwd)/data/xlstatus.db?mode=rwc" \
+DATABASE_CREATE_IF_MISSING=true \
 HTTP_BIND="0.0.0.0:8080" \
 GRPC_BIND="0.0.0.0:50051" \
 SESSION_SECRET="replace-me" \
@@ -63,11 +70,46 @@ XLSTATUS_SEED_ADMIN_PASSWORD="admin123" \
 ./target/release/xlstatus-server
 ```
 
+If you omit both `?mode=rwc` and `DATABASE_CREATE_IF_MISSING=true`, an interactive terminal asks whether to create the SQLite file. Non-interactive starts fail with a clear message so systemd or Docker do not silently create data in the wrong place.
+
+### PostgreSQL New Site
+
+Install PostgreSQL 15+ and create an empty role/database before the first XLStatus start:
+
+```bash
+sudo -u postgres psql <<'SQL'
+CREATE USER xlstatus WITH PASSWORD 'change-this-password';
+CREATE DATABASE xlstatus OWNER xlstatus;
+GRANT ALL PRIVILEGES ON DATABASE xlstatus TO xlstatus;
+SQL
+```
+
+Check the connection:
+
+```bash
+psql 'postgresql://xlstatus:change-this-password@localhost:5432/xlstatus' -c 'select 1;'
+```
+
+Start XLStatus against that database:
+
+```bash
+DATABASE_URL='postgresql://xlstatus:change-this-password@localhost:5432/xlstatus' \
+HTTP_BIND="0.0.0.0:8080" \
+GRPC_BIND="0.0.0.0:50051" \
+SESSION_SECRET="$(openssl rand -hex 32)" \
+XLSTATUS_SEED_ADMIN_USERNAME="admin" \
+XLSTATUS_SEED_ADMIN_PASSWORD="admin123" \
+./target/release/xlstatus-server
+```
+
+XLStatus creates application tables through embedded migrations. Do not pre-load unrelated tables into a fresh XLStatus database.
+
 The server also supports `CONFIG_FILE=/path/to/server.toml`:
 
 ```toml
 [database]
 url = "sqlite:///var/lib/xlstatus/xlstatus.db?mode=rwc"
+create_if_missing = true
 
 [server]
 http_bind = "0.0.0.0:8080"
@@ -85,6 +127,16 @@ Pre-built release binaries are not published yet, so build first and pass `BINAR
 ```bash
 cargo build --release --bin xlstatus-server
 sudo BINARY_PATH=target/release/xlstatus-server \
+  ADMIN_PASSWORD='admin123' \
+  bash deploy/install.sh
+```
+
+To install systemd mode with PostgreSQL, create the PostgreSQL role/database first, then pass the URL:
+
+```bash
+sudo BINARY_PATH=target/release/xlstatus-server \
+  DATABASE_URL='postgresql://xlstatus:change-this-password@localhost:5432/xlstatus' \
+  DATABASE_CREATE_IF_MISSING=false \
   ADMIN_PASSWORD='admin123' \
   bash deploy/install.sh
 ```
@@ -148,7 +200,7 @@ sudo systemctl start xlstatus
 PostgreSQL:
 
 ```bash
-pg_dump 'postgres://xlstatus:xlstatus_password@localhost:5432/xlstatus' > xlstatus.sql
+pg_dump 'postgresql://xlstatus:xlstatus_password@localhost:5432/xlstatus' > xlstatus.sql
 ```
 
 Restore into the same application version that produced the backup, then start the service and check `/healthz`.

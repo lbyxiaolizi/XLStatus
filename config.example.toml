@@ -4,8 +4,12 @@
 [database]
 # SQLite example:
 url = "sqlite:///var/lib/xlstatus/xlstatus.db?mode=rwc"
+# When true, XLStatus creates the SQLite file and parent directory on first boot.
+# `?mode=rwc` in the URL also enables creation.
+create_if_missing = true
 # PostgreSQL example:
-# url = "postgres://xlstatus:xlstatus_password@localhost:5432/xlstatus"
+# url = "postgresql://xlstatus:xlstatus_password@localhost:5432/xlstatus"
+# create_if_missing = false
 
 [server]
 http_bind = "0.0.0.0:8080"

@@ -124,7 +124,8 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Configuration loaded");
 
     // Connect to database
-    let db = db::DatabaseBackend::connect(&config.database.url).await?;
+    let db = db::DatabaseBackend::connect(&config.database.url, config.database.create_if_missing)
+        .await?;
     tracing::info!("Connected to database: {}", config.database.url);
 
     // Run migrations
