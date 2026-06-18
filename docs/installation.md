@@ -1,61 +1,41 @@
-# Installation Guide
+# 安装部署
 
-This guide reflects the current M9 release-stability artifacts in this repository. XLStatus is still under active development; use these steps for repeatable local or lab deployment, and review [implementation-audit.md](./implementation-audit.md) before production use.
+本文档覆盖当前仓库可用的部署路径：Docker Compose、源码运行、systemd 安装脚本、PostgreSQL 新站、Web UI 和 Agent。
 
-## Requirements
+## 平台要求
 
-- Linux x86_64 for systemd installs
-- Docker 20.10+ and Docker Compose v2 for container installs
-- Rust toolchain when building binaries from source
-- Node.js 20+ with Corepack/pnpm when building the web image or running the frontend from source
+- Linux x86_64：systemd 安装脚本当前支持的平台。
+- Docker 20.10+ 和 Docker Compose v2：用于容器部署。
+- Rust 工具链：用于从源码构建 Server 和 Agent。
+- Node.js 20+、Corepack、pnpm：用于构建 `web/`。
+- SQLite 3.40+ 或 PostgreSQL 15+。
 
 ## Docker Compose
 
-SQLite stack:
-
 ```bash
 docker compose up -d
-docker compose ps
 curl -fsS http://localhost:8080/healthz
 ```
 
-The first SQLite startup creates `./data/xlstatus.db` because Compose sets `DATABASE_CREATE_IF_MISSING=true` and uses `?mode=rwc`.
-The full Compose stacks also set `CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000` for the bundled Web UI.
-
-PostgreSQL stack:
+PostgreSQL：
 
 ```bash
 docker compose -f docker-compose.pg.yml up -d
-docker compose -f docker-compose.pg.yml ps
 curl -fsS http://localhost:8080/healthz
 ```
 
-On a new Compose volume, the `postgres:15` image creates the `xlstatus` role and database from `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `POSTGRES_DB`; XLStatus then runs its embedded schema migrations on first server start.
+本地访问：
 
-The Compose files build three images from the repository:
+- Web UI: `http://localhost:3000`
+- API: `http://localhost:8080`
+- Public Status: `http://localhost:3000/status`
 
-- `server`: Rust dashboard API and gRPC server, HTTP on `8080`, gRPC on `50051`.
-- `web`: Next.js dashboard on `3000`.
-- `agent-demo`: disabled by default behind the `agent-demo` profile because the agent must be enrolled before it has a usable config.
-
-The server accepts these environment variables:
-
-```env
-DATABASE_URL=sqlite:///data/xlstatus.db?mode=rwc
-DATABASE_CREATE_IF_MISSING=true
-HTTP_BIND=0.0.0.0:8080
-GRPC_BIND=0.0.0.0:50051
-CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
-SESSION_SECRET=change-me-in-production
-XLSTATUS_SEED_ADMIN_USERNAME=admin
-XLSTATUS_SEED_ADMIN_PASSWORD=admin123
-```
-
-## Source Build
+## 从源码构建
 
 ```bash
 cargo build --release --bin xlstatus-server
 cargo build --release --bin xlstatus-agent
+
 corepack enable
 cd web
 pnpm install --frozen-lockfile
@@ -63,35 +43,63 @@ NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm build
 cd ..
 ```
 
-Run a local server with SQLite:
+前端构建时的 `NEXT_PUBLIC_API_URL` 会进入浏览器 bundle。生产环境请设置为用户浏览器能访问的 API 地址。
+
+## systemd 安装 Server
+
+当前没有预编译 release 二进制，先构建再安装：
 
 ```bash
-mkdir -p ./data
-DATABASE_URL="sqlite://$(pwd)/data/xlstatus.db?mode=rwc" \
-DATABASE_CREATE_IF_MISSING=true \
-HTTP_BIND="0.0.0.0:8080" \
-GRPC_BIND="0.0.0.0:50051" \
-CORS_ALLOWED_ORIGINS="http://localhost:3000,http://127.0.0.1:3000" \
-SESSION_SECRET="replace-me" \
-XLSTATUS_SEED_ADMIN_USERNAME="admin" \
-XLSTATUS_SEED_ADMIN_PASSWORD="admin123" \
-./target/release/xlstatus-server
+cargo build --release --bin xlstatus-server
+sudo BINARY_PATH=target/release/xlstatus-server \
+  ADMIN_USERNAME=admin \
+  ADMIN_PASSWORD='admin123' \
+  CORS_ALLOWED_ORIGINS='http://localhost:3000,http://127.0.0.1:3000' \
+  bash deploy/install.sh
 ```
 
-If you omit both `?mode=rwc` and `DATABASE_CREATE_IF_MISSING=true`, an interactive terminal asks whether to create the SQLite file. Non-interactive starts fail with a clear message so systemd or Docker do not silently create data in the wrong place.
+默认安装位置：
 
-You can use a TOML file instead of environment variables:
+- 二进制：`/usr/local/bin/xlstatus-server`
+- 配置：`/etc/xlstatus/server.toml`
+- 数据：`/var/lib/xlstatus`
+- 服务：`/etc/systemd/system/xlstatus.service`
+
+运维命令：
 
 ```bash
-cp config.example.toml ./config.toml
-CONFIG_FILE=./config.toml ./target/release/xlstatus-server
+sudo systemctl status xlstatus
+sudo journalctl -u xlstatus -n 100 --no-pager
+curl -fsS http://localhost:8080/healthz
 ```
 
-Do not set `DATABASE_URL` when using `CONFIG_FILE`; `DATABASE_URL` selects environment-variable configuration mode.
+脚本会把 `CORS_ALLOWED_ORIGINS` 写入 TOML 的 `server.cors_allowed_origins`，启动失败时会打印最近的 systemd 日志。
 
-### PostgreSQL New Site
+## 自定义安装参数
 
-Install PostgreSQL 15+ and create an empty role/database before the first XLStatus start:
+常用变量：
+
+```bash
+VERSION=v1.0.0
+INSTALL_DIR=/opt/xlstatus
+DATA_DIR=/var/lib/xlstatus
+BINARY_PATH=target/release/xlstatus-server
+CONFIG_FILE=/etc/xlstatus/server.toml
+HTTP_BIND=0.0.0.0:8080
+GRPC_BIND=0.0.0.0:50051
+DATABASE_URL=sqlite:///var/lib/xlstatus/xlstatus.db?mode=rwc
+DATABASE_CREATE_IF_MISSING=true
+CORS_ALLOWED_ORIGINS=https://status.example.com
+SESSION_SECRET="$(openssl rand -hex 32)"
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=admin123
+```
+
+安装脚本会生成完整 `server.toml`。如果要走 `CONFIG_FILE` 模式，不要在 systemd unit 里额外设置 `DATABASE_URL`。
+
+## PostgreSQL 新站
+
+XLStatus 会执行应用迁移，但不会创建 PostgreSQL 用户和数据库。新站需要先准备：
 
 ```bash
 sudo -u postgres psql <<'SQL'
@@ -101,13 +109,13 @@ GRANT ALL PRIVILEGES ON DATABASE xlstatus TO xlstatus;
 SQL
 ```
 
-Check the connection:
+验证连接：
 
 ```bash
 psql 'postgresql://xlstatus:change-this-password@localhost:5432/xlstatus' -c 'select 1;'
 ```
 
-Start XLStatus against that database:
+源码前台运行：
 
 ```bash
 DATABASE_URL='postgresql://xlstatus:change-this-password@localhost:5432/xlstatus' \
@@ -120,86 +128,46 @@ XLSTATUS_SEED_ADMIN_PASSWORD="admin123" \
 ./target/release/xlstatus-server
 ```
 
-XLStatus creates application tables through embedded migrations. Do not pre-load unrelated tables into a fresh XLStatus database.
+systemd 安装：
 
-Run the web dashboard from source after the server is healthy:
+```bash
+sudo BINARY_PATH=target/release/xlstatus-server \
+  DATABASE_URL='postgresql://xlstatus:change-this-password@localhost:5432/xlstatus' \
+  DATABASE_CREATE_IF_MISSING=false \
+  CORS_ALLOWED_ORIGINS='https://status.example.com' \
+  ADMIN_PASSWORD='admin123' \
+  bash deploy/install.sh
+```
+
+新站数据库应为空。恢复备份时，请使用和备份匹配的应用版本并先在测试环境验证。
+
+## Web UI 部署
+
+开发：
 
 ```bash
 cd web
 NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm dev
 ```
 
-For a production-style source run after `pnpm build`:
+生产式运行：
 
 ```bash
 cd web
-NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm start
+NEXT_PUBLIC_API_URL=https://api.example.com pnpm build
+NEXT_PUBLIC_API_URL=https://api.example.com pnpm start
 ```
 
-Open the dashboard at `http://localhost:3000`; the frontend calls the server API configured by `NEXT_PUBLIC_API_URL`.
-The unauthenticated public status page is `http://localhost:3000/status` and reads `GET /api/v1/public/status`.
-The management dashboard uses the BOLD. neo-brutalist palette; the navigation bar exposes explicit light/dark choices and stores the preference in `localStorage.darkMode`.
-If the Web UI runs on a different host, scheme, or port, add that exact browser origin to `CORS_ALLOWED_ORIGINS` or `server.cors_allowed_origins` before starting the API server.
-
-The server also supports `CONFIG_FILE=/path/to/server.toml`:
+如果 Web UI 是 `https://status.example.com`，后端 CORS 必须包含这个精确来源：
 
 ```toml
-[database]
-url = "sqlite:///var/lib/xlstatus/xlstatus.db?mode=rwc"
-create_if_missing = true
-
 [server]
-http_bind = "0.0.0.0:8080"
-grpc_bind = "0.0.0.0:50051"
-cors_allowed_origins = [
-  "http://localhost:3000",
-  "http://127.0.0.1:3000",
-]
-
-[security]
-session_secret = "replace-me-with-a-long-random-secret"
-session_ttl_hours = 24
+cors_allowed_origins = ["https://status.example.com"]
 ```
 
-## systemd Server Install
+## Agent 安装
 
-Pre-built release binaries are not published yet, so build first and pass `BINARY_PATH`:
-
-```bash
-cargo build --release --bin xlstatus-server
-sudo BINARY_PATH=target/release/xlstatus-server \
-  ADMIN_PASSWORD='admin123' \
-  bash deploy/install.sh
-```
-
-To install systemd mode with PostgreSQL, create the PostgreSQL role/database first, then pass the URL:
-
-```bash
-sudo BINARY_PATH=target/release/xlstatus-server \
-  DATABASE_URL='postgresql://xlstatus:change-this-password@localhost:5432/xlstatus' \
-  DATABASE_CREATE_IF_MISSING=false \
-  ADMIN_PASSWORD='admin123' \
-  bash deploy/install.sh
-```
-
-The script installs:
-
-- Binary symlink: `/usr/local/bin/xlstatus-server`
-- Config: `/etc/xlstatus/server.toml`
-- Data directory: `/var/lib/xlstatus`
-- Unit: `/etc/systemd/system/xlstatus.service`
-
-Useful commands:
-
-```bash
-sudo systemctl status xlstatus
-sudo journalctl -u xlstatus -f
-curl -fsS http://localhost:8080/healthz
-```
-
-## Agent Install
-
-Create an enrollment token in the dashboard or with the admin API, then install and enroll the agent:
+先创建 enrollment token，然后：
 
 ```bash
 cargo build --release --bin xlstatus-agent
@@ -211,52 +179,32 @@ sudo BINARY_PATH=target/release/xlstatus-agent \
   bash deploy/install-agent.sh
 ```
 
-The agent CLI currently supports:
+安装后检查：
 
 ```bash
-xlstatus-agent enroll --server http://dashboard.example.com:8080 \
-  --grpc-server http://dashboard.example.com:50051 \
-  --token xle_... \
-  --name web-01 \
-  --config /etc/xlstatus-agent/agent.json
-
-xlstatus-agent run --config /etc/xlstatus-agent/agent.json
+sudo systemctl status xlstatus-agent
+sudo journalctl -u xlstatus-agent -n 100 --no-pager
 ```
 
-The enrollment config is JSON and contains the agent id, dashboard HTTP URL, gRPC URL, public key, and private key. Keep it mode `0600`.
+## 远端 Linux x86_64 验证
 
-## Backup And Restore
-
-The planned `xlstatus-server backup` and `restore` subcommands are not implemented yet. For current builds, use database and filesystem backups.
-
-SQLite:
+在目标服务器上：
 
 ```bash
-sudo systemctl stop xlstatus
-sudo cp /var/lib/xlstatus/xlstatus.db /var/lib/xlstatus/xlstatus.db.$(date +%Y%m%d%H%M%S).bak
-sudo tar czf xlstatus-config-data.tgz /etc/xlstatus /var/lib/xlstatus
-sudo systemctl start xlstatus
+git pull --ff-only
+cargo build --release --bin xlstatus-server
+mkdir -p ./data
+timeout 8s env \
+  DATABASE_URL="sqlite://$(pwd)/data/xlstatus.db?mode=rwc" \
+  DATABASE_CREATE_IF_MISSING=true \
+  HTTP_BIND="0.0.0.0:8080" \
+  GRPC_BIND="0.0.0.0:50051" \
+  CORS_ALLOWED_ORIGINS="http://localhost:3000,http://127.0.0.1:3000" \
+  SESSION_SECRET="replace-me" \
+  XLSTATUS_SEED_ADMIN_USERNAME="admin" \
+  XLSTATUS_SEED_ADMIN_PASSWORD="admin123" \
+  ./target/release/xlstatus-server
+echo $?
 ```
 
-PostgreSQL:
-
-```bash
-pg_dump 'postgresql://xlstatus:xlstatus_password@localhost:5432/xlstatus' > xlstatus.sql
-```
-
-Restore into the same application version that produced the backup, then start the service and check `/healthz`.
-
-## OpenAPI
-
-The workspace includes `utoipa`, but the server does not currently expose or generate a complete OpenAPI document. Treat [api.md](./api.md) as a hand-maintained reference for now and update it when routes change.
-
-## Verification
-
-Run the deterministic M9 install verifier after building debug binaries:
-
-```bash
-cargo build --bin xlstatus-server --bin xlstatus-agent
-test-run/verify-m9-install.sh
-```
-
-The script checks server startup, `/healthz`, admin login, enrollment-token creation, agent enrollment, and a short agent gRPC run.
+退出码 `124` 代表服务持续运行到 timeout。退出码 `1` 或日志里的 `failed to bind` 通常是端口占用或绑定地址错误。

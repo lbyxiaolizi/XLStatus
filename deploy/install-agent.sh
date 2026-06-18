@@ -174,6 +174,9 @@ if systemctl is-active --quiet xlstatus-agent; then
   echo ""
 else
   echo "❌ Failed to start agent"
-  echo "   Check logs: journalctl -u xlstatus-agent -f"
+  echo ""
+  systemctl status xlstatus-agent --no-pager || true
+  echo ""
+  journalctl -u xlstatus-agent -n 80 --no-pager || true
   exit 1
 fi

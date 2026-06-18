@@ -9,9 +9,9 @@
 
 ## 当前状态
 
-XLStatus 仍处于开发中。当前 workspace 已通过 `cargo check --workspace`、`cargo test --workspace`、`cd web && pnpm lint` 和 `cd web && pnpm build`。M0-M9 已有 `test-run/` 下的可重复验收覆盖；真实 24 小时长稳测试仍需在目标部署环境执行。
+XLStatus 仍处于开发中。M0-M9 已有 `test-run/` 下的可重复验收覆盖；真实 24 小时长稳测试仍需在目标部署环境执行。
 
-部署或继续开发前，请先阅读当前实现审计：[docs/implementation-audit.md](./docs/implementation-audit.md)。
+部署或继续开发前，请从当前文档索引开始：[docs/README.md](./docs/README.md)。
 
 ## ✨ 功能特性
 
@@ -58,7 +58,9 @@ docker compose -f docker-compose.pg.yml up -d
 SQLite Compose 首次启动会创建 `./data/xlstatus.db`。PostgreSQL Compose 会在空 volume 上创建 `xlstatus` 用户和数据库，应用表由 XLStatus 自动迁移。
 Compose 已设置 `CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000`，因此 Web UI 可以访问 `http://localhost:8080` 上的 API。
 
-从源码直接运行 SQLite 时，推荐保留 `?mode=rwc` 或设置 `DATABASE_CREATE_IF_MISSING=true`；如果数据库文件不存在且未允许自动创建，交互式运行会询问是否新建，非交互运行会报错退出。PostgreSQL 新站初始化步骤见 [安装指南](./docs/installation.md#postgresql-new-site)。
+从源码直接运行 SQLite 时，推荐保留 `?mode=rwc` 或设置 `DATABASE_CREATE_IF_MISSING=true`；如果数据库文件不存在且未允许自动创建，交互式运行会询问是否新建，非交互运行会报错退出。PostgreSQL 新站初始化步骤见 [安装部署](./docs/installation.md#postgresql-新站)。
+
+服务端前台运行时应该一直占用终端。用于 smoke test 时可以配合 `timeout 8s`；退出码 `124` 表示服务持续运行到超时，直接返回 shell 则应查看终端中的 `Error:` 或 systemd 日志，常见原因是 `8080`/`50051` 端口占用。
 
 ### 使用安装脚本
 
@@ -79,14 +81,14 @@ sudo BINARY_PATH=target/release/xlstatus-agent bash deploy/install-agent.sh
 
 ## 📚 文档
 
-- [当前实现审计](./docs/implementation-audit.md)
 - [文档索引](./docs/README.md)
 - [架构设计](./plan/02-architecture.md)
-- [安装指南](./docs/installation.md)
-- [配置说明](./docs/configuration.md)
+- [安装部署](./docs/installation.md)
+- [配置参考](./docs/configuration.md)
 - [API 文档](./docs/api.md)
-- [Agent 设置](./docs/agent-setup.md)
-- [故障排除](./docs/troubleshooting.md)
+- [Agent 接入](./docs/agent.md)
+- [运维手册](./docs/operations.md)
+- [故障排查](./docs/troubleshooting.md)
 
 ## ⚙️ 配置要点
 
@@ -110,7 +112,7 @@ cd web
 NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm dev
 ```
 
-完整配置矩阵、SQLite 新建数据库行为和 PostgreSQL 新站初始化见 [docs/configuration.zh-CN.md](./docs/configuration.zh-CN.md)。
+完整配置矩阵、SQLite 新建数据库行为和 PostgreSQL 新站初始化见 [docs/configuration.md](./docs/configuration.md)。
 
 ## 🛠️ 开发
 

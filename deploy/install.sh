@@ -13,9 +13,67 @@ HTTP_BIND="${HTTP_BIND:-0.0.0.0:8080}"
 GRPC_BIND="${GRPC_BIND:-0.0.0.0:50051}"
 DATABASE_URL="${DATABASE_URL:-sqlite://$DATA_DIR/xlstatus.db?mode=rwc}"
 DATABASE_CREATE_IF_MISSING="${DATABASE_CREATE_IF_MISSING:-true}"
+CORS_ALLOWED_ORIGINS="${CORS_ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}"
 SESSION_SECRET="${SESSION_SECRET:-}"
 ADMIN_USERNAME="${ADMIN_USERNAME:-admin}"
 ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"
+
+trim() {
+  local value="$*"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+toml_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+cors_origins_toml() {
+  local csv="$1"
+  local first=1
+  local result="["
+  local origin escaped
+
+  IFS=',' read -ra origins <<< "$csv"
+  for raw_origin in "${origins[@]}"; do
+    origin="$(trim "$raw_origin")"
+    [ -z "$origin" ] && continue
+
+    if [ "$origin" = "*" ]; then
+      echo "❌ CORS_ALLOWED_ORIGINS cannot contain '*'; XLStatus uses cookie credentials." >&2
+      exit 1
+    fi
+
+    escaped="$(toml_escape "$origin")"
+    if [ "$first" -eq 1 ]; then
+      result="${result}\"${escaped}\""
+      first=0
+    else
+      result="${result}, \"${escaped}\""
+    fi
+  done
+
+  result="${result}]"
+  printf '%s' "$result"
+}
+
+bind_port() {
+  local bind="$1"
+  printf '%s' "${bind##*:}"
+}
+
+warn_if_port_busy() {
+  local name="$1"
+  local bind="$2"
+  local port
+  port="$(bind_port "$bind")"
+
+  if command -v ss >/dev/null 2>&1 && ss -tlnp 2>/dev/null | grep -Eq ":${port}[[:space:]]"; then
+    echo "⚠️  $name port $port appears to be in use. XLStatus may fail to start."
+    ss -tlnp 2>/dev/null | grep -E ":${port}[[:space:]]" || true
+  fi
+}
 
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║                                                              ║"
@@ -121,6 +179,7 @@ if [ -z "$SESSION_SECRET" ]; then
     SESSION_SECRET="$(date +%s)-$(hostname)-change-me"
   fi
 fi
+CORS_ALLOWED_ORIGINS_TOML="$(cors_origins_toml "$CORS_ALLOWED_ORIGINS")"
 
 cat > "$CONFIG_FILE" << EOF
 [database]
@@ -130,6 +189,7 @@ create_if_missing = $DATABASE_CREATE_IF_MISSING
 [server]
 http_bind = "$HTTP_BIND"
 grpc_bind = "$GRPC_BIND"
+cors_allowed_origins = $CORS_ALLOWED_ORIGINS_TOML
 
 [security]
 session_secret = "$SESSION_SECRET"
@@ -152,14 +212,14 @@ After=network.target
 Type=simple
 User=xlstatus
 Group=xlstatus
-WorkingDirectory=/var/lib/xlstatus
+WorkingDirectory=$DATA_DIR
 ExecStart=/usr/local/bin/xlstatus-server
 Restart=on-failure
 RestartSec=5s
 
-Environment="CONFIG_FILE=/etc/xlstatus/server.toml"
+Environment="CONFIG_FILE=$CONFIG_FILE"
 Environment="RUST_LOG=info"
-Environment="XLSTATUS_SEED_ADMIN_USERNAME=admin"
+Environment="XLSTATUS_SEED_ADMIN_USERNAME=$ADMIN_USERNAME"
 $(if [ -n "$ADMIN_PASSWORD" ]; then printf 'Environment="XLSTATUS_SEED_ADMIN_PASSWORD=%s"\n' "$ADMIN_PASSWORD"; fi)
 
 StandardOutput=journal
@@ -168,8 +228,6 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 EOF
-sed -i.bak "s|CONFIG_FILE=/etc/xlstatus/server.toml|CONFIG_FILE=$CONFIG_FILE|" /etc/systemd/system/xlstatus.service
-sed -i.bak "s|XLSTATUS_SEED_ADMIN_USERNAME=admin|XLSTATUS_SEED_ADMIN_USERNAME=$ADMIN_USERNAME|" /etc/systemd/system/xlstatus.service
 
 systemctl daemon-reload
 systemctl enable xlstatus
@@ -178,6 +236,8 @@ echo "✓ Systemd service installed"
 # Start service
 echo ""
 echo "🚀 Starting XLStatus..."
+warn_if_port_busy "HTTP" "$HTTP_BIND"
+warn_if_port_busy "gRPC" "$GRPC_BIND"
 systemctl start xlstatus
 
 # Wait for service to be ready
@@ -187,8 +247,20 @@ if systemctl is-active --quiet xlstatus; then
   echo "✓ XLStatus is running"
 else
   echo "❌ Failed to start XLStatus"
-  echo "   Check logs: journalctl -u xlstatus -f"
+  echo ""
+  systemctl status xlstatus --no-pager || true
+  echo ""
+  journalctl -u xlstatus -n 80 --no-pager || true
   exit 1
+fi
+
+HTTP_PORT="$(bind_port "$HTTP_BIND")"
+if command -v curl >/dev/null 2>&1; then
+  if curl -fsS "http://127.0.0.1:${HTTP_PORT}/healthz" >/dev/null; then
+    echo "✓ Health check passed"
+  else
+    echo "⚠️  Service is active, but /healthz did not respond on 127.0.0.1:${HTTP_PORT}"
+  fi
 fi
 
 echo ""
@@ -208,8 +280,10 @@ echo "║   ✅ XLStatus Server installed successfully!                 ║"
 echo "║                                                              ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo ""
-echo "📍 Dashboard URL: http://$(hostname -I | awk '{print $1}'):8080"
+echo "📍 API URL: http://$(hostname -I | awk '{print $1}'):${HTTP_PORT}"
 echo "🔑 Admin user: $ADMIN_USERNAME"
+echo "⚙️  Config file: $CONFIG_FILE"
+echo "🌐 CORS origins: $CORS_ALLOWED_ORIGINS"
 echo ""
 echo "📝 Useful commands:"
 echo "   - Start:   systemctl start xlstatus"

@@ -1,6 +1,10 @@
-# Quick Start
+# 快速开始
+
+本页用于把 XLStatus 在本地跑起来。生产或公网部署请继续阅读 [安装部署](./installation.md) 和 [配置参考](./configuration.md)。
 
 ## Docker Compose
+
+SQLite 版本：
 
 ```bash
 docker compose up -d
@@ -8,31 +12,36 @@ curl -fsS http://localhost:8080/healthz
 docker compose ps
 ```
 
-Open:
-
-- API: http://localhost:8080
-- Web UI: http://localhost:3000
-- Public status: http://localhost:3000/status
-
-The default Compose file seeds `admin` / `admin123` for local testing.
-SQLite mode creates `./data/xlstatus.db` on first startup.
-The web UI uses the BOLD. neo-brutalist palette and stores the explicit light/dark choice in `localStorage.darkMode`.
-Compose also sets `CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000`, so the browser can call the API at `http://localhost:8080`.
-
-PostgreSQL variant:
+PostgreSQL 版本：
 
 ```bash
 docker compose -f docker-compose.pg.yml up -d
 curl -fsS http://localhost:8080/healthz
+docker compose -f docker-compose.pg.yml ps
 ```
 
-The PostgreSQL Compose file creates the `xlstatus` role and database on an empty volume; XLStatus applies application migrations on first startup.
+访问：
 
-## Build From Source
+- Web UI: `http://localhost:3000`
+- API: `http://localhost:8080`
+- 公开状态页: `http://localhost:3000/status`
+
+默认本地账号：`admin` / `admin123`。
+
+Compose 已设置：
+
+```env
+CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
+```
+
+因此默认 Web UI 可以访问 API。SQLite Compose 会创建 `./data/xlstatus.db`；PostgreSQL Compose 会在空 volume 上创建数据库用户和库，然后由 XLStatus 执行应用迁移。
+
+## 从源码构建
 
 ```bash
 cargo build --release --bin xlstatus-server
 cargo build --release --bin xlstatus-agent
+
 corepack enable
 cd web
 pnpm install --frozen-lockfile
@@ -40,7 +49,9 @@ NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm build
 cd ..
 ```
 
-Run the server:
+## 前台运行 Server
+
+SQLite：
 
 ```bash
 mkdir -p ./data
@@ -55,9 +66,31 @@ XLSTATUS_SEED_ADMIN_PASSWORD="admin123" \
 ./target/release/xlstatus-server
 ```
 
-If the SQLite file is missing and neither `?mode=rwc` nor `DATABASE_CREATE_IF_MISSING=true` is set, an interactive run asks whether to create it. Non-interactive systemd/Docker starts fail with a clear message so data is not created in the wrong place.
+服务正常时，这个进程会一直运行。另开终端检查：
 
-Equivalent `config.toml` flow:
+```bash
+curl -fsS http://localhost:8080/healthz
+```
+
+短时间 smoke test：
+
+```bash
+timeout 8s env \
+  DATABASE_URL="sqlite://$(pwd)/data/xlstatus.db?mode=rwc" \
+  DATABASE_CREATE_IF_MISSING=true \
+  HTTP_BIND="0.0.0.0:8080" \
+  GRPC_BIND="0.0.0.0:50051" \
+  CORS_ALLOWED_ORIGINS="http://localhost:3000,http://127.0.0.1:3000" \
+  SESSION_SECRET="replace-me" \
+  XLSTATUS_SEED_ADMIN_USERNAME="admin" \
+  XLSTATUS_SEED_ADMIN_PASSWORD="admin123" \
+  ./target/release/xlstatus-server
+echo $?
+```
+
+期望退出码是 `124`，表示服务持续运行到 timeout。如果它直接回到 shell，查看输出中的 `Error:`，常见原因是 `8080` 或 `50051` 被占用。
+
+## 使用 config.toml
 
 ```bash
 cp config.example.toml ./config.toml
@@ -66,9 +99,31 @@ sed -i.bak "s/replace-with-a-long-random-secret/${SESSION_SECRET_VALUE}/" ./conf
 CONFIG_FILE=./config.toml ./target/release/xlstatus-server
 ```
 
-When using `CONFIG_FILE`, do not set `DATABASE_URL` in the same process. Setting `DATABASE_URL` switches the server to environment-variable configuration mode.
+不要同时设置 `DATABASE_URL`。一旦设置 `DATABASE_URL`，服务端会切换到环境变量模式并忽略 `CONFIG_FILE`。
 
-Minimal PostgreSQL new-site setup:
+## 运行 Web UI
+
+开发模式：
+
+```bash
+cd web
+NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm dev
+```
+
+生产式本地运行：
+
+```bash
+cd web
+NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm start
+```
+
+如果 Next.js 端口不是 `3000`，请先把对应来源加入后端 CORS，例如：
+
+```bash
+CORS_ALLOWED_ORIGINS=http://localhost:3001,http://127.0.0.1:3001
+```
+
+## PostgreSQL 新站
 
 ```bash
 sudo -u postgres psql <<'SQL'
@@ -76,7 +131,11 @@ CREATE USER xlstatus WITH PASSWORD 'change-this-password';
 CREATE DATABASE xlstatus OWNER xlstatus;
 GRANT ALL PRIVILEGES ON DATABASE xlstatus TO xlstatus;
 SQL
+```
 
+启动：
+
+```bash
 DATABASE_URL='postgresql://xlstatus:change-this-password@localhost:5432/xlstatus' \
 HTTP_BIND="0.0.0.0:8080" \
 GRPC_BIND="0.0.0.0:50051" \
@@ -87,27 +146,11 @@ XLSTATUS_SEED_ADMIN_PASSWORD="admin123" \
 ./target/release/xlstatus-server
 ```
 
-The first startup runs embedded application migrations. See [configuration.md](./configuration.md) for all configuration options.
+XLStatus 会自动创建应用表。新站数据库应保持为空，除非是在恢复同版本备份。
 
-Run the Web UI from source in another terminal:
+## 注册 Agent
 
-```bash
-cd web
-NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm dev
-```
-
-Open `http://localhost:3000/status` before login to confirm the public status API is reachable. After login, use the navigation theme switch to choose the BOLD. light or dark palette.
-If you run the Web UI on a different port, add that exact origin to `CORS_ALLOWED_ORIGINS` before starting the server.
-Use matching hostname styles for local cookie sessions: pair `localhost` with `localhost`, or `127.0.0.1` with `127.0.0.1`.
-
-For a production-style local run after `pnpm build`:
-
-```bash
-cd web
-NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm start
-```
-
-Enroll and run an agent:
+在 Dashboard 里创建 enrollment token 后：
 
 ```bash
 xlstatus-agent enroll \
@@ -120,20 +163,4 @@ xlstatus-agent enroll \
 xlstatus-agent run --config ./agent.json
 ```
 
-## Verify M9 Install Flow
-
-```bash
-cargo build --bin xlstatus-server --bin xlstatus-agent
-test-run/verify-m9-install.sh
-```
-
-## Troubleshooting
-
-```bash
-docker compose logs server
-docker compose logs web
-sudo journalctl -u xlstatus -f
-sudo journalctl -u xlstatus-agent -f
-```
-
-See [installation.md](./installation.md), [agent-setup.md](./agent-setup.md), and [troubleshooting.md](./troubleshooting.md).
+更多内容见 [Agent 接入](./agent.md)。

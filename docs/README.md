@@ -1,47 +1,43 @@
-# XLStatus Documentation
+# XLStatus 文档
 
-本目录是 XLStatus 当前文档入口。功能完成度以 [implementation-audit.md](./implementation-audit.md) 和 [PROJECT-STATUS.md](../PROJECT-STATUS.md) 为准；旧的完成报告已经移动到 [archive/](./archive/)。
+这里是当前发布版本的权威文档。`docs/` 只保留安装、配置、使用、运维、排障和开发所需内容；历史里程碑、旧完成报告和临时验证记录不再放在发布文档入口里。
 
 ## 推荐阅读顺序
 
-1. [实现审计](./implementation-audit.md) - 对照 `plan/` 的当前验收状态。
-2. [项目状态](../PROJECT-STATUS.md) - M0-M9 总览、验证脚本和剩余风险。
-3. [快速开始](./quickstart.md) / [中文快速开始](./quickstart.zh-CN.md) - 本地启动与基本操作。
-4. [安装指南](./installation.md) - Docker Compose、systemd 和 agent 安装。
-5. [配置说明](./configuration.md) / [中文配置说明](./configuration.zh-CN.md) - 当前二进制实际读取的配置项、`config.toml`、CORS 和数据库初始化。
+1. [快速开始](./quickstart.md)：用 Docker Compose 或源码在本地跑起来。
+2. [安装部署](./installation.md)：源码构建、systemd、PostgreSQL 新站和远端 Linux 验证。
+3. [配置参考](./configuration.md)：`config.toml`、环境变量、CORS、SQLite/PostgreSQL、Web i18n。
+4. [Web 前端](./web.md)：Next.js 构建、运行、API 地址和 CORS 配合。
+5. [Agent 接入](./agent.md)：注册、运行、systemd 和常见问题。
+6. [运维手册](./operations.md)：健康检查、日志、备份、升级和生产运行。
+7. [故障排查](./troubleshooting.md)：服务直接退出、端口冲突、数据库、CORS、Agent。
 
-## 当前文档
+## 文档目录
 
-| 文档 | 用途 |
+| 文档 | 内容 |
 |---|---|
-| [agent-setup.md](./agent-setup.md) | Agent 注册、运行与排障 |
-| [api.md](./api.md) | HTTP API 参考 |
-| [configuration.md](./configuration.md) | 服务端与 Agent 配置、CORS、数据库初始化 |
-| [configuration.zh-CN.md](./configuration.zh-CN.md) | 中文配置说明 |
-| [implementation-audit.md](./implementation-audit.md) | 当前实现验收审计 |
-| [installation.md](./installation.md) | 安装与部署 |
-| [quickstart.md](./quickstart.md) | 英文快速开始 |
-| [quickstart.zh-CN.md](./quickstart.zh-CN.md) | 中文快速开始 |
-| [rbac.md](./rbac.md) | RBAC 与 PAT scope |
-| [troubleshooting.md](./troubleshooting.md) | 故障排查 |
+| [quickstart.md](./quickstart.md) | 最短路径启动 Server、Web UI 和 Agent |
+| [installation.md](./installation.md) | 安装方式、源码构建、systemd、PostgreSQL 新站 |
+| [configuration.md](./configuration.md) | 配置加载规则、环境变量、`config.toml`、数据库和 CORS |
+| [web.md](./web.md) | 前端构建、运行、i18n 和部署注意事项 |
+| [agent.md](./agent.md) | Agent 注册、运行和服务安装 |
+| [api.md](./api.md) | 当前 HTTP、WebSocket、gRPC、MCP 接口概览 |
+| [operations.md](./operations.md) | 运维命令、备份恢复、升级、远端 smoke |
+| [troubleshooting.md](./troubleshooting.md) | 常见故障定位和修复 |
+| [development.md](./development.md) | 本地开发、测试脚本和代码结构 |
+| [release-checklist.md](./release-checklist.md) | 发布前检查清单 |
 
-## 验收与里程碑
+## 当前状态
 
-- [milestones/](./milestones/) 保存 M0-M9 的里程碑记录。
-- [performance/](./performance/) 保存 M8 性能相关说明。
-- [archive/](./archive/) 保存早期状态报告、旧配置指南和历史 Docker/Linux 验证说明。
+- Server：Rust、Axum、Tonic，提供 HTTP API、WebSocket 和 Agent gRPC 服务。
+- Web UI：Next.js，当前语言为简体中文，i18n 配置位于 `web/lib/i18n.ts`。
+- 数据库：SQLite 和 PostgreSQL，应用表由内置迁移自动创建。
+- 发布方式：Docker Compose、本地源码运行、systemd 安装脚本。
+- 平台：Server 和 Agent 的 systemd 安装脚本当前支持 Linux x86_64。
 
-## 计划文档
+## 重要约定
 
-`plan/` 仍是产品和技术计划的基线，尤其是：
-
-- [路线图](../plan/08-roadmap.md)
-- [测试计划](../plan/09-test-plan.md)
-- [验证命令](../plan/15-verification-commands.md)
-
-## 目录约定
-
-- 根目录保留项目入口、构建文件、Compose 文件和当前状态摘要。
-- `docs/` 放当前文档。
-- `docs/archive/` 放历史报告或可能早于当前实现审计的说明。
-- `test-run/` 放可重复验收脚本和本地 smoke 脚本。
+- `DATABASE_URL` 和 `CONFIG_FILE` 不会合并。设置 `DATABASE_URL` 后，服务端进入环境变量配置模式并忽略 TOML 文件。
+- Web UI 的 `NEXT_PUBLIC_API_URL` 只告诉浏览器 API 地址；后端仍需要通过 `CORS_ALLOWED_ORIGINS` 或 `server.cors_allowed_origins` 放行 Web UI 的浏览器来源。
+- Server 前台运行时应该持续占用终端。用于 smoke test 时可配合 `timeout 8s`，退出码 `124` 表示服务持续运行到 timeout。
+- SQLite 新建数据库需要 `?mode=rwc` 或 `create_if_missing = true`。非交互环境不会静默创建未授权的数据库文件。

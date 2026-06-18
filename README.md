@@ -9,9 +9,9 @@ Self-hosted server monitoring and operations system written in Rust. XLStatus pr
 
 ## Current Status
 
-XLStatus is in active development. The workspace currently passes `cargo check --workspace`, `cargo test --workspace`, `cd web && pnpm lint`, and `cd web && pnpm build`. M0-M9 have runnable acceptance coverage in `test-run/`; literal 24-hour soak runs still need to be performed in a target deployment environment.
+XLStatus is in active development. The workspace has runnable acceptance coverage in `test-run/`; literal 24-hour soak runs still need to be performed in a target deployment environment.
 
-Before deploying or extending the project, read the current implementation audit: [docs/implementation-audit.md](./docs/implementation-audit.md).
+Start with the current documentation index: [docs/README.md](./docs/README.md).
 
 ## ✨ Features
 
@@ -59,6 +59,8 @@ Compose sets `CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000` 
 
 When running SQLite from source, keep `?mode=rwc` or set `DATABASE_CREATE_IF_MISSING=true`. If the database file is missing and auto-create is not enabled, interactive runs ask whether to create it and non-interactive runs exit with a clear error. PostgreSQL new-site setup is covered in the [Installation Guide](./docs/installation.md#postgresql-new-site).
 
+A foreground server should keep running. For smoke tests, wrap it with `timeout 8s`; exit code `124` means it stayed alive until the timeout. If it returns directly to the shell, check the printed `Error:` or systemd logs, especially for `8080`/`50051` port conflicts.
+
 ### Using Install Script
 
 **Note**: Pre-built binaries are not yet available. Build from source first.
@@ -78,13 +80,13 @@ sudo BINARY_PATH=target/release/xlstatus-agent bash deploy/install-agent.sh
 
 ## 📚 Documentation
 
-- [Current Implementation Audit](./docs/implementation-audit.md)
 - [Documentation Index](./docs/README.md)
 - [Architecture](./plan/02-architecture.md)
 - [Installation Guide](./docs/installation.md)
 - [Configuration](./docs/configuration.md)
 - [API Documentation](./docs/api.md)
-- [Agent Setup](./docs/agent-setup.md)
+- [Agent Setup](./docs/agent.md)
+- [Operations](./docs/operations.md)
 - [Troubleshooting](./docs/troubleshooting.md)
 
 ## ⚙️ Configuration Essentials

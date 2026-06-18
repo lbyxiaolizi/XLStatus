@@ -6,16 +6,15 @@ After=network.target
 Type=simple
 User=xlstatus
 Group=xlstatus
-WorkingDirectory=/opt/xlstatus
+WorkingDirectory=/var/lib/xlstatus
 ExecStart=/usr/local/bin/xlstatus-server
 Restart=on-failure
 RestartSec=5s
 
-# Environment
+# Environment. Bind addresses and CORS origins are read from the TOML file
+# when CONFIG_FILE is set.
 Environment="CONFIG_FILE=/etc/xlstatus/server.toml"
 Environment="RUST_LOG=info"
-Environment="HTTP_BIND=0.0.0.0:8080"
-Environment="GRPC_BIND=0.0.0.0:50051"
 
 # Security
 NoNewPrivileges=true

@@ -1,3 +1,4 @@
+use anyhow::Context;
 use axum::{
     http::{header, HeaderName, HeaderValue, Method},
     middleware,
@@ -7,6 +8,7 @@ use axum::{
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server as TonicServer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use xlstatus_proto_gen::xlstatus::v1::agent_service_server::AgentServiceServer;
@@ -327,9 +329,11 @@ async fn main() -> anyhow::Result<()> {
                 .layer(cors);
 
             let addr: SocketAddr = bind.parse()?;
-            tracing::info!("HTTP server listening on {}", addr);
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("failed to bind HTTP server to {addr}"))?;
 
-            let listener = tokio::net::TcpListener::bind(addr).await?;
+            tracing::info!("HTTP server listening on {}", addr);
             axum::serve(listener, app)
                 .await
                 .map_err(|e| anyhow::anyhow!("HTTP server error: {}", e))
@@ -360,7 +364,9 @@ async fn main() -> anyhow::Result<()> {
             io_registry: grpc::IoRegistry,
         ) -> anyhow::Result<()> {
             let addr: SocketAddr = bind.parse()?;
-            tracing::info!("gRPC server listening on {}", addr);
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("failed to bind gRPC server to {addr}"))?;
 
             let config = config::Config::load()?;
             let agent_service = grpc::AgentServiceImpl::new(
@@ -382,10 +388,11 @@ async fn main() -> anyhow::Result<()> {
                 .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
                 .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
 
+            tracing::info!("gRPC server listening on {}", addr);
             TonicServer::builder()
                 .add_service(agent_service)
                 .add_service(reflection_service)
-                .serve(addr)
+                .serve_with_incoming(TcpListenerStream::new(listener))
                 .await
                 .map_err(|e| anyhow::anyhow!("gRPC server error: {}", e))
         }
@@ -401,21 +408,27 @@ async fn main() -> anyhow::Result<()> {
         .await
     });
 
-    // Wait for both servers
-    tokio::select! {
-        res = http_handle => {
-            if let Err(e) = res {
-                tracing::error!("HTTP server error: {}", e);
-            }
+    // Both listeners are long-running. If either task returns, surface the
+    // actual inner server error and stop the sibling task instead of silently
+    // dropping back to the shell.
+    let mut http_handle = http_handle;
+    let mut grpc_handle = grpc_handle;
+    let result = tokio::select! {
+        res = &mut http_handle => {
+            grpc_handle.abort();
+            server_task_result("HTTP", res)
         }
-        res = grpc_handle => {
-            if let Err(e) = res {
-                tracing::error!("gRPC server error: {}", e);
-            }
+        res = &mut grpc_handle => {
+            http_handle.abort();
+            server_task_result("gRPC", res)
         }
+    };
+
+    if let Err(e) = &result {
+        tracing::error!("{:#}", e);
     }
 
-    Ok(())
+    result
 }
 
 async fn healthz() -> &'static str {
@@ -454,6 +467,17 @@ fn build_cors_layer(allowed_origins: &[String]) -> anyhow::Result<CorsLayer> {
             HeaderName::from_static("x-csrf-token"),
         ])
         .allow_credentials(true))
+}
+
+fn server_task_result(
+    name: &str,
+    result: Result<anyhow::Result<()>, tokio::task::JoinError>,
+) -> anyhow::Result<()> {
+    match result {
+        Ok(Ok(())) => Err(anyhow::anyhow!("{name} server exited unexpectedly")),
+        Ok(Err(e)) => Err(e.context(format!("{name} server failed"))),
+        Err(e) => Err(anyhow::anyhow!("{name} server task failed: {e}")),
+    }
 }
 
 async fn seed_admin_user(db: &DatabaseBackend) -> anyhow::Result<()> {

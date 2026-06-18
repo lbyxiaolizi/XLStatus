@@ -1,18 +1,18 @@
-# Configuration
+# 配置参考
 
-This document describes the configuration that is implemented in the current XLStatus binaries.
+本文档描述当前 `xlstatus-server` 和 `web/` 实际读取的配置项。
 
-## Server Loading Order
+## 加载顺序
 
-The server loads configuration in this order:
+Server 有两种配置模式：
 
-1. Environment variables when `DATABASE_URL` is set.
-2. TOML file pointed to by `CONFIG_FILE`.
-3. Development defaults.
+1. 如果设置了 `DATABASE_URL`，进入环境变量模式。
+2. 如果没有设置 `DATABASE_URL`，且 `CONFIG_FILE` 指向存在的 TOML 文件，读取该 TOML。
+3. 如果两者都没有，使用开发默认值。
 
-Environment variables override the TOML file only when `DATABASE_URL` is present. If you want file-based configuration, set only `CONFIG_FILE`.
+环境变量模式和 TOML 模式不会合并。使用 `CONFIG_FILE` 时不要同时设置 `DATABASE_URL`。
 
-## Environment Variables
+## 环境变量
 
 ```env
 DATABASE_URL=sqlite:///var/lib/xlstatus/xlstatus.db?mode=rwc
@@ -26,23 +26,27 @@ XLSTATUS_SEED_ADMIN_USERNAME=admin
 XLSTATUS_SEED_ADMIN_PASSWORD=admin123
 ```
 
-`XLSTATUS_SEED_ADMIN_PASSWORD` is only used to seed an admin user when one does not already exist.
+| 变量 | 说明 |
+|---|---|
+| `DATABASE_URL` | SQLite 或 PostgreSQL URL。设置后启用环境变量模式。 |
+| `DATABASE_CREATE_IF_MISSING` | 仅 SQLite 使用。`1`、`true`、`yes`、`y`、`on` 视为开启。 |
+| `HTTP_BIND` | HTTP API 监听地址，默认 `0.0.0.0:8080`。 |
+| `GRPC_BIND` | Agent gRPC 监听地址，默认 `0.0.0.0:50051`。 |
+| `CORS_ALLOWED_ORIGINS` | 允许访问 API 的浏览器来源，多个来源用英文逗号分隔。 |
+| `SESSION_SECRET` | 会话和 Agent JWT 签名密钥。生产必须使用长随机值。 |
+| `SESSION_TTL_HOURS` | Cookie 会话有效期，默认 `24` 小时。 |
+| `XLSTATUS_SEED_ADMIN_USERNAME` | 可选的首个管理员用户名。 |
+| `XLSTATUS_SEED_ADMIN_PASSWORD` | 可选的首个管理员密码。只在用户不存在时创建。 |
 
-| Variable | Required | Description |
-|---|---:|---|
-| `DATABASE_URL` | Yes for env mode | SQLite or PostgreSQL connection URL. Setting this enables environment-variable configuration mode. |
-| `DATABASE_CREATE_IF_MISSING` | No | SQLite-only convenience flag. Truthy values are `1`, `true`, `yes`, `y`, and `on`. |
-| `HTTP_BIND` | No | HTTP API bind address. Default: `0.0.0.0:8080`. |
-| `GRPC_BIND` | No | Agent gRPC bind address. Default: `0.0.0.0:50051`. |
-| `CORS_ALLOWED_ORIGINS` | No | Comma-separated exact browser origins that may call the API. Default allows local Next.js on port `3000`. |
-| `SESSION_SECRET` | Production: yes | Secret used for sessions and agent JWT signing. Generate a long random value for real deployments. |
-| `SESSION_TTL_HOURS` | No | Cookie session lifetime. Default: `24`. |
-| `XLSTATUS_SEED_ADMIN_USERNAME` | No | Optional first admin username. |
-| `XLSTATUS_SEED_ADMIN_PASSWORD` | No | Optional first admin password. Used only when that user does not already exist. |
+## config.toml
 
-## TOML File
+推荐从根目录示例复制：
 
-Copy [../config.example.toml](../config.example.toml) to your target path and edit it:
+```bash
+cp config.example.toml /etc/xlstatus/server.toml
+```
+
+完整示例：
 
 ```toml
 [database]
@@ -62,68 +66,15 @@ session_secret = "replace-with-a-long-random-secret"
 session_ttl_hours = 24
 ```
 
-Run with a config file:
+启动：
 
 ```bash
 CONFIG_FILE=/etc/xlstatus/server.toml /usr/local/bin/xlstatus-server
 ```
 
-The server currently has no `--config`, `--validate`, or `--version` CLI flags.
-
-Important loading behavior:
-
-- If `DATABASE_URL` is set, XLStatus reads environment variables and ignores `CONFIG_FILE`.
-- If `DATABASE_URL` is not set and `CONFIG_FILE` points to an existing file, XLStatus reads that TOML file.
-- If neither is present, development defaults are used.
-- Do not set both `DATABASE_URL` and `CONFIG_FILE` expecting a merge; choose one mode per process.
-
-## Web UI CORS
-
-When the Web UI and API run on different origins, for example `http://localhost:3000` and `http://localhost:8080`, the API must allow the browser origin. Configure exact origins with `CORS_ALLOWED_ORIGINS` or `server.cors_allowed_origins`.
-
-Use the same hostname style for both URLs during local testing. For example, pair `http://localhost:3000` with `http://localhost:8080`, or pair `http://127.0.0.1:3000` with `http://127.0.0.1:8080`, so cookie sessions and CSRF checks behave consistently.
-
-Wildcard CORS origins are not supported because XLStatus uses cookie credentials for the dashboard.
-
-Common examples:
-
-```bash
-# Next.js dev server on the default port
-CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
-
-# Custom frontend port
-CORS_ALLOWED_ORIGINS=http://localhost:3001,http://127.0.0.1:3001
-
-# Public reverse-proxy origin
-CORS_ALLOWED_ORIGINS=https://status.example.com
-```
-
-`NEXT_PUBLIC_API_URL` is a Web UI build/runtime setting. It tells browser code where the API lives:
-
-```bash
-cd web
-NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm dev
-```
-
-The API origin in `NEXT_PUBLIC_API_URL` and the browser origin used to open the Web UI must both be planned together. If the browser opens `http://localhost:3000`, the API server must include `http://localhost:3000` in CORS. If the browser opens `https://status.example.com`, include `https://status.example.com`.
-
-## Web UI i18n
-
-The Web UI locale configuration is implemented in [../web/lib/i18n.ts](../web/lib/i18n.ts).
-
-Current settings:
-
-- Default locale: `zh-CN`
-- Supported locales: `zh-CN`
-- App Router i18n configuration is exported from `web/lib/i18n.ts`; `web/next.config.ts` intentionally does not use the legacy Pages Router `i18n` field
-- Shared user-visible strings should be added to `zhCN` in `web/lib/i18n.ts`
-- Backend protocol values, enum values, and scope strings such as `server:read` should stay unchanged
-
-The root layout sets `<html lang="zh-CN">`, and dates are formatted with the `zh-CN` locale.
-
 ## SQLite
 
-SQLite is the simplest mode for a single-node install:
+推荐：
 
 ```toml
 [database]
@@ -131,21 +82,14 @@ url = "sqlite:///var/lib/xlstatus/xlstatus.db?mode=rwc"
 create_if_missing = true
 ```
 
-Startup behavior when the database file is missing:
+数据库文件不存在时：
 
-- If the URL contains `?mode=rwc`, XLStatus creates the file.
-- If `create_if_missing = true` or `DATABASE_CREATE_IF_MISSING=true`, XLStatus creates the file.
-- If neither is set and the server is started from an interactive terminal, XLStatus asks whether to create the file.
-- If neither is set and the server runs non-interactively, startup fails with a clear message instead of silently creating data in the wrong place.
+- URL 包含 `?mode=rwc`：SQLite 允许创建文件。
+- `create_if_missing = true` 或 `DATABASE_CREATE_IF_MISSING=true`：XLStatus 允许创建父目录和数据库文件。
+- 两者都没有，且是交互式终端：服务端会询问是否创建。
+- 两者都没有，且是 systemd/Docker：服务端失败退出并提示缺失文件。
 
-The parent directory is created automatically when creation is allowed. For systemd installs, make sure the service user can write it:
-
-```bash
-sudo mkdir -p /var/lib/xlstatus
-sudo chown -R xlstatus:xlstatus /var/lib/xlstatus
-```
-
-Use `?mode=rw` when you intentionally want startup to fail if the file is missing:
+如果你希望文件不存在时直接失败：
 
 ```toml
 [database]
@@ -153,11 +97,16 @@ url = "sqlite:///var/lib/xlstatus/xlstatus.db?mode=rw"
 create_if_missing = false
 ```
 
+systemd 权限：
+
+```bash
+sudo mkdir -p /var/lib/xlstatus
+sudo chown -R xlstatus:xlstatus /var/lib/xlstatus
+```
+
 ## PostgreSQL
 
-PostgreSQL is recommended when the database is managed separately, backed up centrally, or shared with production operations tooling.
-
-XLStatus runs its own schema migrations after it connects, but it does not create the PostgreSQL role or database. Create them before first start:
+新站先创建用户和数据库：
 
 ```bash
 sudo -u postgres psql <<'SQL'
@@ -167,13 +116,7 @@ GRANT ALL PRIVILEGES ON DATABASE xlstatus TO xlstatus;
 SQL
 ```
 
-Test the login:
-
-```bash
-psql 'postgresql://xlstatus:change-this-password@localhost:5432/xlstatus' -c 'select 1;'
-```
-
-Then configure XLStatus:
+TOML：
 
 ```toml
 [database]
@@ -181,59 +124,64 @@ url = "postgresql://xlstatus:change-this-password@localhost:5432/xlstatus"
 create_if_missing = false
 ```
 
-Equivalent environment variable:
+XLStatus 连接成功后会自动执行内置迁移。新站数据库应保持为空。
+
+## CORS
+
+Web UI 和 API 不同源时，后端必须允许 Web UI 的浏览器来源。
+
+本地默认：
 
 ```bash
-DATABASE_URL='postgresql://xlstatus:change-this-password@localhost:5432/xlstatus'
+CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
 ```
 
-For a fresh site, the first XLStatus startup creates all application tables through embedded migrations. Keep the database empty before that first run unless you are restoring from a backup made by the same application version.
+TOML：
 
-## Agent
-
-The agent config is generated by enrollment and stored as JSON:
-
-```bash
-xlstatus-agent enroll \
-  --server http://dashboard.example.com:8080 \
-  --grpc-server http://dashboard.example.com:50051 \
-  --token xle_... \
-  --name web-01 \
-  --config /etc/xlstatus-agent/agent.json
+```toml
+[server]
+cors_allowed_origins = [
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+]
 ```
 
-Generated shape:
+生产域名：
 
-```json
-{
-  "server": "http://dashboard.example.com:8080",
-  "grpc_server": "http://dashboard.example.com:50051",
-  "agent_id": "...",
-  "name": "web-01",
-  "public_key": "...",
-  "private_key": "..."
-}
+```toml
+[server]
+cors_allowed_origins = ["https://status.example.com"]
 ```
 
-Run:
+不要使用 `*`。Dashboard 使用 Cookie 会话和 CSRF，服务端会拒绝通配符 CORS。
 
-```bash
-xlstatus-agent run --config /etc/xlstatus-agent/agent.json
+## Web UI 配置
+
+`web/` 使用：
+
+```env
+NEXT_PUBLIC_API_URL=http://localhost:8080
 ```
 
-Keep the agent config at mode `0600`; it contains private key material.
+这个值会进入浏览器 bundle。它不等于后端 CORS：前端要知道 API 地址，后端也要允许 Web UI 的浏览器来源。
 
-## Docker Compose
+## i18n
 
-The Compose files configure the server through environment variables. Render the effective setup with:
+Web UI 国际化配置位于 `web/lib/i18n.ts`。
 
-```bash
-docker compose config
-docker compose -f docker-compose.pg.yml config
+- 默认语言：`zh-CN`
+- 支持语言：`zh-CN`
+- `<html lang="zh-CN">` 由根布局设置
+- 用户可见共享文案放在 `zhCN` 字典
+- 后端协议值、枚举值、scope 字符串不翻译，例如 `server:read`
+
+## 管理员初始化
+
+首次启动可设置：
+
+```env
+XLSTATUS_SEED_ADMIN_USERNAME=admin
+XLSTATUS_SEED_ADMIN_PASSWORD=admin123
 ```
 
-The SQLite Compose files set `DATABASE_CREATE_IF_MISSING=true` and use `?mode=rwc`, so a new local data volume starts cleanly.
-
-The PostgreSQL Compose file uses the official `postgres:15` image with `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `POSTGRES_DB`; the image creates the role and database on an empty volume, then XLStatus applies its application migrations.
-
-The demo agent service is behind the `agent-demo` profile because it needs a pre-enrolled config mounted at `/etc/xlstatus-agent/agent.json`.
+如果该用户名已存在，不会覆盖密码。生产环境应在首次登录后更换密码，并移除明文 seed 变量。

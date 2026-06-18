@@ -1,0 +1,90 @@
+# Agent 接入
+
+Agent 负责采集主机状态、维持 gRPC 会话、执行任务和承载部分运维能力。
+
+## 构建
+
+```bash
+cargo build --release --bin xlstatus-agent
+```
+
+## 注册流程
+
+1. 在 Dashboard 创建 enrollment token。
+2. 在被监控主机上执行 `xlstatus-agent enroll`。
+3. 使用生成的 JSON 配置运行 Agent。
+
+示例：
+
+```bash
+xlstatus-agent enroll \
+  --server http://dashboard.example.com:8080 \
+  --grpc-server http://dashboard.example.com:50051 \
+  --token xle_... \
+  --name web-01 \
+  --config /etc/xlstatus-agent/agent.json
+```
+
+运行：
+
+```bash
+xlstatus-agent run --config /etc/xlstatus-agent/agent.json
+```
+
+## 配置文件
+
+注册会生成 JSON：
+
+```json
+{
+  "server": "http://dashboard.example.com:8080",
+  "grpc_server": "http://dashboard.example.com:50051",
+  "agent_id": "...",
+  "name": "web-01",
+  "public_key": "...",
+  "private_key": "..."
+}
+```
+
+这个文件包含私钥，建议权限为 `0600`。
+
+## systemd 安装
+
+```bash
+sudo BINARY_PATH=target/release/xlstatus-agent \
+  SERVER_URL=http://dashboard.example.com:8080 \
+  GRPC_SERVER=http://dashboard.example.com:50051 \
+  ENROLLMENT_TOKEN=xle_... \
+  AGENT_NAME="$(hostname)" \
+  bash deploy/install-agent.sh
+```
+
+检查：
+
+```bash
+sudo systemctl status xlstatus-agent
+sudo journalctl -u xlstatus-agent -n 100 --no-pager
+```
+
+## 地址说明
+
+- `--server` 是 Dashboard HTTP API 地址，例如 `http://dashboard.example.com:8080`。
+- `--grpc-server` 是 Agent 长连接地址，例如 `http://dashboard.example.com:50051`。
+
+两者不能混用。HTTP API 可通过 `/healthz` 检查，gRPC 端口需要确认网络可达。
+
+## 重新注册
+
+如果配置丢失或私钥泄漏：
+
+1. 在 Dashboard 撤销旧 Agent 或吊销凭据。
+2. 创建新的 enrollment token。
+3. 重新执行 `xlstatus-agent enroll`。
+4. 重启 `xlstatus-agent` 服务。
+
+## 常见问题
+
+- token 过期：重新生成 enrollment token。
+- `--grpc-server` 不可达：检查防火墙、反代或端口映射。
+- Agent 在线后没有数据：查看 `journalctl -u xlstatus-agent -f`。
+- systemd 启动失败：安装脚本会打印最近日志，也可手动运行 `xlstatus-agent run --config ...`。
