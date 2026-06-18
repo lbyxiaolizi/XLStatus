@@ -1,16 +1,10 @@
 use crate::api::types::*;
-use crate::auth::{generate_pat, hash_token};
-use crate::config::Config;
-use crate::db::{CreatePATInput, DatabaseBackend, PATRepository};
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::{IntoResponse, Response},
-    Json, extract::Path,
-};
+use crate::auth::generate_pat;
+use crate::auth::middleware::AuthUser;
+use crate::auth::rbac;
+use crate::db::{CreatePATInput, PATRepository};
+use axum::{extract::Path, extract::State, Json};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use xlstatus_shared::UserId;
 
 use super::auth::AppError;
 
@@ -42,18 +36,30 @@ pub struct PATInfo {
     pub created_at: String,
 }
 
+fn validate_scopes(scopes: &[String], is_admin: bool) -> Result<(), AppError> {
+    rbac::validate_pat_scopes(scopes, is_admin).map_err(|msg| {
+        if msg.contains("admin:*") {
+            AppError::Forbidden(msg)
+        } else {
+            AppError::BadRequest(msg)
+        }
+    })
+}
+
+fn validate_servers(ids: Option<&[String]>) -> Result<(), AppError> {
+    rbac::validate_server_ids(ids).map_err(AppError::BadRequest)
+}
+
 pub async fn create_pat(
     State(state): State<super::auth::AppState>,
-    // TODO: extract user from session
+    auth_user: AuthUser,
     Json(req): Json<CreatePATRequest>,
 ) -> Result<Json<ApiResponse<CreatePATResponse>>, AppError> {
-    // TEMPORARY: Get the first admin user from database for testing
-    // In real implementation, this would come from the authenticated session
-    let user_repo = crate::db::UserRepository::new(state.db.clone());
-    let user = user_repo
-        .find_by_username("admin")
-        .await?
-        .ok_or(AppError::Unauthorized("No user found".to_string()))?;
+    auth_user
+        .require_cookie_session()
+        .map_err(|_| AppError::Forbidden("PAT cannot manage API tokens".to_string()))?;
+    validate_scopes(&req.scopes, auth_user.user.role.is_admin())?;
+    validate_servers(req.server_ids.as_deref())?;
 
     let pat_repo = PATRepository::new(state.db.clone());
 
@@ -73,7 +79,7 @@ pub async fn create_pat(
     let pat = pat_repo
         .create(
             CreatePATInput {
-                user_id: user.id,
+                user_id: auth_user.user.id,
                 name: req.name,
                 scopes: req.scopes,
                 server_ids: req.server_ids,
@@ -94,17 +100,14 @@ pub async fn create_pat(
 
 pub async fn list_pats(
     State(state): State<super::auth::AppState>,
-    // TODO: extract user from session
+    auth_user: AuthUser,
 ) -> Result<Json<ApiResponse<Vec<PATInfo>>>, AppError> {
-    // TEMPORARY: Get the first admin user for testing
-    let user_repo = crate::db::UserRepository::new(state.db.clone());
-    let user = user_repo
-        .find_by_username("admin")
-        .await?
-        .ok_or(AppError::Unauthorized("No user found".to_string()))?;
+    auth_user
+        .require_cookie_session()
+        .map_err(|_| AppError::Forbidden("PAT cannot manage API tokens".to_string()))?;
 
     let pat_repo = PATRepository::new(state.db.clone());
-    let pats = pat_repo.list_by_user(user.id).await?;
+    let pats = pat_repo.list_by_user(auth_user.user.id).await?;
 
     let pat_infos = pats
         .into_iter()
@@ -125,20 +128,19 @@ pub async fn list_pats(
 pub async fn revoke_pat(
     State(state): State<super::auth::AppState>,
     Path(id): Path<String>,
-    // TODO: extract user from session
+    auth_user: AuthUser,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
-    // TEMPORARY: Get the first admin user for testing
-    let user_repo = crate::db::UserRepository::new(state.db.clone());
-    let user = user_repo
-        .find_by_username("admin")
-        .await?
-        .ok_or(AppError::Unauthorized("No user found".to_string()))?;
+    auth_user
+        .require_cookie_session()
+        .map_err(|_| AppError::Forbidden("PAT cannot manage API tokens".to_string()))?;
 
     let pat_repo = PATRepository::new(state.db.clone());
-    let revoked = pat_repo.revoke(&id, user.id).await?;
+    let revoked = pat_repo.revoke(&id, auth_user.user.id).await?;
 
     if !revoked {
-        return Err(AppError::BadRequest("Token not found or already revoked".to_string()));
+        return Err(AppError::BadRequest(
+            "Token not found or already revoked".to_string(),
+        ));
     }
 
     Ok(Json(ApiResponse::success(())))

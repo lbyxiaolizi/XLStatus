@@ -4,16 +4,14 @@ After=network.target
 
 [Service]
 Type=simple
-User=xlstatus-agent
-Group=xlstatus-agent
+User=root
+Group=root
 WorkingDirectory=/opt/xlstatus-agent
-ExecStart=/usr/local/bin/xlstatus-agent
-Restart=on-failure
+ExecStart=/usr/local/bin/xlstatus-agent run --config /etc/xlstatus-agent/agent.json
+Restart=always
 RestartSec=5s
 
 # Environment
-Environment="SERVER_URL=http://localhost:8080"
-Environment="AGENT_NAME=auto"
 Environment="RUST_LOG=info"
 
 # Security
@@ -21,7 +19,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/xlstatus-agent
+ReadWritePaths=/var/lib/xlstatus-agent /etc/xlstatus-agent
 
 # Logging
 StandardOutput=journal

@@ -1,3 +1,6 @@
+#![allow(dead_code)]
+#![allow(unused)]
+
 use crate::db::Db;
 use anyhow::Result;
 use sqlx::Row;

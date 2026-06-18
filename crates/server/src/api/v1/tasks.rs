@@ -1,3 +1,6 @@
+#![allow(dead_code)]
+#![allow(unused_imports)]
+
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -6,12 +9,14 @@ use axum::{
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::api::types::ApiResponse;
-use crate::auth::middleware::AuthUser;
+use crate::api::v1::auth::AppState;
+use crate::auth::middleware::{AuthSession, AuthUser};
+use crate::auth::rbac::{can_access_servers, has_scope};
 use crate::db::repository::tasks::{TaskRepository, TaskRunRepository};
 use crate::db::Db;
+use crate::tasks::{dispatch_task_to_agents, parse_task_schedule};
 use xlstatus_shared::tasks::*;
 
 #[derive(Debug, Deserialize)]
@@ -71,20 +76,23 @@ pub struct TaskRunsResponse {
 
 /// Create a new task
 pub async fn create_task(
-    State(db): State<Db>,
+    State(state): State<AppState>,
     auth_user: AuthUser,
     Json(req): Json<CreateTaskRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    let db = state.db.clone();
+
+    require_scope_or_403(&auth_user, "task:write")?;
+    validate_task_selector_or_403(&auth_user, &req.server_selector_json)?;
     // Validate schedule if present
     if let Some(ref schedule) = req.schedule {
-        if schedule.parse::<cron::Schedule>().is_err() {
+        if parse_task_schedule(schedule).is_err() {
             return Err((
                 StatusCode::BAD_REQUEST,
                 Json(ApiResponse {
                     success: false,
                     data: None,
                     error: Some("Invalid cron schedule".to_string()),
-                    
                 }),
             ));
         }
@@ -110,19 +118,16 @@ pub async fn create_task(
         updated_at: now,
     };
 
-    TaskRepository::create(&db, &task)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse {
-                    success: false,
-                    data: None,
-                    error: Some(format!("Failed to create task: {}", e)),
-                    
-                }),
-            )
-        })?;
+    TaskRepository::create(&db, &task).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse {
+                success: false,
+                data: None,
+                error: Some(format!("Failed to create task: {}", e)),
+            }),
+        )
+    })?;
 
     Ok((
         StatusCode::CREATED,
@@ -130,30 +135,36 @@ pub async fn create_task(
             success: true,
             data: Some(TaskResponse { task }),
             error: None,
-            
         }),
     ))
 }
 
 /// List tasks
 pub async fn list_tasks(
-    State(db): State<Db>,
+    State(state): State<AppState>,
     auth_user: AuthUser,
     Query(query): Query<ListQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
-    let tasks = TaskRepository::list_by_user(&db, &auth_user.user.id.0.to_string(), query.limit, query.offset)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse {
-                    success: false,
-                    data: None,
-                    error: Some(format!("Failed to list tasks: {}", e)),
-                    
-                }),
-            )
-        })?;
+    let db = state.db.clone();
+
+    require_scope_or_403(&auth_user, "task:read")?;
+    let tasks = TaskRepository::list_by_user(
+        &db,
+        &auth_user.user.id.0.to_string(),
+        query.limit,
+        query.offset,
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse {
+                success: false,
+                data: None,
+                error: Some(format!("Failed to list tasks: {}", e)),
+            }),
+        )
+    })?;
 
     let total = tasks.len();
 
@@ -161,16 +172,18 @@ pub async fn list_tasks(
         success: true,
         data: Some(TaskListResponse { tasks, total }),
         error: None,
-        
     }))
 }
 
 /// Get a specific task
 pub async fn get_task(
-    State(db): State<Db>,
+    State(state): State<AppState>,
     auth_user: AuthUser,
     Path(task_id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    let db = state.db.clone();
+
+    require_scope_or_403(&auth_user, "task:read")?;
     let task = TaskRepository::get_by_id(&db, &task_id)
         .await
         .map_err(|e| {
@@ -180,7 +193,6 @@ pub async fn get_task(
                     success: false,
                     data: None,
                     error: Some(format!("Failed to get task: {}", e)),
-                    
                 }),
             )
         })?
@@ -191,7 +203,6 @@ pub async fn get_task(
                     success: false,
                     data: None,
                     error: Some("Task not found".to_string()),
-                    
                 }),
             )
         })?;
@@ -204,7 +215,6 @@ pub async fn get_task(
                 success: false,
                 data: None,
                 error: Some("Not authorized".to_string()),
-                
             }),
         ));
     }
@@ -213,17 +223,19 @@ pub async fn get_task(
         success: true,
         data: Some(TaskResponse { task }),
         error: None,
-        
     }))
 }
 
 /// Update a task
 pub async fn update_task(
-    State(db): State<Db>,
+    State(state): State<AppState>,
     auth_user: AuthUser,
     Path(task_id): Path<String>,
     Json(req): Json<UpdateTaskRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    let db = state.db.clone();
+
+    require_scope_or_403(&auth_user, "task:write")?;
     let mut task = TaskRepository::get_by_id(&db, &task_id)
         .await
         .map_err(|e| {
@@ -233,7 +245,6 @@ pub async fn update_task(
                     success: false,
                     data: None,
                     error: Some(format!("Failed to get task: {}", e)),
-                    
                 }),
             )
         })?
@@ -244,7 +255,6 @@ pub async fn update_task(
                     success: false,
                     data: None,
                     error: Some("Task not found".to_string()),
-                    
                 }),
             )
         })?;
@@ -257,7 +267,6 @@ pub async fn update_task(
                 success: false,
                 data: None,
                 error: Some("Not authorized".to_string()),
-                
             }),
         ));
     }
@@ -268,14 +277,13 @@ pub async fn update_task(
     }
     if let Some(schedule) = req.schedule {
         // Validate schedule
-        if schedule.parse::<cron::Schedule>().is_err() {
+        if parse_task_schedule(&schedule).is_err() {
             return Err((
                 StatusCode::BAD_REQUEST,
                 Json(ApiResponse {
                     success: false,
                     data: None,
                     error: Some("Invalid cron schedule".to_string()),
-                    
                 }),
             ));
         }
@@ -291,6 +299,7 @@ pub async fn update_task(
         task.cover_mode = cover_mode;
     }
     if let Some(server_selector_json) = req.server_selector_json {
+        validate_task_selector_or_403(&auth_user, &server_selector_json)?;
         task.server_selector_json = server_selector_json;
     }
     if let Some(push_successful) = req.push_successful {
@@ -305,34 +314,33 @@ pub async fn update_task(
 
     task.updated_at = Utc::now().to_rfc3339();
 
-    TaskRepository::update(&db, &task)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse {
-                    success: false,
-                    data: None,
-                    error: Some(format!("Failed to update task: {}", e)),
-                    
-                }),
-            )
-        })?;
+    TaskRepository::update(&db, &task).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse {
+                success: false,
+                data: None,
+                error: Some(format!("Failed to update task: {}", e)),
+            }),
+        )
+    })?;
 
     Ok(Json(ApiResponse {
         success: true,
         data: Some(TaskResponse { task }),
         error: None,
-        
     }))
 }
 
 /// Delete a task
 pub async fn delete_task(
-    State(db): State<Db>,
+    State(state): State<AppState>,
     auth_user: AuthUser,
     Path(task_id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    let db = state.db.clone();
+
+    require_scope_or_403(&auth_user, "task:delete")?;
     let task = TaskRepository::get_by_id(&db, &task_id)
         .await
         .map_err(|e| {
@@ -342,7 +350,6 @@ pub async fn delete_task(
                     success: false,
                     data: None,
                     error: Some(format!("Failed to get task: {}", e)),
-                    
                 }),
             )
         })?
@@ -353,7 +360,6 @@ pub async fn delete_task(
                     success: false,
                     data: None,
                     error: Some("Task not found".to_string()),
-                    
                 }),
             )
         })?;
@@ -366,24 +372,20 @@ pub async fn delete_task(
                 success: false,
                 data: None,
                 error: Some("Not authorized".to_string()),
-                
             }),
         ));
     }
 
-    TaskRepository::delete(&db, &task_id)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse {
-                    success: false,
-                    data: None,
-                    error: Some(format!("Failed to delete task: {}", e)),
-                    
-                }),
-            )
-        })?;
+    TaskRepository::delete(&db, &task_id).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse {
+                success: false,
+                data: None,
+                error: Some(format!("Failed to delete task: {}", e)),
+            }),
+        )
+    })?;
 
     Ok((
         StatusCode::NO_CONTENT,
@@ -391,17 +393,25 @@ pub async fn delete_task(
             success: true,
             data: None,
             error: None,
-            
         }),
     ))
 }
 
-/// Manually run a task
+/// Manually run a task.
+///
+/// M5: parse the task's server selector, dispatch a
+/// `ServerMessage::Task` to every live agent that matches, persist a
+/// `task_runs` row per agent, and wait up to ~5s for each
+/// `TaskResult` reply. Agents that are offline are recorded as
+/// `offline`. The response summarizes the per-agent outcomes.
 pub async fn run_task(
-    State(db): State<Db>,
+    State(state): State<AppState>,
     auth_user: AuthUser,
     Path(task_id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    let db = state.db.clone();
+
+    require_scope_or_403(&auth_user, "task:exec")?;
     let task = TaskRepository::get_by_id(&db, &task_id)
         .await
         .map_err(|e| {
@@ -411,7 +421,6 @@ pub async fn run_task(
                     success: false,
                     data: None,
                     error: Some(format!("Failed to get task: {}", e)),
-                    
                 }),
             )
         })?
@@ -422,7 +431,6 @@ pub async fn run_task(
                     success: false,
                     data: None,
                     error: Some("Task not found".to_string()),
-                    
                 }),
             )
         })?;
@@ -435,31 +443,47 @@ pub async fn run_task(
                 success: false,
                 data: None,
                 error: Some("Not authorized".to_string()),
-                
             }),
         ));
     }
 
-    // TODO: Trigger task execution via scheduler
-    // For now, just return success
+    validate_task_selector_or_403(&auth_user, &task.server_selector_json)?;
+
+    let report = dispatch_task_to_agents(
+        &db,
+        &state.session_registry,
+        crate::current_task_response_registry(),
+        &task,
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse {
+                success: false,
+                data: None,
+                error: Some(e.to_string()),
+            }),
+        )
+    })?;
 
     Ok(Json(ApiResponse {
         success: true,
-        data: Some(serde_json::json!({
-            "message": "Task execution triggered"
-        })),
+        data: Some(report),
         error: None,
-        
     }))
 }
 
 /// Get task execution history
 pub async fn get_task_runs(
-    State(db): State<Db>,
+    State(state): State<AppState>,
     auth_user: AuthUser,
     Path(task_id): Path<String>,
     Query(query): Query<ListQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    let db = state.db.clone();
+
+    require_scope_or_403(&auth_user, "task:read")?;
     let task = TaskRepository::get_by_id(&db, &task_id)
         .await
         .map_err(|e| {
@@ -469,7 +493,6 @@ pub async fn get_task_runs(
                     success: false,
                     data: None,
                     error: Some(format!("Failed to get task: {}", e)),
-                    
                 }),
             )
         })?
@@ -480,7 +503,6 @@ pub async fn get_task_runs(
                     success: false,
                     data: None,
                     error: Some("Task not found".to_string()),
-                    
                 }),
             )
         })?;
@@ -493,7 +515,6 @@ pub async fn get_task_runs(
                 success: false,
                 data: None,
                 error: Some("Not authorized".to_string()),
-                
             }),
         ));
     }
@@ -507,7 +528,6 @@ pub async fn get_task_runs(
                     success: false,
                     data: None,
                     error: Some(format!("Failed to list task runs: {}", e)),
-                    
                 }),
             )
         })?;
@@ -518,6 +538,81 @@ pub async fn get_task_runs(
         success: true,
         data: Some(TaskRunsResponse { runs, total }),
         error: None,
-        
     }))
+}
+
+fn require_scope_or_403(
+    auth_user: &AuthUser,
+    required_scope: &str,
+) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
+    let session = AuthSession {
+        session_id: auth_user.session_id.clone(),
+        user_id: auth_user.user.id,
+        username: auth_user.user.username.clone(),
+        role: auth_user.user.role,
+        csrf_token: auth_user.csrf_token.clone(),
+        auth_kind: auth_user.auth_kind.clone(),
+        scopes: auth_user.scopes.clone(),
+        server_ids: auth_user.server_ids.clone(),
+        pat_id: auth_user.pat_id.clone(),
+    };
+    if has_scope(&session, required_scope) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiResponse {
+                success: false,
+                data: None,
+                error: Some(format!("missing required scope: {}", required_scope)),
+            }),
+        ))
+    }
+}
+
+fn validate_task_selector_or_403(
+    auth_user: &AuthUser,
+    selector_json: &str,
+) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
+    let selector: ServerSelector = match serde_json::from_str(selector_json) {
+        Ok(s) => s,
+        Err(_) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse {
+                    success: false,
+                    data: None,
+                    error: Some("server_selector_json is not valid JSON".to_string()),
+                }),
+            ));
+        }
+    };
+
+    if !selector.server_ids.is_empty() {
+        let session = AuthSession {
+            session_id: auth_user.session_id.clone(),
+            user_id: auth_user.user.id,
+            username: auth_user.user.username.clone(),
+            role: auth_user.user.role,
+            csrf_token: auth_user.csrf_token.clone(),
+            auth_kind: auth_user.auth_kind.clone(),
+            scopes: auth_user.scopes.clone(),
+            server_ids: auth_user.server_ids.clone(),
+            pat_id: auth_user.pat_id.clone(),
+        };
+        if !can_access_servers(&session, &selector.server_ids) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(ApiResponse {
+                    success: false,
+                    data: None,
+                    error: Some(
+                        "server_selector_json contains servers outside PAT allowlist".to_string(),
+                    ),
+                }),
+            ));
+        }
+    }
+
+    Ok(())
 }

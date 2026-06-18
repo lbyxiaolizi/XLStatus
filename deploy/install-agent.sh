@@ -6,8 +6,11 @@ set -e
 
 VERSION="${VERSION:-v1.0.0}"
 SERVER_URL="${SERVER_URL:-http://localhost:8080}"
+GRPC_SERVER="${GRPC_SERVER:-}"
 AGENT_NAME="${AGENT_NAME:-$(hostname)}"
 BINARY_PATH="${BINARY_PATH:-}"  # User can provide compiled binary path
+CONFIG_FILE="${CONFIG_FILE:-/etc/xlstatus-agent/agent.json}"
+ENROLLMENT_TOKEN="${ENROLLMENT_TOKEN:-}"
 
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║                                                              ║"
@@ -82,46 +85,56 @@ else
 fi
 
 # Create config directory
-mkdir -p /etc/xlstatus-agent
+mkdir -p "$(dirname "$CONFIG_FILE")"
 mkdir -p /var/lib/xlstatus-agent
 
 # Get enrollment token
-echo ""
-echo "🔑 Please provide the enrollment token from your server:"
-read -r ENROLLMENT_TOKEN
+if [ -z "$ENROLLMENT_TOKEN" ]; then
+  echo ""
+  echo "🔑 Please provide the enrollment token from your server:"
+  read -r ENROLLMENT_TOKEN
+fi
 
 if [ -z "$ENROLLMENT_TOKEN" ]; then
   echo "❌ Enrollment token is required"
   exit 1
 fi
 
-# Create config
-cat > /etc/xlstatus-agent/config.toml << EOF
-server_url = "$SERVER_URL"
-agent_name = "$AGENT_NAME"
-enrollment_token = "$ENROLLMENT_TOKEN"
+# Enroll and create config. The agent writes JSON and stores the Ed25519 keypair.
+echo ""
+echo "🔐 Enrolling agent..."
+if [ -n "$GRPC_SERVER" ]; then
+  /usr/local/bin/xlstatus-agent enroll \
+    --server "$SERVER_URL" \
+    --grpc-server "$GRPC_SERVER" \
+    --token "$ENROLLMENT_TOKEN" \
+    --name "$AGENT_NAME" \
+    --config "$CONFIG_FILE"
+else
+  /usr/local/bin/xlstatus-agent enroll \
+    --server "$SERVER_URL" \
+    --token "$ENROLLMENT_TOKEN" \
+    --name "$AGENT_NAME" \
+    --config "$CONFIG_FILE"
+fi
 
-[logging]
-level = "info"
-EOF
-
-chown xlstatus-agent:xlstatus-agent /etc/xlstatus-agent/config.toml
-chmod 600 /etc/xlstatus-agent/config.toml
+chown root:root "$CONFIG_FILE"
+chmod 600 "$CONFIG_FILE"
 
 # Install systemd service
 echo ""
 echo "🔧 Installing systemd service..."
-cat > /etc/systemd/system/xlstatus-agent.service << 'EOF'
+cat > /etc/systemd/system/xlstatus-agent.service << EOF
 [Unit]
 Description=XLStatus Agent
 After=network.target
 
 [Service]
 Type=simple
-User=xlstatus-agent
-Group=xlstatus-agent
-ExecStart=/usr/local/bin/xlstatus-agent
-Restart=on-failure
+User=root
+Group=root
+ExecStart=/usr/local/bin/xlstatus-agent run --config $CONFIG_FILE
+Restart=always
 RestartSec=5s
 
 Environment="RUST_LOG=info"

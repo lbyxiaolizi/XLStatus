@@ -1,3 +1,4 @@
+use crate::security::validate_outbound_url;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -52,6 +53,7 @@ impl NotificationSender {
         Self {
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("Failed to build HTTP client"),
         }
@@ -81,13 +83,24 @@ impl NotificationSender {
         channel: &NotificationChannel,
         message: &NotificationMessage,
     ) -> Result<()> {
+        let url = validate_outbound_url(&channel.url, "notification webhook").await?;
         let body = self.render_template(&channel.body_template, message)?;
+        let client = if channel.verify_tls {
+            self.client.clone()
+        } else {
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none())
+                .danger_accept_invalid_certs(true)
+                .build()
+                .context("failed to build notification HTTP client")?
+        };
 
         let mut request = match channel.request_method.to_uppercase().as_str() {
-            "GET" => self.client.get(&channel.url),
-            "POST" => self.client.post(&channel.url),
-            "PUT" => self.client.put(&channel.url),
-            _ => self.client.post(&channel.url),
+            "GET" => client.get(url.clone()),
+            "POST" => client.post(url.clone()),
+            "PUT" => client.put(url.clone()),
+            _ => client.post(url.clone()),
         };
 
         // Add headers
@@ -98,18 +111,13 @@ impl NotificationSender {
         request = request.header("Content-Type", "application/json");
         request = request.body(body);
 
-        if !channel.verify_tls {
-            // Note: This requires a custom client builder
-            // For now, we'll use the default client
-        }
-
-        let response = request.send().await.context("Failed to send notification")?;
+        let response = request
+            .send()
+            .await
+            .context("Failed to send notification")?;
 
         if !response.status().is_success() {
-            error!(
-                "Notification failed with status: {}",
-                response.status()
-            );
+            error!("Notification failed with status: {}", response.status());
             anyhow::bail!("Notification request failed");
         }
 
@@ -137,11 +145,7 @@ impl NotificationSender {
     }
 
     /// Render notification template
-    fn render_template(
-        &self,
-        template: &str,
-        message: &NotificationMessage,
-    ) -> Result<String> {
+    fn render_template(&self, template: &str, message: &NotificationMessage) -> Result<String> {
         // Simple template rendering
         let mut rendered = template.to_string();
 
@@ -190,7 +194,8 @@ mod tests {
             },
         };
 
-        let template = r#"{"title": "{{title}}", "message": "{{message}}", "server": "{{metadata.server}}"}"#;
+        let template =
+            r#"{"title": "{{title}}", "message": "{{message}}", "server": "{{metadata.server}}"}"#;
         let rendered = sender.render_template(template, &message).unwrap();
 
         assert!(rendered.contains("Test Alert"));

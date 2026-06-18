@@ -7,22 +7,30 @@ English | [简体中文](./README.zh-CN.md)
 
 Self-hosted server monitoring and operations system written in Rust. XLStatus provides real-time monitoring, service health checks, task scheduling, and automation capabilities.
 
+## Current Status
+
+XLStatus is in active development. The workspace currently passes `cargo check --workspace`, `cargo test --workspace`, `cd web && pnpm lint`, and `cd web && pnpm build`. M0-M9 have runnable acceptance coverage in `test-run/`; literal 24-hour soak runs still need to be performed in a target deployment environment.
+
+Before deploying or extending the project, read the current implementation audit: [docs/implementation-audit.md](./docs/implementation-audit.md).
+
 ## ✨ Features
 
-- **Real-time Server Monitoring** - CPU, memory, disk, network, load, connections, temperature, GPU
-- **Service Monitoring** - HTTP, TCP, ICMP health checks with SSL certificate tracking
-- **Alert Rules** - Flexible alerting with multiple conditions and notification channels
-- **Task Scheduler** - Cron-based and on-demand task execution
-- **NAT Traversal** - Access internal services through port forwarding
-- **DDNS Integration** - Automatic DNS updates (Cloudflare, HE, Webhook)
-- **MCP Integration** - Model Context Protocol for LLM automation
-- **Web Dashboard** - Modern React-based management interface
-- **Public Status Page** - Share system status with your users
-- **Multi-user RBAC** - Role-based access control with server ownership
+- **Real-time Server Monitoring** - CPU, memory, disk, network, load, connections, and temperature data from enrolled agents
+- **Service Monitoring** - HTTP, TCP, ICMP health checks with HTTPS certificate fingerprint and expiry tracking
+- **Alert Rules** - resource, offline, service status, latency, recovery, and webhook notification flows
+- **Task Scheduler** - cron-based and on-demand task execution through live agents
+- **NAT Traversal** - access to internal services through reverse tunneling
+- **DDNS Integration** - DNS updates for Cloudflare, Tencent Cloud, HE, Webhook, and Dummy providers
+- **MCP Integration** - Model Context Protocol REST compatibility and `/mcp` JSON-RPC tools
+- **Web Dashboard** - Next.js management interface for servers, services, alerts, tasks, DDNS, NAT, terminal, and settings
+- **Public Status Page** - public status overview for exposed resources
+- **Multi-user RBAC** - role-based access control, PAT scopes, CSRF protection, and server allowlists
 
 ## 🚀 Quick Start
 
 ### Using Docker Compose (Recommended)
+
+Docker files and Compose files are validated by the M9 smoke script. Use this for local development/testing first, then run your own 24-hour soak before production.
 
 ```bash
 # Clone the repository
@@ -59,6 +67,8 @@ sudo BINARY_PATH=target/release/xlstatus-agent bash deploy/install-agent.sh
 
 ## 📚 Documentation
 
+- [Current Implementation Audit](./docs/implementation-audit.md)
+- [Documentation Index](./docs/README.md)
 - [Architecture](./plan/02-architecture.md)
 - [Installation Guide](./docs/installation.md)
 - [Configuration](./docs/configuration.md)
@@ -153,10 +163,10 @@ XLStatus/
 
 ## 📊 Performance
 
-- Supports 100+ agents with 3-second reporting intervals
-- 1000+ service monitors with 30-second checks
-- Query response times: P95 < 500ms for 30-day data
-- 24-hour stability testing passed
+- Verified dry-run load plan: 100 agents with 3-second reporting intervals over a 24-hour window
+- Planned target: 1000+ service monitors with 30-second checks
+- Planned target: query response P95 < 500ms for 30-day data
+- Literal wall-clock 24-hour stability should still be run in the target deployment environment
 
 ## 🤝 Contributing
 
@@ -180,9 +190,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 🗺️ Roadmap
 
-- [x] M0-M7: Core features and web interface
-- [ ] M8: High-performance optimizations
-- [ ] M9: Production deployment and documentation
+- [x] M0-M9: scaffold, base platform, agent onboarding, real-time monitoring, service monitoring and alerts, operations, DDNS/NAT/MCP, frontend, performance tooling, and release smoke are covered by runnable acceptance scripts
 - [ ] Multi-node Dashboard clustering
 - [ ] Windows and macOS agent support
 - [ ] Mobile applications

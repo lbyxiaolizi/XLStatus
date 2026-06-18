@@ -1,3 +1,6 @@
+#![allow(dead_code)]
+#![allow(unused)]
+
 use crate::db::Db;
 use anyhow::Result;
 use sqlx::Row;
@@ -74,10 +77,7 @@ impl TaskRepository {
 
         let task_opt = match db {
             crate::db::DatabaseBackend::Sqlite(pool) => {
-                let row_opt = sqlx::query(query)
-                    .bind(id)
-                    .fetch_optional(pool)
-                    .await?;
+                let row_opt = sqlx::query(query).bind(id).fetch_optional(pool).await?;
 
                 match row_opt {
                     Some(row) => Some(Self::row_to_task(row)?),
@@ -85,10 +85,7 @@ impl TaskRepository {
                 }
             }
             crate::db::DatabaseBackend::Postgres(pool) => {
-                let row_opt = sqlx::query(query)
-                    .bind(id)
-                    .fetch_optional(pool)
-                    .await?;
+                let row_opt = sqlx::query(query).bind(id).fetch_optional(pool).await?;
 
                 match row_opt {
                     Some(row) => Some(Self::row_to_task(row)?),
@@ -150,24 +147,32 @@ impl TaskRepository {
 
     /// List all enabled scheduled tasks
     pub async fn list_scheduled(db: &Db) -> Result<Vec<Task>> {
-        let query = r#"
-            SELECT id, owner_user_id, name, task_type, schedule, command,
-                   payload_json, cover_mode, server_selector_json,
-                   push_successful, notification_group_id, last_executed_at,
-                   last_result, enabled, created_at, updated_at
-            FROM tasks
-            WHERE enabled = 1 AND schedule IS NOT NULL
-            ORDER BY created_at DESC
-        "#;
-
         let tasks = match db {
             crate::db::DatabaseBackend::Sqlite(pool) => {
+                let query = r#"
+                    SELECT id, owner_user_id, name, task_type, schedule, command,
+                           payload_json, cover_mode, server_selector_json,
+                           push_successful, notification_group_id, last_executed_at,
+                           last_result, enabled, created_at, updated_at
+                    FROM tasks
+                    WHERE enabled = 1 AND schedule IS NOT NULL
+                    ORDER BY created_at DESC
+                "#;
                 let rows = sqlx::query(query).fetch_all(pool).await?;
                 rows.into_iter()
                     .map(Self::row_to_task)
                     .collect::<Result<Vec<_>>>()?
             }
             crate::db::DatabaseBackend::Postgres(pool) => {
+                let query = r#"
+                    SELECT id, owner_user_id, name, task_type, schedule, command,
+                           payload_json, cover_mode, server_selector_json,
+                           push_successful, notification_group_id, last_executed_at,
+                           last_result, enabled, created_at, updated_at
+                    FROM tasks
+                    WHERE enabled = TRUE AND schedule IS NOT NULL
+                    ORDER BY created_at DESC
+                "#;
                 let rows = sqlx::query(query).fetch_all(pool).await?;
                 rows.into_iter()
                     .map(Self::row_to_task)
@@ -309,6 +314,51 @@ impl TaskRepository {
 pub struct TaskRunRepository;
 
 impl TaskRunRepository {
+    /// M5: update a task run with the final status and output once
+    /// the agent's TaskResult arrives.
+    pub async fn update_result(
+        db: &Db,
+        run_id: &str,
+        status: TaskStatus,
+        delay_ms: i64,
+        output: Option<String>,
+        output_truncated: bool,
+        error: Option<String>,
+    ) -> Result<()> {
+        let status_str = match status {
+            TaskStatus::Offline => "pending",
+            TaskStatus::Success => "success",
+            TaskStatus::Failure => "failed",
+            TaskStatus::Timeout => "timeout",
+        };
+        let query = "UPDATE task_runs SET status = ?, delay_ms = ?, output = ?, output_truncated = ?, error = ? WHERE id = ?";
+        match db {
+            crate::db::DatabaseBackend::Sqlite(pool) => {
+                sqlx::query(query)
+                    .bind(status_str)
+                    .bind(delay_ms)
+                    .bind(&output)
+                    .bind(output_truncated)
+                    .bind(&error)
+                    .bind(run_id)
+                    .execute(pool)
+                    .await?;
+            }
+            crate::db::DatabaseBackend::Postgres(pool) => {
+                sqlx::query(query)
+                    .bind(status_str)
+                    .bind(delay_ms)
+                    .bind(&output)
+                    .bind(output_truncated)
+                    .bind(&error)
+                    .bind(run_id)
+                    .execute(pool)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Create a task run record
     pub async fn create(db: &Db, run: &TaskRun) -> Result<()> {
         let query = r#"

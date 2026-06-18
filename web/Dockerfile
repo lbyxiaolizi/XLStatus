@@ -6,7 +6,7 @@ FROM base AS deps
 WORKDIR /app
 
 COPY package.json pnpm-lock.yaml* ./
-RUN corepack enable pnpm && pnpm install --frozen-lockfile
+RUN corepack enable pnpm && corepack prepare pnpm@10.23.0 --activate && pnpm install --frozen-lockfile
 
 # Build stage
 FROM base AS builder
@@ -15,7 +15,7 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
-RUN corepack enable pnpm && pnpm run build
+RUN corepack enable pnpm && corepack prepare pnpm@10.23.0 --activate && pnpm run build
 
 # Runtime stage
 FROM base AS runner

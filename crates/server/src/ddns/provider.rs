@@ -1,5 +1,8 @@
+use crate::security::validate_outbound_url;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use hmac::{Hmac, Mac};
+use sha2::{Digest, Sha256};
 use xlstatus_shared::ddns::*;
 
 /// DDNS provider trait
@@ -50,17 +53,13 @@ impl DdnsProviderTrait for CloudflareProvider {
             .await
             .context("Failed to parse list response")?;
 
-        let records = list_json["result"]
-            .as_array()
-            .context("No result array")?;
+        let records = list_json["result"].as_array().context("No result array")?;
 
         if records.is_empty() {
             anyhow::bail!("DNS record not found: {}", hostname);
         }
 
-        let record_id = records[0]["id"]
-            .as_str()
-            .context("No record ID")?;
+        let record_id = records[0]["id"].as_str().context("No record ID")?;
 
         // Update DNS record
         let update_url = format!(
@@ -147,6 +146,106 @@ impl DdnsProviderTrait for HeProvider {
     }
 }
 
+/// Tencent Cloud DNSPod DDNS provider.
+///
+/// Uses Tencent Cloud API v3 `dnspod` `ModifyDynamicDNS`. The DB/API layer
+/// supplies `record_id`; discovering record IDs can be added later as a
+/// UX helper, but update itself is fully implemented here.
+pub struct TencentCloudProvider {
+    config: TencentCloudConfig,
+    client: reqwest::Client,
+}
+
+impl TencentCloudProvider {
+    pub fn new(config: TencentCloudConfig) -> Self {
+        Self {
+            config,
+            client: reqwest::Client::new(),
+        }
+    }
+
+    fn subdomain_for(&self, hostname: &str) -> String {
+        if !self.config.subdomain.trim().is_empty() && self.config.subdomain != "@" {
+            return self.config.subdomain.clone();
+        }
+        let suffix = format!(".{}", self.config.domain);
+        hostname
+            .strip_suffix(&suffix)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("@")
+            .to_string()
+    }
+}
+
+#[async_trait]
+impl DdnsProviderTrait for TencentCloudProvider {
+    async fn update_ip(&self, hostname: &str, ip: &str) -> Result<()> {
+        let record_id = self
+            .config
+            .record_id
+            .context("Tencent Cloud record_id is required")?;
+        if self.config.secret_id.trim().is_empty() || self.config.secret_key.trim().is_empty() {
+            anyhow::bail!("Tencent Cloud secret_id and secret_key are required");
+        }
+
+        let endpoint = "dnspod.tencentcloudapi.com";
+        let timestamp = chrono::Utc::now().timestamp();
+        let body = serde_json::json!({
+            "Domain": self.config.domain,
+            "SubDomain": self.subdomain_for(hostname),
+            "RecordLine": self.config.record_line,
+            "Value": ip,
+            "RecordId": record_id,
+            "TTL": self.config.ttl,
+        })
+        .to_string();
+        let authorization = tencent_authorization(
+            &self.config.secret_id,
+            &self.config.secret_key,
+            "dnspod",
+            endpoint,
+            "ModifyDynamicDNS",
+            "/",
+            &body,
+            timestamp,
+        )?;
+
+        let response = self
+            .client
+            .post(format!("https://{}", endpoint))
+            .header("Authorization", authorization)
+            .header("Content-Type", "application/json")
+            .header("Host", endpoint)
+            .header("X-TC-Action", "ModifyDynamicDNS")
+            .header("X-TC-Version", "2021-03-23")
+            .header("X-TC-Timestamp", timestamp.to_string())
+            .body(body)
+            .send()
+            .await
+            .context("Failed to update Tencent Cloud DNS record")?;
+
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("Tencent Cloud API HTTP {}: {}", status, text);
+        }
+        let parsed: serde_json::Value = serde_json::from_str(&text)
+            .with_context(|| format!("Failed to parse Tencent Cloud response: {}", text))?;
+        if let Some(error) = parsed
+            .get("Response")
+            .and_then(|response| response.get("Error"))
+        {
+            anyhow::bail!("Tencent Cloud API error: {}", error);
+        }
+
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "Tencent Cloud"
+    }
+}
+
 /// Webhook DDNS provider
 pub struct WebhookProvider {
     config: WebhookConfig,
@@ -157,7 +256,10 @@ impl WebhookProvider {
     pub fn new(config: WebhookConfig) -> Self {
         Self {
             config,
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("failed to build DDNS webhook HTTP client"),
         }
     }
 }
@@ -165,12 +267,17 @@ impl WebhookProvider {
 #[async_trait]
 impl DdnsProviderTrait for WebhookProvider {
     async fn update_ip(&self, hostname: &str, ip: &str) -> Result<()> {
-        let url = self.config.url.replace("{{ip}}", ip).replace("{{hostname}}", hostname);
+        let url = self
+            .config
+            .url
+            .replace("{{ip}}", ip)
+            .replace("{{hostname}}", hostname);
+        let url = validate_outbound_url(&url, "DDNS webhook").await?;
 
         let mut request = match self.config.method.to_uppercase().as_str() {
-            "POST" => self.client.post(&url),
-            "PUT" => self.client.put(&url),
-            _ => self.client.get(&url),
+            "POST" => self.client.post(url.clone()),
+            "PUT" => self.client.put(url.clone()),
+            _ => self.client.get(url.clone()),
         };
 
         // Add custom headers
@@ -188,7 +295,9 @@ impl DdnsProviderTrait for WebhookProvider {
 
         // Add body for POST/PUT
         if let Some(ref body_template) = self.config.body_template {
-            let body = body_template.replace("{{ip}}", ip).replace("{{hostname}}", hostname);
+            let body = body_template
+                .replace("{{ip}}", ip)
+                .replace("{{hostname}}", hostname);
             request = request.body(body);
         }
 
@@ -232,26 +341,80 @@ pub fn create_provider(
 ) -> Result<Box<dyn DdnsProviderTrait>> {
     match provider_type {
         ProviderType::Cloudflare => {
-            let config: CloudflareConfig = serde_json::from_str(config_json)
-                .context("Failed to parse Cloudflare config")?;
+            let config: CloudflareConfig =
+                serde_json::from_str(config_json).context("Failed to parse Cloudflare config")?;
             Ok(Box::new(CloudflareProvider::new(config)))
         }
         ProviderType::He => {
-            let config: HeConfig = serde_json::from_str(config_json)
-                .context("Failed to parse HE config")?;
+            let config: HeConfig =
+                serde_json::from_str(config_json).context("Failed to parse HE config")?;
             Ok(Box::new(HeProvider::new(config)))
         }
         ProviderType::Webhook => {
-            let config: WebhookConfig = serde_json::from_str(config_json)
-                .context("Failed to parse Webhook config")?;
+            let config: WebhookConfig =
+                serde_json::from_str(config_json).context("Failed to parse Webhook config")?;
             Ok(Box::new(WebhookProvider::new(config)))
         }
         ProviderType::Dummy => Ok(Box::new(DummyProvider)),
         ProviderType::TencentCloud => {
-            // TODO: Implement Tencent Cloud provider
-            anyhow::bail!("Tencent Cloud provider not yet implemented")
+            let config: TencentCloudConfig = serde_json::from_str(config_json)
+                .context("Failed to parse Tencent Cloud config")?;
+            Ok(Box::new(TencentCloudProvider::new(config)))
         }
     }
+}
+
+fn tencent_authorization(
+    secret_id: &str,
+    secret_key: &str,
+    service: &str,
+    host: &str,
+    action: &str,
+    canonical_uri: &str,
+    payload: &str,
+    timestamp: i64,
+) -> Result<String> {
+    let date = chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp, 0)
+        .context("invalid Tencent Cloud timestamp")?
+        .format("%Y-%m-%d")
+        .to_string();
+    let hashed_payload = hex::encode(Sha256::digest(payload.as_bytes()));
+    let canonical_headers = format!(
+        "content-type:application/json\nhost:{}\nx-tc-action:{}\n",
+        host, action
+    );
+    let canonical_request = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        "POST",
+        canonical_uri,
+        "",
+        canonical_headers,
+        "content-type;host;x-tc-action",
+        hashed_payload
+    );
+    let credential_scope = format!("{}/{}/tc3_request", date, service);
+    let string_to_sign = format!(
+        "TC3-HMAC-SHA256\n{}\n{}\n{}",
+        timestamp,
+        credential_scope,
+        hex::encode(Sha256::digest(canonical_request.as_bytes()))
+    );
+
+    let secret_date = hmac_sha256(format!("TC3{}", secret_key).as_bytes(), date.as_bytes())?;
+    let secret_service = hmac_sha256(&secret_date, service.as_bytes())?;
+    let secret_signing = hmac_sha256(&secret_service, b"tc3_request")?;
+    let signature = hex::encode(hmac_sha256(&secret_signing, string_to_sign.as_bytes())?);
+
+    Ok(format!(
+        "TC3-HMAC-SHA256 Credential={}/{}, SignedHeaders=content-type;host;x-tc-action, Signature={}",
+        secret_id, credential_scope, signature
+    ))
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).context("invalid HMAC key")?;
+    mac.update(data);
+    Ok(mac.finalize().into_bytes().to_vec())
 }
 
 #[cfg(test)]
@@ -262,5 +425,23 @@ mod tests {
     fn test_create_dummy_provider() {
         let provider = create_provider(ProviderType::Dummy, "{}").unwrap();
         assert_eq!(provider.name(), "Dummy");
+    }
+
+    #[test]
+    fn test_tencent_authorization_generates_signature() {
+        let auth = tencent_authorization(
+            "akid",
+            "secret",
+            "dnspod",
+            "dnspod.tencentcloudapi.com",
+            "ModifyDynamicDNS",
+            "/",
+            "{\"Domain\":\"example.com\"}",
+            1_700_000_000,
+        )
+        .unwrap();
+        assert!(auth.starts_with("TC3-HMAC-SHA256 Credential=akid/"));
+        assert!(auth.contains("SignedHeaders=content-type;host;x-tc-action"));
+        assert!(auth.contains("Signature="));
     }
 }

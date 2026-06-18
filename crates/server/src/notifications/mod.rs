@@ -1,6 +1,4 @@
-pub mod sender;
+#![allow(dead_code)]
+#![allow(unused_imports)]
 
-pub use sender::{
-    NotificationChannel, NotificationMessage, NotificationSender, NotificationSeverity,
-    NotificationType,
-};
+pub mod sender;

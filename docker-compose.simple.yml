@@ -1,0 +1,33 @@
+# Simple Docker Compose for XLStatus - Server Only
+# For full stack (server + web + agent), use docker-compose.yml
+
+services:
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    container_name: xlstatus-server
+    ports:
+      - "8080:8080"
+      - "50051:50051"
+    volumes:
+      - xlstatus-data:/data
+    environment:
+      - DATABASE_URL=sqlite:///data/xlstatus.db?mode=rwc
+      - RUST_LOG=info
+      - HTTP_BIND=0.0.0.0:8080
+      - GRPC_BIND=0.0.0.0:50051
+      - SESSION_SECRET=change-me-in-production
+      - XLSTATUS_SEED_ADMIN_USERNAME=admin
+      - XLSTATUS_SEED_ADMIN_PASSWORD=admin123
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  xlstatus-data:
+    driver: local

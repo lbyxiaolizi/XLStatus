@@ -1,3 +1,6 @@
+#![allow(dead_code)]
+#![allow(unused)]
+
 use crate::db::{CreatePATInput, DatabaseBackend, PersonalAccessToken};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -12,14 +15,20 @@ impl PATRepository {
         Self { db }
     }
 
-    pub async fn create(&self, input: CreatePATInput, token_hash: String) -> Result<PersonalAccessToken> {
+    pub async fn create(
+        &self,
+        input: CreatePATInput,
+        token_hash: String,
+    ) -> Result<PersonalAccessToken> {
         let id = uuid::Uuid::now_v7().to_string();
         let now = Utc::now();
 
         match &self.db {
             DatabaseBackend::Sqlite(pool) => {
                 let scopes_json = serde_json::to_string(&input.scopes)?;
-                let server_ids_json = input.server_ids.as_ref()
+                let server_ids_json = input
+                    .server_ids
+                    .as_ref()
                     .map(|ids| serde_json::to_string(ids))
                     .transpose()?;
 
@@ -43,7 +52,9 @@ impl PATRepository {
             }
             DatabaseBackend::Postgres(pool) => {
                 let scopes_json = serde_json::to_value(&input.scopes)?;
-                let server_ids_json = input.server_ids.as_ref()
+                let server_ids_json = input
+                    .server_ids
+                    .as_ref()
                     .map(|ids| serde_json::to_value(ids))
                     .transpose()?;
 
@@ -97,21 +108,53 @@ impl PATRepository {
                 .fetch_all(pool)
                 .await?;
 
-                Ok(rows.into_iter().map(|(id, user_id_str, name, token_hash, scopes_json, server_ids_json, expires_at, last_used_at, last_used_ip, created_at, revoked_at)| {
-                    PersonalAccessToken {
-                        id,
-                        user_id: UserId(uuid::Uuid::parse_str(&user_id_str).unwrap()),
-                        name,
-                        token_hash,
-                        scopes: serde_json::from_str(&scopes_json).unwrap(),
-                        server_ids: server_ids_json.and_then(|s| serde_json::from_str(&s).ok()),
-                        expires_at: expires_at.and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))),
-                        last_used_at: last_used_at.and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))),
-                        last_used_ip,
-                        created_at: DateTime::parse_from_rfc3339(&created_at).unwrap().with_timezone(&Utc),
-                        revoked_at: revoked_at.and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))),
-                    }
-                }).collect())
+                Ok(rows
+                    .into_iter()
+                    .map(
+                        |(
+                            id,
+                            user_id_str,
+                            name,
+                            token_hash,
+                            scopes_json,
+                            server_ids_json,
+                            expires_at,
+                            last_used_at,
+                            last_used_ip,
+                            created_at,
+                            revoked_at,
+                        )| {
+                            PersonalAccessToken {
+                                id,
+                                user_id: UserId(uuid::Uuid::parse_str(&user_id_str).unwrap()),
+                                name,
+                                token_hash,
+                                scopes: serde_json::from_str(&scopes_json).unwrap(),
+                                server_ids: server_ids_json
+                                    .and_then(|s| serde_json::from_str(&s).ok()),
+                                expires_at: expires_at.and_then(|s| {
+                                    DateTime::parse_from_rfc3339(&s)
+                                        .ok()
+                                        .map(|dt| dt.with_timezone(&Utc))
+                                }),
+                                last_used_at: last_used_at.and_then(|s| {
+                                    DateTime::parse_from_rfc3339(&s)
+                                        .ok()
+                                        .map(|dt| dt.with_timezone(&Utc))
+                                }),
+                                last_used_ip,
+                                created_at: DateTime::parse_from_rfc3339(&created_at)
+                                    .unwrap()
+                                    .with_timezone(&Utc),
+                                revoked_at: revoked_at.and_then(|s| {
+                                    DateTime::parse_from_rfc3339(&s)
+                                        .ok()
+                                        .map(|dt| dt.with_timezone(&Utc))
+                                }),
+                            }
+                        },
+                    )
+                    .collect())
             }
             DatabaseBackend::Postgres(pool) => {
                 let rows = sqlx::query_as::<_, (String, uuid::Uuid, String, String, serde_json::Value, Option<serde_json::Value>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>, DateTime<Utc>, Option<DateTime<Utc>>)>(
@@ -126,8 +169,128 @@ impl PATRepository {
                 .fetch_all(pool)
                 .await?;
 
-                Ok(rows.into_iter().map(|(id, user_id_uuid, name, token_hash, scopes_json, server_ids_json, expires_at, last_used_at, last_used_ip, created_at, revoked_at)| {
-                    PersonalAccessToken {
+                Ok(rows
+                    .into_iter()
+                    .map(
+                        |(
+                            id,
+                            user_id_uuid,
+                            name,
+                            token_hash,
+                            scopes_json,
+                            server_ids_json,
+                            expires_at,
+                            last_used_at,
+                            last_used_ip,
+                            created_at,
+                            revoked_at,
+                        )| {
+                            PersonalAccessToken {
+                                id,
+                                user_id: UserId(user_id_uuid),
+                                name,
+                                token_hash,
+                                scopes: serde_json::from_value(scopes_json).unwrap(),
+                                server_ids: server_ids_json
+                                    .and_then(|v| serde_json::from_value(v).ok()),
+                                expires_at,
+                                last_used_at,
+                                last_used_ip,
+                                created_at,
+                                revoked_at,
+                            }
+                        },
+                    )
+                    .collect())
+            }
+        }
+    }
+
+    pub async fn find_by_token_hash(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<PersonalAccessToken>> {
+        match &self.db {
+            DatabaseBackend::Sqlite(pool) => {
+                let row = sqlx::query_as::<_, (String, String, String, String, String, Option<String>, Option<String>, Option<String>, Option<String>, String, Option<String>)>(
+                    r#"
+                    SELECT id, user_id, name, token_hash, scopes, server_ids, expires_at, last_used_at, last_used_ip, created_at, revoked_at
+                    FROM personal_access_tokens
+                    WHERE token_hash = ? AND revoked_at IS NULL
+                    "#,
+                )
+                .bind(token_hash)
+                .fetch_optional(pool)
+                .await?;
+
+                Ok(row.map(
+                    |(
+                        id,
+                        user_id_str,
+                        name,
+                        token_hash,
+                        scopes_json,
+                        server_ids_json,
+                        expires_at,
+                        last_used_at,
+                        last_used_ip,
+                        created_at,
+                        revoked_at,
+                    )| PersonalAccessToken {
+                        id,
+                        user_id: UserId(uuid::Uuid::parse_str(&user_id_str).unwrap()),
+                        name,
+                        token_hash,
+                        scopes: serde_json::from_str(&scopes_json).unwrap(),
+                        server_ids: server_ids_json.and_then(|s| serde_json::from_str(&s).ok()),
+                        expires_at: expires_at.and_then(|s| {
+                            DateTime::parse_from_rfc3339(&s)
+                                .ok()
+                                .map(|dt| dt.with_timezone(&Utc))
+                        }),
+                        last_used_at: last_used_at.and_then(|s| {
+                            DateTime::parse_from_rfc3339(&s)
+                                .ok()
+                                .map(|dt| dt.with_timezone(&Utc))
+                        }),
+                        last_used_ip,
+                        created_at: DateTime::parse_from_rfc3339(&created_at)
+                            .unwrap()
+                            .with_timezone(&Utc),
+                        revoked_at: revoked_at.and_then(|s| {
+                            DateTime::parse_from_rfc3339(&s)
+                                .ok()
+                                .map(|dt| dt.with_timezone(&Utc))
+                        }),
+                    },
+                ))
+            }
+            DatabaseBackend::Postgres(pool) => {
+                let row = sqlx::query_as::<_, (String, uuid::Uuid, String, String, serde_json::Value, Option<serde_json::Value>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>, DateTime<Utc>, Option<DateTime<Utc>>)>(
+                    r#"
+                    SELECT id, user_id, name, token_hash, scopes, server_ids, expires_at, last_used_at, last_used_ip, created_at, revoked_at
+                    FROM personal_access_tokens
+                    WHERE token_hash = $1 AND revoked_at IS NULL
+                    "#,
+                )
+                .bind(token_hash)
+                .fetch_optional(pool)
+                .await?;
+
+                Ok(row.map(
+                    |(
+                        id,
+                        user_id_uuid,
+                        name,
+                        token_hash,
+                        scopes_json,
+                        server_ids_json,
+                        expires_at,
+                        last_used_at,
+                        last_used_ip,
+                        created_at,
+                        revoked_at,
+                    )| PersonalAccessToken {
                         id,
                         user_id: UserId(user_id_uuid),
                         name,
@@ -139,10 +302,39 @@ impl PATRepository {
                         last_used_ip,
                         created_at,
                         revoked_at,
-                    }
-                }).collect())
+                    },
+                ))
             }
         }
+    }
+
+    pub async fn mark_used(&self, id: &str, ip: Option<&str>) -> Result<()> {
+        let now = Utc::now();
+
+        match &self.db {
+            DatabaseBackend::Sqlite(pool) => {
+                sqlx::query(
+                    "UPDATE personal_access_tokens SET last_used_at = ?, last_used_ip = ? WHERE id = ?",
+                )
+                .bind(now.to_rfc3339())
+                .bind(ip)
+                .bind(id)
+                .execute(pool)
+                .await?;
+            }
+            DatabaseBackend::Postgres(pool) => {
+                sqlx::query(
+                    "UPDATE personal_access_tokens SET last_used_at = $1, last_used_ip = $2 WHERE id = $3",
+                )
+                .bind(now)
+                .bind(ip)
+                .bind(id)
+                .execute(pool)
+                .await?;
+            }
+        }
+
+        Ok(())
     }
 
     pub async fn revoke(&self, id: &str, user_id: UserId) -> Result<bool> {

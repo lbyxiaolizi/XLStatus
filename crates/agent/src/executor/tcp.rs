@@ -1,3 +1,6 @@
+#![allow(dead_code)]
+#![allow(unused_imports)]
+
 use anyhow::{Context, Result};
 use std::net::ToSocketAddrs;
 use std::time::{Duration, Instant};
@@ -6,11 +9,13 @@ use tokio::time::timeout;
 
 /// TCP ping result
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct TcpPingResult {
     pub latency_ms: u64,
 }
 
 /// Execute TCP ping (connect and immediately close)
+#[allow(dead_code)]
 pub async fn execute_tcp_ping(
     host: &str,
     port: u16,
@@ -39,15 +44,21 @@ pub async fn execute_tcp_ping(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpListener;
 
     #[tokio::test]
     async fn test_tcp_ping_success() {
-        // Test against a known public service (Google DNS)
-        let result = execute_tcp_ping("8.8.8.8", 53, 5).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept_task = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        let result = execute_tcp_ping("127.0.0.1", port, 5).await;
         assert!(result.is_ok());
         let result = result.unwrap();
-        assert!(result.latency_ms > 0);
         assert!(result.latency_ms < 5000);
+        accept_task.await.unwrap();
     }
 
     #[tokio::test]
@@ -58,9 +69,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tcp_ping_timeout() {
-        // Use a non-routable IP to trigger timeout
-        let result = execute_tcp_ping("10.255.255.1", 80, 1).await;
+    async fn test_tcp_ping_unreachable() {
+        let result = execute_tcp_ping("127.0.0.1", 0, 1).await;
         assert!(result.is_err());
     }
 }

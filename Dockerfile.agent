@@ -1,7 +1,11 @@
 # Dockerfile for XLStatus Agent
-FROM rust:1.75 as builder
+FROM rust:bookworm AS builder
 
 WORKDIR /app
+
+RUN apt-get update && apt-get install -y \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy workspace files
 COPY Cargo.toml Cargo.lock ./
@@ -27,7 +31,8 @@ COPY --from=builder /app/target/release/xlstatus-agent /usr/local/bin/
 
 # Environment variables
 ENV SERVER_URL=http://localhost:8080
+ENV GRPC_SERVER=http://localhost:50051
 ENV AGENT_NAME=agent-1
 ENV RUST_LOG=info
 
-CMD ["xlstatus-agent"]
+CMD ["xlstatus-agent", "run", "--config", "/etc/xlstatus-agent/agent.json"]

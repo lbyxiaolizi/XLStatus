@@ -1,7 +1,11 @@
 # Dockerfile for XLStatus Server
-FROM rust:1.75 as builder
+FROM rust:bookworm AS builder
 
 WORKDIR /app
+
+RUN apt-get update && apt-get install -y \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy workspace files
 COPY Cargo.toml Cargo.lock ./
@@ -16,6 +20,7 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
+    curl \
     libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
@@ -31,7 +36,9 @@ RUN mkdir -p /data
 EXPOSE 8080 50051
 
 # Environment variables
-ENV DATABASE_URL=sqlite:///data/xlstatus.db
+ENV DATABASE_URL=sqlite:///data/xlstatus.db?mode=rwc
+ENV HTTP_BIND=0.0.0.0:8080
+ENV GRPC_BIND=0.0.0.0:50051
 ENV RUST_LOG=info
 
 CMD ["xlstatus-server"]

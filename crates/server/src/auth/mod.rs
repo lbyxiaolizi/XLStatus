@@ -1,14 +1,13 @@
+#![allow(dead_code)]
+#![allow(unused)]
+
 mod jwt;
 pub mod middleware;
-mod rbac;
+pub mod rbac;
 mod session;
 
-pub use jwt::{sign_agent_jwt, verify_agent_jwt, AgentClaims};
-pub use middleware::{
-    csrf_middleware, generate_csrf_token, session_middleware, AuthSession, AuthUser,
-    CSRF_HEADER_NAME, SESSION_COOKIE_NAME,
-};
-pub use rbac::{has_scope, require_admin, require_auth, require_scope};
+pub use jwt::{sign_agent_jwt, verify_agent_jwt};
+pub use middleware::AuthSession;
 pub use session::SessionRepository;
 
 use rand::Rng;
