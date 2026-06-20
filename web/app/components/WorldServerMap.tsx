@@ -88,8 +88,6 @@ export function WorldServerMap<TServer extends MapServerLike>({
 }: WorldServerMapProps<TServer>) {
   const buckets = useMemo(() => buildRegionBuckets(servers), [servers]);
   const highlighted = useMemo(() => new Map(buckets.regions.filter((bucket) => bucket.point.countryCode).map((bucket) => [bucket.point.countryCode as string, bucket])), [buckets.regions]);
-  const pointBuckets = useMemo(() => buckets.regions.filter((bucket) => !bucket.point.countryCode || !countryFeatureByIso2.has(bucket.point.countryCode)), [buckets.regions]);
-  const maxCount = Math.max(1, ...buckets.regions.map((bucket) => bucket.servers.length));
   const [tooltip, setTooltip] = useState<TooltipState<TServer> | null>(null);
 
   return (
@@ -153,42 +151,6 @@ export function WorldServerMap<TServer extends MapServerLike>({
                       });
                     }}
                   />
-                );
-              })}
-            </g>
-            <g>
-              {pointBuckets.map((bucket) => {
-                const [x, y] = projectPoint(bucket.point.longitude, bucket.point.latitude);
-                const blockSize = 7 + Math.min(7, (bucket.servers.length / maxCount) * 5);
-                return (
-                  <g
-                    key={bucket.point.key}
-                    className="cursor-pointer"
-                    onMouseEnter={() =>
-                      setTooltip({
-                        x,
-                        y,
-                        label: bucket.point.label,
-                        source: sourceLabel(bucket.point.source),
-                        servers: bucket.servers,
-                      })
-                    }
-                  >
-                    <path
-                      d={regionBlockPath(x, y, blockSize)}
-                      fill="var(--accent-color)"
-                      fillOpacity="0.9"
-                      stroke="var(--border-color)"
-                      strokeWidth="2.5"
-                      filter="url(#world-map-shadow)"
-                    />
-                    <path
-                      d={regionBlockPath(x, y, Math.max(3.5, blockSize - 4))}
-                      fill="var(--btn-text)"
-                      fillOpacity="0.18"
-                      pointerEvents="none"
-                    />
-                  </g>
                 );
               })}
             </g>
@@ -339,53 +301,21 @@ function serverLocationPoint(server: MapServerLike): RegionPoint | null {
     };
   }
 
-  if (latitude !== null && longitude !== null) {
-    return {
-      key: `${roundCoordinate(latitude)},${roundCoordinate(longitude)}`,
-      label,
-      latitude,
-      longitude,
-      source: location?.source === "manual" ? "manual" : "geoip",
-    };
-  }
-
-  if (countryCode && countryCoordinates[countryCode]) {
-    const coord = countryCoordinates[countryCode];
-    return {
-      key: countryCode,
-      label,
-      countryCode,
-      latitude: coord.lat,
-      longitude: coord.lng,
-      source: "country",
-    };
-  }
-
   const centroid = centroidForLocation(location, server);
   if (!centroid) return null;
+  if (!countryFeatureByIso2.has(centroid.key)) return null;
   return {
     key: centroid.key,
     label: locationLabel(location, server, centroid.label),
+    countryCode: centroid.key,
     latitude: centroid.lat,
     longitude: centroid.lng,
     source: "country",
   };
 }
 
-function projectPoint(longitude: number, latitude: number): [number, number] {
-  return projection([longitude, latitude]) ?? [width / 2, height / 2];
-}
-
-function regionBlockPath(x: number, y: number, size: number): string {
-  return `M ${x} ${y - size} L ${x + size} ${y} L ${x} ${y + size} L ${x - size} ${y} Z`;
-}
-
 function numberOrNull(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-function roundCoordinate(value: number): string {
-  return value.toFixed(3);
 }
 
 function locationLabel(location: ServerLocationLike | null, server: MapServerLike, fallback?: string): string {
