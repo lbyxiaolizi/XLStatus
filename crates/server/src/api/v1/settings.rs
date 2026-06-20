@@ -245,7 +245,7 @@ pub async fn geoip_provider(db: &DatabaseBackend) -> Result<String, AppError> {
         .as_deref()
         .map(normalize_geoip_provider)
         .transpose()?
-        .unwrap_or_else(|| "empty".to_string()))
+        .unwrap_or_else(|| "mmdb".to_string()))
 }
 
 pub async fn geoip_ipinfo_token(db: &DatabaseBackend) -> Result<Option<String>, AppError> {

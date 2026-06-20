@@ -95,7 +95,7 @@ export default function SettingsPage() {
   const [totpLoading, setTotpLoading] = useState(false);
   const [oauthProviders, setOauthProviders] = useState<OAuthProvider[]>([]);
   const [oauthBindings, setOauthBindings] = useState<OAuthAccount[]>([]);
-  const [geoIp, setGeoIp] = useState({ ip: "1.1.1.1", provider: "empty", token: "" });
+  const [geoIp, setGeoIp] = useState({ ip: "1.1.1.1", provider: "mmdb", token: "" });
   const [geoIpResult, setGeoIpResult] = useState<GeoIpLookupResponse | null>(null);
   const [geoIpMmdbStatus, setGeoIpMmdbStatus] = useState<GeoIpMmdbStatus | null>(null);
   const [geoIpMmdbUrl, setGeoIpMmdbUrl] = useState("");

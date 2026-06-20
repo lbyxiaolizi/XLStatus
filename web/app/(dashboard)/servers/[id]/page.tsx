@@ -47,6 +47,7 @@ interface ServerDetail {
   city?: string | null;
   latitude?: number | null;
   longitude?: number | null;
+  location?: ServerLocation | null;
   plan?: string | null;
   tags?: string[];
   accent_color?: string | null;
@@ -57,6 +58,17 @@ interface ServerDetail {
   last_seen_at?: string | null;
   last_state?: Record<string, unknown> | null;
   last_info?: Record<string, unknown> | null;
+}
+
+interface ServerLocation {
+  source?: string | null;
+  provider?: string | null;
+  country?: string | null;
+  region?: string | null;
+  city?: string | null;
+  latitude?: number | null;
+  longitude?: number | null;
+  timezone?: string | null;
 }
 
 interface MetricSample {
@@ -1173,7 +1185,7 @@ function ServerOverview({
   const trafficQuotaType = server.traffic_quota_type || metadataFromRecord(info, ["traffic_quota_type", "quota_type", "traffic_type", "bandwidth_type"]);
   const trafficQuotaBytes = server.traffic_quota_bytes ?? metadataFromRecord(info, ["traffic_quota_bytes", "traffic_quota", "quota_bytes", "bandwidth_quota_bytes", "monthly_traffic_bytes"]);
   const provider = server.provider || metadataFromRecord(info, ["provider", "vendor", "datacenter", "isp"]);
-  const region = server.region || metadataFromRecord(info, ["region", "location", "country", "city"]);
+  const region = locationLabel(server, info);
   const plan = server.plan || metadataFromRecord(info, ["plan", "package", "sku", "product", "instance_type"]);
   const tags = Array.isArray(server.tags) ? server.tags.filter(Boolean) : [];
   const platformDetails = parsePlatformDetails(info);
@@ -2309,6 +2321,17 @@ function metadataFromRecord(record: Record<string, unknown>, keys: string[]): st
     }
   }
   return null;
+}
+
+function locationLabel(server: ServerDetail, info: Record<string, unknown>): string | null {
+  const parts = [
+    server.location?.country ?? server.country ?? metadataFromRecord(info, ["country", "geo_country", "country_name"]),
+    server.location?.region ?? server.region ?? metadataFromRecord(info, ["region", "geo_region", "state", "province", "location"]),
+    server.location?.city ?? server.city ?? metadataFromRecord(info, ["city", "geo_city"]),
+  ]
+    .map((value) => value?.trim())
+    .filter(Boolean);
+  return parts.length ? Array.from(new Set(parts)).join(" / ") : null;
 }
 
 function valueLabel(value: unknown): string | null {
