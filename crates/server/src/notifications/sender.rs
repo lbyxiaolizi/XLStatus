@@ -83,25 +83,11 @@ impl NotificationSender {
         channel: &NotificationChannel,
         message: &NotificationMessage,
     ) -> Result<()> {
-        let url = validate_outbound_url(&channel.url, "notification webhook").await?;
+        let url_text = self.render_url_template(&channel.url, message);
+        let url = validate_outbound_url(&url_text, "notification webhook").await?;
         let body = self.render_template(&channel.body_template, message)?;
-        let client = if channel.verify_tls {
-            self.client.clone()
-        } else {
-            reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .redirect(reqwest::redirect::Policy::none())
-                .danger_accept_invalid_certs(true)
-                .build()
-                .context("failed to build notification HTTP client")?
-        };
-
-        let mut request = match channel.request_method.to_uppercase().as_str() {
-            "GET" => client.get(url.clone()),
-            "POST" => client.post(url.clone()),
-            "PUT" => client.put(url.clone()),
-            _ => client.post(url.clone()),
-        };
+        let client = self.client_for_channel(channel)?;
+        let mut request = self.request_for_method(&client, &channel.request_method, url);
 
         // Add headers
         for (key, value) in &channel.headers {
@@ -109,7 +95,9 @@ impl NotificationSender {
         }
 
         request = request.header("Content-Type", "application/json");
-        request = request.body(body);
+        if channel.request_method.to_uppercase() != "GET" {
+            request = request.body(body);
+        }
 
         let response = request
             .send()
@@ -131,8 +119,33 @@ impl NotificationSender {
         channel: &NotificationChannel,
         message: &NotificationMessage,
     ) -> Result<()> {
-        // Similar to send_json but with form encoding
-        self.send_json(channel, message).await
+        let url_text = self.render_url_template(&channel.url, message);
+        let url = validate_outbound_url(&url_text, "notification webhook").await?;
+        let body = self.render_template(&channel.body_template, message)?;
+        let client = self.client_for_channel(channel)?;
+        let mut request = self.request_for_method(&client, &channel.request_method, url);
+
+        for (key, value) in &channel.headers {
+            request = request.header(key, value);
+        }
+
+        request = request.header("Content-Type", "application/x-www-form-urlencoded");
+        if channel.request_method.to_uppercase() != "GET" {
+            request = request.body(body);
+        }
+
+        let response = request
+            .send()
+            .await
+            .context("Failed to send notification")?;
+
+        if !response.status().is_success() {
+            error!("Notification failed with status: {}", response.status());
+            anyhow::bail!("Notification request failed");
+        }
+
+        info!("Notification sent successfully");
+        Ok(())
     }
 
     /// Send custom notification
@@ -141,31 +154,88 @@ impl NotificationSender {
         channel: &NotificationChannel,
         message: &NotificationMessage,
     ) -> Result<()> {
-        self.send_json(channel, message).await
+        let url_text = self.render_url_template(&channel.url, message);
+        let url = validate_outbound_url(&url_text, "notification webhook").await?;
+        let body = self.render_template(&channel.body_template, message)?;
+        let client = self.client_for_channel(channel)?;
+        let mut request = self.request_for_method(&client, &channel.request_method, url);
+
+        for (key, value) in &channel.headers {
+            request = request.header(key, value);
+        }
+
+        if channel.request_method.to_uppercase() != "GET" {
+            request = request.body(body);
+        }
+
+        let response = request
+            .send()
+            .await
+            .context("Failed to send notification")?;
+
+        if !response.status().is_success() {
+            error!("Notification failed with status: {}", response.status());
+            anyhow::bail!("Notification request failed");
+        }
+
+        info!("Notification sent successfully");
+        Ok(())
     }
 
     /// Render notification template
     fn render_template(&self, template: &str, message: &NotificationMessage) -> Result<String> {
-        // Simple template rendering
+        if template.trim().is_empty() {
+            return Ok(serde_json::to_string(&message)?);
+        }
+
+        Ok(self.render_value_template(template, message))
+    }
+
+    fn render_url_template(&self, template: &str, message: &NotificationMessage) -> String {
+        self.render_value_template(template, message)
+    }
+
+    fn render_value_template(&self, template: &str, message: &NotificationMessage) -> String {
         let mut rendered = template.to_string();
 
-        // Replace common placeholders
         rendered = rendered.replace("{{title}}", &message.title);
         rendered = rendered.replace("{{message}}", &message.message);
         rendered = rendered.replace("{{severity}}", &format!("{:?}", message.severity));
         rendered = rendered.replace("{{timestamp}}", &message.timestamp);
 
-        // Replace metadata
         for (key, value) in &message.metadata {
             rendered = rendered.replace(&format!("{{{{metadata.{}}}}}", key), value);
         }
 
-        // If template is empty, create default JSON
-        if rendered.is_empty() || rendered == template {
-            rendered = serde_json::to_string(&message)?;
+        rendered
+    }
+
+    fn client_for_channel(&self, channel: &NotificationChannel) -> Result<reqwest::Client> {
+        if channel.verify_tls {
+            return Ok(self.client.clone());
         }
 
-        Ok(rendered)
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .danger_accept_invalid_certs(true)
+            .build()
+            .context("failed to build notification HTTP client")
+    }
+
+    fn request_for_method(
+        &self,
+        client: &reqwest::Client,
+        method: &str,
+        url: reqwest::Url,
+    ) -> reqwest::RequestBuilder {
+        match method.to_uppercase().as_str() {
+            "GET" => client.get(url),
+            "POST" => client.post(url),
+            "PUT" => client.put(url),
+            "PATCH" => client.patch(url),
+            _ => client.post(url),
+        }
     }
 }
 

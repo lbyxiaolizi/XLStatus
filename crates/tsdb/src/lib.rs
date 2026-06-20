@@ -155,8 +155,24 @@ pub trait MetricBackend: Send + Sync + 'static {
     fn latest(&self, agent_id: AgentId) -> Result<Option<MetricSample>, MetricError>;
     fn list_agents(&self) -> Result<Vec<AgentId>, MetricError>;
 
+    fn export_samples(&self) -> Result<Vec<MetricSample>, MetricError> {
+        Err(MetricError::Backend(
+            "metric backend does not support sample export".into(),
+        ))
+    }
+
     fn compact(&self) -> Result<usize, MetricError> {
         Ok(0)
+    }
+
+    fn retention(&self) -> Option<Duration> {
+        None
+    }
+
+    fn set_retention(&self, _retention: Duration) -> Result<(), MetricError> {
+        Err(MetricError::Backend(
+            "metric backend does not support dynamic retention".into(),
+        ))
     }
 
     fn health(&self) -> MetricBackendHealth {
@@ -216,6 +232,15 @@ impl InMemoryMetricStore {
         dropped
     }
 
+    pub fn retention(&self) -> Duration {
+        self.inner.read().retention
+    }
+
+    pub fn set_retention(&self, retention: Duration) -> usize {
+        self.inner.write().retention = retention;
+        self.compact()
+    }
+
     /// Total number of samples currently held. Useful in tests and
     /// admin debug endpoints.
     pub fn len(&self) -> usize {
@@ -224,6 +249,20 @@ impl InMemoryMetricStore {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    pub fn export_samples(&self) -> Vec<MetricSample> {
+        let state = self.inner.read();
+        let mut samples = Vec::new();
+        for (agent_id, entries) in &state.series {
+            samples.extend(entries.iter().map(|(sample_at, fields_json)| MetricSample {
+                agent_id: agent_id.clone(),
+                sample_at: *sample_at,
+                fields_json: fields_json.clone(),
+            }));
+        }
+        samples.sort_by_key(|sample| (sample.agent_id.0, sample.sample_at));
+        samples
     }
 }
 
@@ -312,8 +351,26 @@ impl MetricBackend for InMemoryMetricStore {
         Ok(self.inner.read().series.keys().cloned().collect())
     }
 
+    fn export_samples(&self) -> Result<Vec<MetricSample>, MetricError> {
+        Ok(InMemoryMetricStore::export_samples(self))
+    }
+
     fn compact(&self) -> Result<usize, MetricError> {
         Ok(InMemoryMetricStore::compact(self))
+    }
+
+    fn retention(&self) -> Option<Duration> {
+        Some(InMemoryMetricStore::retention(self))
+    }
+
+    fn set_retention(&self, retention: Duration) -> Result<(), MetricError> {
+        if retention <= Duration::zero() {
+            return Err(MetricError::Backend(
+                "retention must be greater than zero".into(),
+            ));
+        }
+        InMemoryMetricStore::set_retention(self, retention);
+        Ok(())
     }
 
     fn health(&self) -> MetricBackendHealth {
@@ -372,8 +429,20 @@ impl MetricStore {
         self.inner.list_agents()
     }
 
+    pub fn export_samples(&self) -> Result<Vec<MetricSample>, MetricError> {
+        self.inner.export_samples()
+    }
+
     pub fn compact(&self) -> Result<usize, MetricError> {
         self.inner.compact()
+    }
+
+    pub fn retention(&self) -> Option<Duration> {
+        self.inner.retention()
+    }
+
+    pub fn set_retention(&self, retention: Duration) -> Result<(), MetricError> {
+        self.inner.set_retention(retention)
     }
 
     pub fn health(&self) -> MetricBackendHealth {
@@ -500,6 +569,31 @@ mod tests {
 
         assert_eq!(store.len(), 1);
         assert_eq!(store.compact(), 0);
+    }
+
+    #[test]
+    fn retention_can_be_changed_at_runtime() {
+        let store = InMemoryMetricStore::with_retention(Duration::days(30));
+        let agent = id(10);
+        store
+            .write_batch(vec![
+                MetricSample {
+                    agent_id: agent.clone(),
+                    sample_at: Utc::now() - Duration::days(2),
+                    fields_json: json!({ "cpu": 1.0 }),
+                },
+                MetricSample {
+                    agent_id: agent,
+                    sample_at: Utc::now(),
+                    fields_json: json!({ "cpu": 2.0 }),
+                },
+            ])
+            .unwrap();
+
+        assert_eq!(store.len(), 2);
+        assert_eq!(store.set_retention(Duration::days(1)), 1);
+        assert_eq!(store.retention(), Duration::days(1));
+        assert_eq!(store.len(), 1);
     }
 
     #[test]

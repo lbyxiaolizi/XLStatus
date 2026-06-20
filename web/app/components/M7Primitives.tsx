@@ -2,7 +2,7 @@
 
 import { ReactNode, useEffect, useState } from "react";
 import type { ApiResponse } from "@/lib/api";
-import { formatLocaleDate, t } from "@/lib/i18n";
+import { formatLocaleDate, getTranslations } from "@/lib/i18n";
 
 export interface StoredUser {
   id: string;
@@ -51,32 +51,33 @@ export function isAdmin(user: StoredUser | null): boolean {
 }
 
 export function responseError(response: ApiResponse<unknown>): string {
+  const copy = getTranslations();
   const suffix = response.request_id ? ` (${response.request_id})` : "";
-  if (response.status === 401) return `${t.common.authRequired}${suffix}`;
-  if (response.status === 403) return `${t.common.permissionDenied}${suffix}`;
-  if (response.status === 404) return `${t.common.backendNotFound}${suffix}`;
-  return `${response.error || t.common.requestFailed}${suffix}`;
+  if (response.status === 401) return `${copy.common.authRequired}${suffix}`;
+  if (response.status === 403) return `${copy.common.permissionDenied}${suffix}`;
+  if (response.status === 404) return `${copy.common.backendNotFound}${suffix}`;
+  return `${response.error || copy.common.requestFailed}${suffix}`;
 }
 
 export function formatDate(value?: string | number | null): string {
-  if (!value) return t.common.never;
+  if (!value) return getTranslations().common.never;
   const date = typeof value === "number" ? new Date(value * 1000) : new Date(value);
   if (Number.isNaN(date.getTime())) return String(value);
   return formatLocaleDate(date);
 }
 
 export function formatPercent(value?: number | null): string {
-  if (value === undefined || value === null || Number.isNaN(value)) return t.common.notAvailable;
+  if (value === undefined || value === null || Number.isNaN(value)) return getTranslations().common.notAvailable;
   return `${value.toFixed(1)}%`;
 }
 
 export function formatMs(value?: number | null): string {
-  if (value === undefined || value === null || Number.isNaN(value)) return t.common.notAvailable;
+  if (value === undefined || value === null || Number.isNaN(value)) return getTranslations().common.notAvailable;
   return `${value} ms`;
 }
 
 export function formatBytes(value?: number | null): string {
-  if (value === undefined || value === null || Number.isNaN(value)) return t.common.notAvailable;
+  if (value === undefined || value === null || Number.isNaN(value)) return getTranslations().common.notAvailable;
   if (value < 1024) return `${value} B`;
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
   if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
@@ -224,7 +225,7 @@ export function Modal({
         <div className="flex items-center justify-between border-b-4 border-black bg-[var(--accent-bg)] px-5 py-4">
           <h2 className="text-xl font-black uppercase text-[var(--text-main)]">{title}</h2>
           <button type="button" onClick={onClose} className={buttonClass("secondary")}>
-            {t.common.close}
+            {getTranslations().common.close}
           </button>
         </div>
         <div className="px-5 py-5">{children}</div>

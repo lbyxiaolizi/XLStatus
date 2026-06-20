@@ -1178,6 +1178,7 @@ async fn send_host_state(
                 seconds: now,
                 nanos: 0,
             }),
+            uptime_seconds: s.uptime_seconds,
         })),
     };
     tx.send(msg)
@@ -1394,6 +1395,39 @@ async fn run_server_task(
                 }
             }
         }
+        Some(Spec::HttpGet(spec)) => match run_http_probe_task(spec).await {
+            Ok(output) => {
+                result.status = TaskOutcome::Success as i32;
+                result.stdout = output;
+            }
+            Err(e) => {
+                result.status = TaskOutcome::Failure as i32;
+                result.exit_code = 1;
+                result.error = e.to_string();
+            }
+        },
+        Some(Spec::TcpPing(spec)) => match run_tcp_probe_task(spec).await {
+            Ok(output) => {
+                result.status = TaskOutcome::Success as i32;
+                result.stdout = output;
+            }
+            Err(e) => {
+                result.status = TaskOutcome::Failure as i32;
+                result.exit_code = 1;
+                result.error = e.to_string();
+            }
+        },
+        Some(Spec::IcmpPing(spec)) => match run_icmp_probe_task(spec).await {
+            Ok(output) => {
+                result.status = TaskOutcome::Success as i32;
+                result.stdout = output;
+            }
+            Err(e) => {
+                result.status = TaskOutcome::Failure as i32;
+                result.exit_code = 1;
+                result.error = e.to_string();
+            }
+        },
         Some(Spec::FileList(spec)) => {
             if cfg.disable_command_execute {
                 result.status = TaskOutcome::Failure as i32;
@@ -1513,6 +1547,192 @@ async fn run_server_task(
     }
     result.finished_at = finished();
     result
+}
+
+async fn run_http_probe_task(
+    spec: xlstatus_proto_gen::xlstatus::v1::HttpGetTask,
+) -> anyhow::Result<String> {
+    let start = std::time::Instant::now();
+    let timeout = task_timeout_seconds(spec.timeout_seconds);
+    let mut headers = reqwest::header::HeaderMap::new();
+    for (name, value) in spec.headers {
+        headers.insert(
+            reqwest::header::HeaderName::from_bytes(name.as_bytes())?,
+            reqwest::header::HeaderValue::from_str(&value)?,
+        );
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout))
+        .redirect(reqwest::redirect::Policy::none())
+        .danger_accept_invalid_certs(!spec.verify_tls)
+        .build()?;
+
+    let output = match client.get(&spec.url).headers(headers).send().await {
+        Ok(response) => {
+            let status = response.status();
+            probe_output_json(
+                status.is_success(),
+                Some(start.elapsed().as_millis() as i32),
+                Some(status.as_u16() as i32),
+                if status.is_success() {
+                    None
+                } else {
+                    Some(format!("HTTP {}", status.as_u16()))
+                },
+            )
+        }
+        Err(e) => probe_output_json(
+            false,
+            Some(start.elapsed().as_millis() as i32),
+            None,
+            Some(e.to_string()),
+        ),
+    };
+    Ok(output)
+}
+
+async fn run_tcp_probe_task(
+    spec: xlstatus_proto_gen::xlstatus::v1::TcpPingTask,
+) -> anyhow::Result<String> {
+    let start = std::time::Instant::now();
+    let timeout = task_timeout_seconds(spec.timeout_seconds);
+    let addr = socket_addr(&spec.host, spec.port);
+    let output = match tokio::time::timeout(
+        std::time::Duration::from_secs(timeout),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await
+    {
+        Ok(Ok(_)) => probe_output_json(true, Some(start.elapsed().as_millis() as i32), None, None),
+        Ok(Err(e)) => probe_output_json(
+            false,
+            Some(start.elapsed().as_millis() as i32),
+            None,
+            Some(e.to_string()),
+        ),
+        Err(_) => probe_output_json(
+            false,
+            Some(start.elapsed().as_millis() as i32),
+            None,
+            Some("connection timeout".to_string()),
+        ),
+    };
+    Ok(output)
+}
+
+async fn run_icmp_probe_task(
+    spec: xlstatus_proto_gen::xlstatus::v1::IcmpPingTask,
+) -> anyhow::Result<String> {
+    let start = std::time::Instant::now();
+    let timeout = task_timeout_seconds(spec.timeout_seconds);
+    let count = spec.count.clamp(1, 10).to_string();
+    let timeout_text = timeout.to_string();
+    let mut command = if cfg!(target_os = "windows") {
+        let mut cmd = tokio::process::Command::new("ping");
+        cmd.args([
+            "-n",
+            &count,
+            "-w",
+            &(timeout * 1000).to_string(),
+            &spec.host,
+        ]);
+        cmd
+    } else {
+        let mut cmd = tokio::process::Command::new("ping");
+        cmd.args(["-c", &count, "-W", &timeout_text, &spec.host]);
+        cmd
+    };
+
+    let output = match tokio::time::timeout(
+        std::time::Duration::from_secs(timeout + 2),
+        command.output(),
+    )
+    .await
+    {
+        Ok(Ok(output)) => {
+            let latency_ms = start.elapsed().as_millis() as i32;
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                probe_output_json(
+                    true,
+                    Some(parse_ping_latency(&stdout).unwrap_or(latency_ms)),
+                    None,
+                    None,
+                )
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let message = if stderr.trim().is_empty() {
+                    stdout.trim().to_string()
+                } else {
+                    stderr.trim().to_string()
+                };
+                probe_output_json(false, Some(latency_ms), None, Some(message))
+            }
+        }
+        Ok(Err(e)) => probe_output_json(
+            false,
+            Some(start.elapsed().as_millis() as i32),
+            None,
+            Some(e.to_string()),
+        ),
+        Err(_) => probe_output_json(
+            false,
+            Some(start.elapsed().as_millis() as i32),
+            None,
+            Some("ping timeout".to_string()),
+        ),
+    };
+    Ok(output)
+}
+
+fn probe_output_json(
+    success: bool,
+    latency_ms: Option<i32>,
+    status_code: Option<i32>,
+    error: Option<String>,
+) -> String {
+    serde_json::json!({
+        "success": success,
+        "latency_ms": latency_ms,
+        "status_code": status_code,
+        "error": error,
+        "cert_fingerprint": null,
+        "cert_not_after": null,
+    })
+    .to_string()
+}
+
+fn task_timeout_seconds(value: u32) -> u64 {
+    if value == 0 {
+        10
+    } else {
+        u64::from(value)
+    }
+}
+
+fn socket_addr(host: &str, port: u32) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+fn parse_ping_latency(output: &str) -> Option<i32> {
+    for line in output.lines() {
+        if line.contains("min/avg/max") || line.contains("rtt min/avg/max") {
+            if let Some(stats_part) = line.split('=').nth(1) {
+                let values: Vec<&str> = stats_part.trim().split('/').collect();
+                if values.len() >= 2 {
+                    if let Ok(avg) = values[1].trim().parse::<f64>() {
+                        return Some(avg as i32);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn truncate_output<'a>(data: &'a [u8], max_output_bytes: usize, truncated: &mut bool) -> &'a [u8] {

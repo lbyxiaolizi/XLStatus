@@ -40,21 +40,36 @@ pub struct ServerSelector {
     #[serde(default)]
     pub server_ids: Vec<String>,
 
+    /// Specific server IDs to exclude after all include conditions are resolved.
+    #[serde(default)]
+    pub exclude_server_ids: Vec<String>,
+
     /// Server group IDs
     #[serde(default)]
     pub group_ids: Vec<String>,
 
-    /// Tag filters
+    /// Tag names that must all be present on a server.
+    #[serde(default)]
+    pub tag_names: Vec<String>,
+
+    /// Tag filters. A value can be empty to mean the key itself is a tag name.
     #[serde(default)]
     pub tags: HashMap<String, String>,
+
+    /// When a task is fired by a server-scoped alert/service event, target that source server.
+    #[serde(default)]
+    pub source_server: bool,
 }
 
 impl Default for ServerSelector {
     fn default() -> Self {
         Self {
             server_ids: Vec::new(),
+            exclude_server_ids: Vec::new(),
             group_ids: Vec::new(),
+            tag_names: Vec::new(),
             tags: HashMap::new(),
+            source_server: false,
         }
     }
 }

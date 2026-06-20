@@ -3,11 +3,13 @@
 //! See `docs/implementation-audit.md` for the full design notes.
 
 use crate::db::Db;
+use crate::grpc::{SessionRegistry, TaskResponseRegistry};
 use crate::notifications::sender::{
     NotificationChannel, NotificationMessage, NotificationSender, NotificationSeverity,
 };
+use crate::tasks::spawn_triggered_tasks;
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use std::collections::HashMap;
@@ -24,6 +26,8 @@ pub struct AlertRule {
     pub trigger_mode: TriggerMode,
     pub conditions: Vec<AlertCondition>,
     pub notification_group_id: Option<String>,
+    pub failure_task_ids: Vec<String>,
+    pub recovery_task_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -59,6 +63,20 @@ pub enum AlertCondition {
         service_id: String,
         max_latency_ms: i32,
     },
+    CertificateExpiry {
+        service_id: String,
+        days_before: i64,
+    },
+    ServerExpiry {
+        agent_id: String,
+        days_before: i64,
+    },
+    ServerTrafficQuota {
+        agent_id: String,
+        percent: f64,
+        #[serde(default)]
+        direction: TrafficQuotaDirection,
+    },
     ServerOffline {
         agent_id: String,
         offline_seconds: u64,
@@ -80,7 +98,29 @@ pub enum ResourceType {
     Memory,
     Disk,
     Network,
+    NetworkIn,
+    NetworkOut,
+    NetworkTotal,
+    TrafficInTotal,
+    TrafficOutTotal,
     Load,
+    Load5,
+    Load15,
+    Swap,
+    Tcp,
+    Udp,
+    Process,
+    Temperature,
+    Gpu,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TrafficQuotaDirection {
+    #[default]
+    Total,
+    In,
+    Out,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -120,6 +160,8 @@ struct TrafficWindow {
 
 pub struct AlertEngine {
     db: Db,
+    session_registry: SessionRegistry,
+    response_registry: Arc<TaskResponseRegistry>,
     states: Arc<RwLock<HashMap<String, AlertState>>>,
     condition_windows: Arc<RwLock<HashMap<String, DateTime<Utc>>>>,
     traffic_windows: Arc<RwLock<HashMap<String, TrafficWindow>>>,
@@ -128,9 +170,15 @@ pub struct AlertEngine {
 }
 
 impl AlertEngine {
-    pub fn new(db: Db) -> Self {
+    pub fn new(
+        db: Db,
+        session_registry: SessionRegistry,
+        response_registry: Arc<TaskResponseRegistry>,
+    ) -> Self {
         Self {
             db,
+            session_registry,
+            response_registry,
             states: Arc::new(RwLock::new(HashMap::new())),
             condition_windows: Arc::new(RwLock::new(HashMap::new())),
             traffic_windows: Arc::new(RwLock::new(HashMap::new())),
@@ -165,12 +213,15 @@ impl AlertEngine {
 
     async fn evaluate_rule(&self, rule: &AlertRule) -> Result<()> {
         let mut any_triggered = false;
+        let mut source_agent_id = None;
         for c in &rule.conditions {
             if self.check_condition(c).await? {
                 any_triggered = true;
+                source_agent_id = condition_agent_id(c).map(str::to_string);
                 break;
             }
         }
+        let fallback_source_agent_id = source_agent_id.or_else(|| infer_rule_agent_id(rule));
 
         match rule.trigger_mode {
             TriggerMode::Once => {
@@ -182,7 +233,8 @@ impl AlertEngine {
                     .map(|s| s.is_active)
                     .unwrap_or(false);
                 if any_triggered && !already {
-                    self.fire(rule, "fired").await?;
+                    self.fire(rule, "fired", fallback_source_agent_id.as_deref())
+                        .await?;
                     self.states.write().await.insert(
                         rule.id.clone(),
                         AlertState {
@@ -193,7 +245,8 @@ impl AlertEngine {
                         },
                     );
                 } else if !any_triggered && already {
-                    self.fire(rule, "recovered").await?;
+                    self.fire(rule, "recovered", fallback_source_agent_id.as_deref())
+                        .await?;
                     self.states.write().await.insert(
                         rule.id.clone(),
                         AlertState {
@@ -222,7 +275,8 @@ impl AlertEngine {
                         }
                     };
                     if throttle_ok {
-                        self.fire(rule, "fired").await?;
+                        self.fire(rule, "fired", fallback_source_agent_id.as_deref())
+                            .await?;
                         self.states.write().await.insert(
                             rule.id.clone(),
                             AlertState {
@@ -234,7 +288,8 @@ impl AlertEngine {
                         );
                     }
                 } else if already {
-                    self.fire(rule, "recovered").await?;
+                    self.fire(rule, "recovered", fallback_source_agent_id.as_deref())
+                        .await?;
                     self.states.write().await.insert(
                         rule.id.clone(),
                         AlertState {
@@ -268,6 +323,32 @@ impl AlertEngine {
                 .latest_service_latency_ms(service_id)
                 .await
                 .map(|lat| lat > *max_latency_ms as i64),
+            AlertCondition::CertificateExpiry {
+                service_id,
+                days_before,
+            } => self.latest_cert_not_after(service_id).await.map(|value| {
+                value
+                    .map(|not_after| not_after <= Utc::now() + chrono::Duration::days(*days_before))
+                    .unwrap_or(false)
+            }),
+            AlertCondition::ServerExpiry {
+                agent_id,
+                days_before,
+            } => self.server_expires_at(agent_id).await.map(|value| {
+                value
+                    .map(|expires_at| {
+                        expires_at <= Utc::now() + chrono::Duration::days(*days_before)
+                    })
+                    .unwrap_or(false)
+            }),
+            AlertCondition::ServerTrafficQuota {
+                agent_id,
+                percent,
+                direction,
+            } => {
+                self.check_server_traffic_quota(agent_id, *percent, *direction)
+                    .await
+            }
             AlertCondition::ServerOffline {
                 agent_id,
                 offline_seconds,
@@ -420,6 +501,34 @@ impl AlertEngine {
         Ok(row.and_then(|(v,)| v).unwrap_or(-1))
     }
 
+    async fn latest_cert_not_after(&self, service_id: &str) -> Result<Option<DateTime<Utc>>> {
+        match &self.db {
+            crate::db::DatabaseBackend::Sqlite(pool) => {
+                let row: Option<(String,)> = sqlx::query_as(
+                    "SELECT cert_not_after FROM service_results WHERE service_id = ? AND cert_not_after IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+                )
+                .bind(service_id)
+                .fetch_optional(pool)
+                .await?;
+                row.map(|(value,)| {
+                    DateTime::parse_from_rfc3339(&value).map(|dt| dt.with_timezone(&Utc))
+                })
+                .transpose()
+                .map_err(Into::into)
+            }
+            crate::db::DatabaseBackend::Postgres(pool) => {
+                let sid = uuid::Uuid::parse_str(service_id)?;
+                let row: Option<(DateTime<Utc>,)> = sqlx::query_as(
+                    "SELECT cert_not_after FROM service_results WHERE service_id = $1 AND cert_not_after IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+                )
+                .bind(sid)
+                .fetch_optional(pool)
+                .await?;
+                Ok(row.map(|(value,)| value))
+            }
+        }
+    }
+
     async fn last_seen_age_seconds(&self, agent_id: &str) -> Result<i64> {
         let row: Option<(Option<String>,)> = match &self.db {
             crate::db::DatabaseBackend::Sqlite(pool) => {
@@ -442,7 +551,73 @@ impl AlertEngine {
         Ok((Utc::now() - parsed.with_timezone(&Utc)).num_seconds())
     }
 
-    async fn fire(&self, rule: &AlertRule, kind: &str) -> Result<()> {
+    async fn server_expires_at(&self, agent_id: &str) -> Result<Option<DateTime<Utc>>> {
+        let row: Option<(Option<String>,)> = match &self.db {
+            crate::db::DatabaseBackend::Sqlite(pool) => {
+                sqlx::query_as("SELECT expires_at FROM agents WHERE id = ?")
+                    .bind(agent_id)
+                    .fetch_optional(pool)
+                    .await?
+            }
+            crate::db::DatabaseBackend::Postgres(pool) => {
+                sqlx::query_as("SELECT expires_at FROM agents WHERE id = $1")
+                    .bind(agent_id)
+                    .fetch_optional(pool)
+                    .await?
+            }
+        };
+        Ok(row
+            .and_then(|(value,)| value)
+            .and_then(|value| parse_server_expiry(&value)))
+    }
+
+    async fn check_server_traffic_quota(
+        &self,
+        agent_id: &str,
+        percent: f64,
+        direction: TrafficQuotaDirection,
+    ) -> Result<bool> {
+        if !percent.is_finite() || percent <= 0.0 {
+            return Ok(false);
+        }
+        let Some(quota) = self.server_traffic_quota_bytes(agent_id).await? else {
+            return Ok(false);
+        };
+        let last = self.latest.read().await.get(agent_id).cloned();
+        let Some(state) = last else { return Ok(false) };
+        let Some(current_percent) = traffic_quota_percent(&state, quota, direction) else {
+            return Ok(false);
+        };
+        Ok(current_percent >= percent)
+    }
+
+    async fn server_traffic_quota_bytes(&self, agent_id: &str) -> Result<Option<u64>> {
+        let row: Option<(Option<String>,)> = match &self.db {
+            crate::db::DatabaseBackend::Sqlite(pool) => {
+                sqlx::query_as("SELECT dashboard_metadata_json FROM agents WHERE id = ?")
+                    .bind(agent_id)
+                    .fetch_optional(pool)
+                    .await?
+            }
+            crate::db::DatabaseBackend::Postgres(pool) => {
+                sqlx::query_as("SELECT dashboard_metadata_json FROM agents WHERE id = $1")
+                    .bind(agent_id)
+                    .fetch_optional(pool)
+                    .await?
+            }
+        };
+        Ok(row
+            .and_then(|(value,)| value)
+            .as_deref()
+            .and_then(metadata_traffic_quota_bytes))
+    }
+
+    async fn fire(
+        &self,
+        rule: &AlertRule,
+        kind: &str,
+        source_agent_id: Option<&str>,
+    ) -> Result<()> {
         let id = uuid::Uuid::now_v7().to_string();
         let now = Utc::now();
         let payload = serde_json::json!({
@@ -481,6 +656,7 @@ impl AlertEngine {
             }
         }
         info!("alert {} event for rule {} ({})", kind, rule.id, rule.name);
+        self.trigger_tasks(rule, kind, source_agent_id);
 
         let channels = self.channels_for_rule(rule).await.unwrap_or_default();
         if channels.is_empty() {
@@ -509,6 +685,25 @@ impl AlertEngine {
         Ok(())
     }
 
+    fn trigger_tasks(&self, rule: &AlertRule, kind: &str, source_agent_id: Option<&str>) {
+        let task_ids = match kind {
+            "fired" => &rule.failure_task_ids,
+            "recovered" => &rule.recovery_task_ids,
+            _ => return,
+        };
+        if task_ids.is_empty() {
+            return;
+        }
+        spawn_triggered_tasks(
+            self.db.clone(),
+            self.session_registry.clone(),
+            self.response_registry.clone(),
+            task_ids.clone(),
+            format!("alert:{}:{}", rule.id, kind),
+            source_agent_id.map(str::to_string),
+        );
+    }
+
     async fn channels_for_rule(&self, rule: &AlertRule) -> Result<Vec<NotificationChannel>> {
         let Some(ng) = &rule.notification_group_id else {
             return Ok(vec![]);
@@ -530,9 +725,8 @@ impl AlertEngine {
                     .await?
             }
             crate::db::DatabaseBackend::Postgres(pool) => {
-                let png = uuid::Uuid::parse_str(ng)?;
                 sqlx::query_as("SELECT n.id::text, n.name, n.url, n.request_method, n.request_type, n.headers_json, n.body_template, n.verify_tls FROM notifications n JOIN notification_group_members ngm ON ngm.notification_id = n.id WHERE ngm.group_id = $1")
-                    .bind(png)
+                    .bind(ng)
                     .fetch_all(pool)
                     .await?
             }
@@ -571,12 +765,31 @@ impl AlertEngine {
         let mut out = Vec::new();
         match &self.db {
             crate::db::DatabaseBackend::Sqlite(pool) => {
-                let rows: Vec<(String, String, i64, String, String, Option<String>)> = sqlx::query_as(
-                    "SELECT id, name, enabled, trigger_mode, rules_json, notification_group_id FROM alert_rules WHERE enabled = 1",
+                let rows: Vec<(
+                    String,
+                    String,
+                    i64,
+                    String,
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                )> = sqlx::query_as(
+                    "SELECT id, name, enabled, trigger_mode, rules_json, notification_group_id, fail_task_ids_json, recover_task_ids_json FROM alert_rules WHERE enabled = 1",
                 )
                 .fetch_all(pool)
                 .await?;
-                for (id, name, enabled, trigger_mode, rules_json, notification_group_id) in rows {
+                for (
+                    id,
+                    name,
+                    enabled,
+                    trigger_mode,
+                    rules_json,
+                    notification_group_id,
+                    fail_task_ids_json,
+                    recover_task_ids_json,
+                ) in rows
+                {
                     out.push(AlertRule {
                         id,
                         name,
@@ -585,16 +798,37 @@ impl AlertEngine {
                         conditions: serde_json::from_str(&rules_json)
                             .context("invalid rules_json")?,
                         notification_group_id,
+                        failure_task_ids: parse_task_ids_json(fail_task_ids_json),
+                        recovery_task_ids: parse_task_ids_json(recover_task_ids_json),
                     });
                 }
             }
             crate::db::DatabaseBackend::Postgres(pool) => {
-                let rows: Vec<(String, String, bool, String, String, Option<String>)> = sqlx::query_as(
-                    "SELECT id::text, name, enabled, trigger_mode, rules_json, notification_group_id::text FROM alert_rules WHERE enabled = 1",
+                let rows: Vec<(
+                    String,
+                    String,
+                    bool,
+                    String,
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                )> = sqlx::query_as(
+                    "SELECT id::text, name, enabled, trigger_mode, rules_json, notification_group_id::text, fail_task_ids_json, recover_task_ids_json FROM alert_rules WHERE enabled = 1",
                 )
                 .fetch_all(pool)
                 .await?;
-                for (id, name, enabled, trigger_mode, rules_json, notification_group_id) in rows {
+                for (
+                    id,
+                    name,
+                    enabled,
+                    trigger_mode,
+                    rules_json,
+                    notification_group_id,
+                    fail_task_ids_json,
+                    recover_task_ids_json,
+                ) in rows
+                {
                     out.push(AlertRule {
                         id,
                         name,
@@ -603,6 +837,8 @@ impl AlertEngine {
                         conditions: serde_json::from_str(&rules_json)
                             .context("invalid rules_json")?,
                         notification_group_id,
+                        failure_task_ids: parse_task_ids_json(fail_task_ids_json),
+                        recovery_task_ids: parse_task_ids_json(recover_task_ids_json),
                     });
                 }
             }
@@ -621,6 +857,33 @@ impl AlertEngine {
             }
         }
     }
+}
+
+fn condition_agent_id(condition: &AlertCondition) -> Option<&str> {
+    match condition {
+        AlertCondition::ServerExpiry { agent_id, .. }
+        | AlertCondition::ServerTrafficQuota { agent_id, .. }
+        | AlertCondition::ServerOffline { agent_id, .. }
+        | AlertCondition::ServerResource { agent_id, .. } => Some(agent_id.as_str()),
+        AlertCondition::ServiceDown { .. }
+        | AlertCondition::ServiceLatency { .. }
+        | AlertCondition::CertificateExpiry { .. } => None,
+    }
+}
+
+fn infer_rule_agent_id(rule: &AlertRule) -> Option<String> {
+    let mut found: Option<&str> = None;
+    for condition in &rule.conditions {
+        let Some(agent_id) = condition_agent_id(condition) else {
+            continue;
+        };
+        match found {
+            Some(existing) if existing != agent_id => return None,
+            Some(_) => {}
+            None => found = Some(agent_id),
+        }
+    }
+    found.map(str::to_string)
 }
 
 fn resource_value(state: &serde_json::Value, resource: ResourceType) -> Option<f64> {
@@ -647,26 +910,205 @@ fn resource_value(state: &serde_json::Value, resource: ResourceType) -> Option<f
             (total > 0.0).then_some((used / total) * 100.0)
         }
         ResourceType::Network => network_total_bytes(state).map(|bytes| bytes as f64),
+        ResourceType::NetworkIn => json_f64_by_keys(
+            state,
+            &["net_rx_bps", "network_in_speed", "network_rx_bps", "rx_bps"],
+        ),
+        ResourceType::NetworkOut => json_f64_by_keys(
+            state,
+            &[
+                "net_tx_bps",
+                "network_out_speed",
+                "network_tx_bps",
+                "tx_bps",
+            ],
+        ),
+        ResourceType::NetworkTotal => {
+            let rx = resource_value(state, ResourceType::NetworkIn).unwrap_or_default();
+            let tx = resource_value(state, ResourceType::NetworkOut).unwrap_or_default();
+            (rx > 0.0 || tx > 0.0).then_some(rx + tx)
+        }
+        ResourceType::TrafficInTotal => {
+            network_total_by_field(state, "bytes_recv").map(|bytes| bytes as f64)
+        }
+        ResourceType::TrafficOutTotal => {
+            network_total_by_field(state, "bytes_sent").map(|bytes| bytes as f64)
+        }
         ResourceType::Load => state.get("load_1").and_then(|v| v.as_f64()),
+        ResourceType::Load5 => json_f64_by_keys(state, &["load_5", "load5"]),
+        ResourceType::Load15 => json_f64_by_keys(state, &["load_15", "load15"]),
+        ResourceType::Swap => {
+            json_f64_by_keys(state, &["swap_percent", "swap_usage"]).or_else(|| {
+                let used = json_f64_by_keys(state, &["swap_used"])?;
+                let total = json_f64_by_keys(state, &["swap_total"])?;
+                (total > 0.0).then_some((used / total) * 100.0)
+            })
+        }
+        ResourceType::Tcp => {
+            json_f64_by_keys(state, &["tcp_connections", "tcp_conn_count", "tcp_count"])
+        }
+        ResourceType::Udp => {
+            json_f64_by_keys(state, &["udp_connections", "udp_conn_count", "udp_count"])
+        }
+        ResourceType::Process => {
+            json_f64_by_keys(state, &["process_count", "processes", "processes_count"])
+        }
+        ResourceType::Temperature => {
+            json_f64_by_keys(state, &["temperature", "cpu_temp", "max_temp", "temp"])
+                .or_else(|| {
+                    max_array_number(state, "temperatures", &["value", "temperature", "temp"])
+                })
+                .or_else(|| max_array_number(state, "components", &["temperature", "temp"]))
+        }
+        ResourceType::Gpu => {
+            json_f64_by_keys(state, &["gpu_percent", "gpu_usage", "gpu_utilization"]).or_else(
+                || max_array_number(state, "gpus", &["utilization", "usage", "gpu_percent"]),
+            )
+        }
     }
 }
 
 fn network_total_bytes(state: &serde_json::Value) -> Option<u64> {
+    let recv = network_total_by_field(state, "bytes_recv").unwrap_or_default();
+    let sent = network_total_by_field(state, "bytes_sent").unwrap_or_default();
+    (recv > 0 || sent > 0).then_some(recv.saturating_add(sent))
+}
+
+fn traffic_used_bytes(state: &serde_json::Value, direction: TrafficQuotaDirection) -> Option<u64> {
+    match direction {
+        TrafficQuotaDirection::Total => network_total_bytes(state),
+        TrafficQuotaDirection::In => network_total_by_field(state, "bytes_recv"),
+        TrafficQuotaDirection::Out => network_total_by_field(state, "bytes_sent"),
+    }
+}
+
+fn traffic_quota_percent(
+    state: &serde_json::Value,
+    quota_bytes: u64,
+    direction: TrafficQuotaDirection,
+) -> Option<f64> {
+    if quota_bytes == 0 {
+        return None;
+    }
+    let used = traffic_used_bytes(state, direction)?;
+    Some((used as f64 / quota_bytes as f64) * 100.0)
+}
+
+fn metadata_traffic_quota_bytes(value: &str) -> Option<u64> {
+    let parsed = serde_json::from_str::<serde_json::Value>(value).ok()?;
+    metadata_u64_from_value(
+        &parsed,
+        &[
+            "traffic_quota_bytes",
+            "traffic_quota",
+            "quota_bytes",
+            "bandwidth_quota_bytes",
+            "monthly_traffic_bytes",
+        ],
+    )
+}
+
+fn metadata_u64_from_value(value: &serde_json::Value, keys: &[&str]) -> Option<u64> {
+    for key in keys {
+        if let Some(value) = value.get(*key).and_then(json_u64) {
+            return Some(value);
+        }
+    }
+    for container in ["billing", "plan", "metadata", "custom", "traffic", "limits"] {
+        if let Some(child) = value.get(container) {
+            for key in keys {
+                if let Some(value) = child.get(*key).and_then(json_u64) {
+                    return Some(value);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn parse_server_expiry(value: &str) -> Option<DateTime<Utc>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(value) = DateTime::parse_from_rfc3339(trimmed) {
+        return Some(value.with_timezone(&Utc));
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
+        return date
+            .and_hms_opt(23, 59, 59)
+            .map(|value| DateTime::from_naive_utc_and_offset(value, Utc));
+    }
+    None
+}
+
+fn parse_task_ids_json(value: Option<String>) -> Vec<String> {
+    value
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+        .unwrap_or_default()
+}
+
+fn network_total_by_field(state: &serde_json::Value, field: &str) -> Option<u64> {
+    let direct_keys = match field {
+        "bytes_recv" => &["network_in_total", "net_rx_bytes", "bytes_recv_total"][..],
+        "bytes_sent" => &["network_out_total", "net_tx_bytes", "bytes_sent_total"][..],
+        _ => &[][..],
+    };
+    for key in direct_keys {
+        if let Some(value) = state.get(*key).and_then(json_u64) {
+            return Some(value);
+        }
+    }
     let net_io = state.get("net_io").and_then(|v| v.as_array())?;
     let mut total = 0u64;
     for nic in net_io {
-        total = total.saturating_add(
-            nic.get("bytes_sent")
-                .and_then(|v| v.as_u64())
-                .unwrap_or_default(),
-        );
-        total = total.saturating_add(
-            nic.get("bytes_recv")
-                .and_then(|v| v.as_u64())
-                .unwrap_or_default(),
-        );
+        total = total.saturating_add(nic.get(field).and_then(json_u64).unwrap_or_default());
     }
     Some(total)
+}
+
+fn json_f64_by_keys(state: &serde_json::Value, keys: &[&str]) -> Option<f64> {
+    for key in keys {
+        if let Some(value) = state.get(*key).and_then(json_f64) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn json_f64(value: &serde_json::Value) -> Option<f64> {
+    if let Some(value) = value.as_f64() {
+        return value.is_finite().then_some(value);
+    }
+    value
+        .as_str()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+}
+
+fn json_u64(value: &serde_json::Value) -> Option<u64> {
+    if let Some(value) = value.as_u64() {
+        return Some(value);
+    }
+    if let Some(value) = value.as_i64() {
+        return u64::try_from(value).ok();
+    }
+    value
+        .as_str()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
+fn max_array_number(state: &serde_json::Value, array_key: &str, keys: &[&str]) -> Option<f64> {
+    state
+        .get(array_key)
+        .and_then(|value| value.as_array())
+        .and_then(|items| {
+            items
+                .iter()
+                .filter_map(|item| json_f64_by_keys(item, keys))
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        })
 }
 
 #[cfg(test)]
@@ -710,11 +1152,129 @@ mod tests {
         }
     }
 
+    #[test]
+    fn server_asset_conditions_round_trip() {
+        let expiry = AlertCondition::ServerExpiry {
+            agent_id: "a".into(),
+            days_before: 14,
+        };
+        let quota = AlertCondition::ServerTrafficQuota {
+            agent_id: "a".into(),
+            percent: 80.0,
+            direction: TrafficQuotaDirection::Out,
+        };
+
+        let expiry_back: AlertCondition =
+            serde_json::from_str(&serde_json::to_string(&expiry).unwrap()).unwrap();
+        let quota_back: AlertCondition =
+            serde_json::from_str(&serde_json::to_string(&quota).unwrap()).unwrap();
+
+        assert!(matches!(
+            expiry_back,
+            AlertCondition::ServerExpiry {
+                days_before: 14,
+                ..
+            }
+        ));
+        assert!(matches!(
+            quota_back,
+            AlertCondition::ServerTrafficQuota {
+                percent,
+                direction: TrafficQuotaDirection::Out,
+                ..
+            } if (percent - 80.0).abs() < 1e-6
+        ));
+    }
+
+    #[test]
+    fn extracts_extended_resource_values() {
+        let state = serde_json::json!({
+            "swap_used": 512,
+            "swap_total": 1024,
+            "net_rx_bps": 1000,
+            "net_tx_bps": 2000,
+            "network_in_total": 3000,
+            "network_out_total": 4000,
+            "load_5": 0.7,
+            "load_15": 0.9,
+            "tcp_connections": 42,
+            "udp_count": 7,
+            "process_count": 128,
+            "temperatures": [{ "value": 41.0 }, { "value": 55.5 }],
+            "gpus": [{ "utilization": 76.0 }]
+        });
+
+        assert_eq!(resource_value(&state, ResourceType::Swap), Some(50.0));
+        assert_eq!(
+            resource_value(&state, ResourceType::NetworkIn),
+            Some(1000.0)
+        );
+        assert_eq!(
+            resource_value(&state, ResourceType::NetworkOut),
+            Some(2000.0)
+        );
+        assert_eq!(
+            resource_value(&state, ResourceType::NetworkTotal),
+            Some(3000.0)
+        );
+        assert_eq!(
+            resource_value(&state, ResourceType::TrafficInTotal),
+            Some(3000.0)
+        );
+        assert_eq!(
+            resource_value(&state, ResourceType::TrafficOutTotal),
+            Some(4000.0)
+        );
+        assert_eq!(resource_value(&state, ResourceType::Load5), Some(0.7));
+        assert_eq!(resource_value(&state, ResourceType::Load15), Some(0.9));
+        assert_eq!(resource_value(&state, ResourceType::Tcp), Some(42.0));
+        assert_eq!(resource_value(&state, ResourceType::Udp), Some(7.0));
+        assert_eq!(resource_value(&state, ResourceType::Process), Some(128.0));
+        assert_eq!(
+            resource_value(&state, ResourceType::Temperature),
+            Some(55.5)
+        );
+        assert_eq!(resource_value(&state, ResourceType::Gpu), Some(76.0));
+    }
+
+    #[test]
+    fn parses_asset_expiry_and_traffic_quota() {
+        assert!(parse_server_expiry("2026-12-31").is_some());
+        assert!(parse_server_expiry("2026-12-31T08:00:00Z").is_some());
+        assert!(parse_server_expiry("not-a-date").is_none());
+
+        assert_eq!(
+            metadata_traffic_quota_bytes(r#"{"traffic":{"traffic_quota_bytes":1099511627776}}"#),
+            Some(1_099_511_627_776)
+        );
+
+        let state = serde_json::json!({
+            "network_in_total": 400,
+            "network_out_total": 600
+        });
+        assert_eq!(
+            traffic_quota_percent(&state, 1000, TrafficQuotaDirection::Total),
+            Some(100.0)
+        );
+        assert_eq!(
+            traffic_quota_percent(&state, 1000, TrafficQuotaDirection::In),
+            Some(40.0)
+        );
+        assert_eq!(
+            traffic_quota_percent(&state, 1000, TrafficQuotaDirection::Out),
+            Some(60.0)
+        );
+    }
+
     #[tokio::test]
     async fn observe_and_read_latest() {
         let pool = sqlx::SqlitePool::connect_lazy("sqlite::memory:").unwrap();
         let db = Db::Sqlite(pool);
-        let engine = Arc::new(AlertEngine::new(db));
+        let engine = Arc::new(AlertEngine::new(
+            db,
+            crate::grpc::SessionRegistry::new(),
+            crate::current_task_response_registry(),
+        ));
         engine
             .observe_agent_state("agent-1", serde_json::json!({"cpu_percent": 42.0}))
             .await;

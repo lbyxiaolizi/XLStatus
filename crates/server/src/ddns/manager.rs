@@ -1,7 +1,9 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 
+use crate::api::v1::settings;
 use crate::db::Db;
+use crate::security::validate_outbound_url;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -181,6 +183,34 @@ impl DdnsManager {
             if cfg.last_applied_ip.as_deref() == Some(new_ip.as_str()) {
                 continue;
             }
+            if let Some(resolver_url) = settings::ddns_resolver_url(&self.db)
+                .await
+                .map_err(|err| anyhow::anyhow!("{err:?}"))?
+            {
+                match resolver_contains_ip(&resolver_url, &cfg.domain, &new_ip).await {
+                    Ok(true) => {
+                        let now = chrono::Utc::now().to_rfc3339();
+                        DdnsConfigRepository::record_history(
+                            &self.db,
+                            &uuid::Uuid::now_v7().to_string(),
+                            &cfg.id,
+                            cfg.last_applied_ip.as_deref(),
+                            &new_ip,
+                            true,
+                            None,
+                            &now,
+                        )
+                        .await?;
+                        DdnsConfigRepository::update_after_apply(&self.db, &cfg.id, &new_ip, &now)
+                            .await?;
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(err) => {
+                        error!("DDNS resolver check failed for {}: {}", cfg.domain, err);
+                    }
+                }
+            }
             self.apply_update(&cfg, &new_ip).await;
         }
         Ok(())
@@ -358,6 +388,39 @@ impl DdnsManager {
             last_check: chrono::Utc::now().to_rfc3339(),
         }
     }
+}
+
+async fn resolver_contains_ip(resolver_url: &str, domain: &str, ip: &str) -> Result<bool> {
+    let record_type = if ip.parse::<std::net::Ipv6Addr>().is_ok() {
+        "AAAA"
+    } else {
+        "A"
+    };
+    let mut url = reqwest::Url::parse(resolver_url).context("DDNS resolver URL is invalid")?;
+    url.query_pairs_mut()
+        .append_pair("name", domain)
+        .append_pair("type", record_type);
+    let url = validate_outbound_url(url.as_str(), "DDNS resolver").await?;
+    let raw = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("failed to build DDNS resolver client")?
+        .get(url)
+        .send()
+        .await
+        .context("DDNS resolver request failed")?
+        .json::<serde_json::Value>()
+        .await
+        .context("DDNS resolver response is invalid")?;
+    let answers = raw
+        .get("Answer")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten();
+    Ok(answers
+        .filter_map(|item| item.get("data").and_then(|value| value.as_str()))
+        .any(|value| value == ip))
 }
 
 #[derive(Debug, serde::Serialize)]

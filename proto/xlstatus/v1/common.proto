@@ -43,6 +43,7 @@ message HostState {
   repeated TempSensor temperatures = 14;
   repeated GpuState gpus = 15;
   google.protobuf.Timestamp timestamp = 16;
+  uint64 uptime_seconds = 17;
 }
 
 message DiskState {

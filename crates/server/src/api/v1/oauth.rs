@@ -1,0 +1,1085 @@
+//! Generic OAuth2/OIDC login and account binding.
+
+use crate::api::types::{ApiResponse, UserInfo};
+use crate::api::v1::auth::{
+    active_waf_ban, record_waf_event, register_oauth_failure, AppError, AppState,
+};
+use crate::auth::middleware::{derive_csrf_token, AuthUser, CSRF_COOKIE_NAME, SESSION_COOKIE_NAME};
+use crate::auth::{generate_session_token, hash_token};
+use crate::config::OidcProviderConfig;
+use crate::db::{CreateSessionInput, DatabaseBackend, UserRepository};
+use axum::{
+    extract::{Path, Query, State},
+    http::{header, HeaderMap, HeaderValue},
+    response::{AppendHeaders, IntoResponse, Redirect, Response},
+    Json,
+};
+use chrono::{Duration, Utc};
+use hmac::{Hmac, Mac};
+use rand::Rng;
+use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
+use sha2::Sha256;
+use sqlx::Row;
+use xlstatus_shared::UserId;
+
+type HmacSha256 = Hmac<Sha256>;
+
+#[derive(Debug, Serialize)]
+pub struct OAuthProviderView {
+    pub id: String,
+    pub display_name: String,
+    pub scopes: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OAuthProviderListResponse {
+    pub providers: Vec<OAuthProviderView>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OAuthAccountView {
+    pub provider: String,
+    pub provider_display_name: String,
+    pub subject: String,
+    pub email: Option<String>,
+    pub display_name: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OAuthAccountListResponse {
+    pub accounts: Vec<OAuthAccountView>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OAuthStartQuery {
+    pub return_to: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OAuthCallbackQuery {
+    pub code: Option<String>,
+    pub state: String,
+    pub error: Option<String>,
+    pub error_description: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OAuthState {
+    provider: String,
+    flow: OAuthFlow,
+    user_id: Option<String>,
+    return_to: String,
+    nonce: String,
+    exp: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum OAuthFlow {
+    Login,
+    Bind,
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenResponse {
+    access_token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OidcUserInfo {
+    sub: String,
+    email: Option<String>,
+    name: Option<String>,
+    preferred_username: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenAuthMethod {
+    ClientSecretPost,
+    ClientSecretBasic,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserinfoAuthMethod {
+    Bearer,
+    Query,
+    None,
+}
+
+pub async fn list_oauth_providers(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<OAuthProviderListResponse>> {
+    Json(ApiResponse::success(OAuthProviderListResponse {
+        providers: state
+            .config
+            .oauth2
+            .providers
+            .iter()
+            .map(provider_view)
+            .collect(),
+    }))
+}
+
+pub async fn start_oauth_login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(provider_id): Path<String>,
+    Query(query): Query<OAuthStartQuery>,
+) -> Result<Response, AppError> {
+    let client_ip = client_ip_from_headers(&headers);
+    if active_waf_ban(&state.db, &client_ip).await?.is_some() {
+        record_waf_event(
+            &state.db,
+            &client_ip,
+            Some(&provider_id),
+            "oauth_blocked",
+            Some("active WAF ban"),
+        )
+        .await?;
+        return Err(AppError::Forbidden(
+            "IP temporarily blocked by WAF".to_string(),
+        ));
+    }
+    let provider = oauth_provider(&state, &provider_id)?;
+    let oauth_state = OAuthState {
+        provider: provider.id.clone(),
+        flow: OAuthFlow::Login,
+        user_id: None,
+        return_to: sanitize_return_to(query.return_to),
+        nonce: random_nonce(),
+        exp: (Utc::now() + Duration::minutes(10)).timestamp(),
+    };
+    Ok(Redirect::temporary(&authorize_url(
+        provider,
+        &encode_state(&state.config.security.session_secret, &oauth_state)?,
+        &oauth_state.nonce,
+    )?)
+    .into_response())
+}
+
+pub async fn start_oauth_bind(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path(provider_id): Path<String>,
+    Query(query): Query<OAuthStartQuery>,
+) -> Result<Response, AppError> {
+    require_cookie_session(&auth_user)?;
+    let provider = oauth_provider(&state, &provider_id)?;
+    let oauth_state = OAuthState {
+        provider: provider.id.clone(),
+        flow: OAuthFlow::Bind,
+        user_id: Some(auth_user.user.id.0.to_string()),
+        return_to: sanitize_return_to(query.return_to),
+        nonce: random_nonce(),
+        exp: (Utc::now() + Duration::minutes(10)).timestamp(),
+    };
+    Ok(Redirect::temporary(&authorize_url(
+        provider,
+        &encode_state(&state.config.security.session_secret, &oauth_state)?,
+        &oauth_state.nonce,
+    )?)
+    .into_response())
+}
+
+pub async fn list_oauth_bindings(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+) -> Result<Json<ApiResponse<OAuthAccountListResponse>>, AppError> {
+    require_cookie_session(&auth_user)?;
+    Ok(Json(ApiResponse::success(OAuthAccountListResponse {
+        accounts: load_oauth_accounts(&state, auth_user.user.id).await?,
+    })))
+}
+
+pub async fn unbind_oauth_provider(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path(provider_id): Path<String>,
+) -> Result<Json<ApiResponse<()>>, AppError> {
+    require_cookie_session(&auth_user)?;
+    if provider_id.trim().is_empty() {
+        return Err(AppError::BadRequest("OAuth provider is required".into()));
+    }
+    delete_oauth_account(&state.db, auth_user.user.id, &provider_id).await?;
+    Ok(Json(ApiResponse::success(())))
+}
+
+pub async fn oauth_callback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<OAuthCallbackQuery>,
+) -> Result<Response, AppError> {
+    let client_ip = client_ip_from_headers(&headers);
+    if active_waf_ban(&state.db, &client_ip).await?.is_some() {
+        record_waf_event(
+            &state.db,
+            &client_ip,
+            None,
+            "oauth_blocked",
+            Some("active WAF ban"),
+        )
+        .await?;
+        return Err(AppError::Forbidden(
+            "IP temporarily blocked by WAF".to_string(),
+        ));
+    }
+    let oauth_state = match decode_state(&state.config.security.session_secret, &query.state) {
+        Ok(state) => state,
+        Err(err) => {
+            register_oauth_failure(&state.db, &client_ip, None, "invalid state").await?;
+            return Err(err);
+        }
+    };
+    if let Some(error) = query.error {
+        let message = query.error_description.unwrap_or(error);
+        register_oauth_failure(&state.db, &client_ip, Some(&oauth_state.provider), &message)
+            .await?;
+        return Ok(
+            Redirect::temporary(&frontend_redirect(&state, &oauth_state, false, &message)?)
+                .into_response(),
+        );
+    }
+
+    let provider = oauth_provider(&state, &oauth_state.provider)?;
+    let code = query
+        .code
+        .ok_or(AppError::BadRequest("OAuth callback missing code".into()));
+    let code = match code {
+        Ok(code) => code,
+        Err(err) => {
+            register_oauth_failure(
+                &state.db,
+                &client_ip,
+                Some(&oauth_state.provider),
+                "missing code",
+            )
+            .await?;
+            return Err(err);
+        }
+    };
+    let token = match exchange_code(provider, &code).await {
+        Ok(token) => token,
+        Err(err) => {
+            register_oauth_failure(
+                &state.db,
+                &client_ip,
+                Some(&oauth_state.provider),
+                "token exchange failed",
+            )
+            .await?;
+            return Err(err);
+        }
+    };
+    let userinfo = match fetch_userinfo(provider, &token.access_token).await {
+        Ok(userinfo) => userinfo,
+        Err(err) => {
+            register_oauth_failure(
+                &state.db,
+                &client_ip,
+                Some(&oauth_state.provider),
+                "userinfo request failed",
+            )
+            .await?;
+            return Err(err);
+        }
+    };
+
+    match oauth_state.flow {
+        OAuthFlow::Bind => {
+            let user_id = oauth_state
+                .user_id
+                .as_deref()
+                .ok_or(AppError::BadRequest("OAuth bind state missing user".into()))
+                .and_then(parse_user_id)?;
+            bind_oauth_account(&state.db, user_id, provider, &userinfo).await?;
+            Ok(Redirect::temporary(&frontend_redirect(
+                &state,
+                &oauth_state,
+                true,
+                "oauth_bound",
+            )?)
+            .into_response())
+        }
+        OAuthFlow::Login => {
+            let Some(user_id) = find_bound_user(&state.db, provider, &userinfo.sub).await? else {
+                register_oauth_failure(
+                    &state.db,
+                    &client_ip,
+                    Some(&oauth_state.provider),
+                    "account not bound",
+                )
+                .await?;
+                return Ok(Redirect::temporary(&frontend_redirect(
+                    &state,
+                    &oauth_state,
+                    false,
+                    "oauth_account_not_bound",
+                )?)
+                .into_response());
+            };
+            let user_repo = UserRepository::new(state.db.clone());
+            let user = user_repo
+                .find_by_id(user_id)
+                .await?
+                .ok_or(AppError::Unauthorized(
+                    "OAuth account user not found".into(),
+                ))?;
+            let (session_cookie, csrf_cookie) =
+                create_oauth_session(&state, &headers, user.id).await?;
+            record_waf_event(
+                &state.db,
+                &client_ip,
+                Some(&oauth_state.provider),
+                "oauth_success",
+                None,
+            )
+            .await?;
+            Ok((
+                AppendHeaders([
+                    (header::SET_COOKIE, session_cookie),
+                    (header::SET_COOKIE, csrf_cookie),
+                ]),
+                Redirect::temporary(&frontend_redirect(
+                    &state,
+                    &oauth_state,
+                    true,
+                    "oauth_login",
+                )?),
+            )
+                .into_response())
+        }
+    }
+}
+
+pub async fn get_profile(auth_user: AuthUser) -> Result<Json<ApiResponse<UserInfo>>, AppError> {
+    Ok(Json(ApiResponse::success(UserInfo {
+        id: auth_user.user.id.0.to_string(),
+        username: auth_user.user.username,
+        role: auth_user.user.role.to_string(),
+        created_at: Some(auth_user.user.created_at.to_rfc3339()),
+        updated_at: Some(auth_user.user.updated_at.to_rfc3339()),
+    })))
+}
+
+fn require_cookie_session(auth_user: &AuthUser) -> Result<(), AppError> {
+    if auth_user.is_pat() {
+        return Err(AppError::Forbidden("Cookie session required".into()));
+    }
+    Ok(())
+}
+
+fn provider_view(provider: &OidcProviderConfig) -> OAuthProviderView {
+    OAuthProviderView {
+        id: provider.id.clone(),
+        display_name: provider
+            .display_name
+            .clone()
+            .unwrap_or_else(|| provider.id.clone()),
+        scopes: provider.scopes.clone(),
+    }
+}
+
+fn oauth_provider<'a>(
+    state: &'a AppState,
+    provider_id: &str,
+) -> Result<&'a OidcProviderConfig, AppError> {
+    state
+        .config
+        .oauth2
+        .provider(provider_id)
+        .ok_or(AppError::NotFound("OAuth provider not found".into()))
+}
+
+fn authorize_url(
+    provider: &OidcProviderConfig,
+    state: &str,
+    nonce: &str,
+) -> Result<String, AppError> {
+    let scope = provider.scopes.join(" ");
+    let mut url = reqwest::Url::parse_with_params(
+        &provider.auth_url,
+        [
+            ("response_type", "code"),
+            ("client_id", provider.client_id.as_str()),
+            ("redirect_uri", provider.redirect_url.as_str()),
+            ("scope", scope.as_str()),
+            ("state", state),
+            ("nonce", nonce),
+        ],
+    )
+    .map_err(|e| AppError::BadRequest(format!("invalid OAuth auth URL: {e}")))?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        for (key, value) in &provider.extra_auth_params {
+            let key = key.trim();
+            if key.is_empty() || is_reserved_auth_param(key) {
+                continue;
+            }
+            pairs.append_pair(key, value);
+        }
+    }
+    Ok(url.to_string())
+}
+
+async fn exchange_code(
+    provider: &OidcProviderConfig,
+    code: &str,
+) -> Result<TokenResponse, AppError> {
+    let client = reqwest::Client::new();
+    let token_auth_method = parse_token_auth_method(&provider.token_auth_method)?;
+    if matches!(
+        token_auth_method,
+        TokenAuthMethod::ClientSecretPost | TokenAuthMethod::ClientSecretBasic
+    ) && provider.client_secret.trim().is_empty()
+    {
+        return Err(AppError::BadRequest(
+            "OAuth client_secret is required for the configured token auth method".into(),
+        ));
+    }
+
+    let mut form = vec![
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("redirect_uri", provider.redirect_url.as_str()),
+    ];
+    match token_auth_method {
+        TokenAuthMethod::ClientSecretPost => {
+            form.push(("client_id", provider.client_id.as_str()));
+            form.push(("client_secret", provider.client_secret.as_str()));
+        }
+        TokenAuthMethod::ClientSecretBasic => {}
+        TokenAuthMethod::None => {
+            form.push(("client_id", provider.client_id.as_str()));
+        }
+    }
+
+    let request = client.post(&provider.token_url).form(&form);
+    let request = match token_auth_method {
+        TokenAuthMethod::ClientSecretBasic => {
+            request.basic_auth(&provider.client_id, Some(&provider.client_secret))
+        }
+        TokenAuthMethod::ClientSecretPost | TokenAuthMethod::None => request,
+    };
+    let response = request
+        .send()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("OAuth token request failed: {e}")))?;
+    if !response.status().is_success() {
+        return Err(AppError::BadRequest(format!(
+            "OAuth token request failed with {}",
+            response.status()
+        )));
+    }
+    response
+        .json::<TokenResponse>()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("OAuth token response is invalid: {e}")))
+}
+
+async fn fetch_userinfo(
+    provider: &OidcProviderConfig,
+    access_token: &str,
+) -> Result<OidcUserInfo, AppError> {
+    let client = reqwest::Client::new();
+    let userinfo_auth_method = parse_userinfo_auth_method(&provider.userinfo_auth_method)?;
+    let mut url = reqwest::Url::parse(&provider.userinfo_url)
+        .map_err(|e| AppError::BadRequest(format!("invalid OIDC userinfo URL: {e}")))?;
+    if matches!(userinfo_auth_method, UserinfoAuthMethod::Query) {
+        url.query_pairs_mut()
+            .append_pair("access_token", access_token);
+    }
+    let request = client.get(url);
+    let request = match userinfo_auth_method {
+        UserinfoAuthMethod::Bearer => request.bearer_auth(access_token),
+        UserinfoAuthMethod::Query | UserinfoAuthMethod::None => request,
+    };
+    let response = request
+        .send()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("OIDC userinfo request failed: {e}")))?;
+    if !response.status().is_success() {
+        return Err(AppError::BadRequest(format!(
+            "OIDC userinfo request failed with {}",
+            response.status()
+        )));
+    }
+    let raw = response
+        .json::<JsonValue>()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("OIDC userinfo response is invalid: {e}")))?;
+    normalize_userinfo(provider, &raw)
+}
+
+fn normalize_userinfo(
+    provider: &OidcProviderConfig,
+    raw: &JsonValue,
+) -> Result<OidcUserInfo, AppError> {
+    let sub = userinfo_field(raw, &provider.subject_field)
+        .ok_or(AppError::BadRequest("OIDC userinfo missing subject".into()))?;
+    let userinfo = OidcUserInfo {
+        sub,
+        email: userinfo_field(raw, &provider.email_field),
+        name: userinfo_field(raw, &provider.name_field),
+        preferred_username: userinfo_field(raw, &provider.username_field),
+    };
+    if userinfo.sub.trim().is_empty() {
+        return Err(AppError::BadRequest("OIDC userinfo missing subject".into()));
+    }
+    Ok(userinfo)
+}
+
+fn userinfo_field(raw: &JsonValue, field: &str) -> Option<String> {
+    let field = field.trim();
+    if field.is_empty() {
+        return None;
+    }
+    let value = if field.starts_with('/') {
+        raw.pointer(field)?
+    } else {
+        let mut current = raw;
+        for part in field.split('.') {
+            let part = part.trim();
+            if part.is_empty() {
+                return None;
+            }
+            current = current.get(part)?;
+        }
+        current
+    };
+    json_scalar(value)
+}
+
+fn json_scalar(value: &JsonValue) -> Option<String> {
+    match value {
+        JsonValue::String(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        JsonValue::Number(value) => Some(value.to_string()),
+        JsonValue::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn parse_token_auth_method(value: &str) -> Result<TokenAuthMethod, AppError> {
+    match normalize_method_name(value).as_str() {
+        "client_secret_post" | "post" => Ok(TokenAuthMethod::ClientSecretPost),
+        "client_secret_basic" | "basic" => Ok(TokenAuthMethod::ClientSecretBasic),
+        "none" | "public" => Ok(TokenAuthMethod::None),
+        _ => Err(AppError::BadRequest(format!(
+            "unsupported OAuth token_auth_method: {value}"
+        ))),
+    }
+}
+
+fn parse_userinfo_auth_method(value: &str) -> Result<UserinfoAuthMethod, AppError> {
+    match normalize_method_name(value).as_str() {
+        "bearer" | "bearer_header" | "authorization_header" => Ok(UserinfoAuthMethod::Bearer),
+        "query" | "access_token_query" => Ok(UserinfoAuthMethod::Query),
+        "none" => Ok(UserinfoAuthMethod::None),
+        _ => Err(AppError::BadRequest(format!(
+            "unsupported OIDC userinfo_auth_method: {value}"
+        ))),
+    }
+}
+
+fn normalize_method_name(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace(['-', ' '], "_")
+}
+
+fn is_reserved_auth_param(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "response_type" | "client_id" | "redirect_uri" | "scope" | "state" | "nonce"
+    )
+}
+
+async fn load_oauth_accounts(
+    state: &AppState,
+    user_id: UserId,
+) -> Result<Vec<OAuthAccountView>, AppError> {
+    let accounts = match &state.db {
+        DatabaseBackend::Sqlite(pool) => {
+            let rows = sqlx::query(
+                r#"
+                SELECT provider, subject, email, display_name, created_at, updated_at
+                FROM oauth_accounts
+                WHERE user_id = ?
+                ORDER BY provider ASC
+                "#,
+            )
+            .bind(user_id.0.to_string())
+            .fetch_all(pool)
+            .await?;
+            rows.into_iter()
+                .map(|row| {
+                    oauth_account_view(
+                        state,
+                        row.get("provider"),
+                        row.get("subject"),
+                        row.get("email"),
+                        row.get("display_name"),
+                        row.get("created_at"),
+                        row.get("updated_at"),
+                    )
+                })
+                .collect()
+        }
+        DatabaseBackend::Postgres(pool) => {
+            let rows = sqlx::query(
+                r#"
+                SELECT
+                    provider,
+                    subject,
+                    email,
+                    display_name,
+                    created_at::text AS created_at,
+                    updated_at::text AS updated_at
+                FROM oauth_accounts
+                WHERE user_id = $1
+                ORDER BY provider ASC
+                "#,
+            )
+            .bind(user_id.0)
+            .fetch_all(pool)
+            .await?;
+            rows.into_iter()
+                .map(|row| {
+                    oauth_account_view(
+                        state,
+                        row.get("provider"),
+                        row.get("subject"),
+                        row.get("email"),
+                        row.get("display_name"),
+                        row.get("created_at"),
+                        row.get("updated_at"),
+                    )
+                })
+                .collect()
+        }
+    };
+    Ok(accounts)
+}
+
+fn oauth_account_view(
+    state: &AppState,
+    provider: String,
+    subject: String,
+    email: Option<String>,
+    display_name: Option<String>,
+    created_at: String,
+    updated_at: String,
+) -> OAuthAccountView {
+    let provider_display_name = state
+        .config
+        .oauth2
+        .provider(&provider)
+        .and_then(|provider| provider.display_name.clone())
+        .unwrap_or_else(|| provider.clone());
+    OAuthAccountView {
+        provider,
+        provider_display_name,
+        subject,
+        email,
+        display_name,
+        created_at,
+        updated_at,
+    }
+}
+
+async fn find_bound_user(
+    db: &DatabaseBackend,
+    provider: &OidcProviderConfig,
+    subject: &str,
+) -> Result<Option<UserId>, AppError> {
+    match db {
+        DatabaseBackend::Sqlite(pool) => {
+            let row: Option<(String,)> = sqlx::query_as(
+                "SELECT user_id FROM oauth_accounts WHERE provider = ? AND subject = ?",
+            )
+            .bind(&provider.id)
+            .bind(subject)
+            .fetch_optional(pool)
+            .await?;
+            row.map(|(id,)| parse_user_id(&id)).transpose()
+        }
+        DatabaseBackend::Postgres(pool) => {
+            let row: Option<(uuid::Uuid,)> = sqlx::query_as(
+                "SELECT user_id FROM oauth_accounts WHERE provider = $1 AND subject = $2",
+            )
+            .bind(&provider.id)
+            .bind(subject)
+            .fetch_optional(pool)
+            .await?;
+            Ok(row.map(|(id,)| UserId(id)))
+        }
+    }
+}
+
+async fn bind_oauth_account(
+    db: &DatabaseBackend,
+    user_id: UserId,
+    provider: &OidcProviderConfig,
+    userinfo: &OidcUserInfo,
+) -> Result<(), AppError> {
+    let id = uuid::Uuid::now_v7();
+    let now = Utc::now();
+    let display_name = userinfo
+        .name
+        .as_deref()
+        .or(userinfo.preferred_username.as_deref());
+    match db {
+        DatabaseBackend::Sqlite(pool) => {
+            sqlx::query("DELETE FROM oauth_accounts WHERE provider = ? AND user_id = ?")
+                .bind(&provider.id)
+                .bind(user_id.0.to_string())
+                .execute(pool)
+                .await?;
+            sqlx::query(
+                r#"
+                INSERT INTO oauth_accounts (id, user_id, provider, subject, email, display_name, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(provider, subject) DO UPDATE SET
+                    user_id = excluded.user_id,
+                    email = excluded.email,
+                    display_name = excluded.display_name,
+                    updated_at = excluded.updated_at
+                "#,
+            )
+            .bind(id.to_string())
+            .bind(user_id.0.to_string())
+            .bind(&provider.id)
+            .bind(&userinfo.sub)
+            .bind(&userinfo.email)
+            .bind(display_name)
+            .bind(now.to_rfc3339())
+            .bind(now.to_rfc3339())
+            .execute(pool)
+            .await?;
+        }
+        DatabaseBackend::Postgres(pool) => {
+            sqlx::query("DELETE FROM oauth_accounts WHERE provider = $1 AND user_id = $2")
+                .bind(&provider.id)
+                .bind(user_id.0)
+                .execute(pool)
+                .await?;
+            sqlx::query(
+                r#"
+                INSERT INTO oauth_accounts (id, user_id, provider, subject, email, display_name, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                ON CONFLICT(provider, subject) DO UPDATE SET
+                    user_id = excluded.user_id,
+                    email = excluded.email,
+                    display_name = excluded.display_name,
+                    updated_at = excluded.updated_at
+                "#,
+            )
+            .bind(id)
+            .bind(user_id.0)
+            .bind(&provider.id)
+            .bind(&userinfo.sub)
+            .bind(&userinfo.email)
+            .bind(display_name)
+            .bind(now)
+            .bind(now)
+            .execute(pool)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn delete_oauth_account(
+    db: &DatabaseBackend,
+    user_id: UserId,
+    provider_id: &str,
+) -> Result<(), AppError> {
+    match db {
+        DatabaseBackend::Sqlite(pool) => {
+            sqlx::query("DELETE FROM oauth_accounts WHERE provider = ? AND user_id = ?")
+                .bind(provider_id)
+                .bind(user_id.0.to_string())
+                .execute(pool)
+                .await?;
+        }
+        DatabaseBackend::Postgres(pool) => {
+            sqlx::query("DELETE FROM oauth_accounts WHERE provider = $1 AND user_id = $2")
+                .bind(provider_id)
+                .bind(user_id.0)
+                .execute(pool)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn create_oauth_session(
+    state: &AppState,
+    headers: &HeaderMap,
+    user_id: UserId,
+) -> Result<(HeaderValue, HeaderValue), AppError> {
+    let session_token = generate_session_token();
+    let token_hash = hash_token(&session_token);
+    let session_repo = crate::auth::SessionRepository::new(state.db.clone());
+    let expires_at = Utc::now() + Duration::hours(state.config.security.session_ttl_hours);
+    session_repo
+        .create(
+            CreateSessionInput {
+                user_id,
+                ip: Some(client_ip_from_headers(headers)),
+                user_agent: header_value(headers, header::USER_AGENT.as_str()),
+                expires_at,
+            },
+            token_hash.clone(),
+        )
+        .await?;
+
+    let csrf_token = derive_csrf_token(&token_hash);
+    let session_cookie = HeaderValue::from_str(&format!(
+        "{}={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}",
+        SESSION_COOKIE_NAME,
+        session_token,
+        state.config.security.session_ttl_hours * 3600
+    ))
+    .map_err(|e| AppError::BadRequest(format!("Invalid session cookie: {e}")))?;
+    let csrf_cookie = HeaderValue::from_str(&format!(
+        "{}={}; SameSite=Lax; Path=/; Max-Age={}",
+        CSRF_COOKIE_NAME,
+        csrf_token,
+        state.config.security.session_ttl_hours * 3600
+    ))
+    .map_err(|e| AppError::BadRequest(format!("Invalid session cookie: {e}")))?;
+    Ok((session_cookie, csrf_cookie))
+}
+
+fn frontend_redirect(
+    state: &AppState,
+    oauth_state: &OAuthState,
+    success: bool,
+    message: &str,
+) -> Result<String, AppError> {
+    let url = reqwest::Url::parse_with_params(
+        &state.config.oauth2.frontend_redirect_url,
+        &[
+            ("oauth", if success { "success" } else { "error" }),
+            ("message", message),
+            ("return_to", oauth_state.return_to.as_str()),
+        ],
+    )
+    .map_err(|e| AppError::BadRequest(format!("invalid OAuth frontend redirect URL: {e}")))?;
+    Ok(url.to_string())
+}
+
+fn encode_state(secret: &str, state: &OAuthState) -> Result<String, AppError> {
+    let payload = serde_json::to_vec(state)
+        .map_err(|e| AppError::BadRequest(format!("OAuth state encode failed: {e}")))?;
+    let payload_hex = hex::encode(&payload);
+    let signature = sign_state(secret, payload_hex.as_bytes())?;
+    Ok(format!("{payload_hex}.{signature}"))
+}
+
+fn decode_state(secret: &str, encoded: &str) -> Result<OAuthState, AppError> {
+    let Some((payload_hex, signature)) = encoded.split_once('.') else {
+        return Err(AppError::BadRequest("OAuth state is invalid".into()));
+    };
+    let expected = sign_state(secret, payload_hex.as_bytes())?;
+    if !constant_time_eq(signature.as_bytes(), expected.as_bytes()) {
+        return Err(AppError::BadRequest(
+            "OAuth state signature is invalid".into(),
+        ));
+    }
+    let payload = hex::decode(payload_hex)
+        .map_err(|e| AppError::BadRequest(format!("OAuth state payload is invalid: {e}")))?;
+    let state: OAuthState = serde_json::from_slice(&payload)
+        .map_err(|e| AppError::BadRequest(format!("OAuth state payload is invalid: {e}")))?;
+    if state.exp < Utc::now().timestamp() {
+        return Err(AppError::BadRequest("OAuth state has expired".into()));
+    }
+    Ok(state)
+}
+
+fn sign_state(secret: &str, payload: &[u8]) -> Result<String, AppError> {
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .map_err(|e| AppError::BadRequest(format!("OAuth state signing failed: {e}")))?;
+    mac.update(payload);
+    Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right.iter())
+        .fold(0_u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
+}
+
+fn sanitize_return_to(value: Option<String>) -> String {
+    value
+        .filter(|item| item.starts_with('/') && !item.starts_with("//"))
+        .unwrap_or_else(|| "/dashboard".to_string())
+}
+
+fn random_nonce() -> String {
+    let mut rng = rand::thread_rng();
+    let bytes: [u8; 16] = rng.gen();
+    hex::encode(bytes)
+}
+
+fn parse_user_id(id: &str) -> Result<UserId, AppError> {
+    uuid::Uuid::parse_str(id)
+        .map(UserId)
+        .map_err(|e| AppError::BadRequest(format!("invalid user id: {e}")))
+}
+
+fn client_ip_from_headers(headers: &HeaderMap) -> String {
+    header_value(headers, "x-forwarded-for")
+        .and_then(|value| {
+            value
+                .split(',')
+                .next()
+                .map(str::trim)
+                .map(ToString::to_string)
+        })
+        .filter(|value| !value.is_empty())
+        .or_else(|| header_value(headers, "x-real-ip"))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn test_provider() -> OidcProviderConfig {
+        OidcProviderConfig {
+            id: "oidc".into(),
+            display_name: None,
+            auth_url: "https://login.example.com/auth".into(),
+            token_url: "https://login.example.com/token".into(),
+            userinfo_url: "https://login.example.com/userinfo".into(),
+            client_id: "client".into(),
+            client_secret: "secret".into(),
+            redirect_url: "https://status.example.com/oauth/callback".into(),
+            scopes: vec!["openid".into(), "profile".into()],
+            token_auth_method: "client_secret_post".into(),
+            userinfo_auth_method: "bearer".into(),
+            extra_auth_params: HashMap::new(),
+            subject_field: "sub".into(),
+            email_field: "email".into(),
+            name_field: "name".into(),
+            username_field: "preferred_username".into(),
+        }
+    }
+
+    #[test]
+    fn signed_state_round_trips() {
+        let state = OAuthState {
+            provider: "oidc".into(),
+            flow: OAuthFlow::Login,
+            user_id: None,
+            return_to: "/dashboard".into(),
+            nonce: "abc".into(),
+            exp: (Utc::now() + Duration::minutes(1)).timestamp(),
+        };
+        let encoded = encode_state("secret", &state).unwrap();
+        let decoded = decode_state("secret", &encoded).unwrap();
+        assert_eq!(decoded.provider, state.provider);
+        assert_eq!(decoded.flow, OAuthFlow::Login);
+    }
+
+    #[test]
+    fn rejects_tampered_state() {
+        let state = OAuthState {
+            provider: "oidc".into(),
+            flow: OAuthFlow::Login,
+            user_id: None,
+            return_to: "/dashboard".into(),
+            nonce: "abc".into(),
+            exp: (Utc::now() + Duration::minutes(1)).timestamp(),
+        };
+        let mut encoded = encode_state("secret", &state).unwrap();
+        encoded.push('0');
+        assert!(decode_state("secret", &encoded).is_err());
+    }
+
+    #[test]
+    fn return_to_must_be_local_path() {
+        assert_eq!(sanitize_return_to(Some("/settings".into())), "/settings");
+        assert_eq!(
+            sanitize_return_to(Some("https://x.test".into())),
+            "/dashboard"
+        );
+        assert_eq!(sanitize_return_to(Some("//x.test".into())), "/dashboard");
+    }
+
+    #[test]
+    fn authorize_url_includes_extra_params_without_overriding_core() {
+        let mut provider = test_provider();
+        provider
+            .extra_auth_params
+            .insert("prompt".into(), "select_account".into());
+        provider
+            .extra_auth_params
+            .insert("client_id".into(), "evil".into());
+        let url = authorize_url(&provider, "state", "nonce").unwrap();
+        let parsed = reqwest::Url::parse(&url).unwrap();
+        let params: Vec<(String, String)> = parsed.query_pairs().into_owned().collect();
+        assert!(params.contains(&("prompt".into(), "select_account".into())));
+        assert!(params.contains(&("client_id".into(), "client".into())));
+        assert!(!params.contains(&("client_id".into(), "evil".into())));
+    }
+
+    #[test]
+    fn normalizes_userinfo_with_custom_claim_paths() {
+        let mut provider = test_provider();
+        provider.subject_field = "data.id".into();
+        provider.email_field = "/profile/mail".into();
+        provider.name_field = "profile.displayName".into();
+        provider.username_field = "login".into();
+        let raw = serde_json::json!({
+            "data": { "id": 42 },
+            "profile": { "mail": " alice@example.com ", "displayName": "Alice" },
+            "login": true
+        });
+        let userinfo = normalize_userinfo(&provider, &raw).unwrap();
+        assert_eq!(userinfo.sub, "42");
+        assert_eq!(userinfo.email.as_deref(), Some("alice@example.com"));
+        assert_eq!(userinfo.name.as_deref(), Some("Alice"));
+        assert_eq!(userinfo.preferred_username.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn parses_oauth_auth_method_aliases() {
+        assert_eq!(
+            parse_token_auth_method("client-secret-basic").unwrap(),
+            TokenAuthMethod::ClientSecretBasic
+        );
+        assert_eq!(
+            parse_token_auth_method("public").unwrap(),
+            TokenAuthMethod::None
+        );
+        assert_eq!(
+            parse_userinfo_auth_method("access token query").unwrap(),
+            UserinfoAuthMethod::Query
+        );
+    }
+}

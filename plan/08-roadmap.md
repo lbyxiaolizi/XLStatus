@@ -203,6 +203,101 @@
 
 ## 后续版本
 
+后续版本按 [16-komari-nezha-gap.md](./16-komari-nezha-gap.md) 的对标缺口计划推进。
+
+### M10 通知、告警和自动化闭环
+
+交付：
+
+- 通知渠道和通知组 CRUD、测试接口和 UI。
+- 告警资源指标补齐：GPU、Swap、网络速度、累计流量、周期流量、load1/5/15、TCP/UDP 连接数、进程数、温度。
+- HTTPS 证书变化、即将过期和已过期告警。
+- 告警和服务监控失败/恢复触发任务。
+- 服务监控覆盖全部、指定、排除和默认加入新 Agent。
+
+验收：
+
+- 管理员可在 UI 配置通知组并完成测试发送。
+- 服务失败、恢复、延迟越界和证书事件都可通知并触发任务。
+- 周期流量规则跨重启保持窗口一致。
+
+### M11 多租户资源管理
+
+交付：
+
+- Server group CRUD、成员管理和批量移动。
+- 批量删除、批量操作结果分类。
+- 服务器所有权转移、重试、取消、回滚和审计。
+- 服务器资产字段：public note、hide for guest、display index、账单、币种、自动续费、流量额度。
+
+验收：
+
+- 成员不能看到或操作无权服务器。
+- PAT allowlist 收口所有批量操作。
+- 公开状态页不会泄露私有备注和隐藏资源。
+
+### M12 账号安全和运营防护
+
+交付：
+
+- OAuth2/OIDC 登录、绑定和解绑。
+- TOTP 2FA 和敏感操作二次校验。
+- WAF、在线用户列表和管理员封禁。
+- 强制认证模式。
+
+验收：
+
+- OAuth2 登录和密码登录均可按配置启用或禁用。
+- 2FA 开启后，敏感操作必须通过 TOTP。
+- 登录、PAT、Agent 和 OAuth2 暴力尝试会被 WAF 记录和封禁。
+
+### M13 备份、GeoIP 和维护
+
+交付：
+
+- 备份下载、恢复上传、版本和数据库类型校验。
+- SQLite VACUUM、TSDB compact/retention、系统维护 API。
+- GeoIP provider 管理、测试、MMDB 更新。
+- IP 变化通知和 DDNS 自定义 DNS resolver。
+
+验收：
+
+- 备份恢复后用户、服务器、监控、任务、通知和历史指标可用。
+- IP 变化后在一个上报周期内触发通知。
+
+### M14 主题、多语言和公开页增强
+
+交付：
+
+- 前台/后台模板选择、主题上传、导入、删除、配置和预览。
+- 站点名称、Logo、favicon、自定义 head/body。
+- 完整简体中文和英文 i18n。
+- 私有站点、MJPEG 状态图流、世界地图或地理聚合视图。
+
+验收：
+
+- 管理员可切换主题和语言。
+- 私有站点开启后匿名用户无法访问公开数据。
+- MJPEG 状态图可以被外部页面持续嵌入。
+
+### M15 Provider 生态和兼容入口
+
+交付：
+
+- 内置 Telegram、Bark、Email、ServerChan、Discord/Slack 通知模板。
+- JavaScript provider 或插件化 provider 扩展点。
+- Cloudflare Tunnel 管理入口。
+- Agent auto-discovery key。
+- Nezha Agent 兼容入口评估和可选实现。
+
+验收：
+
+- 常见通知 provider 无需手写完整 webhook body 即可配置。
+- Cloudflare Tunnel 可在 UI 启停并查看状态。
+- 兼容入口默认关闭，开启后有单独鉴权和审计。
+
+### 长期版本
+
 - Linux arm64 Agent。
 - Windows Agent。
 - macOS Agent。
@@ -210,4 +305,4 @@
 - VictoriaMetrics、ClickHouse 或 TimescaleDB 外部指标后端实现。
 - 多节点 Dashboard。
 - 更细粒度的文件沙箱策略。
-- 插件化通知 provider 和 DDNS provider。
+- 通知 provider、DDNS provider、主题组件和后端工具的插件化。

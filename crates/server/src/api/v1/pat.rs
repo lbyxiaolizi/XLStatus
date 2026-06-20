@@ -3,7 +3,7 @@ use crate::auth::generate_pat;
 use crate::auth::middleware::AuthUser;
 use crate::auth::rbac;
 use crate::db::{CreatePATInput, PATRepository};
-use axum::{extract::Path, extract::State, Json};
+use axum::{extract::Path, extract::State, http::HeaderMap, Json};
 use serde::{Deserialize, Serialize};
 
 use super::auth::AppError;
@@ -53,11 +53,13 @@ fn validate_servers(ids: Option<&[String]>) -> Result<(), AppError> {
 pub async fn create_pat(
     State(state): State<super::auth::AppState>,
     auth_user: AuthUser,
+    headers: HeaderMap,
     Json(req): Json<CreatePATRequest>,
 ) -> Result<Json<ApiResponse<CreatePATResponse>>, AppError> {
     auth_user
         .require_cookie_session()
         .map_err(|_| AppError::Forbidden("PAT cannot manage API tokens".to_string()))?;
+    super::auth::require_sensitive_totp(&state.db, auth_user.user.id, &headers).await?;
     validate_scopes(&req.scopes, auth_user.user.role.is_admin())?;
     validate_servers(req.server_ids.as_deref())?;
 
@@ -129,10 +131,12 @@ pub async fn revoke_pat(
     State(state): State<super::auth::AppState>,
     Path(id): Path<String>,
     auth_user: AuthUser,
+    headers: HeaderMap,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
     auth_user
         .require_cookie_session()
         .map_err(|_| AppError::Forbidden("PAT cannot manage API tokens".to_string()))?;
+    super::auth::require_sensitive_totp(&state.db, auth_user.user.id, &headers).await?;
 
     let pat_repo = PATRepository::new(state.db.clone());
     let revoked = pat_repo.revoke(&id, auth_user.user.id).await?;

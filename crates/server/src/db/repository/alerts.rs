@@ -18,6 +18,8 @@ pub struct AlertRuleRow {
     pub trigger_mode: TriggerMode,
     pub conditions: Vec<AlertCondition>,
     pub notification_group_id: Option<String>,
+    pub failure_task_ids: Vec<String>,
+    pub recovery_task_ids: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -38,14 +40,18 @@ impl AlertRepository {
         trigger_mode: TriggerMode,
         conditions: &[AlertCondition],
         notification_group_id: Option<&str>,
+        failure_task_ids: &[String],
+        recovery_task_ids: &[String],
     ) -> Result<AlertRuleRow> {
         let id = Uuid::now_v7().to_string();
         let now = Utc::now();
         let conditions_json = serde_json::to_string(conditions)?;
+        let failure_task_ids_json = serde_json::to_string(failure_task_ids)?;
+        let recovery_task_ids_json = serde_json::to_string(recovery_task_ids)?;
         match &self.db {
             DatabaseBackend::Sqlite(pool) => {
                 sqlx::query(
-                    "INSERT INTO alert_rules (id, owner_user_id, name, enabled, trigger_mode, rules_json, notification_group_id, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?)",
+                    "INSERT INTO alert_rules (id, owner_user_id, name, enabled, trigger_mode, rules_json, notification_group_id, fail_task_ids_json, recover_task_ids_json, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(&id)
                 .bind(owner_user_id)
@@ -53,6 +59,8 @@ impl AlertRepository {
                 .bind(trigger_mode.as_db())
                 .bind(&conditions_json)
                 .bind(notification_group_id)
+                .bind(&failure_task_ids_json)
+                .bind(&recovery_task_ids_json)
                 .bind(now.to_rfc3339())
                 .bind(now.to_rfc3339())
                 .execute(pool)
@@ -63,7 +71,7 @@ impl AlertRepository {
                 let poid = Uuid::parse_str(owner_user_id)?;
                 let png = notification_group_id.map(Uuid::parse_str).transpose()?;
                 sqlx::query(
-                    "INSERT INTO alert_rules (id, owner_user_id, name, enabled, trigger_mode, rules_json, notification_group_id, created_at, updated_at) VALUES ($1, $2, $3, true, $4, $5, $6, $7, $8)",
+                    "INSERT INTO alert_rules (id, owner_user_id, name, enabled, trigger_mode, rules_json, notification_group_id, fail_task_ids_json, recover_task_ids_json, created_at, updated_at) VALUES ($1, $2, $3, true, $4, $5, $6, $7, $8, $9, $10)",
                 )
                 .bind(pid)
                 .bind(poid)
@@ -71,6 +79,8 @@ impl AlertRepository {
                 .bind(trigger_mode.as_db())
                 .bind(&conditions_json)
                 .bind(png)
+                .bind(&failure_task_ids_json)
+                .bind(&recovery_task_ids_json)
                 .bind(now)
                 .bind(now)
                 .execute(pool)
@@ -85,6 +95,8 @@ impl AlertRepository {
             trigger_mode,
             conditions: conditions.to_vec(),
             notification_group_id: notification_group_id.map(|s| s.to_string()),
+            failure_task_ids: failure_task_ids.to_vec(),
+            recovery_task_ids: recovery_task_ids.to_vec(),
             created_at: now,
             updated_at: now,
         })
@@ -95,9 +107,19 @@ impl AlertRepository {
         match &self.db {
             DatabaseBackend::Sqlite(pool) => {
                 let rows: Vec<(
-                    String, String, String, i64, String, String, Option<String>, String, String,
+                    String,
+                    String,
+                    String,
+                    i64,
+                    String,
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    String,
+                    String,
                 )> = sqlx::query_as(
-                    "SELECT id, owner_user_id, name, enabled, trigger_mode, rules_json, notification_group_id, created_at, updated_at FROM alert_rules ORDER BY created_at DESC",
+                    "SELECT id, owner_user_id, name, enabled, trigger_mode, rules_json, notification_group_id, fail_task_ids_json, recover_task_ids_json, created_at, updated_at FROM alert_rules ORDER BY created_at DESC",
                 )
                 .fetch_all(pool)
                 .await?;
@@ -109,6 +131,8 @@ impl AlertRepository {
                     trigger_mode,
                     rules_json,
                     notification_group_id,
+                    fail_task_ids_json,
+                    recover_task_ids_json,
                     created_at,
                     updated_at,
                 ) in rows
@@ -122,6 +146,8 @@ impl AlertRepository {
                         conditions: serde_json::from_str(&rules_json)
                             .context("invalid rules_json")?,
                         notification_group_id,
+                        failure_task_ids: parse_task_ids_json(fail_task_ids_json),
+                        recovery_task_ids: parse_task_ids_json(recover_task_ids_json),
                         created_at: parse_dt(&created_at)?,
                         updated_at: parse_dt(&updated_at)?,
                     });
@@ -129,9 +155,19 @@ impl AlertRepository {
             }
             DatabaseBackend::Postgres(pool) => {
                 let rows: Vec<(
-                    String, String, String, bool, String, String, Option<String>, String, String,
+                    String,
+                    String,
+                    String,
+                    bool,
+                    String,
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    String,
+                    String,
                 )> = sqlx::query_as(
-                    "SELECT id::text, owner_user_id::text, name, enabled, trigger_mode, rules_json, notification_group_id::text, created_at::text, updated_at::text FROM alert_rules ORDER BY created_at DESC",
+                    "SELECT id::text, owner_user_id::text, name, enabled, trigger_mode, rules_json, notification_group_id::text, fail_task_ids_json, recover_task_ids_json, created_at::text, updated_at::text FROM alert_rules ORDER BY created_at DESC",
                 )
                 .fetch_all(pool)
                 .await?;
@@ -143,6 +179,8 @@ impl AlertRepository {
                     trigger_mode,
                     rules_json,
                     notification_group_id,
+                    fail_task_ids_json,
+                    recover_task_ids_json,
                     created_at,
                     updated_at,
                 ) in rows
@@ -156,6 +194,8 @@ impl AlertRepository {
                         conditions: serde_json::from_str(&rules_json)
                             .context("invalid rules_json")?,
                         notification_group_id,
+                        failure_task_ids: parse_task_ids_json(fail_task_ids_json),
+                        recovery_task_ids: parse_task_ids_json(recover_task_ids_json),
                         created_at: parse_dt(&created_at)?,
                         updated_at: parse_dt(&updated_at)?,
                     });
@@ -254,6 +294,13 @@ fn parse_dt(s: &str) -> Result<DateTime<Utc>> {
     Ok(DateTime::parse_from_rfc3339(s)?.with_timezone(&Utc))
 }
 
+fn parse_task_ids_json(value: Option<String>) -> Vec<String> {
+    value
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,6 +322,8 @@ mod tests {
                 duration_seconds: 0,
             }],
             notification_group_id: None,
+            failure_task_ids: Vec::new(),
+            recovery_task_ids: Vec::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

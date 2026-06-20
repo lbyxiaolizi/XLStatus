@@ -22,6 +22,10 @@ pub struct CreateAlertRuleRequest {
     pub conditions: Vec<JsonValue>,
     #[serde(default)]
     pub notification_group_id: Option<String>,
+    #[serde(default, alias = "fail_task_ids")]
+    pub failure_task_ids: Vec<String>,
+    #[serde(default, alias = "recover_task_ids")]
+    pub recovery_task_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -32,6 +36,8 @@ pub struct AlertRuleView {
     pub trigger: String,
     pub conditions: Vec<JsonValue>,
     pub notification_group_id: Option<String>,
+    pub failure_task_ids: Vec<String>,
+    pub recovery_task_ids: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -53,6 +59,10 @@ pub async fn create_alert_rule(
         _ => TriggerMode::Once,
     };
     let owner = auth.user_id.0.to_string();
+    let failure_task_ids = normalize_id_list(req.failure_task_ids);
+    let recovery_task_ids = normalize_id_list(req.recovery_task_ids);
+    ensure_tasks_owned_by(&state.db, &owner, &failure_task_ids).await?;
+    ensure_tasks_owned_by(&state.db, &owner, &recovery_task_ids).await?;
     let repo = AlertRepository::new(state.db.clone());
     let row = repo
         .create(
@@ -61,6 +71,8 @@ pub async fn create_alert_rule(
             trigger,
             &conditions,
             req.notification_group_id.as_deref(),
+            &failure_task_ids,
+            &recovery_task_ids,
         )
         .await
         .map_err(|e| AppError::Database(e))?;
@@ -164,9 +176,66 @@ fn row_to_view(r: &crate::db::repository::alerts::AlertRuleRow) -> AlertRuleView
             .map(|c| serde_json::to_value(c).unwrap_or(JsonValue::Null))
             .collect(),
         notification_group_id: r.notification_group_id.clone(),
+        failure_task_ids: r.failure_task_ids.clone(),
+        recovery_task_ids: r.recovery_task_ids.clone(),
         created_at: r.created_at.to_rfc3339(),
         updated_at: r.updated_at.to_rfc3339(),
     }
+}
+
+async fn ensure_tasks_owned_by(
+    db: &crate::db::Db,
+    owner_user_id: &str,
+    task_ids: &[String],
+) -> Result<(), AppError> {
+    for task_id in task_ids {
+        let exists = match db {
+            crate::db::DatabaseBackend::Sqlite(pool) => {
+                let row: (i64,) =
+                    sqlx::query_as("SELECT COUNT(*) FROM tasks WHERE id = ? AND owner_user_id = ?")
+                        .bind(task_id)
+                        .bind(owner_user_id)
+                        .fetch_one(pool)
+                        .await
+                        .map_err(db_err)?;
+                row.0 > 0
+            }
+            crate::db::DatabaseBackend::Postgres(pool) => {
+                let owner = uuid::Uuid::parse_str(owner_user_id)
+                    .map_err(|e| AppError::BadRequest(format!("invalid owner_user_id: {e}")))?;
+                let row: (i64,) = sqlx::query_as(
+                    "SELECT COUNT(*) FROM tasks WHERE id = $1 AND owner_user_id = $2",
+                )
+                .bind(task_id)
+                .bind(owner)
+                .fetch_one(pool)
+                .await
+                .map_err(db_err)?;
+                row.0 > 0
+            }
+        };
+        if !exists {
+            return Err(AppError::BadRequest(format!(
+                "task {task_id} does not exist or is not owned by current user"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn normalize_id_list(values: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for value in values {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() && !out.iter().any(|existing| existing == trimmed) {
+            out.push(trimmed.to_string());
+        }
+    }
+    out
+}
+
+fn db_err(err: sqlx::Error) -> AppError {
+    AppError::Database(anyhow::anyhow!(err))
 }
 
 fn parse_conditions(items: &[JsonValue]) -> Result<Vec<AlertCondition>, AppError> {
@@ -174,9 +243,32 @@ fn parse_conditions(items: &[JsonValue]) -> Result<Vec<AlertCondition>, AppError
     for v in items {
         let c: AlertCondition = serde_json::from_value(v.clone())
             .map_err(|e| AppError::BadRequest(format!("invalid condition: {e}")))?;
+        validate_condition(&c)?;
         out.push(c);
     }
     Ok(out)
+}
+
+fn validate_condition(condition: &AlertCondition) -> Result<(), AppError> {
+    match condition {
+        AlertCondition::CertificateExpiry { days_before, .. }
+        | AlertCondition::ServerExpiry { days_before, .. } => {
+            if *days_before < 0 {
+                return Err(AppError::BadRequest(
+                    "days_before must be greater than or equal to 0".into(),
+                ));
+            }
+        }
+        AlertCondition::ServerTrafficQuota { percent, .. } => {
+            if !percent.is_finite() || *percent <= 0.0 {
+                return Err(AppError::BadRequest(
+                    "percent must be greater than 0".into(),
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]

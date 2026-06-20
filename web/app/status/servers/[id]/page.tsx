@@ -1,0 +1,1683 @@
+"use client";
+
+import Link from "next/link";
+import { MouseEvent, useCallback, useEffect, useMemo, useState } from "react";
+import Navigation from "@/app/components/Navigation";
+import {
+  asRecord,
+  asString,
+  EmptyState,
+  InlineError,
+  PageHeader,
+  PageShell,
+  StatusBadge,
+  buttonClass,
+  compactId,
+  formatBytes,
+  formatDate,
+  formatMs,
+  formatPercent,
+  responseError,
+} from "@/app/components/M7Primitives";
+import { apiClient } from "@/lib/api";
+
+interface PageProps {
+  params: Promise<{ id: string }> | { id: string };
+}
+
+interface PublicServerDetail {
+  id: string;
+  name: string;
+  remark?: string | null;
+  expires_at?: string | null;
+  renewal_price?: string | number | null;
+  provider?: string | null;
+  region?: string | null;
+  plan?: string | null;
+  tags?: string[];
+  accent_color?: string | null;
+  status: string;
+  last_seen_at?: string | null;
+  last_state?: Record<string, unknown> | null;
+  last_info?: Record<string, unknown> | null;
+}
+
+interface MetricSample {
+  sample_at: string;
+  fields_json?: Record<string, unknown> | null;
+}
+
+interface PublicServiceResult {
+  server_id?: string | null;
+  status: string;
+  delay_ms?: number | null;
+  created_at: string;
+}
+
+interface PublicService {
+  id: string;
+  name: string;
+  server_id?: string | null;
+  server_ids?: string[];
+  history?: PublicServiceResult[];
+}
+
+interface ChartPoint {
+  time: number;
+  value: number;
+}
+
+interface ChartSeries {
+  id?: string;
+  label: string;
+  color: string;
+  points: ChartPoint[];
+  axis?: ChartAxis;
+  kind?: ChartKind;
+  opacity?: number;
+  strokeDasharray?: string;
+  strokeWidth?: number;
+}
+
+interface ProbeHistory {
+  id: string;
+  label: string;
+  color: string;
+  latency: ChartPoint[];
+  loss: ChartPoint[];
+  lossRate: number;
+  minLatency?: number;
+  maxLatency?: number;
+  latestLatency?: number;
+}
+
+type MetricsRange = "1d" | "7d" | "30d";
+type ChartTab = "resources" | "network";
+type ChartAxis = "left" | "right";
+type ChartKind = "line" | "area";
+
+export default function PublicServerDetailPage({ params }: PageProps) {
+  const [serverId, setServerId] = useState("");
+  const [server, setServer] = useState<PublicServerDetail | null>(null);
+  const [metrics, setMetrics] = useState<MetricSample[]>([]);
+  const [services, setServices] = useState<PublicService[]>([]);
+  const [metricsRange, setMetricsRange] = useState<MetricsRange>("1d");
+  const [chartTab, setChartTab] = useState<ChartTab>("resources");
+  const [selectedProbeIds, setSelectedProbeIds] = useState<string[]>([]);
+  const [probePeakCutEnabled, setProbePeakCutEnabled] = useState(false);
+  const [showMissingInfo, setShowMissingInfo] = useState(() => initialShowMissingInfo());
+  const [loading, setLoading] = useState(true);
+  const [metricsLoading, setMetricsLoading] = useState(false);
+  const [probeLoading, setProbeLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [monitorError, setMonitorError] = useState<string | null>(null);
+
+  useEffect(() => {
+    void Promise.resolve(params).then((value) => setServerId(value.id));
+  }, [params]);
+
+  const loadServer = useCallback(async () => {
+    if (!serverId) return;
+    setLoading(true);
+    setError(null);
+    const response = await apiClient.getPublicServer(serverId);
+    setLoading(false);
+    if (response.success && response.data) {
+      setServer(response.data as unknown as PublicServerDetail);
+    } else {
+      setError(responseError(response));
+      setServer(null);
+    }
+  }, [serverId]);
+
+  const loadMetrics = useCallback(async () => {
+    if (!serverId) return;
+    setMetricsLoading(true);
+    setMonitorError(null);
+    const response = await apiClient.getPublicServerMetrics(serverId, metricsRange);
+    setMetricsLoading(false);
+    if (response.success && response.data) {
+      const series = asRecord(response.data.series);
+      const samples = Array.isArray(series.samples) ? series.samples : [];
+      setMetrics(samples.map(normalizeMetricSample).filter((item): item is MetricSample => Boolean(item)));
+    } else {
+      setMetrics([]);
+      setMonitorError(responseError(response));
+    }
+  }, [metricsRange, serverId]);
+
+  const loadServices = useCallback(async () => {
+    setProbeLoading(true);
+    const response = await apiClient.getPublicStatus();
+    setProbeLoading(false);
+    if (response.success && response.data) {
+      setServices(((response.data.services as PublicService[]) ?? []).filter((service) => service.id));
+    } else {
+      setServices([]);
+      setMonitorError(responseError(response));
+    }
+  }, []);
+
+  useEffect(() => {
+    const timeoutId = window.setTimeout(() => void loadServer(), 0);
+    return () => window.clearTimeout(timeoutId);
+  }, [loadServer]);
+
+  useEffect(() => {
+    const timeoutId = window.setTimeout(() => void loadMetrics(), 0);
+    return () => window.clearTimeout(timeoutId);
+  }, [loadMetrics]);
+
+  useEffect(() => {
+    const timeoutId = window.setTimeout(() => void loadServices(), 0);
+    return () => window.clearTimeout(timeoutId);
+  }, [loadServices]);
+
+  const metricCharts = useMemo(() => buildMetricCharts(metrics, server?.last_state), [metrics, server?.last_state]);
+  const probeHistories = useMemo(() => buildProbeHistories(services, serverId, metricsRange), [metricsRange, serverId, services]);
+  const activeSelectedProbeIds = useMemo(
+    () => selectedProbeIds.filter((id) => probeHistories.some((history) => history.id === id)),
+    [probeHistories, selectedProbeIds],
+  );
+  const visibleProbeHistories = useMemo(
+    () =>
+      activeSelectedProbeIds.length
+        ? probeHistories.filter((history) => activeSelectedProbeIds.includes(history.id))
+        : probeHistories,
+    [activeSelectedProbeIds, probeHistories],
+  );
+  const probeLatencySeries = useMemo(
+    () =>
+      visibleProbeHistories.map((history) => ({
+        id: `${history.id}:latency`,
+        label: history.label,
+        color: history.color,
+        points: history.latency,
+        axis: "left" as const,
+      })),
+    [visibleProbeHistories],
+  );
+  const probeLossSeries = useMemo(
+    () =>
+      visibleProbeHistories.map((history) => ({
+        id: `${history.id}:loss`,
+        label: history.label,
+        color: history.color,
+        points: history.loss,
+        axis: "right" as const,
+        kind: "area" as const,
+        opacity: 0.18,
+        strokeDasharray: "5 4",
+        strokeWidth: 2,
+      })),
+    [visibleProbeHistories],
+  );
+
+  function toggleProbeSelection(id: string) {
+    setSelectedProbeIds((current) =>
+      current.includes(id) ? current.filter((item) => item !== id) : [...current, id],
+    );
+  }
+
+  function changeShowMissingInfo(next: boolean) {
+    setShowMissingInfo(next);
+    window.localStorage.setItem("xlstatus_public_detail_show_missing", next ? "1" : "0");
+  }
+
+  return (
+    <div className="min-h-screen">
+      <Navigation />
+      <PageShell>
+        <PageHeader
+          eyebrow="公开服务器"
+          title={server?.name || compactId(serverId)}
+          detail={`最后在线 ${formatDate(server?.last_seen_at)}`}
+          actions={
+            <>
+              <Link href="/status" className={buttonClass("secondary")}>返回状态页</Link>
+              {server ? <StatusBadge tone={serverTone(server.status)}>{statusLabel(server.status)}</StatusBadge> : null}
+            </>
+          }
+        />
+        <InlineError message={error} />
+
+        {loading && !server ? <EmptyState title="正在加载公开服务器" /> : null}
+
+        {server ? (
+          <div className="mt-5 grid gap-5">
+            <PublicServerOverview
+              server={server}
+              showMissing={showMissingInfo}
+              onShowMissingChange={changeShowMissingInfo}
+            />
+            <PublicMonitoringCharts
+              activeTab={chartTab}
+              onTabChange={setChartTab}
+              metricsRange={metricsRange}
+              onRangeChange={setMetricsRange}
+              monitorError={monitorError}
+              metricCharts={metricCharts}
+              metricsLoading={metricsLoading}
+              probeLoading={probeLoading}
+              probeHistories={probeHistories}
+              selectedProbeIds={activeSelectedProbeIds}
+              probePeakCutEnabled={probePeakCutEnabled}
+              probeLatencySeries={probeLatencySeries}
+              probeLossSeries={probeLossSeries}
+              onToggleProbe={toggleProbeSelection}
+              onClearProbes={() => setSelectedProbeIds([])}
+              onPeakCutChange={setProbePeakCutEnabled}
+            />
+          </div>
+        ) : null}
+      </PageShell>
+    </div>
+  );
+}
+
+function PublicServerOverview({
+  server,
+  showMissing,
+  onShowMissingChange,
+}: {
+  server: PublicServerDetail;
+  showMissing: boolean;
+  onShowMissingChange: (next: boolean) => void;
+}) {
+  const info = server.last_info ?? {};
+  const state = server.last_state ?? {};
+  const remark = server.remark || metadataFromRecord(info, ["remark", "note", "public_note", "description"]);
+  const expiresAt = server.expires_at || metadataFromRecord(info, ["expires_at", "expired_at", "expire_at", "due_at", "end_at"]);
+  const renewalPrice = server.renewal_price ?? metadataFromRecord(info, ["renewal_price", "renew_price", "renewal", "price", "billing_price"]);
+  const provider = server.provider || metadataFromRecord(info, ["provider", "vendor", "datacenter", "isp"]);
+  const region = server.region || metadataFromRecord(info, ["region", "location", "country", "city"]);
+  const plan = server.plan || metadataFromRecord(info, ["plan", "package", "sku", "product", "instance_type"]);
+  const tags = Array.isArray(server.tags) ? server.tags.filter(Boolean) : [];
+  const platformDetails = parsePlatformDetails(info);
+  const platform = joinLabels([platformDetails.os, platformDetails.version]);
+  const load = [optionalNumber(state.load_1), optionalNumber(state.load_5), optionalNumber(state.load_15)]
+    .map((value) => (value === undefined ? null : value.toFixed(2)))
+    .filter(Boolean)
+    .join(" / ");
+  const tcp = optionalNumber(state.tcp_connections);
+  const udp = optionalNumber(state.udp_connections);
+  const tiles = filterInfoTiles(
+    [
+      { label: "备注", value: remark, wide: true },
+      { label: "供应商", value: provider },
+      { label: "地区", value: region },
+      { label: "套餐", value: plan },
+      { label: "到期", value: expiresAt ? formatDate(expiresAt) : null, danger: isExpired(expiresAt) },
+      {
+        label: "续费",
+        value: renewalPrice === null || renewalPrice === undefined || renewalPrice === "" ? null : String(renewalPrice),
+      },
+    ],
+    showMissing,
+  );
+  const hostRows = filterInfoRows(
+    [
+      ["主机名", stringValue(info.hostname)],
+      ["系统", platform],
+      ["内核", stringValue(info.kernel_version)],
+      ["架构", stringValue(info.arch)],
+      ["Agent", platformDetails.agent],
+    ],
+    showMissing,
+  );
+  const resourceRows = filterInfoRows(
+    [
+      ["CPU 核心", numberLabel(info.cpu_cores)],
+      ["内存", resourceBytes(state.memory_used, state.memory_total, info.total_memory)],
+      ["Swap", resourceBytes(state.swap_used, state.swap_total, info.total_swap)],
+      ["磁盘", diskLabel(state, info)],
+    ],
+    showMissing,
+  );
+  const runtimeRows = filterInfoRows(
+    [
+      ["运行时间", durationLabel(state.uptime_seconds)],
+      ["负载", load],
+      ["进程", numberLabel(state.process_count)],
+      ["连接", tcp === undefined && udp === undefined ? "" : `TCP ${tcp ?? 0} / UDP ${udp ?? 0}`],
+      ["上报", platformDetails.report],
+      ["限制", platformDetails.flags],
+    ],
+    showMissing,
+  );
+
+  return (
+    <section className="border-2 border-black bg-[var(--accent-bg)] p-4 shadow-[var(--shadow-brutal)]">
+      <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h2 className="break-words text-2xl font-black uppercase">{server.name}</h2>
+          <p className="mt-1 break-all font-mono text-xs font-bold text-[var(--text-muted)]">{server.id}</p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <label className="inline-flex min-h-10 items-center gap-2 border-2 border-black bg-[var(--bg-card)] px-3 py-2 text-xs font-black shadow-[var(--shadow-brutal-sm)]">
+            <input
+              type="checkbox"
+              checked={showMissing}
+              onChange={(event) => onShowMissingChange(event.target.checked)}
+              className="h-4 w-4 accent-black"
+            />
+            显示缺失
+          </label>
+          <StatusBadge tone={serverTone(server.status)}>{statusLabel(server.status)}</StatusBadge>
+        </div>
+      </div>
+
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
+        {tiles.map((tile) => (
+          <InfoTile
+            key={tile.label}
+            label={tile.label}
+            value={displayInfoValue(tile.value)}
+            danger={tile.danger}
+            wide={tile.wide}
+          />
+        ))}
+      </div>
+
+      {tags.length ? (
+        <div className="mt-3 flex flex-wrap gap-2">
+          {tags.map((tag) => (
+            <span key={tag} className="border-2 border-black bg-[var(--bg-card)] px-2 py-1 text-xs font-black shadow-[var(--shadow-brutal-sm)]">
+              {tag}
+            </span>
+          ))}
+        </div>
+      ) : null}
+
+      <div className="mt-4 grid gap-3 lg:grid-cols-3">
+        {hostRows.length || showMissing ? <InfoGroup title="主机" rows={hostRows} /> : null}
+        {resourceRows.length || showMissing ? <InfoGroup title="资源" rows={resourceRows} /> : null}
+        {runtimeRows.length || showMissing ? <InfoGroup title="运行/网络" rows={runtimeRows} /> : null}
+      </div>
+    </section>
+  );
+}
+
+function PublicMonitoringCharts({
+  activeTab,
+  onTabChange,
+  metricsRange,
+  onRangeChange,
+  monitorError,
+  metricCharts,
+  metricsLoading,
+  probeLoading,
+  probeHistories,
+  selectedProbeIds,
+  probePeakCutEnabled,
+  probeLatencySeries,
+  probeLossSeries,
+  onToggleProbe,
+  onClearProbes,
+  onPeakCutChange,
+}: {
+  activeTab: ChartTab;
+  onTabChange: (tab: ChartTab) => void;
+  metricsRange: MetricsRange;
+  onRangeChange: (range: MetricsRange) => void;
+  monitorError: string | null;
+  metricCharts: ReturnType<typeof buildMetricCharts>;
+  metricsLoading: boolean;
+  probeLoading: boolean;
+  probeHistories: ProbeHistory[];
+  selectedProbeIds: string[];
+  probePeakCutEnabled: boolean;
+  probeLatencySeries: ChartSeries[];
+  probeLossSeries: ChartSeries[];
+  onToggleProbe: (id: string) => void;
+  onClearProbes: () => void;
+  onPeakCutChange: (enabled: boolean) => void;
+}) {
+  const resourceCharts = [
+    {
+      key: "cpu",
+      title: "CPU",
+      value: formatPercent(metricCharts.latestCpu),
+      series: [{ id: "cpu", label: "CPU", color: "var(--accent-color)", points: metricCharts.cpu }],
+      maxValue: 100,
+      formatValue: (value: number) => `${value.toFixed(1)}%`,
+    },
+    {
+      key: "memory",
+      title: "内存",
+      value: formatPercent(metricCharts.latestMemory),
+      series: [{ id: "memory", label: "内存", color: "var(--btn-bg)", points: metricCharts.memory }],
+      maxValue: 100,
+      formatValue: (value: number) => `${value.toFixed(1)}%`,
+    },
+    {
+      key: "load",
+      title: "负载",
+      value: metricCharts.latestLoad === undefined ? "N/A" : metricCharts.latestLoad.toFixed(2),
+      series: [{ id: "load", label: "负载", color: "#0ea5e9", points: metricCharts.load }],
+      formatValue: (value: number) => value.toFixed(2),
+    },
+    {
+      key: "disk",
+      title: "磁盘",
+      value: formatPercent(metricCharts.latestDisk),
+      series: [{ id: "disk", label: "磁盘", color: "#f97316", points: metricCharts.disk }],
+      maxValue: 100,
+      formatValue: (value: number) => `${value.toFixed(1)}%`,
+    },
+    {
+      key: "swap",
+      title: "Swap",
+      value: formatPercent(metricCharts.latestSwap),
+      series: [{ id: "swap", label: "Swap", color: "#a855f7", points: metricCharts.swap }],
+      maxValue: 100,
+      formatValue: (value: number) => `${value.toFixed(1)}%`,
+    },
+    {
+      key: "process",
+      title: "进程",
+      value: metricCharts.latestProcess === undefined ? "N/A" : String(Math.round(metricCharts.latestProcess)),
+      series: [{ id: "process", label: "进程", color: "#10b981", points: metricCharts.process }],
+      formatValue: (value: number) => String(Math.round(value)),
+    },
+    {
+      key: "connection",
+      title: "连接",
+      value: `TCP ${metricCharts.latestTcp === undefined ? "N/A" : Math.round(metricCharts.latestTcp)} / UDP ${metricCharts.latestUdp === undefined ? "N/A" : Math.round(metricCharts.latestUdp)}`,
+      series: [
+        { id: "tcp", label: "TCP", color: "var(--accent-color)", points: metricCharts.tcp },
+        { id: "udp", label: "UDP", color: "var(--border-color)", points: metricCharts.udp },
+      ],
+      formatValue: (value: number) => String(Math.round(value)),
+    },
+    {
+      key: "temperature",
+      title: "温度",
+      value: metricCharts.latestTemperature === undefined ? "N/A" : `${metricCharts.latestTemperature.toFixed(1)} °C`,
+      series: [{ id: "temperature", label: "温度", color: "#dc2626", points: metricCharts.temperature }],
+      formatValue: (value: number) => `${value.toFixed(1)} °C`,
+    },
+    {
+      key: "gpu",
+      title: "GPU",
+      value: formatPercent(metricCharts.latestGpu),
+      series: [{ id: "gpu", label: "GPU", color: "#ef4444", points: metricCharts.gpu }],
+      maxValue: 100,
+      formatValue: (value: number) => `${value.toFixed(1)}%`,
+    },
+  ];
+  const visibleResourceCharts = metricsLoading ? resourceCharts : resourceCharts.filter((chart) => chartHasData(chart.series));
+
+  return (
+    <section className="border-2 border-black bg-[var(--accent-bg)] p-4 shadow-[var(--shadow-brutal)]">
+      <div className="mb-4 flex flex-wrap items-end justify-between gap-3 border-b-4 border-black pb-3">
+        <h2 className="text-2xl font-black uppercase">监控图表</h2>
+        <div className="flex flex-wrap gap-2">
+          {(["1d", "7d", "30d"] as const).map((range) => (
+            <button key={range} type="button" onClick={() => onRangeChange(range)} className={buttonClass(metricsRange === range ? "primary" : "secondary")}>
+              {range}
+            </button>
+          ))}
+        </div>
+      </div>
+      <InlineError message={monitorError} />
+      <div className="mb-4 flex items-end gap-1 overflow-x-auto border-b-4 border-black">
+        {(
+          [
+            ["resources", "资源"],
+            ["network", "网络 / 探测"],
+          ] as Array<[ChartTab, string]>
+        ).map(([tab, label]) => (
+          <button
+            key={tab}
+            type="button"
+            onClick={() => onTabChange(tab)}
+            className={`border-2 border-b-0 border-black px-4 py-2 text-sm font-black uppercase shadow-[var(--shadow-brutal-sm)] ${
+              activeTab === tab
+                ? "translate-y-1 bg-[var(--bg-card)] text-[var(--text-main)]"
+                : "bg-[var(--btn-bg)] text-[var(--btn-text)]"
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+      {activeTab === "resources" ? (
+        visibleResourceCharts.length ? (
+          <div className="grid gap-4 lg:grid-cols-2">
+            {visibleResourceCharts.map((chart) => (
+              <MetricChartCard
+                key={chart.key}
+                title={chart.title}
+                value={chart.value}
+                loading={metricsLoading}
+                series={chart.series}
+                maxValue={chart.maxValue}
+                formatValue={chart.formatValue}
+              />
+            ))}
+          </div>
+        ) : (
+          <EmptyState title="暂无资源图表" detail="服务器暂未上报可绘制的资源指标。" />
+        )
+      ) : null}
+      {activeTab === "network" ? (
+        <NetworkProbePanel
+          metricsLoading={metricsLoading}
+          metricCharts={metricCharts}
+          histories={probeHistories}
+          selectedIds={selectedProbeIds}
+          probeLoading={probeLoading}
+          peakCutEnabled={probePeakCutEnabled}
+          latencySeries={probeLatencySeries}
+          lossSeries={probeLossSeries}
+          onToggle={onToggleProbe}
+          onClear={onClearProbes}
+          onPeakCutChange={onPeakCutChange}
+        />
+      ) : null}
+    </section>
+  );
+}
+
+function NetworkProbePanel({
+  metricsLoading,
+  metricCharts,
+  histories,
+  selectedIds,
+  probeLoading,
+  peakCutEnabled,
+  latencySeries,
+  lossSeries,
+  onToggle,
+  onClear,
+  onPeakCutChange,
+}: {
+  metricsLoading: boolean;
+  metricCharts: ReturnType<typeof buildMetricCharts>;
+  histories: ProbeHistory[];
+  selectedIds: string[];
+  probeLoading: boolean;
+  peakCutEnabled: boolean;
+  latencySeries: ChartSeries[];
+  lossSeries: ChartSeries[];
+  onToggle: (id: string) => void;
+  onClear: () => void;
+  onPeakCutChange: (enabled: boolean) => void;
+}) {
+  const visibleHistories = selectedIds.length
+    ? histories.filter((history) => selectedIds.includes(history.id))
+    : histories;
+  const displayedLatencySeries = peakCutEnabled
+    ? latencySeries.map((item) => ({ ...item, points: smoothPeakPoints(item.points) }))
+    : latencySeries;
+  const networkSeries = [
+    { id: "tx", label: "上传", color: "var(--accent-color)", points: metricCharts.tx },
+    { id: "rx", label: "下载", color: "var(--border-color)", points: metricCharts.rx },
+  ];
+  const hasNetworkData = chartHasData(networkSeries);
+  const hasProbeData = chartHasData(displayedLatencySeries) || chartHasData(lossSeries);
+  const showNetworkChart = metricsLoading || hasNetworkData;
+  const showProbeChart = probeLoading || hasProbeData;
+
+  return (
+    <div className="grid gap-4">
+      {showNetworkChart ? (
+        <MetricChartCard
+          title="网络"
+          value={`↑ ${formatRate(metricCharts.latestTx)} / ↓ ${formatRate(metricCharts.latestRx)}`}
+          loading={metricsLoading}
+          series={networkSeries}
+          formatValue={formatRate}
+        />
+      ) : null}
+      {histories.length ? (
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex flex-wrap gap-2">
+            {histories.map((history) => {
+              const active = selectedIds.length === 0 || selectedIds.includes(history.id);
+              return (
+                <button
+                  key={history.id}
+                  type="button"
+                  onClick={() => onToggle(history.id)}
+                  className={`inline-flex min-h-12 items-center gap-2 border-2 border-black px-3 py-2 text-left text-xs font-black shadow-[var(--shadow-brutal-sm)] ${
+                    active
+                      ? "bg-[var(--bg-card)] text-[var(--text-main)]"
+                      : "bg-[var(--btn-bg)] text-[var(--btn-text)]"
+                  }`}
+                >
+                  <span className="h-3 w-3 shrink-0 border-2 border-black" style={{ background: history.color }} />
+                  <span className="grid gap-0.5">
+                    <span>{history.label}</span>
+                    <span className="text-[11px] text-[var(--text-muted)]">
+                      {history.latestLatency === undefined ? "N/A" : formatMs(Math.round(history.latestLatency))}
+                      {" / "}
+                      ↓{history.minLatency === undefined ? "N/A" : Math.round(history.minLatency)}
+                      {" "}
+                      ↑{history.maxLatency === undefined ? "N/A" : Math.round(history.maxLatency)}
+                      {" / "}
+                      {formatPercent(history.lossRate)}
+                    </span>
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            {selectedIds.length ? (
+              <button type="button" className={buttonClass("secondary")} onClick={onClear}>
+                清空选择 ({selectedIds.length})
+              </button>
+            ) : null}
+            <label className="inline-flex min-h-10 items-center gap-2 border-2 border-black bg-[var(--bg-card)] px-3 py-2 text-xs font-black shadow-[var(--shadow-brutal-sm)]">
+              <input
+                type="checkbox"
+                checked={peakCutEnabled}
+                onChange={(event) => onPeakCutChange(event.target.checked)}
+                className="h-4 w-4 accent-black"
+              />
+              削峰
+            </label>
+          </div>
+        </div>
+      ) : null}
+      {showProbeChart ? (
+        <ProbeOverlayChartCard
+          loading={probeLoading}
+          latencySeries={displayedLatencySeries}
+          lossSeries={lossSeries}
+          latestLatency={latestProbeLatency(latencySeries)}
+          averageLoss={averageLossRate(visibleHistories)}
+        />
+      ) : null}
+      {!showNetworkChart && !showProbeChart ? (
+        <EmptyState title="暂无网络 / 探测图表" detail="服务器暂未上报网络历史，且没有关联探测历史。" />
+      ) : null}
+    </div>
+  );
+}
+
+function MetricChartCard({
+  title,
+  value,
+  loading,
+  series,
+  maxValue,
+  formatValue,
+}: {
+  title: string;
+  value: string;
+  loading: boolean;
+  series: ChartSeries[];
+  maxValue?: number;
+  formatValue: (value: number) => string;
+}) {
+  const hasData = chartHasData(series);
+
+  return (
+    <section className="border-2 border-black bg-[var(--bg-card)] p-4 shadow-[var(--shadow-brutal)]">
+      <div className="mb-3 flex items-start justify-between gap-3">
+        <div>
+          <h3 className="text-xl font-black uppercase">{title}</h3>
+          <p className="mt-1 text-sm font-black text-[var(--text-muted)]">{value}</p>
+        </div>
+        <span className="border-2 border-black bg-[var(--accent-bg)] px-2 py-1 text-xs font-black shadow-[var(--shadow-brutal-sm)]">
+          {loading ? "加载中" : "LIVE"}
+        </span>
+      </div>
+      {loading ? (
+        <ChartEmpty label="正在加载图表..." />
+      ) : hasData ? (
+        <MiniLineChart series={series} maxValue={maxValue} formatValue={formatValue} />
+      ) : (
+        <ChartEmpty label="暂无历史数据" />
+      )}
+      {hasData ? (
+        <div className="mt-3 flex flex-wrap gap-2">
+          {series.map((item) => (
+            <span key={item.id ?? item.label} className="inline-flex items-center gap-2 border-2 border-black bg-[var(--accent-bg)] px-2 py-1 text-xs font-black">
+              <span className="h-2.5 w-2.5 border-2 border-black" style={{ background: item.color }} />
+              {item.label}
+            </span>
+          ))}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function chartHasData(series: ChartSeries[]): boolean {
+  return series.some((item) => item.points.some((point) => Number.isFinite(point.time) && Number.isFinite(point.value)));
+}
+
+function ProbeOverlayChartCard({
+  loading,
+  latencySeries,
+  lossSeries,
+  latestLatency,
+  averageLoss,
+}: {
+  loading: boolean;
+  latencySeries: ChartSeries[];
+  lossSeries: ChartSeries[];
+  latestLatency: string;
+  averageLoss?: number;
+}) {
+  const hasData = chartHasData(latencySeries) || chartHasData(lossSeries);
+
+  return (
+    <section className="border-2 border-black bg-[var(--bg-card)] p-4 shadow-[var(--shadow-brutal)]">
+      <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h3 className="text-xl font-black uppercase">探测延迟 / 丢包率</h3>
+          <p className="mt-1 text-sm font-black text-[var(--text-muted)]">
+            {latestLatency} / {formatPercent(averageLoss)}
+          </p>
+        </div>
+        <span className="border-2 border-black bg-[var(--accent-bg)] px-2 py-1 text-xs font-black shadow-[var(--shadow-brutal-sm)]">
+          {loading ? "加载中" : "LIVE"}
+        </span>
+      </div>
+      {loading ? (
+        <ChartEmpty label="正在加载图表..." tall />
+      ) : hasData ? (
+        <MiniDualAxisChart latencySeries={latencySeries} lossSeries={lossSeries} />
+      ) : (
+        <ChartEmpty label="暂无探测历史" tall />
+      )}
+      {hasData ? (
+        <div className="mt-3 flex flex-wrap gap-2">
+          {latencySeries.map((item) => (
+            <span key={item.id ?? item.label} className="inline-flex items-center gap-2 border-2 border-black bg-[var(--accent-bg)] px-2 py-1 text-xs font-black">
+              <span className="h-2.5 w-2.5 border-2 border-black" style={{ background: item.color }} />
+              {item.label} 延迟
+            </span>
+          ))}
+          {lossSeries.map((item) => (
+            <span key={`${item.id ?? item.label}-loss`} className="inline-flex items-center gap-2 border-2 border-black bg-[var(--accent-bg)] px-2 py-1 text-xs font-black">
+              <span className="h-2.5 w-2.5 border-2 border-black bg-[#facc15]" />
+              {item.label} 丢包
+            </span>
+          ))}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function MiniLineChart({ series, maxValue, formatValue }: { series: ChartSeries[]; maxValue?: number; formatValue: (value: number) => string }) {
+  const [hover, setHover] = useState<{
+    x: number;
+    time: number;
+    values: Array<{ label: string; color: string; value: number }>;
+  } | null>(null);
+  const width = 640;
+  const height = 190;
+  const padding = { top: 14, right: 16, bottom: 30, left: 46 };
+  const plotWidth = width - padding.left - padding.right;
+  const plotHeight = height - padding.top - padding.bottom;
+  const allPoints = series.flatMap((item) => item.points).filter(isFinitePoint);
+  if (!allPoints.length) return <ChartEmpty label="暂无历史数据" />;
+  const timeValues = Array.from(new Set(allPoints.map((point) => point.time))).sort((a, b) => a - b);
+  const minTime = timeValues[0];
+  const maxTime = timeValues[timeValues.length - 1];
+  const maxSeriesValue = Math.max(...allPoints.map((point) => point.value), 1);
+  const yMax = maxValue ?? Math.ceil(maxSeriesValue * 1.2);
+  const timeSpan = Math.max(maxTime - minTime, 1);
+
+  function x(time: number): number {
+    if (allPoints.length === 1) return padding.left + plotWidth / 2;
+    return padding.left + ((time - minTime) / timeSpan) * plotWidth;
+  }
+
+  function y(value: number): number {
+    const clamped = Math.max(0, Math.min(yMax, value));
+    return padding.top + plotHeight - (clamped / yMax) * plotHeight;
+  }
+
+  function handleMove(event: MouseEvent<SVGSVGElement>) {
+    const localX = svgPointerX(event, width);
+    if (localX < padding.left || localX > width - padding.right) {
+      setHover(null);
+      return;
+    }
+    const targetTime = minTime + ((localX - padding.left) / plotWidth) * timeSpan;
+    const hoverTime = nearestValue(timeValues, targetTime);
+    const values = series
+      .map((item) => {
+        const point = nearestPoint(item.points, hoverTime);
+        return point ? { label: item.label, color: item.color, value: point.value, time: point.time } : null;
+      })
+      .filter((item): item is { label: string; color: string; value: number; time: number } => Boolean(item));
+    if (!values.length) {
+      setHover(null);
+      return;
+    }
+    setHover({
+      x: x(hoverTime),
+      time: hoverTime,
+      values: values.map(({ label, color, value }) => ({ label, color, value })),
+    });
+  }
+
+  const tooltipWidth = 210;
+  const tooltipHeight = hover ? 28 + hover.values.length * 20 : 0;
+  const tooltipX = hover ? Math.min(Math.max(hover.x + 12, padding.left), width - padding.right - tooltipWidth) : 0;
+  const tooltipY = hover ? Math.max(padding.top + 4, padding.top + plotHeight - tooltipHeight - 8) : 0;
+
+  return (
+    <svg
+      className="h-48 w-full border-2 border-black bg-[var(--bg-page)]"
+      viewBox={`0 0 ${width} ${height}`}
+      role="img"
+      aria-label={`${series.map((item) => item.label).join(" / ")} 趋势图`}
+      onMouseMove={handleMove}
+      onMouseLeave={() => setHover(null)}
+    >
+      {[0, 0.25, 0.5, 0.75, 1].map((ratio) => {
+        const lineY = padding.top + plotHeight * ratio;
+        return (
+          <line
+            key={ratio}
+            x1={padding.left}
+            x2={width - padding.right}
+            y1={lineY}
+            y2={lineY}
+            stroke="var(--border-color)"
+            strokeOpacity="0.18"
+            strokeWidth="2"
+          />
+        );
+      })}
+      <text x={8} y={padding.top + 10} fill="var(--text-muted)" fontSize="12" fontWeight="900">{formatValue(yMax)}</text>
+      <text x={8} y={padding.top + plotHeight} fill="var(--text-muted)" fontSize="12" fontWeight="900">{formatValue(0)}</text>
+      <text x={padding.left} y={height - 9} fill="var(--text-muted)" fontSize="12" fontWeight="900">{formatChartTime(minTime)}</text>
+      <text x={width - padding.right} y={height - 9} fill="var(--text-muted)" fontSize="12" fontWeight="900" textAnchor="end">{formatChartTime(maxTime)}</text>
+      {series.map((item) => {
+        const points = item.points.filter(isFinitePoint);
+        const path = points.map((point, index) => `${index === 0 ? "M" : "L"} ${x(point.time).toFixed(2)} ${y(point.value).toFixed(2)}`).join(" ");
+        return (
+          <g key={item.id ?? item.label}>
+            <path
+              d={path}
+              fill="none"
+              stroke={item.color}
+              strokeLinecap="square"
+              strokeLinejoin="round"
+              strokeWidth="4"
+            />
+            {points.length === 1 ? (
+              <circle cx={x(points[0].time)} cy={y(points[0].value)} r="5" fill={item.color} stroke="var(--border-color)" strokeWidth="2" />
+            ) : null}
+          </g>
+        );
+      })}
+      {hover ? (
+        <g>
+          <line x1={hover.x} x2={hover.x} y1={padding.top} y2={padding.top + plotHeight} stroke="var(--border-color)" strokeDasharray="6 5" strokeWidth="2" />
+          <rect x={tooltipX} y={tooltipY} width={tooltipWidth} height={tooltipHeight} fill="var(--bg-card)" stroke="var(--border-color)" strokeWidth="2" />
+          <text x={tooltipX + 10} y={tooltipY + 18} fill="var(--text-main)" fontSize="12" fontWeight="900">
+            {formatChartTime(hover.time)}
+          </text>
+          {hover.values.map((item, index) => (
+            <g key={item.label} transform={`translate(${tooltipX + 10}, ${tooltipY + 36 + index * 20})`}>
+              <rect width="9" height="9" y="-8" fill={item.color} stroke="var(--border-color)" strokeWidth="1.5" />
+              <text x="16" y="0" fill="var(--text-main)" fontSize="12" fontWeight="900">
+                {item.label}: {formatValue(item.value)}
+              </text>
+            </g>
+          ))}
+        </g>
+      ) : null}
+    </svg>
+  );
+}
+
+function MiniDualAxisChart({ latencySeries, lossSeries }: { latencySeries: ChartSeries[]; lossSeries: ChartSeries[] }) {
+  const [hover, setHover] = useState<{
+    x: number;
+    time: number;
+    values: Array<{ label: string; color: string; value: number; kind: "latency" | "loss" }>;
+  } | null>(null);
+  const width = 760;
+  const height = 240;
+  const padding = { top: 16, right: 52, bottom: 34, left: 52 };
+  const plotWidth = width - padding.left - padding.right;
+  const plotHeight = height - padding.top - padding.bottom;
+  const allPoints = [...latencySeries, ...lossSeries].flatMap((item) => item.points).filter(isFinitePoint);
+  const latencyPoints = latencySeries.flatMap((item) => item.points).filter(isFinitePoint);
+  if (!allPoints.length) return <ChartEmpty label="暂无探测历史" tall />;
+
+  const timeValues = Array.from(new Set(allPoints.map((point) => point.time))).sort((a, b) => a - b);
+  const minTime = timeValues[0];
+  const maxTime = timeValues[timeValues.length - 1];
+  const maxLatency = Math.max(...latencyPoints.map((point) => point.value), 1);
+  const latencyMax = Math.max(1, Math.ceil(maxLatency * 1.2));
+  const lossMax = 100;
+  const timeSpan = Math.max(maxTime - minTime, 1);
+
+  function x(time: number): number {
+    if (allPoints.length === 1) return padding.left + plotWidth / 2;
+    return padding.left + ((time - minTime) / timeSpan) * plotWidth;
+  }
+
+  function yLatency(value: number): number {
+    const clamped = Math.max(0, Math.min(latencyMax, value));
+    return padding.top + plotHeight - (clamped / latencyMax) * plotHeight;
+  }
+
+  function yLoss(value: number): number {
+    const clamped = Math.max(0, Math.min(lossMax, value));
+    return padding.top + plotHeight - (clamped / lossMax) * plotHeight;
+  }
+
+  function handleMove(event: MouseEvent<SVGSVGElement>) {
+    const localX = svgPointerX(event, width);
+    if (localX < padding.left || localX > width - padding.right) {
+      setHover(null);
+      return;
+    }
+    const targetTime = minTime + ((localX - padding.left) / plotWidth) * timeSpan;
+    const hoverTime = nearestValue(timeValues, targetTime);
+    const values = [
+      ...latencySeries.map((item) => {
+        const point = nearestPoint(item.points, hoverTime);
+        return point ? { label: `${item.label} 延迟`, color: item.color, value: point.value, time: point.time, kind: "latency" as const } : null;
+      }),
+      ...lossSeries.map((item) => {
+        const point = nearestPoint(item.points, hoverTime);
+        return point ? { label: `${item.label} 丢包`, color: "#facc15", value: point.value, time: point.time, kind: "loss" as const } : null;
+      }),
+    ].filter((item): item is { label: string; color: string; value: number; time: number; kind: "latency" | "loss" } => Boolean(item));
+    if (!values.length) {
+      setHover(null);
+      return;
+    }
+    setHover({
+      x: x(hoverTime),
+      time: hoverTime,
+      values: values.map(({ label, color, value, kind }) => ({ label, color, value, kind })),
+    });
+  }
+
+  const tooltipWidth = 240;
+  const tooltipHeight = hover ? 28 + hover.values.length * 20 : 0;
+  const tooltipX = hover ? Math.min(Math.max(hover.x + 12, padding.left), width - padding.right - tooltipWidth) : 0;
+  const tooltipY = hover ? Math.max(padding.top + 4, padding.top + plotHeight - tooltipHeight - 8) : 0;
+  const lossBaseline = padding.top + plotHeight;
+
+  return (
+    <svg
+      className="h-60 w-full border-2 border-black bg-[var(--bg-page)]"
+      viewBox={`0 0 ${width} ${height}`}
+      role="img"
+      aria-label="探测延迟与丢包率趋势图"
+      onMouseMove={handleMove}
+      onMouseLeave={() => setHover(null)}
+    >
+      {[0, 0.25, 0.5, 0.75, 1].map((ratio) => {
+        const lineY = padding.top + plotHeight * ratio;
+        return (
+          <line
+            key={ratio}
+            x1={padding.left}
+            x2={width - padding.right}
+            y1={lineY}
+            y2={lineY}
+            stroke="var(--border-color)"
+            strokeOpacity="0.18"
+            strokeWidth="2"
+          />
+        );
+      })}
+      <text x={8} y={padding.top + 10} fill="var(--text-muted)" fontSize="12" fontWeight="900">{formatMs(latencyMax)}</text>
+      <text x={8} y={padding.top + plotHeight} fill="var(--text-muted)" fontSize="12" fontWeight="900">0 ms</text>
+      <text x={width - 8} y={padding.top + 10} fill="var(--text-muted)" fontSize="12" fontWeight="900" textAnchor="end">100%</text>
+      <text x={width - 8} y={padding.top + plotHeight} fill="var(--text-muted)" fontSize="12" fontWeight="900" textAnchor="end">0%</text>
+      <text x={padding.left} y={height - 10} fill="var(--text-muted)" fontSize="12" fontWeight="900">{formatChartTime(minTime)}</text>
+      <text x={width - padding.right} y={height - 10} fill="var(--text-muted)" fontSize="12" fontWeight="900" textAnchor="end">{formatChartTime(maxTime)}</text>
+      {lossSeries.map((item) => {
+        const points = item.points.filter(isFinitePoint);
+        const linePath = points.map((point, index) => `${index === 0 ? "M" : "L"} ${x(point.time).toFixed(2)} ${yLoss(point.value).toFixed(2)}`).join(" ");
+        const areaPath = points.length
+          ? `${linePath} L ${x(points[points.length - 1].time).toFixed(2)} ${lossBaseline.toFixed(2)} L ${x(points[0].time).toFixed(2)} ${lossBaseline.toFixed(2)} Z`
+          : "";
+        return (
+          <g key={`${item.id ?? item.label}-loss`}>
+            {areaPath ? <path d={areaPath} fill="#facc15" fillOpacity="0.14" stroke="none" /> : null}
+            <path d={linePath} fill="none" stroke="#ca8a04" strokeDasharray="6 5" strokeLinecap="square" strokeLinejoin="round" strokeWidth="2.5" />
+          </g>
+        );
+      })}
+      {latencySeries.map((item) => {
+        const points = item.points.filter(isFinitePoint);
+        const path = points.map((point, index) => `${index === 0 ? "M" : "L"} ${x(point.time).toFixed(2)} ${yLatency(point.value).toFixed(2)}`).join(" ");
+        return (
+          <g key={item.id ?? item.label}>
+            <path d={path} fill="none" stroke={item.color} strokeLinecap="square" strokeLinejoin="round" strokeWidth="4" />
+            {points.length === 1 ? (
+              <circle cx={x(points[0].time)} cy={yLatency(points[0].value)} r="5" fill={item.color} stroke="var(--border-color)" strokeWidth="2" />
+            ) : null}
+          </g>
+        );
+      })}
+      {hover ? (
+        <g>
+          <line x1={hover.x} x2={hover.x} y1={padding.top} y2={padding.top + plotHeight} stroke="var(--border-color)" strokeDasharray="6 5" strokeWidth="2" />
+          <rect x={tooltipX} y={tooltipY} width={tooltipWidth} height={tooltipHeight} fill="var(--bg-card)" stroke="var(--border-color)" strokeWidth="2" />
+          <text x={tooltipX + 10} y={tooltipY + 18} fill="var(--text-main)" fontSize="12" fontWeight="900">
+            {formatChartTime(hover.time)}
+          </text>
+          {hover.values.map((item, index) => (
+            <g key={`${item.label}-${index}`} transform={`translate(${tooltipX + 10}, ${tooltipY + 36 + index * 20})`}>
+              <rect width="9" height="9" y="-8" fill={item.color} stroke="var(--border-color)" strokeWidth="1.5" />
+              <text x="16" y="0" fill="var(--text-main)" fontSize="12" fontWeight="900">
+                {item.label}: {item.kind === "latency" ? formatMs(Math.round(item.value)) : `${item.value.toFixed(1)}%`}
+              </text>
+            </g>
+          ))}
+        </g>
+      ) : null}
+    </svg>
+  );
+}
+
+function nearestPoint(points: ChartPoint[], targetTime: number): ChartPoint | null {
+  let best: ChartPoint | null = null;
+  for (const point of points) {
+    if (!best || Math.abs(point.time - targetTime) < Math.abs(best.time - targetTime)) {
+      best = point;
+    }
+  }
+  return best;
+}
+
+function nearestValue(values: number[], target: number): number {
+  let best = values[0] ?? target;
+  for (const value of values) {
+    if (Math.abs(value - target) < Math.abs(best - target)) best = value;
+  }
+  return best;
+}
+
+function svgPointerX(event: MouseEvent<SVGSVGElement>, fallbackWidth: number): number {
+  const svg = event.currentTarget;
+  const matrix = svg.getScreenCTM();
+  if (matrix) {
+    const point = svg.createSVGPoint();
+    point.x = event.clientX;
+    point.y = event.clientY;
+    return point.matrixTransform(matrix.inverse()).x;
+  }
+
+  const rect = svg.getBoundingClientRect();
+  return ((event.clientX - rect.left) / rect.width) * fallbackWidth;
+}
+
+function ChartEmpty({ label, tall = false }: { label: string; tall?: boolean }) {
+  return (
+    <div className={`flex ${tall ? "h-56" : "h-44"} items-center justify-center border-2 border-black bg-[var(--accent-bg)] text-sm font-black`}>
+      {label}
+    </div>
+  );
+}
+
+function buildMetricCharts(samples: MetricSample[], lastState?: Record<string, unknown> | null) {
+  const rows = samples
+    .map((sample) => ({
+      time: new Date(sample.sample_at).getTime(),
+      state: sample.fields_json ?? {},
+    }))
+    .filter((row) => Number.isFinite(row.time));
+
+  if (rows.length === 0 && lastState) {
+    rows.push({ time: Date.now(), state: lastState });
+  }
+
+  const cpu: ChartPoint[] = [];
+  const memory: ChartPoint[] = [];
+  const disk: ChartPoint[] = [];
+  const swap: ChartPoint[] = [];
+  const load: ChartPoint[] = [];
+  const process: ChartPoint[] = [];
+  const tcp: ChartPoint[] = [];
+  const udp: ChartPoint[] = [];
+  const gpu: ChartPoint[] = [];
+  const temperature: ChartPoint[] = [];
+  const rx: ChartPoint[] = [];
+  const tx: ChartPoint[] = [];
+  let previous: { time: number; rxTotal?: number; txTotal?: number } | null = null;
+
+  for (const row of rows) {
+    const state = row.state;
+    const cpuValue = optionalNumber(state.cpu_percent);
+    const memoryUsed = optionalNumber(state.memory_used);
+    const memoryTotal = optionalNumber(state.memory_total);
+    const diskPercent = diskUsagePercent(state);
+    const swapPercent = percentFromUsedTotal(state.swap_used, state.swap_total);
+    const loadValue = optionalNumber(state.load_1) ?? optionalNumber(state.load1);
+    const processValue = optionalNumber(state.process_count);
+    const tcpValue = optionalNumber(state.tcp_connections);
+    const udpValue = optionalNumber(state.udp_connections);
+    const gpuValue = gpuUsagePercent(state);
+    const temperatureValue = maxTemperature(state);
+    const rxTotal = netTotal(state, "bytes_recv", "network_in_total");
+    const txTotal = netTotal(state, "bytes_sent", "network_out_total");
+    const rxRate = optionalNumber(state.net_rx_bps) ?? optionalNumber(state.network_in_speed);
+    const txRate = optionalNumber(state.net_tx_bps) ?? optionalNumber(state.network_out_speed);
+
+    if (cpuValue !== undefined) cpu.push({ time: row.time, value: cpuValue });
+    if (memoryUsed !== undefined && memoryTotal && memoryTotal > 0) {
+      memory.push({ time: row.time, value: (memoryUsed / memoryTotal) * 100 });
+    }
+    if (diskPercent !== undefined) disk.push({ time: row.time, value: diskPercent });
+    if (swapPercent !== undefined) swap.push({ time: row.time, value: swapPercent });
+    if (loadValue !== undefined) load.push({ time: row.time, value: loadValue });
+    if (processValue !== undefined) process.push({ time: row.time, value: processValue });
+    if (tcpValue !== undefined) tcp.push({ time: row.time, value: tcpValue });
+    if (udpValue !== undefined) udp.push({ time: row.time, value: udpValue });
+    if (gpuValue !== undefined) gpu.push({ time: row.time, value: gpuValue });
+    if (temperatureValue !== undefined) temperature.push({ time: row.time, value: temperatureValue });
+    if (rxRate !== undefined) rx.push({ time: row.time, value: rxRate });
+    else if (rxTotal !== undefined) rx.push({ time: row.time, value: rateFromPrevious(row.time, rxTotal, previous?.time, previous?.rxTotal) });
+    if (txRate !== undefined) tx.push({ time: row.time, value: txRate });
+    else if (txTotal !== undefined) tx.push({ time: row.time, value: rateFromPrevious(row.time, txTotal, previous?.time, previous?.txTotal) });
+    previous = { time: row.time, rxTotal, txTotal };
+  }
+
+  return {
+    cpu: thinPoints(cpu),
+    memory: thinPoints(memory),
+    disk: thinPoints(disk),
+    swap: thinPoints(swap),
+    load: thinPoints(load),
+    process: thinPoints(process),
+    tcp: thinPoints(tcp),
+    udp: thinPoints(udp),
+    gpu: thinPoints(gpu),
+    temperature: thinPoints(temperature),
+    rx: thinPoints(rx),
+    tx: thinPoints(tx),
+    latestCpu: latestValue(cpu),
+    latestMemory: latestValue(memory),
+    latestDisk: latestValue(disk),
+    latestSwap: latestValue(swap),
+    latestLoad: latestValue(load),
+    latestProcess: latestValue(process),
+    latestTcp: latestValue(tcp),
+    latestUdp: latestValue(udp),
+    latestGpu: latestValue(gpu),
+    latestTemperature: latestValue(temperature),
+    latestRx: latestValue(rx),
+    latestTx: latestValue(tx),
+  };
+}
+
+function buildProbeHistories(services: PublicService[], serverId: string, range: MetricsRange): ProbeHistory[] {
+  return services
+    .filter((service) => serviceBelongsToServer(service, serverId))
+    .map((service, index) => {
+      const serverIds = Array.isArray(service.server_ids) ? service.server_ids : [];
+      const results = (service.history ?? [])
+        .filter((result) => !result.server_id || result.server_id === serverId || serverIds.length <= 1)
+        .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
+        .slice(-historyLimitForRange(range));
+      const latency = thinPoints(
+        results
+          .filter((result) => typeof result.delay_ms === "number")
+          .map((result) => ({ time: new Date(result.created_at).getTime(), value: result.delay_ms ?? 0 }))
+          .filter(isFinitePoint),
+      );
+      const loss = thinPoints(buildProbeLossPoints(results));
+      return {
+        id: service.id,
+        label: service.name || compactId(service.id),
+        color: chartColors[index % chartColors.length],
+        latency,
+        loss,
+        lossRate: averagePointValue(loss) ?? packetLossRate(results),
+        minLatency: minPointValue(latency),
+        maxLatency: maxPointValue(latency),
+        latestLatency: latestDelay(results),
+      };
+    })
+    .filter((history) => history.latency.length || history.loss.length);
+}
+
+function normalizeMetricSample(sample: unknown): MetricSample | null {
+  const row = asRecord(sample);
+  const sampleAt = asString(row.sample_at);
+  if (!sampleAt) return null;
+  return { sample_at: sampleAt, fields_json: asRecord(row.fields_json) };
+}
+
+function InfoGroup({ title, rows }: { title: string; rows: Array<[string, string]> }) {
+  return (
+    <div className="border-2 border-black bg-[var(--bg-card)] p-3 shadow-[var(--shadow-brutal-sm)]">
+      <h3 className="mb-3 text-sm font-black uppercase">{title}</h3>
+      <dl className="grid gap-2">
+        {rows.map(([label, value]) => (
+          <div key={label} className="grid grid-cols-[5.5rem_minmax(0,1fr)] gap-2 border-t-2 border-black pt-2 first:border-t-0 first:pt-0">
+            <dt className="text-xs font-black text-[var(--text-muted)]">{label}</dt>
+            <dd className="min-w-0 break-words text-sm font-black">{value}</dd>
+          </div>
+        ))}
+      </dl>
+    </div>
+  );
+}
+
+function InfoTile({ label, value, danger = false, wide = false }: { label: string; value: string; danger?: boolean; wide?: boolean }) {
+  return (
+    <div className={`border-2 border-black ${danger ? "bg-[var(--btn-bg)] text-[var(--btn-text)]" : "bg-[var(--bg-card)] text-[var(--text-main)]"} p-3 shadow-[var(--shadow-brutal-sm)] ${wide ? "sm:col-span-2" : ""}`}>
+      <div className="text-xs font-black text-[var(--text-muted)]">{label}</div>
+      <div className="mt-1 break-words text-sm font-black">{value}</div>
+    </div>
+  );
+}
+
+function filterInfoTiles<T extends { value?: string | null }>(tiles: T[], showMissing: boolean): T[] {
+  return showMissing ? tiles : tiles.filter((tile) => !isMissingInfoValue(tile.value));
+}
+
+function filterInfoRows(rows: Array<[string, string | null | undefined]>, showMissing: boolean): Array<[string, string]> {
+  return rows
+    .filter(([, value]) => showMissing || !isMissingInfoValue(value))
+    .map(([label, value]) => [label, displayInfoValue(value)]);
+}
+
+function displayInfoValue(value?: string | null): string {
+  return isMissingInfoValue(value) ? "N/A" : String(value);
+}
+
+function isMissingInfoValue(value?: string | null): boolean {
+  const normalized = String(value ?? "").trim();
+  return !normalized || normalized === "N/A" || normalized === "暂无数据";
+}
+
+function serviceBelongsToServer(service: PublicService, serverId: string): boolean {
+  const serverIds = Array.isArray(service.server_ids) ? service.server_ids : [];
+  return service.server_id === serverId || serverIds.includes(serverId);
+}
+
+function serviceResultOk(status: string): boolean {
+  return status === "success" || status === "up" || status === "ok";
+}
+
+function historyLimitForRange(range: MetricsRange): number {
+  if (range === "30d") return 1440;
+  if (range === "7d") return 720;
+  return 240;
+}
+
+function buildProbeLossPoints(results: PublicServiceResult[]): ChartPoint[] {
+  const rows = results
+    .map((result) => ({
+      time: new Date(result.created_at).getTime(),
+      delay: result.delay_ms,
+      status: result.status,
+    }))
+    .filter((row) => Number.isFinite(row.time));
+  if (!rows.length) return [];
+
+  const derivedLoss = calculatePacketLossFromDelays(rows.map((row) => row.delay ?? 0));
+  return rows.map((row, index) => ({
+    time: row.time,
+    value: serviceResultOk(row.status) ? derivedLoss[index] ?? 0 : 100,
+  }));
+}
+
+function calculatePacketLossFromDelays(delays: number[]): number[] {
+  if (!delays.length) return [];
+  const windowSize = Math.min(10, Math.max(3, Math.floor(delays.length / 10)));
+  const timeoutThreshold = 3000;
+  const extremeDelayThreshold = 10000;
+  const packetLossRates: number[] = [];
+
+  for (let index = 0; index < delays.length; index += 1) {
+    const currentDelay = delays[index];
+    let lossRate = 0;
+
+    if (!currentDelay || currentDelay <= 0) {
+      lossRate = 100;
+    } else if (currentDelay >= extremeDelayThreshold) {
+      lossRate = Math.min(95, 60 + (currentDelay - extremeDelayThreshold) / 1000);
+    } else if (currentDelay >= timeoutThreshold) {
+      lossRate = Math.min(50, (currentDelay - timeoutThreshold) / 200);
+    } else {
+      const start = Math.max(0, index - Math.floor(windowSize / 2));
+      const end = Math.min(delays.length, index + Math.ceil(windowSize / 2));
+      const windowDelays = delays.slice(start, end).filter((delay) => delay > 0);
+      if (windowDelays.length > 2) {
+        const mean = windowDelays.reduce((sum, delay) => sum + delay, 0) / windowDelays.length;
+        const variance = windowDelays.reduce((sum, delay) => sum + (delay - mean) ** 2, 0) / windowDelays.length;
+        const coefficientOfVariation = Math.sqrt(variance) / mean;
+        if (coefficientOfVariation > 0.8) {
+          lossRate = Math.min(25, coefficientOfVariation * 15);
+        } else if (coefficientOfVariation > 0.5) {
+          lossRate = Math.min(10, coefficientOfVariation * 8);
+        } else if (coefficientOfVariation > 0.3) {
+          lossRate = Math.min(5, coefficientOfVariation * 5);
+        }
+        if (currentDelay > mean * 2.5) {
+          lossRate += Math.min(15, (currentDelay / mean - 2.5) * 10);
+        }
+      }
+    }
+
+    if (index > 0) {
+      lossRate = 0.3 * lossRate + 0.7 * packetLossRates[index - 1];
+    }
+    packetLossRates.push(Math.max(0, Math.min(100, Number(lossRate.toFixed(2)))));
+  }
+
+  return packetLossRates;
+}
+
+function packetLossRate(results: PublicServiceResult[]): number {
+  if (!results.length) return 0;
+  const lost = results.filter((result) => !serviceResultOk(result.status)).length;
+  return (lost / results.length) * 100;
+}
+
+function latestDelay(results: PublicServiceResult[]): number | undefined {
+  return results
+    .filter((result) => typeof result.delay_ms === "number")
+    .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
+    .at(-1)?.delay_ms ?? undefined;
+}
+
+function statusLabel(status?: string): string {
+  if (!status) return "未知";
+  const labels: Record<string, string> = {
+    online: "在线",
+    offline: "离线",
+    down: "异常",
+    degraded: "降级",
+    revoked: "已撤销",
+    success: "成功",
+    up: "正常",
+    failure: "失败",
+    timeout: "超时",
+  };
+  return labels[status] || status;
+}
+
+function serverTone(status: string): "green" | "red" | "yellow" | "gray" {
+  if (status === "online") return "green";
+  if (status === "offline" || status === "down") return "red";
+  if (status === "degraded" || status === "revoked") return "yellow";
+  return "gray";
+}
+
+function stringValue(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function metadataFromRecord(record: Record<string, unknown>, keys: string[]): string | null {
+  for (const key of keys) {
+    const value = valueLabel(record[key]);
+    if (value) return value;
+  }
+  for (const container of ["billing", "plan", "metadata", "custom"]) {
+    const child = asRecord(record[container]);
+    for (const key of keys) {
+      const value = valueLabel(child[key]);
+      if (value) return value;
+    }
+  }
+  return null;
+}
+
+function valueLabel(value: unknown): string | null {
+  if (typeof value === "string") return value.trim() || null;
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  if (typeof value === "boolean") return String(value);
+  return null;
+}
+
+function parsePlatformDetails(info: Record<string, unknown>): { os: string; version: string; agent: string; report: string; flags: string } {
+  const os = stringValue(info.platform) || stringValue(info.os);
+  const rawVersion = stringValue(info.platform_version) || stringValue(info.os_version);
+  const parts = rawVersion
+    .split("|")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const version = parts.find((part) => !part.includes("=")) || rawVersion;
+  const kv = new Map<string, string>();
+  for (const part of parts) {
+    const [key, ...rest] = part.split("=");
+    if (key && rest.length) kv.set(key.trim(), rest.join("=").trim());
+  }
+  const report = [
+    kv.get("report") ? `主机 ${kv.get("report")}` : "",
+    kv.get("ip_report") ? `IP ${kv.get("ip_report")}` : "",
+  ]
+    .filter(Boolean)
+    .join(" / ");
+  return {
+    os,
+    version,
+    agent: kv.get("agent") || "",
+    report,
+    flags: [
+      flagLabel("auto_update_disabled", "自动更新", kv),
+      flagLabel("force_update_disabled", "强制更新", kv),
+      flagLabel("command_disabled", "命令", kv),
+      flagLabel("nat_disabled", "NAT", kv),
+      flagLabel("send_query_disabled", "查询上报", kv),
+    ]
+      .filter(Boolean)
+      .join(" / "),
+  };
+}
+
+function flagLabel(key: string, label: string, values: Map<string, string>): string {
+  const value = values.get(key);
+  if (value === undefined) return "";
+  return `${label}${value === "true" ? "关" : "开"}`;
+}
+
+function numberLabel(value: unknown): string {
+  const parsed = optionalNumber(value);
+  return parsed === undefined ? "N/A" : String(parsed);
+}
+
+function resourceBytes(usedValue: unknown, totalValue: unknown, infoTotalValue?: unknown): string {
+  const used = optionalNumber(usedValue);
+  const total = optionalNumber(totalValue) ?? optionalNumber(infoTotalValue);
+  if (used !== undefined && total !== undefined && total > 0) return `${formatBytes(used)} / ${formatBytes(total)}`;
+  return total === undefined ? "N/A" : formatBytes(total);
+}
+
+function diskLabel(state: Record<string, unknown>, info: Record<string, unknown>): string {
+  const stateDisks = Array.isArray(state.disks) ? state.disks : [];
+  const infoDisks = Array.isArray(info.disks) ? info.disks : [];
+  const disks = stateDisks.length ? stateDisks : infoDisks;
+  const used = disks.reduce((sum, item) => sum + (optionalNumber(asRecord(item).used) ?? 0), 0);
+  const total = disks.reduce((sum, item) => sum + (optionalNumber(asRecord(item).total) ?? 0), 0);
+  if (used > 0 && total > 0) return `${formatBytes(used)} / ${formatBytes(total)}`;
+  return total > 0 ? formatBytes(total) : "N/A";
+}
+
+function durationLabel(value: unknown): string {
+  const seconds = optionalNumber(value);
+  if (seconds === undefined) return "N/A";
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (days > 0) return `${days} 天 ${hours} 小时`;
+  if (hours > 0) return `${hours} 小时 ${minutes} 分钟`;
+  return `${minutes} 分钟`;
+}
+
+function joinLabels(values: Array<string | undefined>): string {
+  return values.filter(Boolean).join(" ");
+}
+
+function optionalNumber(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return undefined;
+}
+
+function percentFromUsedTotal(usedValue: unknown, totalValue: unknown): number | undefined {
+  const used = optionalNumber(usedValue);
+  const total = optionalNumber(totalValue);
+  if (used === undefined || !total || total <= 0) return undefined;
+  return (used / total) * 100;
+}
+
+function diskUsagePercent(state: Record<string, unknown>): number | undefined {
+  const direct = optionalNumber(state.disk_percent) ?? percentFromUsedTotal(state.disk_used, state.disk_total);
+  if (direct !== undefined) return direct;
+  const disks = Array.isArray(state.disks) ? state.disks : [];
+  const used = disks.reduce((sum, item) => sum + (optionalNumber(asRecord(item).used) ?? 0), 0);
+  const total = disks.reduce((sum, item) => sum + (optionalNumber(asRecord(item).total) ?? 0), 0);
+  return total > 0 ? (used / total) * 100 : undefined;
+}
+
+function gpuUsagePercent(state: Record<string, unknown>): number | undefined {
+  return optionalNumber(state.gpu_percent) ?? optionalNumber(state.gpu_usage) ?? optionalNumber(state.gpu);
+}
+
+function maxTemperature(state: Record<string, unknown>): number | undefined {
+  const direct = optionalNumber(state.temperature) ?? optionalNumber(state.temp);
+  if (direct !== undefined) return direct;
+  const sensors = Array.isArray(state.temperatures) ? state.temperatures : [];
+  const values = sensors
+    .map((item) => {
+      if (typeof item === "number") return item;
+      const sensor = asRecord(item);
+      return optionalNumber(sensor.temperature) ?? optionalNumber(sensor.temp) ?? optionalNumber(sensor.value);
+    })
+    .filter((value): value is number => value !== undefined);
+  return values.length ? Math.max(...values) : undefined;
+}
+
+function netTotal(state: Record<string, unknown>, field: "bytes_recv" | "bytes_sent", fallbackKey: string): number | undefined {
+  const fallback = optionalNumber(state[fallbackKey]);
+  if (fallback !== undefined) return fallback;
+  const netIo = Array.isArray(state.net_io) ? state.net_io : Array.isArray(state.network_interfaces) ? state.network_interfaces : [];
+  const total = netIo.reduce((sum, item) => sum + (optionalNumber(asRecord(item)[field]) ?? 0), 0);
+  return netIo.length > 0 ? total : undefined;
+}
+
+function rateFromPrevious(time: number, total: number, previousTime?: number, previousTotal?: number): number {
+  if (previousTime === undefined || previousTotal === undefined || time <= previousTime || total < previousTotal) return 0;
+  return (total - previousTotal) / ((time - previousTime) / 1000);
+}
+
+function thinPoints(points: ChartPoint[], limit = 240): ChartPoint[] {
+  if (points.length <= limit) return points;
+  const lastIndex = points.length - 1;
+  const step = lastIndex / (limit - 1);
+  const seen = new Set<number>();
+  const out: ChartPoint[] = [];
+  for (let index = 0; index < limit; index += 1) {
+    const point = points[Math.round(index * step)];
+    if (point && !seen.has(point.time)) {
+      seen.add(point.time);
+      out.push(point);
+    }
+  }
+  const last = points[lastIndex];
+  if (last && !seen.has(last.time)) out.push(last);
+  return out;
+}
+
+function smoothPeakPoints(points: ChartPoint[]): ChartPoint[] {
+  if (points.length < 7) return points;
+  const windowSize = 7;
+  const alpha = 0.35;
+  let previous: number | null = null;
+  return points.map((point, index) => {
+    if (index < windowSize - 1) return point;
+    const window = points.slice(index - windowSize + 1, index + 1).map((item) => item.value);
+    const median = medianValue(window);
+    const deviations = window.map((value) => Math.abs(value - median));
+    const mad = Math.max(medianValue(deviations) * 1.4826, 1);
+    const valid = window.filter((value) => Math.abs(value - median) <= 3 * mad && value <= Math.max(median * 3, median + mad));
+    const next = valid.length ? valid.reduce((sum, value) => sum + value, 0) / valid.length : median;
+    previous = previous === null ? next : alpha * next + (1 - alpha) * previous;
+    return { ...point, value: previous };
+  });
+}
+
+function medianValue(values: number[]): number {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0 ? (sorted[middle - 1] + sorted[middle]) / 2 : sorted[middle];
+}
+
+function latestValue(points: ChartPoint[]): number | undefined {
+  return points.length ? points[points.length - 1]?.value : undefined;
+}
+
+function minPointValue(points: ChartPoint[]): number | undefined {
+  return points.length ? Math.min(...points.map((point) => point.value)) : undefined;
+}
+
+function maxPointValue(points: ChartPoint[]): number | undefined {
+  return points.length ? Math.max(...points.map((point) => point.value)) : undefined;
+}
+
+function latestProbeLatency(series: ChartSeries[]): string {
+  const latest = series.flatMap((item) => item.points).sort((a, b) => a.time - b.time).at(-1);
+  return latest ? formatMs(Math.round(latest.value)) : "N/A";
+}
+
+function averageLossRate(histories: ProbeHistory[]): number | undefined {
+  if (!histories.length) return undefined;
+  return histories.reduce((sum, history) => sum + history.lossRate, 0) / histories.length;
+}
+
+function averagePointValue(points: ChartPoint[]): number | undefined {
+  if (!points.length) return undefined;
+  return points.reduce((sum, point) => sum + point.value, 0) / points.length;
+}
+
+function formatRate(value?: number): string {
+  if (value === undefined || Number.isNaN(value)) return "N/A";
+  return `${formatBytes(value)}/s`;
+}
+
+function formatChartTime(value: number): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function isFinitePoint(point: ChartPoint): boolean {
+  return Number.isFinite(point.time) && Number.isFinite(point.value);
+}
+
+function isExpired(value?: string | null): boolean {
+  if (!value) return false;
+  const date = new Date(value);
+  return !Number.isNaN(date.getTime()) && date.getTime() < Date.now();
+}
+
+function initialShowMissingInfo(): boolean {
+  if (typeof window === "undefined") return false;
+  return window.localStorage.getItem("xlstatus_public_detail_show_missing") === "1";
+}
+
+const chartColors = [
+  "var(--accent-color)",
+  "var(--btn-bg)",
+  "#0ea5e9",
+  "#f97316",
+  "#10b981",
+  "#a855f7",
+];

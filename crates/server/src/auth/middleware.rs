@@ -4,7 +4,7 @@
 use axum::{
     async_trait,
     extract::{FromRequestParts, Request, State},
-    http::{header, request::Parts, StatusCode},
+    http::{header, request::Parts, HeaderMap, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -13,7 +13,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use xlstatus_shared::{UserId, UserRole};
 
-use crate::api::v1::auth::AppState;
+use crate::api::v1::auth::{active_waf_ban, record_waf_event, register_pat_failure, AppState};
 use crate::auth::{hash_token, SessionRepository};
 use crate::db::{PATRepository, User, UserRepository};
 
@@ -154,6 +154,7 @@ pub async fn session_middleware(
     mut request: Request,
     next: Next,
 ) -> Response {
+    let client_ip = client_ip_from_headers(request.headers());
     let bearer_token = request
         .headers()
         .get(header::AUTHORIZATION)
@@ -167,31 +168,74 @@ pub async fn session_middleware(
         .map(str::to_string);
 
     if let Some(token) = bearer_token {
+        if active_waf_ban(&state.db, &client_ip)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            let _ = record_waf_event(
+                &state.db,
+                &client_ip,
+                None,
+                "pat_blocked",
+                Some("active WAF ban"),
+            )
+            .await;
+            return StatusCode::FORBIDDEN.into_response();
+        }
+
         let token_hash = hash_token(&token);
         let pat_repo = PATRepository::new(state.db.clone());
-        if let Ok(Some(pat)) = pat_repo.find_by_token_hash(&token_hash).await {
-            let is_expired = pat
-                .expires_at
-                .map(|expires_at| expires_at <= Utc::now())
-                .unwrap_or(false);
-            if !is_expired {
-                let user_repo = UserRepository::new(state.db.clone());
-                if let Ok(Some(user)) = user_repo.find_by_id(pat.user_id).await {
-                    let auth_session = AuthSession {
-                        session_id: pat.id.clone(),
-                        user_id: user.id,
-                        username: user.username.clone(),
-                        role: user.role,
-                        csrf_token: String::new(),
-                        auth_kind: AuthKind::PersonalAccessToken,
-                        scopes: pat.scopes.clone(),
-                        server_ids: pat.server_ids.clone(),
-                        pat_id: Some(pat.id.clone()),
-                    };
-                    let _ = pat_repo.mark_used(&pat.id, None).await;
-                    request.extensions_mut().insert(auth_session);
-                    request.extensions_mut().insert(user);
+        match pat_repo.find_by_token_hash(&token_hash).await {
+            Ok(Some(pat)) => {
+                let is_expired = pat
+                    .expires_at
+                    .map(|expires_at| expires_at <= Utc::now())
+                    .unwrap_or(false);
+                if is_expired {
+                    let _ =
+                        register_pat_failure(&state.db, &client_ip, Some(&pat.id), "expired token")
+                            .await;
+                } else {
+                    let user_repo = UserRepository::new(state.db.clone());
+                    match user_repo.find_by_id(pat.user_id).await {
+                        Ok(Some(user)) => {
+                            let auth_session = AuthSession {
+                                session_id: pat.id.clone(),
+                                user_id: user.id,
+                                username: user.username.clone(),
+                                role: user.role,
+                                csrf_token: String::new(),
+                                auth_kind: AuthKind::PersonalAccessToken,
+                                scopes: pat.scopes.clone(),
+                                server_ids: pat.server_ids.clone(),
+                                pat_id: Some(pat.id.clone()),
+                            };
+                            let _ = pat_repo.mark_used(&pat.id, Some(&client_ip)).await;
+                            request.extensions_mut().insert(auth_session);
+                            request.extensions_mut().insert(user);
+                        }
+                        Ok(None) => {
+                            let _ = register_pat_failure(
+                                &state.db,
+                                &client_ip,
+                                Some(&pat.id),
+                                "token user not found",
+                            )
+                            .await;
+                        }
+                        Err(err) => {
+                            tracing::warn!("failed to load PAT user: {}", err);
+                        }
+                    }
                 }
+            }
+            Ok(None) => {
+                let _ = register_pat_failure(&state.db, &client_ip, None, "invalid token").await;
+            }
+            Err(err) => {
+                tracing::warn!("failed to load PAT by token hash: {}", err);
             }
         }
     } else if let Some(cookie) = cookie_jar.get(SESSION_COOKIE_NAME) {
@@ -279,4 +323,23 @@ pub fn generate_csrf_token() -> String {
 
 pub fn derive_csrf_token(token_hash: &str) -> String {
     crate::auth::hash_token(&format!("csrf:{}", token_hash))
+}
+
+fn client_ip_from_headers(headers: &HeaderMap) -> String {
+    header_value(headers, "x-forwarded-for")
+        .and_then(|value| value.split(',').next().map(str::trim).map(str::to_string))
+        .or_else(|| header_value(headers, "x-real-ip"))
+        .or_else(|| header_value(headers, "cf-connecting-ip"))
+        .map(|value| value.chars().take(128).collect::<String>())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }

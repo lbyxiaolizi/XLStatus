@@ -1,5 +1,5 @@
 // API client for XLStatus backend
-import { t } from "@/lib/i18n";
+import { getTranslations } from "@/lib/i18n";
 
 const DEFAULT_API_PORT = "8080";
 
@@ -41,6 +41,44 @@ export interface ServerListResponse {
   total?: number;
 }
 
+export interface ServerGroup {
+  id: string;
+  owner_user_id: string;
+  name: string;
+  color?: string | null;
+  display_order?: number | null;
+  server_ids: string[];
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface ServerGroupListResponse {
+  groups: ServerGroup[];
+  total?: number;
+}
+
+export interface ServerOwnerTransfer {
+  id: string;
+  server_id: string;
+  from_user_id?: string | null;
+  to_user_id: string;
+  requested_by_user_id?: string | null;
+  api_token_id?: string | null;
+  status: string;
+  attempts: number;
+  error?: string | null;
+  completed_at?: string | null;
+  cancelled_at?: string | null;
+  last_attempt_at: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ServerOwnerTransferListResponse {
+  transfers: ServerOwnerTransfer[];
+  total?: number;
+}
+
 export interface ServiceListResponse {
   services: unknown[];
   total?: number;
@@ -50,6 +88,215 @@ export interface PublicStatusResponse {
   servers: unknown[];
   services: unknown[];
   updated_at?: string;
+  site?: PublicSiteBranding;
+  theme?: ThemeDefinition | null;
+}
+
+export interface PublicSiteBranding {
+  site_name: string;
+  logo_url?: string | null;
+  favicon_url?: string | null;
+  theme_color?: string | null;
+  background_url?: string | null;
+  custom_head?: string | null;
+  custom_body?: string | null;
+}
+
+export interface ThemeDefinition {
+  id: string;
+  name: string;
+  description?: string | null;
+  target: "public" | "dashboard" | "both" | string;
+  variables: Record<string, string>;
+  custom_css?: string | null;
+  builtin: boolean;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface ThemeListResponse {
+  themes: ThemeDefinition[];
+  selected_public_theme_id?: string | null;
+  selected_dashboard_theme_id?: string | null;
+}
+
+export interface ImportThemeRequest {
+  theme: {
+    id: string;
+    name: string;
+    description?: string | null;
+    target?: "public" | "dashboard" | "both" | string;
+    variables?: Record<string, string>;
+    custom_css?: string | null;
+  };
+}
+
+export interface UserListResponse {
+  users: unknown[];
+  total?: number;
+}
+
+export interface SessionListResponse {
+  sessions: unknown[];
+  total?: number;
+}
+
+export interface WafBanListResponse {
+  bans: unknown[];
+  total?: number;
+}
+
+export interface CreateWafBansResponse {
+  bans: unknown[];
+}
+
+export interface MaintenanceStatusResponse {
+  database_backend: string;
+  backup_supported: boolean;
+  archive_supported: boolean;
+  restore_supported: boolean;
+  vacuum_supported: boolean;
+  tsdb_compact_supported: boolean;
+  tsdb_backend?: string;
+  tsdb_status?: string;
+  tsdb_samples?: number | null;
+  tsdb_retention_days?: number | null;
+  tsdb_retention_configurable?: boolean;
+}
+
+export interface MaintenanceRestoreResponse {
+  dry_run: boolean;
+  restored: boolean;
+  compatible: boolean;
+  database_backend: string;
+  user_version: number;
+  table_count: number;
+  row_count: number;
+  message: string;
+}
+
+export interface TsdbCompactResponse {
+  action: string;
+  success: boolean;
+  backend: string;
+  removed_samples: number;
+  samples_before?: number | null;
+  samples_after?: number | null;
+  message: string;
+}
+
+export interface TsdbRetentionResponse {
+  action: string;
+  success: boolean;
+  backend: string;
+  retention_days: number;
+  samples_before?: number | null;
+  samples_after?: number | null;
+  message: string;
+}
+
+export interface CloudflaredStatusResponse {
+  token_configured: boolean;
+  running: boolean;
+  pid?: number | null;
+  started_at?: string | null;
+  last_error?: string | null;
+  logs: string[];
+}
+
+export interface CloudflaredActionResponse {
+  action: string;
+  success: boolean;
+  status: CloudflaredStatusResponse;
+}
+
+export interface TotpStatusResponse {
+  enabled: boolean;
+  setup_pending: boolean;
+}
+
+export interface TotpSetupResponse {
+  secret: string;
+  otpauth_uri: string;
+  enabled: boolean;
+}
+
+export interface OAuthProvider {
+  id: string;
+  display_name: string;
+  scopes: string[];
+}
+
+export interface OAuthProviderListResponse {
+  providers: OAuthProvider[];
+}
+
+export interface OAuthAccount {
+  provider: string;
+  provider_display_name: string;
+  subject: string;
+  email?: string | null;
+  display_name?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface OAuthAccountListResponse {
+  accounts: OAuthAccount[];
+}
+
+export interface GeoIpLookupResponse {
+  provider: string;
+  ip: string;
+  country?: string | null;
+  region?: string | null;
+  city?: string | null;
+  latitude?: number | null;
+  longitude?: number | null;
+  isp?: string | null;
+  organization?: string | null;
+  timezone?: string | null;
+  raw?: unknown;
+}
+
+export interface GeoIpMmdbStatus {
+  configured: boolean;
+  path: string;
+  size_bytes?: number | null;
+  modified_at?: string | null;
+  database_type?: string | null;
+  build_epoch?: number | null;
+  build_at?: string | null;
+  ip_version?: number | null;
+  languages: string[];
+  description: Record<string, string>;
+  error?: string | null;
+}
+
+export interface GeoIpMaintenanceResponse {
+  action: string;
+  supported: boolean;
+  message: string;
+  status?: GeoIpMmdbStatus | null;
+}
+
+export interface SystemSettingsResponse {
+  public_site_enabled: boolean;
+  public_site_name: string;
+  public_logo_url?: string | null;
+  public_favicon_url?: string | null;
+  public_theme_color?: string | null;
+  public_background_url?: string | null;
+  public_custom_head?: string | null;
+  public_custom_body?: string | null;
+  geoip_provider: string;
+  geoip_ipinfo_token?: string;
+  geoip_ipinfo_token_configured: boolean;
+  geoip_ip_change_enabled: boolean;
+  geoip_ip_change_notification_group_id?: string | null;
+  geoip_ip_change_server_ids: string[];
+  geoip_ip_change_severity: string;
+  ddns_resolver_url?: string | null;
 }
 
 export interface TaskListResponse {
@@ -75,6 +322,20 @@ export interface AlertRuleListResponse {
 export interface AlertEventListResponse {
   events: unknown[];
   total?: number;
+}
+
+export interface NotificationListResponse {
+  notifications: unknown[];
+  total?: number;
+}
+
+export interface NotificationGroupListResponse {
+  groups: unknown[];
+  total?: number;
+}
+
+export interface NotificationProviderListResponse {
+  providers: unknown[];
 }
 
 export interface DdnsConfigListResponse {
@@ -166,7 +427,8 @@ class ApiClient {
     const { anonymous, headers, ...fetchOptions } = options;
     const csrfToken = getCookie("xlstatus_csrf");
     const hasBody = fetchOptions.body !== undefined && fetchOptions.body !== null;
-    const defaultHeaders: HeadersInit = hasBody
+    const isFormData = typeof FormData !== "undefined" && fetchOptions.body instanceof FormData;
+    const defaultHeaders: HeadersInit = hasBody && !isFormData
       ? { "Content-Type": "application/json" }
       : {};
 
@@ -208,7 +470,7 @@ class ApiClient {
     } catch (error) {
       return {
         success: false,
-        error: error instanceof Error ? error.message : t.common.networkError,
+        error: error instanceof Error ? error.message : getTranslations().common.networkError,
       };
     }
   }
@@ -235,17 +497,23 @@ class ApiClient {
       }
     }
 
-    return last ?? { success: false, error: t.common.noRequestAttempted };
+    return last ?? { success: false, error: getTranslations().common.noRequestAttempted };
+  }
+
+  private sensitiveHeaders(totpCode?: string): HeadersInit {
+    const code = totpCode?.trim();
+    return code ? { "x-totp-code": code } : {};
   }
 
   // Auth
   async login(
     username: string,
     password: string,
+    totpCode?: string,
   ): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>("/api/v1/auth/login", {
       method: "POST",
-      body: JSON.stringify({ username, password }),
+      body: JSON.stringify({ username, password, totp_code: totpCode }),
     });
   }
 
@@ -255,10 +523,133 @@ class ApiClient {
     });
   }
 
-  async createUser(user: JsonObject): Promise<ApiResponse<JsonObject>> {
+  async getProfile(): Promise<ApiResponse<JsonObject>> {
+    return this.request<JsonObject>("/api/v1/profile");
+  }
+
+  async listOAuthProviders(): Promise<ApiResponse<OAuthProviderListResponse>> {
+    return this.request<OAuthProviderListResponse>("/api/v1/oauth2/providers", {
+      anonymous: true,
+    });
+  }
+
+  async listOAuthBindings(): Promise<ApiResponse<OAuthAccountListResponse>> {
+    return this.request<OAuthAccountListResponse>("/api/v1/oauth2/bindings");
+  }
+
+  getOAuthLoginUrl(providerId: string, returnTo = "/dashboard"): string {
+    const query = new URLSearchParams({ return_to: returnTo });
+    return `${this.baseUrl}/api/v1/oauth2/${encodeURIComponent(providerId)}?${query.toString()}`;
+  }
+
+  getOAuthBindUrl(providerId: string, returnTo = "/settings"): string {
+    const query = new URLSearchParams({ return_to: returnTo });
+    return `${this.baseUrl}/api/v1/oauth2/${encodeURIComponent(providerId)}/bind?${query.toString()}`;
+  }
+
+  async unbindOAuthProvider(providerId: string): Promise<ApiResponse<JsonObject>> {
+    return this.request<JsonObject>(`/api/v1/oauth2/${encodeURIComponent(providerId)}/unbind`, {
+      method: "POST",
+    });
+  }
+
+  async createUser(user: JsonObject, totpCode?: string): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>("/api/v1/users", {
       method: "POST",
       body: JSON.stringify(user),
+      headers: this.sensitiveHeaders(totpCode),
+    });
+  }
+
+  async listUsers(limit = 100, offset = 0): Promise<ApiResponse<UserListResponse>> {
+    return this.request<UserListResponse>(
+      `/api/v1/users?limit=${limit}&offset=${offset}`,
+    );
+  }
+
+  async updateUser(
+    id: string,
+    user: JsonObject,
+    totpCode?: string,
+  ): Promise<ApiResponse<JsonObject>> {
+    return this.request<JsonObject>(`/api/v1/users/${encodeURIComponent(id)}`, {
+      method: "POST",
+      body: JSON.stringify(user),
+      headers: this.sensitiveHeaders(totpCode),
+    });
+  }
+
+  async deleteUser(id: string, totpCode?: string): Promise<ApiResponse<JsonObject>> {
+    return this.request<JsonObject>(`/api/v1/users/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      headers: this.sensitiveHeaders(totpCode),
+    });
+  }
+
+  async listSessions(
+    limit = 100,
+    offset = 0,
+  ): Promise<ApiResponse<SessionListResponse>> {
+    return this.request<SessionListResponse>(
+      `/api/v1/sessions?limit=${limit}&offset=${offset}`,
+    );
+  }
+
+  async deleteSession(id: string, totpCode?: string): Promise<ApiResponse<JsonObject>> {
+    return this.request<JsonObject>(`/api/v1/sessions/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      headers: this.sensitiveHeaders(totpCode),
+    });
+  }
+
+  async listWafBans(
+    limit = 100,
+    offset = 0,
+  ): Promise<ApiResponse<WafBanListResponse>> {
+    return this.request<WafBanListResponse>(
+      `/api/v1/waf/bans?limit=${limit}&offset=${offset}`,
+    );
+  }
+
+  async createWafBans(
+    payload: JsonObject,
+    totpCode?: string,
+  ): Promise<ApiResponse<CreateWafBansResponse>> {
+    return this.request<CreateWafBansResponse>("/api/v1/waf/bans", {
+      method: "POST",
+      body: JSON.stringify(payload),
+      headers: this.sensitiveHeaders(totpCode),
+    });
+  }
+
+  async deleteWafBan(id: string, totpCode?: string): Promise<ApiResponse<JsonObject>> {
+    return this.request<JsonObject>(`/api/v1/waf/bans/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      headers: this.sensitiveHeaders(totpCode),
+    });
+  }
+
+  async getTotpStatus(): Promise<ApiResponse<TotpStatusResponse>> {
+    return this.request<TotpStatusResponse>("/api/v1/auth/totp/status");
+  }
+
+  async setupTotp(): Promise<ApiResponse<TotpSetupResponse>> {
+    return this.request<TotpSetupResponse>("/api/v1/auth/totp/setup", {
+      method: "POST",
+    });
+  }
+
+  async enableTotp(code: string): Promise<ApiResponse<TotpStatusResponse>> {
+    return this.request<TotpStatusResponse>("/api/v1/auth/totp/enable", {
+      method: "POST",
+      body: JSON.stringify({ code }),
+    });
+  }
+
+  async disableTotp(code: string): Promise<ApiResponse<TotpStatusResponse>> {
+    return this.request<TotpStatusResponse>("/api/v1/auth/totp/disable", {
+      method: "POST",
+      body: JSON.stringify({ code }),
     });
   }
 
@@ -267,16 +658,21 @@ class ApiClient {
     return this.request<unknown[]>("/api/v1/tokens");
   }
 
-  async createPat(token: JsonObject): Promise<ApiResponse<CreatePatResponse>> {
+  async createPat(
+    token: JsonObject,
+    totpCode?: string,
+  ): Promise<ApiResponse<CreatePatResponse>> {
     return this.request<CreatePatResponse>("/api/v1/tokens", {
       method: "POST",
       body: JSON.stringify(token),
+      headers: this.sensitiveHeaders(totpCode),
     });
   }
 
-  async revokePat(id: string): Promise<ApiResponse<JsonObject>> {
+  async revokePat(id: string, totpCode?: string): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(`/api/v1/tokens/${encodeURIComponent(id)}`, {
       method: "DELETE",
+      headers: this.sensitiveHeaders(totpCode),
     });
   }
 
@@ -308,6 +704,117 @@ class ApiClient {
 
   async getServer(id: string): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(`/api/v1/servers/${encodeURIComponent(id)}`);
+  }
+
+  async updateServer(
+    id: string,
+    payload: JsonObject,
+  ): Promise<ApiResponse<JsonObject>> {
+    return this.requestWithFallback<JsonObject>(
+      `/api/v1/servers/${encodeURIComponent(id)}`,
+      payload,
+      ["POST", "PATCH", "PUT"],
+    );
+  }
+
+  async batchUpdateServers(
+    payload: JsonObject,
+    totpCode?: string,
+  ): Promise<ApiResponse<JsonObject>> {
+    return this.request<JsonObject>("/api/v1/servers/batch", {
+      method: "POST",
+      body: JSON.stringify(payload),
+      headers: this.sensitiveHeaders(totpCode),
+    });
+  }
+
+  async listServerOwnerTransfers(
+    limit = 20,
+    offset = 0,
+    serverId?: string,
+  ): Promise<ApiResponse<ServerOwnerTransferListResponse>> {
+    const query = new URLSearchParams({
+      limit: String(limit),
+      offset: String(offset),
+    });
+    if (serverId) query.set("server_id", serverId);
+    return this.request<ServerOwnerTransferListResponse>(
+      `/api/v1/server-transfers?${query.toString()}`,
+    );
+  }
+
+  async retryServerOwnerTransfer(
+    id: string,
+    totpCode?: string,
+  ): Promise<ApiResponse<ServerOwnerTransfer>> {
+    return this.request<ServerOwnerTransfer>(
+      `/api/v1/server-transfers/${encodeURIComponent(id)}/retry`,
+      {
+        method: "POST",
+        headers: this.sensitiveHeaders(totpCode),
+      },
+    );
+  }
+
+  async cancelServerOwnerTransfer(
+    id: string,
+  ): Promise<ApiResponse<ServerOwnerTransfer>> {
+    return this.request<ServerOwnerTransfer>(
+      `/api/v1/server-transfers/${encodeURIComponent(id)}/cancel`,
+      { method: "POST" },
+    );
+  }
+
+  async listServerGroups(): Promise<ApiResponse<ServerGroupListResponse>> {
+    return this.request<ServerGroupListResponse>("/api/v1/server-groups");
+  }
+
+  async createServerGroup(group: JsonObject): Promise<ApiResponse<ServerGroup>> {
+    return this.request<ServerGroup>("/api/v1/server-groups", {
+      method: "POST",
+      body: JSON.stringify(group),
+    });
+  }
+
+  async updateServerGroup(
+    id: string,
+    group: JsonObject,
+  ): Promise<ApiResponse<ServerGroup>> {
+    return this.requestWithFallback<ServerGroup>(
+      `/api/v1/server-groups/${encodeURIComponent(id)}`,
+      group,
+      ["PATCH", "POST", "PUT"],
+    );
+  }
+
+  async deleteServerGroup(id: string): Promise<ApiResponse<JsonObject>> {
+    return this.request<JsonObject>(
+      `/api/v1/server-groups/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+    );
+  }
+
+  async addServerGroupMembers(
+    id: string,
+    serverIds: string[],
+  ): Promise<ApiResponse<ServerGroup>> {
+    return this.request<ServerGroup>(
+      `/api/v1/server-groups/${encodeURIComponent(id)}/members`,
+      {
+        method: "POST",
+        body: JSON.stringify({ server_ids: serverIds }),
+      },
+    );
+  }
+
+  async deleteServerGroupMember(
+    id: string,
+    serverId: string,
+  ): Promise<ApiResponse<ServerGroup>> {
+    return this.request<ServerGroup>(
+      `/api/v1/server-groups/${encodeURIComponent(id)}/members/${encodeURIComponent(serverId)}`,
+      { method: "DELETE" },
+    );
   }
 
   async getServerMetrics(
@@ -432,6 +939,23 @@ class ApiClient {
     });
   }
 
+  async getPublicServer(id: string): Promise<ApiResponse<JsonObject>> {
+    return this.request<JsonObject>(
+      `/api/v1/public/servers/${encodeURIComponent(id)}`,
+      { anonymous: true },
+    );
+  }
+
+  async getPublicServerMetrics(
+    id: string,
+    range = "1d",
+  ): Promise<ApiResponse<JsonObject>> {
+    return this.request<JsonObject>(
+      `/api/v1/public/servers/${encodeURIComponent(id)}/metrics?range=${encodeURIComponent(range)}`,
+      { anonymous: true },
+    );
+  }
+
   async getService(id: string): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(`/api/v1/services/${encodeURIComponent(id)}`);
   }
@@ -514,6 +1038,115 @@ class ApiClient {
   async listAlertEvents(limit = 20): Promise<ApiResponse<AlertEventListResponse>> {
     return this.request<AlertEventListResponse>(
       `/api/v1/alert-events?limit=${limit}`,
+    );
+  }
+
+  // Notifications
+  async listNotifications(
+    limit = 100,
+    offset = 0,
+  ): Promise<ApiResponse<NotificationListResponse>> {
+    return this.request<NotificationListResponse>(
+      `/api/v1/notifications?limit=${limit}&offset=${offset}`,
+    );
+  }
+
+  async createNotification(
+    notification: JsonObject,
+  ): Promise<ApiResponse<JsonObject>> {
+    return this.request<JsonObject>("/api/v1/notifications", {
+      method: "POST",
+      body: JSON.stringify(notification),
+    });
+  }
+
+  async updateNotification(
+    id: string,
+    notification: JsonObject,
+  ): Promise<ApiResponse<JsonObject>> {
+    return this.requestWithFallback<JsonObject>(
+      `/api/v1/notifications/${encodeURIComponent(id)}`,
+      notification,
+      ["PATCH", "POST", "PUT"],
+    );
+  }
+
+  async deleteNotification(id: string): Promise<ApiResponse<JsonObject>> {
+    return this.request<JsonObject>(
+      `/api/v1/notifications/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+    );
+  }
+
+  async testNotification(id: string): Promise<ApiResponse<JsonObject>> {
+    return this.request<JsonObject>(
+      `/api/v1/notifications/${encodeURIComponent(id)}/test`,
+      { method: "POST" },
+    );
+  }
+
+  async listNotificationGroups(
+    limit = 100,
+    offset = 0,
+  ): Promise<ApiResponse<NotificationGroupListResponse>> {
+    return this.request<NotificationGroupListResponse>(
+      `/api/v1/notification-groups?limit=${limit}&offset=${offset}`,
+    );
+  }
+
+  async createNotificationGroup(
+    group: JsonObject,
+  ): Promise<ApiResponse<JsonObject>> {
+    return this.request<JsonObject>("/api/v1/notification-groups", {
+      method: "POST",
+      body: JSON.stringify(group),
+    });
+  }
+
+  async updateNotificationGroup(
+    id: string,
+    group: JsonObject,
+  ): Promise<ApiResponse<JsonObject>> {
+    return this.requestWithFallback<JsonObject>(
+      `/api/v1/notification-groups/${encodeURIComponent(id)}`,
+      group,
+      ["PATCH", "POST", "PUT"],
+    );
+  }
+
+  async deleteNotificationGroup(id: string): Promise<ApiResponse<JsonObject>> {
+    return this.request<JsonObject>(
+      `/api/v1/notification-groups/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+    );
+  }
+
+  async addNotificationGroupMember(
+    id: string,
+    notificationId: string,
+  ): Promise<ApiResponse<JsonObject>> {
+    return this.request<JsonObject>(
+      `/api/v1/notification-groups/${encodeURIComponent(id)}/members`,
+      {
+        method: "POST",
+        body: JSON.stringify({ notification_id: notificationId }),
+      },
+    );
+  }
+
+  async deleteNotificationGroupMember(
+    id: string,
+    notificationId: string,
+  ): Promise<ApiResponse<JsonObject>> {
+    return this.request<JsonObject>(
+      `/api/v1/notification-groups/${encodeURIComponent(id)}/members/${encodeURIComponent(notificationId)}`,
+      { method: "DELETE" },
+    );
+  }
+
+  async listNotificationProviders(): Promise<ApiResponse<NotificationProviderListResponse>> {
+    return this.request<NotificationProviderListResponse>(
+      "/api/v1/notification-providers",
     );
   }
 
@@ -665,6 +1298,178 @@ class ApiClient {
     });
   }
 
+  // Maintenance
+  async getMaintenanceStatus(): Promise<ApiResponse<MaintenanceStatusResponse>> {
+    return this.request<MaintenanceStatusResponse>("/api/v1/maintenance/status");
+  }
+
+  getMaintenanceBackupUrl(): string {
+    return `${this.baseUrl}/api/v1/maintenance/backup`;
+  }
+
+  getMaintenanceArchiveUrl(): string {
+    return `${this.baseUrl}/api/v1/maintenance/archive`;
+  }
+
+  async vacuumSqlite(totpCode?: string): Promise<ApiResponse<JsonObject>> {
+    return this.request<JsonObject>("/api/v1/maintenance/sqlite-vacuum", {
+      method: "POST",
+      headers: this.sensitiveHeaders(totpCode),
+    });
+  }
+
+  async compactTsdb(totpCode?: string): Promise<ApiResponse<TsdbCompactResponse>> {
+    return this.request<TsdbCompactResponse>("/api/v1/maintenance/tsdb-compact", {
+      method: "POST",
+      headers: this.sensitiveHeaders(totpCode),
+    });
+  }
+
+  async updateTsdbRetention(
+    retentionDays: number,
+    totpCode?: string,
+  ): Promise<ApiResponse<TsdbRetentionResponse>> {
+    return this.request<TsdbRetentionResponse>("/api/v1/maintenance/tsdb-retention", {
+      method: "POST",
+      body: JSON.stringify({ retention_days: retentionDays }),
+      headers: this.sensitiveHeaders(totpCode),
+    });
+  }
+
+  async getCloudflaredStatus(): Promise<ApiResponse<CloudflaredStatusResponse>> {
+    return this.request<CloudflaredStatusResponse>("/api/v1/cloudflared/status");
+  }
+
+  async saveCloudflaredToken(
+    token: string | null,
+    totpCode?: string,
+  ): Promise<ApiResponse<CloudflaredActionResponse>> {
+    return this.request<CloudflaredActionResponse>("/api/v1/cloudflared/token", {
+      method: "POST",
+      body: JSON.stringify({ token }),
+      headers: this.sensitiveHeaders(totpCode),
+    });
+  }
+
+  async startCloudflared(totpCode?: string): Promise<ApiResponse<CloudflaredActionResponse>> {
+    return this.request<CloudflaredActionResponse>("/api/v1/cloudflared/start", {
+      method: "POST",
+      headers: this.sensitiveHeaders(totpCode),
+    });
+  }
+
+  async stopCloudflared(totpCode?: string): Promise<ApiResponse<CloudflaredActionResponse>> {
+    return this.request<CloudflaredActionResponse>("/api/v1/cloudflared/stop", {
+      method: "POST",
+      headers: this.sensitiveHeaders(totpCode),
+    });
+  }
+
+  async restoreBackup(
+    file: File,
+    dryRun: boolean,
+    totpCode?: string,
+  ): Promise<ApiResponse<MaintenanceRestoreResponse>> {
+    return this.request<MaintenanceRestoreResponse>(
+      `/api/v1/maintenance/restore?dry_run=${dryRun ? "true" : "false"}`,
+      {
+        method: "POST",
+        body: file,
+        headers: {
+          "Content-Type": "application/vnd.sqlite3",
+          ...this.sensitiveHeaders(totpCode),
+        },
+      },
+    );
+  }
+
+  async testGeoIp(
+    ip: string,
+    provider = "empty",
+    token = "",
+  ): Promise<ApiResponse<GeoIpLookupResponse>> {
+    const query = new URLSearchParams({ ip, provider });
+    if (token.trim()) query.set("token", token.trim());
+    return this.request<GeoIpLookupResponse>(`/api/v1/geoip/test?${query.toString()}`);
+  }
+
+  async getGeoIpStatus(): Promise<ApiResponse<GeoIpMmdbStatus>> {
+    return this.request<GeoIpMmdbStatus>("/api/v1/geoip/status");
+  }
+
+  async updateGeoIpDatabase(input: JsonObject = {}): Promise<ApiResponse<GeoIpMaintenanceResponse>> {
+    const body = Object.keys(input).length ? JSON.stringify(input) : undefined;
+    return this.request<GeoIpMaintenanceResponse>("/api/v1/geoip/update", {
+      method: "POST",
+      body,
+    });
+  }
+
+  async uploadGeoIpDatabase(file: File): Promise<ApiResponse<GeoIpMaintenanceResponse>> {
+    const form = new FormData();
+    form.set("file", file);
+    return this.request<GeoIpMaintenanceResponse>("/api/v1/geoip/upload", {
+      method: "POST",
+      body: form,
+    });
+  }
+
+  async getSettings(): Promise<ApiResponse<SystemSettingsResponse>> {
+    return this.request<SystemSettingsResponse>("/api/v1/settings");
+  }
+
+  async updateSettings(
+    settings: Partial<SystemSettingsResponse>,
+  ): Promise<ApiResponse<SystemSettingsResponse>> {
+    return this.requestWithFallback<SystemSettingsResponse>(
+      "/api/v1/settings",
+      settings,
+      ["PATCH", "POST"],
+    );
+  }
+
+  async listThemes(): Promise<ApiResponse<ThemeListResponse>> {
+    return this.request<ThemeListResponse>("/api/v1/themes");
+  }
+
+  async importTheme(theme: ImportThemeRequest["theme"]): Promise<ApiResponse<ThemeDefinition>> {
+    return this.request<ThemeDefinition>("/api/v1/themes/import", {
+      method: "POST",
+      body: JSON.stringify({ theme }),
+    });
+  }
+
+  async updateTheme(
+    id: string,
+    theme: JsonObject,
+  ): Promise<ApiResponse<ThemeDefinition>> {
+    return this.requestWithFallback<ThemeDefinition>(
+      `/api/v1/themes/${encodeURIComponent(id)}`,
+      theme,
+      ["PATCH", "POST"],
+    );
+  }
+
+  async selectTheme(
+    id: string,
+    target: "public" | "dashboard" | "both",
+  ): Promise<ApiResponse<ThemeListResponse>> {
+    return this.request<ThemeListResponse>(
+      `/api/v1/themes/${encodeURIComponent(id)}/select`,
+      {
+        method: "POST",
+        body: JSON.stringify({ target }),
+      },
+    );
+  }
+
+  async deleteTheme(id: string): Promise<ApiResponse<JsonObject>> {
+    return this.request<JsonObject>(
+      `/api/v1/themes/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+    );
+  }
+
   // MCP
   async listMcpTools(): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>("/api/v1/mcp/tools");
@@ -717,9 +1522,9 @@ function normalizeEnvelope<T>(payload: unknown, status: number): ApiResponse<T> 
       ? errorValue
       : errorValue && typeof errorValue === "object"
         ? String(
-            (errorValue as Record<string, unknown>).message ??
+              (errorValue as Record<string, unknown>).message ??
               (errorValue as Record<string, unknown>).code ??
-              t.common.requestFailed,
+              getTranslations().common.requestFailed,
           )
         : undefined;
 

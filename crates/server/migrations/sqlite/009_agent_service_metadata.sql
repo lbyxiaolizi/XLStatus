@@ -1,0 +1,5 @@
+-- Editable dashboard metadata and per-server service assignment.
+--
+-- SQLite applies these columns through DatabaseBackend::run_migrations
+-- using sqlite_add_column_if_missing, because older SQLite builds do not
+-- support ALTER TABLE ADD COLUMN IF NOT EXISTS.

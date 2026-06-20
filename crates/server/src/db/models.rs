@@ -108,6 +108,10 @@ pub struct CreateAgentInput {
 #[derive(Debug, Clone)]
 pub struct AgentWithState {
     pub agent: Agent,
+    pub remark: Option<String>,
+    pub expires_at: Option<String>,
+    pub renewal_price: Option<String>,
+    pub dashboard_metadata_json: Option<String>,
     pub last_state_json: Option<String>,
     pub last_info_json: Option<String>,
 }

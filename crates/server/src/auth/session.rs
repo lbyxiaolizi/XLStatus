@@ -131,6 +131,8 @@ impl SessionRepository {
                     .await?;
             }
             DatabaseBackend::Postgres(pool) => {
+                let session_id = uuid::Uuid::parse_str(session_id)
+                    .map_err(|e| anyhow::anyhow!("invalid session id: {}", e))?;
                 sqlx::query("DELETE FROM sessions WHERE id = $1")
                     .bind(session_id)
                     .execute(pool)

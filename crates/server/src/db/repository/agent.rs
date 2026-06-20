@@ -485,6 +485,70 @@ impl AgentRepository {
         Ok(())
     }
 
+    pub async fn update_dashboard_metadata(
+        &self,
+        id: AgentId,
+        name: Option<&str>,
+        remark: Option<&str>,
+        expires_at: Option<&str>,
+        renewal_price: Option<&str>,
+        dashboard_metadata_json: Option<&str>,
+    ) -> Result<bool> {
+        let now = Utc::now();
+        let affected = match &self.db {
+            DatabaseBackend::Sqlite(pool) => {
+                let result = sqlx::query(
+                    r#"
+                    UPDATE agents
+                       SET name = COALESCE(?, name),
+                           remark = ?,
+                           expires_at = ?,
+                           renewal_price = ?,
+                           dashboard_metadata_json = ?,
+                           updated_at = ?
+                     WHERE id = ?
+                    "#,
+                )
+                .bind(name)
+                .bind(remark)
+                .bind(expires_at)
+                .bind(renewal_price)
+                .bind(dashboard_metadata_json)
+                .bind(now.to_rfc3339())
+                .bind(id.0.to_string())
+                .execute(pool)
+                .await?;
+                result.rows_affected()
+            }
+            DatabaseBackend::Postgres(pool) => {
+                let result = sqlx::query(
+                    r#"
+                    UPDATE agents
+                       SET name = COALESCE($1, name),
+                           remark = $2,
+                           expires_at = $3,
+                           renewal_price = $4,
+                           dashboard_metadata_json = $5,
+                           updated_at = $6
+                     WHERE id = $7
+                    "#,
+                )
+                .bind(name)
+                .bind(remark)
+                .bind(expires_at)
+                .bind(renewal_price)
+                .bind(dashboard_metadata_json)
+                .bind(now)
+                .bind(id.0)
+                .execute(pool)
+                .await?;
+                result.rows_affected()
+            }
+        };
+
+        Ok(affected > 0)
+    }
+
     pub async fn revoke(&self, id: AgentId) -> Result<bool> {
         let now = Utc::now();
 
@@ -525,9 +589,10 @@ impl AgentRepository {
         let total = self.count_total().await?;
         let rows = match &self.db {
             DatabaseBackend::Sqlite(pool) => {
-                let rows = sqlx::query_as::<_, (String, String, String, String, Option<String>, Option<String>, String, String, Option<String>, Option<String>, Option<String>, Option<String>)>(
+                let rows = sqlx::query_as::<_, (String, String, String, String, Option<String>, Option<String>, String, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)>(
                     r#"
                     SELECT id, name, public_key, owner_user_id, last_seen_at, revoked_at, created_at, updated_at,
+                           remark, expires_at, renewal_price, dashboard_metadata_json,
                            last_state_json, last_state_at, last_info_json, last_info_at
                     FROM agents
                     ORDER BY created_at DESC
@@ -556,6 +621,10 @@ impl AgentRepository {
                         Option<String>,
                         Option<String>,
                         Option<String>,
+                        Option<String>,
+                        Option<String>,
+                        Option<String>,
+                        Option<String>,
                     ),
                 >(
                     r#"
@@ -564,6 +633,7 @@ impl AgentRepository {
                            to_char(revoked_at,  'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
                            to_char(created_at,  'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
                            to_char(updated_at,  'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                           remark, expires_at, renewal_price, dashboard_metadata_json,
                            last_state_json, last_state_at::text, last_info_json, last_info_at::text
                     FROM agents
                     ORDER BY created_at DESC
@@ -589,6 +659,10 @@ impl AgentRepository {
                     revoked_at,
                     created_at,
                     updated_at,
+                    remark,
+                    expires_at,
+                    renewal_price,
+                    dashboard_metadata_json,
                     last_state_json,
                     _last_state_at,
                     last_info_json,
@@ -606,6 +680,10 @@ impl AgentRepository {
                     };
                     AgentWithState {
                         agent,
+                        remark,
+                        expires_at,
+                        renewal_price,
+                        dashboard_metadata_json,
                         last_state_json,
                         last_info_json,
                     }
@@ -640,8 +718,8 @@ impl AgentRepository {
     pub async fn find_by_id_with_state(&self, id: AgentId) -> Result<Option<AgentWithState>> {
         match &self.db {
             DatabaseBackend::Sqlite(pool) => {
-                let row = sqlx::query_as::<_, (String, String, String, String, Option<String>, Option<String>, String, String, Option<String>, Option<String>, Option<String>, Option<String>)>(
-                    "SELECT id, name, public_key, owner_user_id, last_seen_at, revoked_at, created_at, updated_at, last_state_json, last_state_at, last_info_json, last_info_at FROM agents WHERE id = ?",
+                let row = sqlx::query_as::<_, (String, String, String, String, Option<String>, Option<String>, String, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)>(
+                    "SELECT id, name, public_key, owner_user_id, last_seen_at, revoked_at, created_at, updated_at, remark, expires_at, renewal_price, dashboard_metadata_json, last_state_json, last_state_at, last_info_json, last_info_at FROM agents WHERE id = ?",
                 )
                 .bind(id.0.to_string())
                 .fetch_optional(pool)
@@ -656,6 +734,10 @@ impl AgentRepository {
                         revoked_at,
                         created_at,
                         updated_at,
+                        remark,
+                        expires_at,
+                        renewal_price,
+                        dashboard_metadata_json,
                         last_state_json,
                         _last_state_at,
                         last_info_json,
@@ -674,6 +756,10 @@ impl AgentRepository {
                                 created_at: parse_rfc3339_opt(&created_at).unwrap_or_else(Utc::now),
                                 updated_at: parse_rfc3339_opt(&updated_at).unwrap_or_else(Utc::now),
                             },
+                            remark,
+                            expires_at,
+                            renewal_price,
+                            dashboard_metadata_json,
                             last_state_json,
                             last_info_json,
                         }
@@ -681,8 +767,8 @@ impl AgentRepository {
                 ))
             }
             DatabaseBackend::Postgres(pool) => {
-                let row = sqlx::query_as::<_, (uuid::Uuid, String, String, uuid::Uuid, Option<DateTime<Utc>>, Option<DateTime<Utc>>, DateTime<Utc>, DateTime<Utc>, Option<String>, Option<DateTime<Utc>>, Option<String>, Option<DateTime<Utc>>)>(
-                    "SELECT id, name, public_key, owner_user_id, last_seen_at, revoked_at, created_at, updated_at, last_state_json, last_state_at, last_info_json, last_info_at FROM agents WHERE id = $1",
+                let row = sqlx::query_as::<_, (uuid::Uuid, String, String, uuid::Uuid, Option<DateTime<Utc>>, Option<DateTime<Utc>>, DateTime<Utc>, DateTime<Utc>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<DateTime<Utc>>, Option<String>, Option<DateTime<Utc>>)>(
+                    "SELECT id, name, public_key, owner_user_id, last_seen_at, revoked_at, created_at, updated_at, remark, expires_at, renewal_price, dashboard_metadata_json, last_state_json, last_state_at, last_info_json, last_info_at FROM agents WHERE id = $1",
                 )
                 .bind(id.0)
                 .fetch_optional(pool)
@@ -697,6 +783,10 @@ impl AgentRepository {
                         revoked_at,
                         created_at,
                         updated_at,
+                        remark,
+                        expires_at,
+                        renewal_price,
+                        dashboard_metadata_json,
                         last_state_json,
                         _last_state_at,
                         last_info_json,
@@ -713,6 +803,10 @@ impl AgentRepository {
                                 created_at,
                                 updated_at,
                             },
+                            remark,
+                            expires_at,
+                            renewal_price,
+                            dashboard_metadata_json,
                             last_state_json,
                             last_info_json,
                         }

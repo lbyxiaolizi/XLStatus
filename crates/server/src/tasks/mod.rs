@@ -3,13 +3,18 @@ pub mod scheduler;
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use cron::Schedule;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
+use tracing::{info, warn};
 use xlstatus_shared::tasks::*;
 
 use crate::db::repository::tasks::{TaskRepository, TaskRunRepository};
 use crate::db::Db;
 use crate::grpc::{SessionRegistry, TaskResponseRegistry};
+use crate::notifications::sender::{
+    NotificationChannel, NotificationMessage, NotificationSender, NotificationSeverity,
+};
 
 pub(crate) fn parse_task_schedule(schedule: &str) -> Result<Schedule> {
     let trimmed = schedule.trim();
@@ -45,6 +50,16 @@ pub async fn dispatch_task_to_agents(
     response_registry: Arc<TaskResponseRegistry>,
     task: &Task,
 ) -> Result<TaskDispatchReport> {
+    dispatch_task_to_agents_with_source(db, session_registry, response_registry, task, None).await
+}
+
+pub async fn dispatch_task_to_agents_with_source(
+    db: &Db,
+    session_registry: &SessionRegistry,
+    response_registry: Arc<TaskResponseRegistry>,
+    task: &Task,
+    source_agent_id: Option<&str>,
+) -> Result<TaskDispatchReport> {
     let selector: ServerSelector = serde_json::from_str(&task.server_selector_json)
         .context("task.server_selector_json is invalid")?;
 
@@ -56,7 +71,14 @@ pub async fn dispatch_task_to_agents(
         anyhow::bail!("Shell command is empty");
     }
 
-    let target_agent_ids = resolve_server_ids(db, &selector, task.cover_mode).await?;
+    let target_agent_ids = resolve_server_ids(
+        db,
+        &selector,
+        task.cover_mode,
+        &task.owner_user_id,
+        source_agent_id,
+    )
+    .await?;
     if target_agent_ids.is_empty() {
         anyhow::bail!("No target servers resolved from selector");
     }
@@ -258,7 +280,7 @@ pub async fn dispatch_task_to_agents(
     TaskRepository::update_last_execution(db, &task.id, &Utc::now().to_rfc3339(), &last_result)
         .await?;
 
-    Ok(TaskDispatchReport {
+    let report = TaskDispatchReport {
         task_id: task.id.clone(),
         summary: TaskDispatchSummary {
             success,
@@ -268,50 +290,497 @@ pub async fn dispatch_task_to_agents(
             total,
         },
         runs,
-    })
+    };
+
+    if let Err(err) = send_task_dispatch_notification(db, task, &report).await {
+        warn!("task {} notification failed: {}", task.id, err);
+    }
+
+    Ok(report)
+}
+
+pub fn spawn_triggered_tasks(
+    db: Db,
+    session_registry: SessionRegistry,
+    response_registry: Arc<TaskResponseRegistry>,
+    task_ids: Vec<String>,
+    source: String,
+    source_agent_id: Option<String>,
+) {
+    let mut seen = std::collections::HashSet::new();
+    for task_id in task_ids
+        .into_iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+    {
+        if !seen.insert(task_id.clone()) {
+            continue;
+        }
+        let db = db.clone();
+        let session_registry = session_registry.clone();
+        let response_registry = response_registry.clone();
+        let source = source.clone();
+        let source_agent_id = source_agent_id.clone();
+        tokio::spawn(async move {
+            if let Err(err) = run_triggered_task(
+                db,
+                session_registry,
+                response_registry,
+                &task_id,
+                &source,
+                source_agent_id.as_deref(),
+            )
+            .await
+            {
+                warn!("triggered task {} from {} failed: {}", task_id, source, err);
+            }
+        });
+    }
+}
+
+async fn run_triggered_task(
+    db: Db,
+    session_registry: SessionRegistry,
+    response_registry: Arc<TaskResponseRegistry>,
+    task_id: &str,
+    source: &str,
+    source_agent_id: Option<&str>,
+) -> Result<()> {
+    let task = TaskRepository::get_by_id(&db, task_id)
+        .await?
+        .context("Task not found")?;
+    if !task.enabled {
+        info!(
+            "triggered task {} from {} skipped: disabled",
+            task.id, source
+        );
+        return Ok(());
+    }
+    let report = dispatch_task_to_agents_with_source(
+        &db,
+        &session_registry,
+        response_registry,
+        &task,
+        source_agent_id,
+    )
+    .await?;
+    info!(
+        "triggered task {} from {} completed: success={}, failure={}, offline={}, timeout={}, total={}",
+        task.id,
+        source,
+        report.summary.success,
+        report.summary.failure,
+        report.summary.offline,
+        report.summary.timeout,
+        report.summary.total
+    );
+    Ok(())
 }
 
 async fn resolve_server_ids(
     db: &Db,
     selector: &ServerSelector,
     cover_mode: CoverMode,
+    owner_user_id: &str,
+    source_agent_id: Option<&str>,
 ) -> Result<Vec<String>> {
-    if !selector.server_ids.is_empty() {
-        return Ok(match cover_mode {
-            CoverMode::Any => selector.server_ids.iter().take(1).cloned().collect(),
-            CoverMode::All | CoverMode::Specific => selector.server_ids.clone(),
-        });
+    let records = list_owned_agent_records(db, owner_user_id).await?;
+    let owned_ids: HashSet<String> = records.iter().map(|record| record.id.clone()).collect();
+    let mut candidates = Vec::new();
+    let has_include_selector =
+        selector.source_server || !selector.server_ids.is_empty() || !selector.group_ids.is_empty();
+
+    if selector.source_server {
+        if let Some(agent_id) = source_agent_id {
+            if owned_ids.contains(agent_id) {
+                candidates.push(agent_id.to_string());
+            }
+        }
     }
 
-    match cover_mode {
-        CoverMode::Specific => Ok(Vec::new()),
-        CoverMode::All => list_all_agent_ids(db).await,
-        CoverMode::Any => Ok(list_all_agent_ids(db).await?.into_iter().take(1).collect()),
+    for agent_id in &selector.server_ids {
+        if owned_ids.contains(agent_id) {
+            candidates.push(agent_id.clone());
+        }
     }
+
+    candidates.extend(list_group_agent_ids(db, owner_user_id, &selector.group_ids).await?);
+
+    let tag_filters = normalized_selector_tags(selector);
+    if !tag_filters.is_empty() {
+        let tag_matched: HashSet<String> = records
+            .iter()
+            .filter(|record| agent_matches_tag_filters(record, &tag_filters))
+            .map(|record| record.id.clone())
+            .collect();
+        if has_include_selector {
+            candidates.retain(|agent_id| tag_matched.contains(agent_id));
+        } else {
+            candidates.extend(tag_matched);
+        }
+    } else if !has_include_selector {
+        if matches!(cover_mode, CoverMode::All | CoverMode::Any) {
+            candidates.extend(records.iter().map(|record| record.id.clone()));
+        }
+    }
+
+    let excluded: HashSet<String> = selector.exclude_server_ids.iter().cloned().collect();
+    let mut seen = HashSet::new();
+    let mut resolved = Vec::new();
+    for agent_id in candidates {
+        if excluded.contains(&agent_id) || !owned_ids.contains(&agent_id) {
+            continue;
+        }
+        if seen.insert(agent_id.clone()) {
+            resolved.push(agent_id);
+        }
+    }
+
+    if matches!(cover_mode, CoverMode::Any) {
+        resolved.truncate(1);
+    }
+
+    Ok(resolved)
 }
 
-async fn list_all_agent_ids(db: &Db) -> Result<Vec<String>> {
+#[derive(Debug, Clone)]
+struct AgentSelectorRecord {
+    id: String,
+    name: String,
+    dashboard_metadata_json: Option<String>,
+    last_info_json: Option<String>,
+    last_state_json: Option<String>,
+}
+
+async fn list_owned_agent_records(
+    db: &Db,
+    owner_user_id: &str,
+) -> Result<Vec<AgentSelectorRecord>> {
     use sqlx::Row;
     match db {
         crate::db::DatabaseBackend::Sqlite(pool) => {
-            let rows = sqlx::query("SELECT id FROM agents WHERE revoked_at IS NULL")
+            let rows = sqlx::query(
+                "SELECT id, name, dashboard_metadata_json, last_info_json, last_state_json FROM agents WHERE owner_user_id = ? AND revoked_at IS NULL ORDER BY created_at ASC",
+            )
+            .bind(owner_user_id)
                 .fetch_all(pool)
                 .await?;
             Ok(rows
                 .into_iter()
-                .filter_map(|row| row.try_get::<String, _>("id").ok())
+                .map(|row| AgentSelectorRecord {
+                    id: row.try_get::<String, _>("id").unwrap_or_default(),
+                    name: row.try_get::<String, _>("name").unwrap_or_default(),
+                    dashboard_metadata_json: row.try_get("dashboard_metadata_json").ok(),
+                    last_info_json: row.try_get("last_info_json").ok(),
+                    last_state_json: row.try_get("last_state_json").ok(),
+                })
                 .collect())
         }
         crate::db::DatabaseBackend::Postgres(pool) => {
-            let rows = sqlx::query("SELECT id::text AS id FROM agents WHERE revoked_at IS NULL")
+            let owner_id = uuid::Uuid::parse_str(owner_user_id)?;
+            let rows = sqlx::query(
+                "SELECT id::text AS id, name, dashboard_metadata_json, last_info_json, last_state_json FROM agents WHERE owner_user_id = $1 AND revoked_at IS NULL ORDER BY created_at ASC",
+            )
+            .bind(owner_id)
                 .fetch_all(pool)
                 .await?;
             Ok(rows
                 .into_iter()
-                .filter_map(|row| row.try_get::<String, _>("id").ok())
+                .map(|row| AgentSelectorRecord {
+                    id: row.try_get::<String, _>("id").unwrap_or_default(),
+                    name: row.try_get::<String, _>("name").unwrap_or_default(),
+                    dashboard_metadata_json: row.try_get("dashboard_metadata_json").ok(),
+                    last_info_json: row.try_get("last_info_json").ok(),
+                    last_state_json: row.try_get("last_state_json").ok(),
+                })
                 .collect())
         }
     }
+}
+
+async fn list_group_agent_ids(
+    db: &Db,
+    owner_user_id: &str,
+    group_ids: &[String],
+) -> Result<Vec<String>> {
+    if group_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    use sqlx::Row;
+    let mut out = Vec::new();
+    match db {
+        crate::db::DatabaseBackend::Sqlite(pool) => {
+            for group_id in group_ids {
+                let rows = sqlx::query(
+                    "SELECT sgm.agent_id FROM server_group_members sgm JOIN server_groups sg ON sg.id = sgm.group_id WHERE sg.id = ? AND sg.owner_user_id = ? ORDER BY sgm.created_at ASC",
+                )
+                .bind(group_id)
+                .bind(owner_user_id)
+                .fetch_all(pool)
+                .await?;
+                out.extend(
+                    rows.into_iter()
+                        .filter_map(|row| row.try_get::<String, _>("agent_id").ok()),
+                );
+            }
+        }
+        crate::db::DatabaseBackend::Postgres(pool) => {
+            let owner_id = uuid::Uuid::parse_str(owner_user_id)?;
+            for group_id in group_ids {
+                let Ok(group_uuid) = uuid::Uuid::parse_str(group_id) else {
+                    continue;
+                };
+                let rows = sqlx::query(
+                    "SELECT sgm.agent_id::text AS agent_id FROM server_group_members sgm JOIN server_groups sg ON sg.id = sgm.group_id WHERE sg.id = $1 AND sg.owner_user_id = $2 ORDER BY sgm.created_at ASC",
+                )
+                .bind(group_uuid)
+                .bind(owner_id)
+                .fetch_all(pool)
+                .await?;
+                out.extend(
+                    rows.into_iter()
+                        .filter_map(|row| row.try_get::<String, _>("agent_id").ok()),
+                );
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn normalized_selector_tags(selector: &ServerSelector) -> Vec<String> {
+    let mut tags = selector
+        .tag_names
+        .iter()
+        .filter_map(|tag| normalize_tag_filter(tag))
+        .collect::<Vec<_>>();
+
+    for (key, value) in &selector.tags {
+        let key = key.trim();
+        let value = value.trim();
+        if value.is_empty() || value == "*" || value.eq_ignore_ascii_case("true") {
+            if let Some(tag) = normalize_tag_filter(key) {
+                tags.push(tag);
+            }
+            continue;
+        }
+        if let Some(tag) = normalize_tag_filter(value) {
+            tags.push(tag);
+        }
+        if let Some(tag) = normalize_tag_filter(&format!("{key}:{value}")) {
+            tags.push(tag);
+        }
+    }
+
+    let mut seen = HashSet::new();
+    tags.into_iter()
+        .filter(|tag| seen.insert(tag.clone()))
+        .collect()
+}
+
+fn normalize_tag_filter(value: &str) -> Option<String> {
+    let trimmed = value.trim().trim_start_matches('#').to_lowercase();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
+fn agent_matches_tag_filters(record: &AgentSelectorRecord, filters: &[String]) -> bool {
+    let tags = agent_tags(record);
+    filters.iter().all(|filter| tags.contains(filter))
+}
+
+fn agent_tags(record: &AgentSelectorRecord) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for tag in record
+        .dashboard_metadata_json
+        .as_deref()
+        .into_iter()
+        .chain(record.last_info_json.as_deref())
+        .chain(record.last_state_json.as_deref())
+        .filter_map(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+        .flat_map(|value| tags_from_json_source(&value))
+    {
+        if let Some(tag) = normalize_tag_filter(&tag) {
+            out.insert(tag);
+        }
+    }
+    if let Some(tag) = normalize_tag_filter(&record.name) {
+        out.insert(tag);
+    }
+    out
+}
+
+fn tags_from_json_source(value: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    for key in ["tags", "labels"] {
+        if let Some(value) = value.get(key) {
+            out.extend(tags_from_json_value(value));
+        }
+    }
+    for container in ["metadata", "custom"] {
+        if let Some(child) = value.get(container) {
+            for key in ["tags", "labels"] {
+                if let Some(value) = child.get(key) {
+                    out.extend(tags_from_json_value(value));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn tags_from_json_value(value: &serde_json::Value) -> Vec<String> {
+    match value {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.as_str().map(str::to_string))
+            .collect(),
+        serde_json::Value::String(value) => value
+            .split(',')
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())
+            .collect(),
+        serde_json::Value::Object(map) => map
+            .iter()
+            .flat_map(|(key, value)| {
+                if let Some(label) = value.as_str() {
+                    vec![label.to_string(), format!("{key}:{label}")]
+                } else if value.as_bool() == Some(true) {
+                    vec![key.to_string()]
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+async fn send_task_dispatch_notification(
+    db: &Db,
+    task: &Task,
+    report: &TaskDispatchReport,
+) -> Result<()> {
+    let Some(group_id) = task.notification_group_id.as_deref() else {
+        return Ok(());
+    };
+    let has_failure =
+        report.summary.failure > 0 || report.summary.offline > 0 || report.summary.timeout > 0;
+    if !has_failure && !task.push_successful {
+        return Ok(());
+    }
+
+    let channels = notification_channels_for_group(db, group_id).await?;
+    if channels.is_empty() {
+        return Ok(());
+    }
+
+    let result = if has_failure { "failure" } else { "success" };
+    let severity = if has_failure {
+        NotificationSeverity::Error
+    } else {
+        NotificationSeverity::Info
+    };
+    let mut metadata = HashMap::new();
+    metadata.insert("task_id".to_string(), task.id.clone());
+    metadata.insert("task_name".to_string(), task.name.clone());
+    metadata.insert("result".to_string(), result.to_string());
+    metadata.insert("success".to_string(), report.summary.success.to_string());
+    metadata.insert("failure".to_string(), report.summary.failure.to_string());
+    metadata.insert("offline".to_string(), report.summary.offline.to_string());
+    metadata.insert("timeout".to_string(), report.summary.timeout.to_string());
+    metadata.insert("total".to_string(), report.summary.total.to_string());
+
+    let message = NotificationMessage {
+        title: format!(
+            "任务执行{}：{}",
+            if has_failure { "异常" } else { "成功" },
+            task.name
+        ),
+        message: format!(
+            "任务 {} 执行完成：success={}, failure={}, offline={}, timeout={}, total={}",
+            task.name,
+            report.summary.success,
+            report.summary.failure,
+            report.summary.offline,
+            report.summary.timeout,
+            report.summary.total
+        ),
+        severity,
+        timestamp: Utc::now().to_rfc3339(),
+        metadata,
+    };
+
+    let sender = Arc::new(NotificationSender::new());
+    for channel in channels {
+        let sender = sender.clone();
+        let message = message.clone();
+        tokio::spawn(async move {
+            if let Err(err) = sender.send(&channel, &message).await {
+                warn!("task notification send failed: {}", err);
+            }
+        });
+    }
+    Ok(())
+}
+
+async fn notification_channels_for_group(
+    db: &Db,
+    group_id: &str,
+) -> Result<Vec<NotificationChannel>> {
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        bool,
+    )> = match db {
+        crate::db::DatabaseBackend::Sqlite(pool) => {
+            sqlx::query_as("SELECT n.id, n.name, n.url, n.request_method, n.request_type, n.headers_json, n.body_template, n.verify_tls FROM notifications n JOIN notification_group_members ngm ON ngm.notification_id = n.id WHERE ngm.group_id = ?")
+                .bind(group_id)
+                .fetch_all(pool)
+                .await?
+        }
+        crate::db::DatabaseBackend::Postgres(pool) => {
+            sqlx::query_as("SELECT n.id::text, n.name, n.url, n.request_method, n.request_type, n.headers_json, n.body_template, n.verify_tls FROM notifications n JOIN notification_group_members ngm ON ngm.notification_id = n.id WHERE ngm.group_id = $1")
+                .bind(group_id)
+                .fetch_all(pool)
+                .await?
+        }
+    };
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(
+                id,
+                name,
+                url,
+                request_method,
+                request_type,
+                headers_json,
+                body_template,
+                verify_tls,
+            )| {
+                let headers: HashMap<String, String> = headers_json
+                    .as_deref()
+                    .and_then(|value| serde_json::from_str(value).ok())
+                    .unwrap_or_default();
+                NotificationChannel {
+                    id,
+                    name,
+                    url,
+                    request_method,
+                    request_type,
+                    headers,
+                    body_template: body_template.unwrap_or_default(),
+                    verify_tls,
+                }
+            },
+        )
+        .collect())
 }
 
 async fn create_run(

@@ -111,11 +111,127 @@ impl DatabaseBackend {
                 .await?;
                 sqlite_add_column_if_missing(pool, "agents", "last_info_at", "last_info_at TEXT")
                     .await?;
+                sqlite_add_column_if_missing(pool, "agents", "remark", "remark TEXT").await?;
+                sqlite_add_column_if_missing(pool, "agents", "expires_at", "expires_at TEXT")
+                    .await?;
+                sqlite_add_column_if_missing(pool, "agents", "renewal_price", "renewal_price TEXT")
+                    .await?;
+                sqlite_add_column_if_missing(
+                    pool,
+                    "agents",
+                    "dashboard_metadata_json",
+                    "dashboard_metadata_json TEXT",
+                )
+                .await?;
+                sqlite_add_column_if_missing(
+                    pool,
+                    "services",
+                    "server_id",
+                    "server_id TEXT REFERENCES agents(id) ON DELETE SET NULL",
+                )
+                .await?;
+                sqlite_add_column_if_missing(
+                    pool,
+                    "services",
+                    "cover_mode",
+                    "cover_mode TEXT NOT NULL DEFAULT 'local'",
+                )
+                .await?;
+                sqlite_add_column_if_missing(
+                    pool,
+                    "services",
+                    "exclude_server_ids_json",
+                    "exclude_server_ids_json TEXT",
+                )
+                .await?;
+                sqlite_add_column_if_missing(
+                    pool,
+                    "services",
+                    "failure_task_ids_json",
+                    "failure_task_ids_json TEXT",
+                )
+                .await?;
+                sqlite_add_column_if_missing(
+                    pool,
+                    "services",
+                    "recovery_task_ids_json",
+                    "recovery_task_ids_json TEXT",
+                )
+                .await?;
+                sqlite_add_column_if_missing(
+                    pool,
+                    "alert_rules",
+                    "fail_task_ids_json",
+                    "fail_task_ids_json TEXT",
+                )
+                .await?;
+                sqlite_add_column_if_missing(
+                    pool,
+                    "alert_rules",
+                    "recover_task_ids_json",
+                    "recover_task_ids_json TEXT",
+                )
+                .await?;
+                sqlx::query(
+                    "UPDATE services SET cover_mode = 'specific' WHERE server_id IS NOT NULL AND TRIM(server_id) <> '' AND cover_mode = 'local'",
+                )
+                .execute(pool)
+                .await?;
+                sqlx::query(
+                    "CREATE INDEX IF NOT EXISTS idx_services_server ON services(server_id)",
+                )
+                .execute(pool)
+                .await?;
+                sqlx::query(include_str!(
+                    "../../migrations/sqlite/010_service_servers.sql"
+                ))
+                .execute(pool)
+                .await?;
                 sqlx::query(include_str!("../../migrations/sqlite/007_m4_m6.sql"))
                     .execute(pool)
                     .await?;
                 sqlx::query(include_str!(
                     "../../migrations/sqlite/008_m8_performance.sql"
+                ))
+                .execute(pool)
+                .await?;
+                sqlx::query(include_str!("../../migrations/sqlite/011_waf.sql"))
+                    .execute(pool)
+                    .await?;
+                sqlx::query(include_str!("../../migrations/sqlite/012_auth_totp.sql"))
+                    .execute(pool)
+                    .await?;
+                sqlite_add_column_if_missing(pool, "users", "totp_secret", "totp_secret TEXT")
+                    .await?;
+                sqlite_add_column_if_missing(
+                    pool,
+                    "users",
+                    "totp_enabled",
+                    "totp_enabled INTEGER NOT NULL DEFAULT 0",
+                )
+                .await?;
+                sqlx::query(include_str!(
+                    "../../migrations/sqlite/013_oauth_accounts.sql"
+                ))
+                .execute(pool)
+                .await?;
+                sqlx::query(include_str!(
+                    "../../migrations/sqlite/014_agent_ip_events.sql"
+                ))
+                .execute(pool)
+                .await?;
+                sqlx::query(include_str!(
+                    "../../migrations/sqlite/015_server_groups.sql"
+                ))
+                .execute(pool)
+                .await?;
+                sqlx::query(include_str!(
+                    "../../migrations/sqlite/016_system_settings.sql"
+                ))
+                .execute(pool)
+                .await?;
+                sqlx::query(include_str!(
+                    "../../migrations/sqlite/019_server_owner_transfers.sql"
                 ))
                 .execute(pool)
                 .await?;
@@ -130,7 +246,7 @@ impl DatabaseBackend {
                 // raw_sql calls causes "foreign key constraint cannot be implemented"
                 // errors on later files.
                 let batch = format!(
-                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
                     include_str!("../../migrations/postgres/001_initial.sql"),
                     include_str!("../../migrations/postgres/002_agents.sql"),
                     include_str!("../../migrations/postgres/003_services.sql"),
@@ -139,6 +255,17 @@ impl DatabaseBackend {
                     include_str!("../../migrations/postgres/006_agent_state.sql"),
                     include_str!("../../migrations/postgres/007_m4_m6.sql"),
                     include_str!("../../migrations/postgres/008_m8_performance.sql"),
+                    include_str!("../../migrations/postgres/009_agent_service_metadata.sql"),
+                    include_str!("../../migrations/postgres/010_service_servers.sql"),
+                    include_str!("../../migrations/postgres/011_waf.sql"),
+                    include_str!("../../migrations/postgres/012_service_cover_mode.sql"),
+                    include_str!("../../migrations/postgres/013_auth_totp.sql"),
+                    include_str!("../../migrations/postgres/014_oauth_accounts.sql"),
+                    include_str!("../../migrations/postgres/015_agent_ip_events.sql"),
+                    include_str!("../../migrations/postgres/016_server_groups.sql"),
+                    include_str!("../../migrations/postgres/017_system_settings.sql"),
+                    include_str!("../../migrations/postgres/018_trigger_task_ids.sql"),
+                    include_str!("../../migrations/postgres/019_server_owner_transfers.sql"),
                 );
                 sqlx::raw_sql(batch.as_str()).execute(pool).await?;
                 Ok(())

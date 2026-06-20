@@ -1,0 +1,1 @@
+-- SQLite TOTP columns are added idempotently from DatabaseBackend::run_migrations.

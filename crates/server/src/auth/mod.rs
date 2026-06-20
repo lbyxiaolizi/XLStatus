@@ -5,6 +5,7 @@ mod jwt;
 pub mod middleware;
 pub mod rbac;
 mod session;
+pub mod totp;
 
 pub use jwt::{sign_agent_jwt, verify_agent_jwt};
 pub use middleware::AuthSession;

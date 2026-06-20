@@ -2,6 +2,7 @@ mod session;
 
 pub use session::{IoRegistry, SessionRegistry, TaskResponseRegistry};
 
+use crate::api::v1::auth::{active_waf_ban, record_waf_event, register_agent_auth_failure};
 use crate::auth::verify_agent_jwt;
 use crate::db::{AgentRepository, DatabaseBackend};
 use crate::realtime::{BroadcastHub, RealtimeEvent};
@@ -54,31 +55,16 @@ impl AgentService for AgentServiceImpl {
         &self,
         request: Request<tonic::Streaming<AgentMessage>>,
     ) -> Result<Response<Self::SessionStream>, Status> {
-        let token = request
-            .metadata()
-            .get("authorization")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| {
-                value
-                    .strip_prefix("bearer ")
-                    .or_else(|| value.strip_prefix("Bearer "))
-            })
-            .ok_or_else(|| Status::unauthenticated("missing bearer token"))?;
-        let claims = verify_agent_jwt(token, &self.jwt_secret)
-            .map_err(|_| Status::unauthenticated("invalid bearer token"))?;
-        let agent_id = AgentId(
-            uuid::Uuid::parse_str(&claims.sub)
-                .map_err(|_| Status::unauthenticated("invalid agent id"))?,
-        );
-        let agent_repo = AgentRepository::new(self.db.clone());
-        let agent = agent_repo
-            .find_by_id(agent_id)
-            .await
-            .map_err(|_| Status::internal("failed to load agent"))?
-            .ok_or_else(|| Status::unauthenticated("agent not found"))?;
-        if agent.revoked_at.is_some() {
-            return Err(Status::permission_denied("agent revoked"));
-        }
+        let client_ip = client_ip_from_grpc_request(&request);
+        let bearer_token = bearer_token_from_grpc_request(&request).map(ToString::to_string);
+        let agent_id = authenticate_agent_request(
+            &self.db,
+            &self.jwt_secret,
+            client_ip,
+            bearer_token,
+            "session",
+        )
+        .await?;
 
         let mut in_stream = request.into_inner();
         let (tx, rx) = mpsc::channel(128);
@@ -192,6 +178,24 @@ impl AgentService for AgentServiceImpl {
                                 tracing::warn!("DDNS agent IP check failed: {}", e);
                             }
                         }
+                        if let Err(e) = crate::api::v1::geoip::handle_agent_ip_report(
+                            &db,
+                            agent_id,
+                            if report.ipv4.trim().is_empty() {
+                                None
+                            } else {
+                                Some(report.ipv4.as_str())
+                            },
+                            if report.ipv6.trim().is_empty() {
+                                None
+                            } else {
+                                Some(report.ipv6.as_str())
+                            },
+                        )
+                        .await
+                        {
+                            tracing::warn!("Agent IP change handling failed: {}", e);
+                        }
                         realtime.publish(RealtimeEvent::new(
                             "geo_ip",
                             agent_id.0,
@@ -216,31 +220,16 @@ impl AgentService for AgentServiceImpl {
         &self,
         request: Request<tonic::Streaming<IoFrame>>,
     ) -> Result<Response<Self::IoStreamStream>, Status> {
-        let token = request
-            .metadata()
-            .get("authorization")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| {
-                value
-                    .strip_prefix("bearer ")
-                    .or_else(|| value.strip_prefix("Bearer "))
-            })
-            .ok_or_else(|| Status::unauthenticated("missing bearer token"))?;
-        let claims = verify_agent_jwt(token, &self.jwt_secret)
-            .map_err(|_| Status::unauthenticated("invalid bearer token"))?;
-        let agent_id = AgentId(
-            uuid::Uuid::parse_str(&claims.sub)
-                .map_err(|_| Status::unauthenticated("invalid agent id"))?,
-        );
-        let agent_repo = AgentRepository::new(self.db.clone());
-        let agent = agent_repo
-            .find_by_id(agent_id)
-            .await
-            .map_err(|_| Status::internal("failed to load agent"))?
-            .ok_or_else(|| Status::unauthenticated("agent not found"))?;
-        if agent.revoked_at.is_some() {
-            return Err(Status::permission_denied("agent revoked"));
-        }
+        let client_ip = client_ip_from_grpc_request(&request);
+        let bearer_token = bearer_token_from_grpc_request(&request).map(ToString::to_string);
+        let agent_id = authenticate_agent_request(
+            &self.db,
+            &self.jwt_secret,
+            client_ip,
+            bearer_token,
+            "io_stream",
+        )
+        .await?;
 
         let mut in_stream = request.into_inner();
         let (tx, rx) = mpsc::channel(128);
@@ -262,6 +251,119 @@ impl AgentService for AgentServiceImpl {
 
         Ok(Response::new(ReceiverStream::new(rx)))
     }
+}
+
+async fn authenticate_agent_request(
+    db: &DatabaseBackend,
+    jwt_secret: &str,
+    client_ip: String,
+    bearer_token: Option<String>,
+    stream_name: &str,
+) -> Result<AgentId, Status> {
+    if active_waf_ban(db, &client_ip)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        let _ = record_waf_event(
+            db,
+            &client_ip,
+            Some(stream_name),
+            "agent_auth_blocked",
+            Some("active WAF ban"),
+        )
+        .await;
+        return Err(Status::permission_denied("IP temporarily blocked by WAF"));
+    }
+
+    let Some(token) = bearer_token else {
+        let _ =
+            register_agent_auth_failure(db, &client_ip, Some(stream_name), "missing bearer token")
+                .await;
+        return Err(Status::unauthenticated("missing bearer token"));
+    };
+    let claims = match verify_agent_jwt(&token, jwt_secret) {
+        Ok(claims) => claims,
+        Err(_) => {
+            let _ = register_agent_auth_failure(
+                db,
+                &client_ip,
+                Some(stream_name),
+                "invalid bearer token",
+            )
+            .await;
+            return Err(Status::unauthenticated("invalid bearer token"));
+        }
+    };
+    let agent_id = match uuid::Uuid::parse_str(&claims.sub).map(AgentId) {
+        Ok(agent_id) => agent_id,
+        Err(_) => {
+            let _ =
+                register_agent_auth_failure(db, &client_ip, Some(&claims.sub), "invalid agent id")
+                    .await;
+            return Err(Status::unauthenticated("invalid agent id"));
+        }
+    };
+
+    let agent_repo = AgentRepository::new(db.clone());
+    let agent = match agent_repo.find_by_id(agent_id).await {
+        Ok(Some(agent)) => agent,
+        Ok(None) => {
+            let agent_ref = agent_id.0.to_string();
+            let _ =
+                register_agent_auth_failure(db, &client_ip, Some(&agent_ref), "agent not found")
+                    .await;
+            return Err(Status::unauthenticated("agent not found"));
+        }
+        Err(err) => {
+            tracing::warn!("failed to load agent during gRPC auth: {}", err);
+            return Err(Status::internal("failed to load agent"));
+        }
+    };
+    if agent.revoked_at.is_some() {
+        let agent_ref = agent_id.0.to_string();
+        let _ =
+            register_agent_auth_failure(db, &client_ip, Some(&agent_ref), "agent revoked").await;
+        return Err(Status::permission_denied("agent revoked"));
+    }
+
+    Ok(agent_id)
+}
+
+fn bearer_token_from_grpc_request<T>(request: &Request<T>) -> Option<&str> {
+    request
+        .metadata()
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            value
+                .strip_prefix("bearer ")
+                .or_else(|| value.strip_prefix("Bearer "))
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn client_ip_from_grpc_request<T>(request: &Request<T>) -> String {
+    grpc_metadata_value(request, "x-forwarded-for")
+        .and_then(|value| value.split(',').next().map(str::trim).map(str::to_string))
+        .or_else(|| grpc_metadata_value(request, "x-real-ip"))
+        .or_else(|| grpc_metadata_value(request, "cf-connecting-ip"))
+        .or_else(|| request.remote_addr().map(|addr| addr.ip().to_string()))
+        .map(|value| value.chars().take(128).collect::<String>())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn grpc_metadata_value<T>(request: &Request<T>, name: &str) -> Option<String> {
+    request
+        .metadata()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 /// M3: hand-rolled JSON serializer for the gRPC HostState message.
@@ -299,6 +401,9 @@ fn state_to_json(s: &xlstatus_proto_gen::xlstatus::v1::HostState) -> String {
         "process_count": s.process_count,
         "disks": disks,
         "net_io": net_io,
+        "network_in_total": s.net_io.iter().map(|n| n.bytes_recv).sum::<u64>(),
+        "network_out_total": s.net_io.iter().map(|n| n.bytes_sent).sum::<u64>(),
+        "uptime_seconds": s.uptime_seconds,
         "temperatures": temperatures,
     }))
     .unwrap_or_else(|_| String::new())

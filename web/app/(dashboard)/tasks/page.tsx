@@ -23,7 +23,7 @@ import {
   textareaClass,
   thClass,
 } from "@/app/components/M7Primitives";
-import { apiClient, type JsonObject } from "@/lib/api";
+import { apiClient, type JsonObject, type ServerGroup } from "@/lib/api";
 
 type TaskType = "shell" | "http_get" | "icmp_ping" | "tcp_ping";
 type CoverMode = "all" | "any" | "specific";
@@ -32,6 +32,12 @@ interface Server {
   id: string;
   name: string;
   status: string;
+  tags?: string[];
+}
+
+interface NotificationGroup {
+  id: string;
+  name: string;
 }
 
 interface Task {
@@ -44,6 +50,7 @@ interface Task {
   cover_mode: CoverMode;
   server_selector_json: string;
   push_successful: boolean;
+  notification_group_id?: string | null;
   enabled: boolean;
   last_executed_at?: string | null;
   last_result?: string | null;
@@ -67,7 +74,12 @@ interface TaskForm {
   payload_json: string;
   cover_mode: CoverMode;
   selected_server_ids: string[];
+  excluded_server_ids: string[];
+  selected_group_ids: string[];
+  tag_names: string[];
+  source_server: boolean;
   push_successful: boolean;
+  notification_group_id: string;
   enabled: boolean;
 }
 
@@ -79,13 +91,20 @@ const blankForm: TaskForm = {
   payload_json: "",
   cover_mode: "specific",
   selected_server_ids: [],
+  excluded_server_ids: [],
+  selected_group_ids: [],
+  tag_names: [],
+  source_server: false,
   push_successful: false,
+  notification_group_id: "",
   enabled: true,
 };
 
 export default function TasksPage() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [servers, setServers] = useState<Server[]>([]);
+  const [serverGroups, setServerGroups] = useState<ServerGroup[]>([]);
+  const [notificationGroups, setNotificationGroups] = useState<NotificationGroup[]>([]);
   const [runs, setRuns] = useState<TaskRun[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -100,9 +119,11 @@ export default function TasksPage() {
   const loadTasks = useCallback(async () => {
     setLoading(true);
     setError(null);
-    const [tasksResponse, serversResponse] = await Promise.all([
+    const [tasksResponse, serversResponse, groupsResponse, notificationGroupsResponse] = await Promise.all([
       apiClient.listTasks(200, 0),
       apiClient.listServers(200, 0),
+      apiClient.listServerGroups(),
+      apiClient.listNotificationGroups(200, 0),
     ]);
     if (tasksResponse.success && tasksResponse.data) {
       setTasks((tasksResponse.data.tasks as Task[]) ?? []);
@@ -111,6 +132,12 @@ export default function TasksPage() {
     }
     if (serversResponse.success && serversResponse.data) {
       setServers((serversResponse.data.servers as Server[]) ?? []);
+    }
+    if (groupsResponse.success && groupsResponse.data) {
+      setServerGroups(groupsResponse.data.groups ?? []);
+    }
+    if (notificationGroupsResponse.success && notificationGroupsResponse.data) {
+      setNotificationGroups((notificationGroupsResponse.data.groups as NotificationGroup[]) ?? []);
     }
     setLoading(false);
   }, []);
@@ -146,7 +173,12 @@ export default function TasksPage() {
       payload_json: task.payload_json || "",
       cover_mode: task.cover_mode || "specific",
       selected_server_ids: selector.server_ids,
+      excluded_server_ids: selector.exclude_server_ids,
+      selected_group_ids: selector.group_ids,
+      tag_names: selector.tag_names,
+      source_server: selector.source_server,
       push_successful: Boolean(task.push_successful),
+      notification_group_id: task.notification_group_id || "",
       enabled: task.enabled,
     });
     setModal("edit");
@@ -260,7 +292,15 @@ export default function TasksPage() {
 
         {modal === "create" || modal === "edit" ? (
           <Modal title={modal === "edit" ? "编辑任务" : "新增任务"} onClose={() => setModal(null)}>
-            <TaskFormView form={form} setForm={setForm} servers={servers} saving={saving} onSubmit={submitForm} />
+            <TaskFormView
+              form={form}
+              setForm={setForm}
+              servers={servers}
+              serverGroups={serverGroups}
+              notificationGroups={notificationGroups}
+              saving={saving}
+              onSubmit={submitForm}
+            />
           </Modal>
         ) : null}
 
@@ -293,12 +333,16 @@ function TaskFormView({
   form,
   setForm,
   servers,
+  serverGroups,
+  notificationGroups,
   saving,
   onSubmit,
 }: {
   form: TaskForm;
   setForm: React.Dispatch<React.SetStateAction<TaskForm>>;
   servers: Server[];
+  serverGroups: ServerGroup[];
+  notificationGroups: NotificationGroup[];
   saving: boolean;
   onSubmit: (event: FormEvent) => void;
 }) {
@@ -347,7 +391,52 @@ function TaskFormView({
           </select>
         </Field>
       </div>
+      <div className="grid gap-4 sm:grid-cols-2">
+        <Field label="服务器分组">
+          <select
+            multiple
+            className={`${selectClass} min-h-28`}
+            value={form.selected_group_ids}
+            onChange={(e) => setForm((f) => ({ ...f, selected_group_ids: Array.from(e.target.selectedOptions).map((option) => option.value) }))}
+          >
+            {serverGroups.map((group) => (
+              <option key={group.id} value={group.id}>{group.name} ({group.server_ids.length})</option>
+            ))}
+          </select>
+        </Field>
+        <Field label="排除服务器">
+          <select
+            multiple
+            className={`${selectClass} min-h-28`}
+            value={form.excluded_server_ids}
+            onChange={(e) => setForm((f) => ({ ...f, excluded_server_ids: Array.from(e.target.selectedOptions).map((option) => option.value) }))}
+          >
+            {servers.map((server) => (
+              <option key={server.id} value={server.id}>{server.name} ({server.status})</option>
+            ))}
+          </select>
+        </Field>
+      </div>
+      <div className="grid gap-4 sm:grid-cols-2">
+        <Field label="标签条件">
+          <input
+            className={inputClass}
+            value={form.tag_names.join(", ")}
+            onChange={(e) => setForm((f) => ({ ...f, tag_names: splitTags(e.target.value) }))}
+            placeholder="prod, cn2, edge"
+          />
+        </Field>
+        <Field label="通知组">
+          <select className={selectClass} value={form.notification_group_id} onChange={(e) => setForm((f) => ({ ...f, notification_group_id: e.target.value }))}>
+            <option value="">不通知</option>
+            {notificationGroups.map((group) => (
+              <option key={group.id} value={group.id}>{group.name}</option>
+            ))}
+          </select>
+        </Field>
+      </div>
       <div className="flex flex-wrap gap-4 text-sm font-black">
+        <label><input type="checkbox" checked={form.source_server} onChange={(e) => setForm((f) => ({ ...f, source_server: e.target.checked }))} /> 触发来源服务器</label>
         <label><input type="checkbox" checked={form.push_successful} onChange={(e) => setForm((f) => ({ ...f, push_successful: e.target.checked }))} /> 推送成功结果</label>
         <label><input type="checkbox" checked={form.enabled} onChange={(e) => setForm((f) => ({ ...f, enabled: e.target.checked }))} /> 启用</label>
       </div>
@@ -356,16 +445,45 @@ function TaskFormView({
   );
 }
 
-function parseSelector(value: string): { server_ids: string[] } {
+function parseSelector(value: string): {
+  server_ids: string[];
+  exclude_server_ids: string[];
+  group_ids: string[];
+  tag_names: string[];
+  source_server: boolean;
+} {
   try {
-    const parsed = JSON.parse(value) as { server_ids?: string[] };
-    return { server_ids: Array.isArray(parsed.server_ids) ? parsed.server_ids : [] };
+    const parsed = JSON.parse(value) as {
+      server_ids?: string[];
+      exclude_server_ids?: string[];
+      group_ids?: string[];
+      tag_names?: string[];
+      source_server?: boolean;
+      tags?: Record<string, string>;
+    };
+    const mapTags = parsed.tags
+      ? Object.entries(parsed.tags).map(([key, value]) => value || key)
+      : [];
+    return {
+      server_ids: Array.isArray(parsed.server_ids) ? parsed.server_ids : [],
+      exclude_server_ids: Array.isArray(parsed.exclude_server_ids) ? parsed.exclude_server_ids : [],
+      group_ids: Array.isArray(parsed.group_ids) ? parsed.group_ids : [],
+      tag_names: splitTags([...(Array.isArray(parsed.tag_names) ? parsed.tag_names : []), ...mapTags].join(",")),
+      source_server: Boolean(parsed.source_server),
+    };
   } catch {
-    return { server_ids: [] };
+    return {
+      server_ids: [],
+      exclude_server_ids: [],
+      group_ids: [],
+      tag_names: [],
+      source_server: false,
+    };
   }
 }
 
 function formToPayload(form: TaskForm): JsonObject {
+  const tagNames = splitTags(form.tag_names.join(","));
   return {
     name: form.name.trim(),
     task_type: form.task_type,
@@ -373,10 +491,32 @@ function formToPayload(form: TaskForm): JsonObject {
     command: form.command,
     payload_json: form.payload_json.trim() || null,
     cover_mode: form.cover_mode,
-    server_selector_json: JSON.stringify({ server_ids: form.selected_server_ids }),
+    server_selector_json: JSON.stringify({
+      server_ids: form.selected_server_ids,
+      exclude_server_ids: form.excluded_server_ids,
+      group_ids: form.selected_group_ids,
+      tag_names: tagNames,
+      tags: Object.fromEntries(tagNames.map((tag) => [tag, ""])),
+      source_server: form.source_server,
+    }),
     push_successful: form.push_successful,
+    notification_group_id: form.notification_group_id || null,
     enabled: form.enabled,
   };
+}
+
+function splitTags(value: string): string[] {
+  const seen = new Set<string>();
+  return value
+    .split(/[,\n]/)
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0)
+    .filter((item) => {
+      const key = item.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
 }
 
 function resultLabel(value?: string | null): string {

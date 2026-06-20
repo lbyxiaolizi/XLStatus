@@ -36,23 +36,47 @@ use crate::services::monitor::ServiceMonitor;
 use api::v1::agent::{create_enrollment_token, enroll};
 use api::v1::agent_jwt::{get_agent_jwt, get_agent_jwt_challenge};
 use api::v1::alerts::{create_alert_rule, delete_alert_rule, list_alert_events, list_alert_rules};
-use api::v1::auth::{create_user, login, logout, AppState};
+use api::v1::auth::{
+    create_user, create_waf_bans, delete_session, delete_user, delete_waf_ban, disable_totp,
+    enable_totp, get_totp_status, list_sessions, list_users, list_waf_bans, login, logout,
+    setup_totp, update_user, AppState,
+};
 use api::v1::ddns::{
     check_ddns_now, create_ddns_config, delete_ddns_config, list_ddns_configs, list_ddns_history,
     reload_ddns_providers,
+};
+use api::v1::geoip::{
+    geoip_status, geoip_upload_body_limit, test_geoip, update_geoip_database, upload_geoip_database,
+};
+use api::v1::maintenance::{
+    compact_tsdb, download_archive, download_backup, maintenance_status, restore_backup,
+    restore_body_limit, update_tsdb_retention, vacuum_sqlite,
 };
 use api::v1::mcp::{execute_mcp_tool, get_mcp_info, handle_mcp_jsonrpc, list_mcp_tools};
 use api::v1::nat::{
     create_nat_mapping, delete_nat_mapping, get_nat_mapping, list_all_nat_mappings,
     list_nat_mappings, update_nat_mapping,
 };
+use api::v1::notifications::{
+    add_notification_group_member, create_notification, create_notification_group,
+    delete_notification, delete_notification_group, delete_notification_group_member,
+    list_notification_groups, list_notification_providers, list_notifications, test_notification,
+    update_notification, update_notification_group,
+};
+use api::v1::oauth::{
+    get_profile, list_oauth_bindings, list_oauth_providers, oauth_callback, start_oauth_bind,
+    start_oauth_login, unbind_oauth_provider,
+};
+use api::v1::openapi::openapi_json;
 use api::v1::pat::{create_pat, list_pats, revoke_pat};
 use api::v1::server_ops::{
     apply_config, delete_file, download_url, force_update, get_config, list_files, read_file,
     upload_url, write_file,
 };
 use api::v1::service_history::{get_service_history, get_service_uptime};
+use api::v1::settings::{get_settings, update_settings};
 use api::v1::terminal::{create_terminal_session, ws_terminal};
+use api::v1::themes::{delete_theme, import_theme, list_themes, select_theme, update_theme};
 // M3: server list / detail / metrics routes are registered inline below
 use api::v1::services::{
     create_service, delete_service, get_service, list_services, test_probe, update_service,
@@ -141,13 +165,27 @@ async fn main() -> anyhow::Result<()> {
 
     seed_admin_user(&db).await?;
 
+    // Build the live agent session registry before background jobs
+    // that may dispatch work to connected agents.
+    let session_registry = grpc::SessionRegistry::new();
+    let io_registry = grpc::IoRegistry::new();
+    let task_response_registry = current_task_response_registry();
+
     // M4: start service monitor + alert engine in the background.
-    let monitor = Arc::new(ServiceMonitor::new(db.clone()));
+    let monitor = Arc::new(ServiceMonitor::new(
+        db.clone(),
+        session_registry.clone(),
+        task_response_registry.clone(),
+    ));
     let monitor_clone = monitor.clone();
     tokio::spawn(async move {
         monitor_clone.start().await;
     });
-    let alert_engine = Arc::new(AlertEngine::new(db.clone()));
+    let alert_engine = Arc::new(AlertEngine::new(
+        db.clone(),
+        session_registry.clone(),
+        task_response_registry.clone(),
+    ));
     let alert_engine_clone = alert_engine.clone();
     tokio::spawn(async move {
         alert_engine_clone.start().await;
@@ -166,12 +204,6 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("DDNS manager started");
     }
     crate::set_ddns_manager(ddns_manager);
-
-    // Build the live agent session registry first so the HTTP
-    // AppState (M5 task dispatch) can reach it.
-    let session_registry = grpc::SessionRegistry::new();
-    let io_registry = grpc::IoRegistry::new();
-    let task_response_registry = current_task_response_registry();
 
     // M6: start the NAT manager after the shared IO registry exists,
     // so reverse-tunnel listeners can forward new public connections
@@ -196,7 +228,7 @@ async fn main() -> anyhow::Result<()> {
     let task_scheduler = Arc::new(crate::tasks::scheduler::TaskScheduler::new(
         db.clone(),
         session_registry.clone(),
-        task_response_registry,
+        task_response_registry.clone(),
     ));
     let task_scheduler_clone = task_scheduler.clone();
     tokio::spawn(async move {
@@ -207,6 +239,16 @@ async fn main() -> anyhow::Result<()> {
     // the AppState handlers (M5 task dispatch) can reach the live
     // agent sessions registered by the gRPC service.
     let metrics = xlstatus_tsdb::MetricStore::in_memory();
+    match api::v1::settings::tsdb_retention_days(&db).await {
+        Ok(days) => {
+            if let Err(err) = metrics.set_retention(chrono::Duration::days(days)) {
+                tracing::warn!("failed to apply TSDB retention setting: {}", err);
+            }
+        }
+        Err(err) => {
+            tracing::warn!("failed to load TSDB retention setting: {:?}", err);
+        }
+    }
     let realtime = crate::realtime::BroadcastHub::new();
     let state = AppState {
         db: db.clone(),
@@ -226,7 +268,83 @@ async fn main() -> anyhow::Result<()> {
             let cors = build_cors_layer(&state.config.server.cors_allowed_origins)?;
             let protected = Router::new()
                 .route("/api/v1/auth/logout", post(logout))
+                .route("/api/v1/auth/totp/status", get(get_totp_status))
+                .route("/api/v1/auth/totp/setup", post(setup_totp))
+                .route("/api/v1/auth/totp/enable", post(enable_totp))
+                .route("/api/v1/auth/totp/disable", post(disable_totp))
+                .route("/api/v1/profile", get(get_profile))
+                .route("/api/v1/oauth2/bindings", get(list_oauth_bindings))
+                .route("/api/v1/oauth2/:provider/bind", get(start_oauth_bind))
+                .route(
+                    "/api/v1/oauth2/:provider/unbind",
+                    post(unbind_oauth_provider),
+                )
+                .route("/api/v1/users", get(list_users))
                 .route("/api/v1/users", post(create_user))
+                .route("/api/v1/users/:id", post(update_user))
+                .route("/api/v1/users/:id", axum::routing::delete(delete_user))
+                .route("/api/v1/sessions", get(list_sessions))
+                .route(
+                    "/api/v1/sessions/:id",
+                    axum::routing::delete(delete_session),
+                )
+                .route("/api/v1/waf/bans", get(list_waf_bans))
+                .route("/api/v1/waf/bans", post(create_waf_bans))
+                .route(
+                    "/api/v1/waf/bans/:id",
+                    axum::routing::delete(delete_waf_ban),
+                )
+                .route("/api/v1/maintenance/status", get(maintenance_status))
+                .route("/api/v1/maintenance/backup", get(download_backup))
+                .route("/api/v1/maintenance/archive", get(download_archive))
+                .route(
+                    "/api/v1/maintenance/restore",
+                    post(restore_backup).layer(restore_body_limit()),
+                )
+                .route("/api/v1/maintenance/sqlite-vacuum", post(vacuum_sqlite))
+                .route("/api/v1/maintenance/tsdb-compact", post(compact_tsdb))
+                .route(
+                    "/api/v1/maintenance/tsdb-retention",
+                    post(update_tsdb_retention),
+                )
+                .route(
+                    "/api/v1/cloudflared/status",
+                    get(api::v1::cloudflared::cloudflared_status),
+                )
+                .route(
+                    "/api/v1/cloudflared/token",
+                    post(api::v1::cloudflared::save_cloudflared_token),
+                )
+                .route(
+                    "/api/v1/cloudflared/start",
+                    post(api::v1::cloudflared::start_cloudflared),
+                )
+                .route(
+                    "/api/v1/cloudflared/stop",
+                    post(api::v1::cloudflared::stop_cloudflared),
+                )
+                .route("/api/v1/geoip/status", get(geoip_status))
+                .route("/api/v1/geoip/test", get(test_geoip))
+                .route("/api/v1/geoip/update", post(update_geoip_database))
+                .route(
+                    "/api/v1/geoip/upload",
+                    post(upload_geoip_database).layer(geoip_upload_body_limit()),
+                )
+                .route("/api/v1/settings", get(get_settings))
+                .route(
+                    "/api/v1/settings",
+                    post(update_settings).patch(update_settings),
+                )
+                .route("/api/v1/themes", get(list_themes))
+                .route(
+                    "/api/v1/themes/import",
+                    post(import_theme).put(import_theme),
+                )
+                .route(
+                    "/api/v1/themes/:id",
+                    post(update_theme).patch(update_theme).delete(delete_theme),
+                )
+                .route("/api/v1/themes/:id/select", post(select_theme))
                 .route("/api/v1/tokens", post(create_pat))
                 .route("/api/v1/tokens", get(list_pats))
                 .route("/api/v1/tokens/:id", axum::routing::delete(revoke_pat))
@@ -254,6 +372,40 @@ async fn main() -> anyhow::Result<()> {
                     axum::routing::delete(delete_alert_rule),
                 )
                 .route("/api/v1/alert-events", get(list_alert_events))
+                // Notifications
+                .route("/api/v1/notifications", get(list_notifications))
+                .route("/api/v1/notifications", post(create_notification))
+                .route(
+                    "/api/v1/notifications/:id",
+                    post(update_notification).patch(update_notification),
+                )
+                .route("/api/v1/notifications/:id", delete(delete_notification))
+                .route("/api/v1/notifications/:id/test", post(test_notification))
+                .route("/api/v1/notification-groups", get(list_notification_groups))
+                .route(
+                    "/api/v1/notification-groups",
+                    post(create_notification_group),
+                )
+                .route(
+                    "/api/v1/notification-groups/:id",
+                    post(update_notification_group).patch(update_notification_group),
+                )
+                .route(
+                    "/api/v1/notification-groups/:id",
+                    delete(delete_notification_group),
+                )
+                .route(
+                    "/api/v1/notification-groups/:id/members",
+                    post(add_notification_group_member),
+                )
+                .route(
+                    "/api/v1/notification-groups/:id/members/:notification_id",
+                    delete(delete_notification_group_member),
+                )
+                .route(
+                    "/api/v1/notification-providers",
+                    get(list_notification_providers),
+                )
                 // M6: DDNS config + history endpoints
                 .route("/api/v1/ddns/configs", post(create_ddns_config))
                 .route("/api/v1/ddns/configs", get(list_ddns_configs))
@@ -272,7 +424,49 @@ async fn main() -> anyhow::Result<()> {
                 )
                 // M3 server listing and metrics endpoints
                 .route("/api/v1/servers", get(api::v1::servers::list_servers))
+                .route(
+                    "/api/v1/servers/batch",
+                    post(api::v1::servers::batch_update_servers),
+                )
+                .route(
+                    "/api/v1/server-transfers",
+                    get(api::v1::servers::list_server_owner_transfers),
+                )
+                .route(
+                    "/api/v1/server-transfers/:id/retry",
+                    post(api::v1::servers::retry_server_owner_transfer),
+                )
+                .route(
+                    "/api/v1/server-transfers/:id/cancel",
+                    post(api::v1::servers::cancel_server_owner_transfer),
+                )
+                .route(
+                    "/api/v1/server-groups",
+                    get(api::v1::servers::list_server_groups),
+                )
+                .route(
+                    "/api/v1/server-groups",
+                    post(api::v1::servers::create_server_group),
+                )
+                .route(
+                    "/api/v1/server-groups/:id",
+                    post(api::v1::servers::update_server_group)
+                        .patch(api::v1::servers::update_server_group),
+                )
+                .route(
+                    "/api/v1/server-groups/:id",
+                    delete(api::v1::servers::delete_server_group),
+                )
+                .route(
+                    "/api/v1/server-groups/:id/members",
+                    post(api::v1::servers::add_server_group_members),
+                )
+                .route(
+                    "/api/v1/server-groups/:id/members/:server_id",
+                    delete(api::v1::servers::delete_server_group_member),
+                )
                 .route("/api/v1/servers/:id", get(api::v1::servers::get_server))
+                .route("/api/v1/servers/:id", post(api::v1::servers::update_server))
                 .route(
                     "/api/v1/servers/:id/metrics",
                     get(api::v1::servers::get_server_metrics),
@@ -317,7 +511,23 @@ async fn main() -> anyhow::Result<()> {
                 .route("/install-agent.sh", get(install_agent_script))
                 .route("/api/v1/agents/install.sh", get(install_agent_script))
                 .route("/api/v1/auth/login", post(login))
+                .route("/api/v1/openapi.json", get(openapi_json))
+                .route("/api/v1/oauth2/providers", get(list_oauth_providers))
+                .route("/api/v1/oauth2/:provider", get(start_oauth_login))
+                .route("/api/v1/oauth2/callback", get(oauth_callback))
                 .route("/api/v1/public/status", get(api::v1::public::public_status))
+                .route(
+                    "/api/v1/public/mjpeg",
+                    get(api::v1::public::public_status_mjpeg),
+                )
+                .route(
+                    "/api/v1/public/servers/:id",
+                    get(api::v1::public::public_server_detail),
+                )
+                .route(
+                    "/api/v1/public/servers/:id/metrics",
+                    get(api::v1::public::public_server_metrics),
+                )
                 .route("/api/v1/agents/enroll", post(enroll))
                 .route("/api/v1/transfers/temp/download", get(temp_download))
                 .route(

@@ -41,7 +41,7 @@ pub struct UpdateTaskRequest {
     pub cover_mode: Option<CoverMode>,
     pub server_selector_json: Option<String>,
     pub push_successful: Option<bool>,
-    pub notification_group_id: Option<String>,
+    pub notification_group_id: Option<Option<String>>,
     pub enabled: Option<bool>,
 }
 
@@ -306,7 +306,9 @@ pub async fn update_task(
         task.push_successful = push_successful;
     }
     if let Some(notification_group_id) = req.notification_group_id {
-        task.notification_group_id = Some(notification_group_id);
+        task.notification_group_id = notification_group_id
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
     }
     if let Some(enabled) = req.enabled {
         task.enabled = enabled;
@@ -588,7 +590,9 @@ fn validate_task_selector_or_403(
         }
     };
 
-    if !selector.server_ids.is_empty() {
+    let mut scoped_server_ids = selector.server_ids.clone();
+    scoped_server_ids.extend(selector.exclude_server_ids.clone());
+    if !scoped_server_ids.is_empty() {
         let session = AuthSession {
             session_id: auth_user.session_id.clone(),
             user_id: auth_user.user.id,
@@ -600,7 +604,7 @@ fn validate_task_selector_or_403(
             server_ids: auth_user.server_ids.clone(),
             pat_id: auth_user.pat_id.clone(),
         };
-        if !can_access_servers(&session, &selector.server_ids) {
+        if !can_access_servers(&session, &scoped_server_ids) {
             return Err((
                 StatusCode::FORBIDDEN,
                 Json(ApiResponse {
