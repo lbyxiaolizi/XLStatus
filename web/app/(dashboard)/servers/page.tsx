@@ -4,6 +4,7 @@ import Link from "next/link";
 import type { ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Navigation from "@/app/components/Navigation";
+import { WorldServerMap } from "@/app/components/WorldServerMap";
 import {
   asRecord,
   asString,
@@ -132,14 +133,6 @@ type ServerStatusFilter = "all" | "online" | "offline" | "other";
 type ServerViewMode = "cards" | "compact";
 type ServerSortKey = "default" | "name" | "status" | "cpu" | "memory" | "load" | "uptime" | "upload" | "download" | "totalUpload" | "totalDownload";
 type SortOrder = "asc" | "desc";
-
-interface RegionPoint {
-  key: string;
-  label: string;
-  x: number;
-  y: number;
-  source: "manual" | "geoip" | "centroid";
-}
 
 export default function ServersPage() {
   const storedUser = useStoredUser();
@@ -824,7 +817,14 @@ export default function ServersPage() {
           ) : null}
         </div>
 
-        {showMap ? <ServerRegionMap servers={filtered} /> : null}
+        {showMap ? (
+          <WorldServerMap
+            servers={filtered}
+            title="服务器地图"
+            ariaLabel="服务器国家和地区分布地图"
+            serverHref={(server) => `/servers/${encodeURIComponent(server.id)}`}
+          />
+        ) : null}
 
         {showServices ? (
           <ServiceTrackerPanel loading={servicesLoading} error={serviceError} trackers={visibleServiceTrackers} />
@@ -943,137 +943,6 @@ function SummaryTile({ label, value, detail }: { label: string; value: string; d
       <div className="mt-2 break-words text-2xl font-black">{value}</div>
       <div className="mt-1 text-sm font-bold text-[var(--text-muted)]">{detail}</div>
     </BrutalCard>
-  );
-}
-
-function ServerRegionMap({ servers }: { servers: Server[] }) {
-  const buckets = useMemo(() => buildRegionBuckets(servers), [servers]);
-  const active = buckets.regions;
-  const maxCount = Math.max(1, ...active.map((item) => item.servers.length));
-
-  return (
-    <section className="mb-5 border-2 border-black bg-[var(--accent-bg)] p-4 shadow-[var(--shadow-brutal)]">
-      <div className="mb-3 flex flex-wrap items-end justify-between gap-3 border-b-4 border-black pb-3">
-        <div>
-          <h2 className="text-xl font-black uppercase">服务器地图</h2>
-          <p className="mt-1 text-sm font-bold text-[var(--text-muted)]">
-            {active.length} 个已识别地区 / {servers.length} 台服务器
-          </p>
-        </div>
-        <span className="border-2 border-black bg-[var(--bg-card)] px-2 py-1 text-xs font-black shadow-[var(--shadow-brutal-sm)]">
-          {buckets.unmatched.length ? `${buckets.unmatched.length} 未识别` : "全部识别"}
-        </span>
-      </div>
-      <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_18rem]">
-        <svg
-          className="min-h-72 w-full border-2 border-black bg-[var(--bg-page)] shadow-[var(--shadow-brutal-sm)]"
-          viewBox="0 0 900 420"
-          role="img"
-          aria-label="服务器地区分布地图"
-        >
-          <rect width="900" height="420" fill="var(--bg-page)" />
-          <image href="/world-land-110m.svg" x="0" y="0" width="900" height="420" opacity="0.88" />
-          {active.map(({ point, servers: regionServers }) => {
-            const count = regionServers.length;
-            const radius = count ? 7 + Math.min(18, (count / maxCount) * 12) : 3;
-            return (
-              <g key={point.key}>
-                <circle
-                  cx={point.x}
-                  cy={point.y}
-                  r={radius + 7}
-                  fill="var(--accent-color)"
-                  opacity="0.16"
-                />
-                <circle
-                  cx={point.x}
-                  cy={point.y}
-                  r={radius}
-                  fill="var(--accent-color)"
-                  stroke="var(--border-color)"
-                  strokeWidth="3"
-                  opacity="1"
-                />
-                <text
-                  x={point.x}
-                  y={point.y + 4}
-                  textAnchor="middle"
-                  fill="var(--text-main)"
-                  fontSize="11"
-                  fontWeight="900"
-                >
-                  {count}
-                </text>
-              </g>
-            );
-          })}
-          {active.map(({ point, servers: regionServers }) => (
-            <g key={`${point.key}-label`}>
-              <rect
-                x={Math.min(point.x + 12, 805)}
-                y={Math.max(10, point.y - 22)}
-                width={Math.max(78, point.label.length * 15 + 34)}
-                height="26"
-                fill="var(--bg-card)"
-                stroke="var(--border-color)"
-                strokeWidth="2"
-              />
-              <text
-                x={Math.min(point.x + 22, 815)}
-                y={Math.max(28, point.y - 5)}
-                fill="var(--text-main)"
-                fontSize="12"
-                fontWeight="900"
-              >
-                {point.label} {regionServers.length}
-              </text>
-            </g>
-          ))}
-        </svg>
-        <div className="grid content-start gap-3">
-          {active.length ? (
-            active.map(({ point, servers: regionServers }) => (
-              <div key={point.key} className="border-2 border-black bg-[var(--bg-card)] p-3 shadow-[var(--shadow-brutal-sm)]">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-sm font-black">{point.label}</span>
-                  <StatusBadge tone={regionServers.some((server) => server.status !== "online") ? "yellow" : "green"}>
-                    {regionServers.length} 台
-                  </StatusBadge>
-                </div>
-                <div className="mt-2 grid gap-1">
-                  {regionServers.slice(0, 4).map((server) => (
-                    <Link
-                      key={server.id}
-                      href={`/servers/${encodeURIComponent(server.id)}`}
-                      className="truncate text-xs font-bold text-[var(--text-muted)] underline decoration-2 underline-offset-2"
-                    >
-                      {server.name}
-                    </Link>
-                  ))}
-                  {regionServers.length > 4 ? (
-                    <span className="text-xs font-black text-[var(--text-muted)]">+{regionServers.length - 4} 台</span>
-                  ) : null}
-                </div>
-              </div>
-            ))
-          ) : (
-            <EmptyState title="暂无可识别地区" detail="GeoIP 或手动位置字段可用后会点亮地图。" />
-          )}
-          {buckets.unmatched.length ? (
-            <div className="border-2 border-black bg-[var(--bg-card)] p-3 shadow-[var(--shadow-brutal-sm)]">
-              <div className="text-sm font-black">未识别</div>
-              <div className="mt-2 flex flex-wrap gap-2">
-                {buckets.unmatched.slice(0, 8).map((server) => (
-                  <span key={server.id} className="border-2 border-black bg-[var(--accent-bg)] px-2 py-1 text-[11px] font-black">
-                    {server.name}
-                  </span>
-                ))}
-              </div>
-            </div>
-          ) : null}
-        </div>
-      </div>
-    </section>
   );
 }
 
@@ -1371,61 +1240,6 @@ function transferStatusTone(status: string): "green" | "red" | "yellow" | "gray"
   return "yellow";
 }
 
-function buildRegionBuckets(servers: Server[]): {
-  regions: Array<{ point: RegionPoint; servers: Server[] }>;
-  unmatched: Server[];
-} {
-  const buckets = new Map<string, { point: RegionPoint; servers: Server[] }>();
-  const unmatched: Server[] = [];
-
-  for (const server of servers) {
-    const point = serverLocationPoint(server);
-    if (!point) {
-      unmatched.push(server);
-      continue;
-    }
-    const current = buckets.get(point.key);
-    if (current) {
-      current.servers.push(server);
-    } else {
-      buckets.set(point.key, { point, servers: [server] });
-    }
-  }
-
-  return {
-    regions: Array.from(buckets.values())
-      .sort((a, b) => b.servers.length - a.servers.length || a.point.label.localeCompare(b.point.label, "zh-CN")),
-    unmatched,
-  };
-}
-
-function serverLocationPoint(server: Server): RegionPoint | null {
-  const location = server.location ?? null;
-  const latitude = numberOrNull(location?.latitude ?? server.latitude);
-  const longitude = numberOrNull(location?.longitude ?? server.longitude);
-  const label = locationLabel(location, server);
-  if (latitude !== null && longitude !== null) {
-    const projected = projectLonLat(longitude, latitude);
-    return {
-      key: `${roundCoordinate(latitude)},${roundCoordinate(longitude)}`,
-      label,
-      x: projected.x,
-      y: projected.y,
-      source: location?.source === "manual" ? "manual" : "geoip",
-    };
-  }
-
-  const centroid = centroidForLocation(location, server);
-  if (!centroid) return null;
-  return {
-    key: centroid.key,
-    label: locationLabel(location, server, centroid.label),
-    x: centroid.x,
-    y: centroid.y,
-    source: "centroid",
-  };
-}
-
 function serverMatchesQuery(server: Server, query: string): boolean {
   const needle = query.trim().toLowerCase();
   if (!needle) return true;
@@ -1683,111 +1497,3 @@ function hasBrowserSessionSignal(): boolean {
 function buildWsUrl(): string {
   return buildWebSocketUrl("/ws/servers");
 }
-
-function numberOrNull(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-function roundCoordinate(value: number): string {
-  return value.toFixed(3);
-}
-
-function projectLonLat(longitude: number, latitude: number): { x: number; y: number } {
-  return {
-    x: Math.max(24, Math.min(876, ((longitude + 180) / 360) * 900)),
-    y: Math.max(24, Math.min(396, ((90 - latitude) / 180) * 420)),
-  };
-}
-
-function locationLabel(location: ServerLocation | null, server: Server, fallback?: string): string {
-  return [location?.country ?? server.country, location?.region ?? server.region, location?.city ?? server.city]
-    .filter(Boolean)
-    .join(" / ") || fallback || server.region || server.name;
-}
-
-function centroidForLocation(location: ServerLocation | null, server: Server): LocationCentroid | null {
-  const keys = [
-    location?.country,
-    server.country,
-    location?.region,
-    server.region,
-    location?.city,
-    server.city,
-  ];
-  for (const value of keys) {
-    const key = normalizeLocationKey(value);
-    if (key && locationCentroids[key]) return locationCentroids[key];
-  }
-  return null;
-}
-
-function normalizeLocationKey(value?: string | null): string {
-  return String(value ?? "")
-    .trim()
-    .toLowerCase()
-    .replace(/[\s_.]+/g, "-");
-}
-
-interface LocationCentroid {
-  key: string;
-  label: string;
-  x: number;
-  y: number;
-}
-
-const centroidSeeds = [
-  ["us", "美国", -98.58, 39.83],
-  ["united-states", "美国", -98.58, 39.83],
-  ["美国", "美国", -98.58, 39.83],
-  ["ca", "加拿大", -106.35, 56.13],
-  ["canada", "加拿大", -106.35, 56.13],
-  ["加拿大", "加拿大", -106.35, 56.13],
-  ["br", "巴西", -51.93, -14.24],
-  ["brazil", "巴西", -51.93, -14.24],
-  ["gb", "英国", -3.44, 55.38],
-  ["uk", "英国", -3.44, 55.38],
-  ["united-kingdom", "英国", -3.44, 55.38],
-  ["de", "德国", 10.45, 51.17],
-  ["germany", "德国", 10.45, 51.17],
-  ["fr", "法国", 2.21, 46.23],
-  ["france", "法国", 2.21, 46.23],
-  ["nl", "荷兰", 5.29, 52.13],
-  ["netherlands", "荷兰", 5.29, 52.13],
-  ["ru", "俄罗斯", 105.32, 61.52],
-  ["russia", "俄罗斯", 105.32, 61.52],
-  ["tr", "土耳其", 35.24, 38.96],
-  ["turkey", "土耳其", 35.24, 38.96],
-  ["ae", "阿联酋", 53.85, 23.42],
-  ["uae", "阿联酋", 53.85, 23.42],
-  ["in", "印度", 78.96, 20.59],
-  ["india", "印度", 78.96, 20.59],
-  ["sg", "新加坡", 103.82, 1.35],
-  ["singapore", "新加坡", 103.82, 1.35],
-  ["新加坡", "新加坡", 103.82, 1.35],
-  ["hk", "香港", 114.17, 22.32],
-  ["hong-kong", "香港", 114.17, 22.32],
-  ["香港", "香港", 114.17, 22.32],
-  ["cn", "中国大陆", 104.2, 35.86],
-  ["china", "中国大陆", 104.2, 35.86],
-  ["中国", "中国大陆", 104.2, 35.86],
-  ["tw", "台湾", 120.96, 23.7],
-  ["taiwan", "台湾", 120.96, 23.7],
-  ["台湾", "台湾", 120.96, 23.7],
-  ["jp", "日本", 138.25, 36.2],
-  ["japan", "日本", 138.25, 36.2],
-  ["日本", "日本", 138.25, 36.2],
-  ["kr", "韩国", 127.77, 35.91],
-  ["korea", "韩国", 127.77, 35.91],
-  ["south-korea", "韩国", 127.77, 35.91],
-  ["au", "澳大利亚", 133.78, -25.27],
-  ["australia", "澳大利亚", 133.78, -25.27],
-  ["za", "南非", 22.94, -30.56],
-  ["south-africa", "南非", 22.94, -30.56],
-] as const;
-
-const locationCentroids: Record<string, LocationCentroid> = Object.fromEntries(
-  centroidSeeds.map(([key, label, longitude, latitude]) => {
-    const projected = projectLonLat(longitude, latitude);
-    return [normalizeLocationKey(key), { key: normalizeLocationKey(key), label, ...projected }];
-  }),
-);
