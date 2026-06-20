@@ -159,7 +159,7 @@ export function WorldServerMap<TServer extends MapServerLike>({
             <g>
               {pointBuckets.map((bucket) => {
                 const [x, y] = projectPoint(bucket.point.longitude, bucket.point.latitude);
-                const radius = 5 + Math.min(13, (bucket.servers.length / maxCount) * 10);
+                const blockSize = 7 + Math.min(7, (bucket.servers.length / maxCount) * 5);
                 return (
                   <g
                     key={bucket.point.key}
@@ -174,11 +174,20 @@ export function WorldServerMap<TServer extends MapServerLike>({
                       })
                     }
                   >
-                    <circle cx={x} cy={y} r={radius + 8} fill="var(--accent-color)" opacity="0.16" />
-                    <circle cx={x} cy={y} r={radius} fill="var(--accent-color)" stroke="var(--border-color)" strokeWidth="3" />
-                    <text x={x} y={y + 4} textAnchor="middle" fill="var(--btn-text)" fontSize="11" fontWeight="900">
-                      {bucket.servers.length}
-                    </text>
+                    <path
+                      d={regionBlockPath(x, y, blockSize)}
+                      fill="var(--accent-color)"
+                      fillOpacity="0.9"
+                      stroke="var(--border-color)"
+                      strokeWidth="2.5"
+                      filter="url(#world-map-shadow)"
+                    />
+                    <path
+                      d={regionBlockPath(x, y, Math.max(3.5, blockSize - 4))}
+                      fill="var(--btn-text)"
+                      fillOpacity="0.18"
+                      pointerEvents="none"
+                    />
                   </g>
                 );
               })}
@@ -365,6 +374,10 @@ function serverLocationPoint(server: MapServerLike): RegionPoint | null {
 
 function projectPoint(longitude: number, latitude: number): [number, number] {
   return projection([longitude, latitude]) ?? [width / 2, height / 2];
+}
+
+function regionBlockPath(x: number, y: number, size: number): string {
+  return `M ${x} ${y - size} L ${x + size} ${y} L ${x} ${y + size} L ${x - size} ${y} Z`;
 }
 
 function numberOrNull(value: unknown): number | null {
