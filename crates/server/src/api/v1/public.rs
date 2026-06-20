@@ -1,5 +1,6 @@
 use crate::api::types::ApiResponse;
 use crate::api::v1::auth::{AppError, AppState};
+use crate::api::v1::geoip::{lookup_agent_geo_location, AgentGeoLocation};
 use crate::api::v1::settings::{public_site_branding, PublicSiteBranding};
 use crate::api::v1::themes::{selected_public_theme, ThemeDefinition};
 use crate::db::{AgentRepository, DatabaseBackend};
@@ -48,6 +49,11 @@ pub struct PublicServerView {
     pub traffic_quota_type: Option<String>,
     pub provider: Option<String>,
     pub region: Option<String>,
+    pub country: Option<String>,
+    pub city: Option<String>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub location: Option<PublicServerLocationView>,
     pub plan: Option<String>,
     pub tags: Vec<String>,
     pub accent_color: Option<String>,
@@ -80,6 +86,11 @@ pub struct PublicServerDetailView {
     pub traffic_quota_type: Option<String>,
     pub provider: Option<String>,
     pub region: Option<String>,
+    pub country: Option<String>,
+    pub city: Option<String>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub location: Option<PublicServerLocationView>,
     pub plan: Option<String>,
     pub tags: Vec<String>,
     pub accent_color: Option<String>,
@@ -130,6 +141,18 @@ pub struct PublicServiceResultView {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct PublicServerLocationView {
+    pub source: String,
+    pub provider: Option<String>,
+    pub country: Option<String>,
+    pub region: Option<String>,
+    pub city: Option<String>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub timezone: Option<String>,
+}
+
 pub async fn public_status(
     State(state): State<AppState>,
 ) -> Result<Json<ApiResponse<PublicStatusResponse>>, AppError> {
@@ -171,6 +194,10 @@ pub async fn public_server_detail(
     let agent = row.agent;
     let public_note =
         public_note_from_metadata(&dashboard, &[last_info.as_ref(), last_state.as_ref()]);
+    let location = public_server_location_view(
+        &dashboard,
+        lookup_agent_geo_location(&state.db, agent.id).await,
+    );
     Ok(Json(ApiResponse::success(PublicServerDetailView {
         id: agent.id.0.to_string(),
         name: agent.name,
@@ -202,6 +229,11 @@ pub async fn public_server_detail(
         traffic_quota_type: dashboard.traffic_quota_type,
         provider: dashboard.provider,
         region: dashboard.region,
+        country: location.as_ref().and_then(|item| item.country.clone()),
+        city: location.as_ref().and_then(|item| item.city.clone()),
+        latitude: location.as_ref().and_then(|item| item.latitude),
+        longitude: location.as_ref().and_then(|item| item.longitude),
+        location,
         plan: dashboard.plan,
         tags: dashboard.tags,
         accent_color: dashboard.accent_color,
@@ -309,88 +341,96 @@ async fn public_servers(state: &AppState) -> Result<Vec<PublicServerView>, AppEr
     let agent_repo = AgentRepository::new(state.db.clone());
     let (rows, _) = agent_repo.list_with_state(100, 0).await?;
 
-    Ok(rows
-        .into_iter()
-        .filter_map(|row| {
-            let agent = row.agent;
-            let parsed = parse_json(row.last_state_json.as_deref());
-            let parsed_info = parse_json(row.last_info_json.as_deref());
-            let dashboard = dashboard_metadata(
-                row.dashboard_metadata_json.as_deref(),
-                &[parsed_info.as_ref(), parsed.as_ref()],
-            );
-            if hidden_from_public(&dashboard) {
-                return None;
-            }
-            let public_note =
-                public_note_from_metadata(&dashboard, &[parsed_info.as_ref(), parsed.as_ref()]);
+    let mut servers = Vec::new();
+    for row in rows.into_iter() {
+        let agent = row.agent;
+        let parsed = parse_json(row.last_state_json.as_deref());
+        let parsed_info = parse_json(row.last_info_json.as_deref());
+        let dashboard = dashboard_metadata(
+            row.dashboard_metadata_json.as_deref(),
+            &[parsed_info.as_ref(), parsed.as_ref()],
+        );
+        if hidden_from_public(&dashboard) {
+            continue;
+        }
+        let public_note =
+            public_note_from_metadata(&dashboard, &[parsed_info.as_ref(), parsed.as_ref()]);
+        let location = public_server_location_view(
+            &dashboard,
+            lookup_agent_geo_location(&state.db, agent.id).await,
+        );
 
-            Some(PublicServerView {
-                id: agent.id.0.to_string(),
-                name: agent.name,
-                remark: public_note.clone(),
-                public_note,
-                expires_at: row.expires_at.or_else(|| {
-                    metadata_string(
-                        &[parsed_info.as_ref(), parsed.as_ref()],
-                        &["expires_at", "expired_at", "expire_at", "due_at", "end_at"],
-                    )
-                }),
-                renewal_price: row.renewal_price.or_else(|| {
-                    metadata_string(
-                        &[parsed_info.as_ref(), parsed.as_ref()],
-                        &[
-                            "renewal_price",
-                            "renew_price",
-                            "renewal",
-                            "price",
-                            "billing_price",
-                        ],
-                    )
-                }),
-                price: dashboard.price,
-                currency: dashboard.currency,
-                billing_cycle: dashboard.billing_cycle,
-                auto_renew: dashboard.auto_renew,
-                traffic_quota_bytes: dashboard.traffic_quota_bytes,
-                traffic_quota_type: dashboard.traffic_quota_type,
-                provider: dashboard.provider,
-                region: dashboard.region,
-                plan: dashboard.plan,
-                tags: dashboard.tags,
-                accent_color: dashboard.accent_color,
-                status: server_status(agent.last_seen_at, agent.revoked_at).to_string(),
-                last_seen_at: agent.last_seen_at.map(|t| t.to_rfc3339()),
-                cpu_percent: parsed
-                    .as_ref()
-                    .and_then(|v| v.get("cpu_percent"))
-                    .and_then(|v| v.as_f64()),
-                memory_used: parsed
-                    .as_ref()
-                    .and_then(|v| v.get("memory_used"))
-                    .and_then(|v| v.as_i64()),
-                memory_total: parsed
-                    .as_ref()
-                    .and_then(|v| v.get("memory_total"))
-                    .and_then(|v| v.as_i64()),
-                load_1: parsed
-                    .as_ref()
-                    .and_then(|v| v.get("load_1"))
-                    .and_then(|v| v.as_f64()),
-                net_rx_bps: parsed
-                    .as_ref()
-                    .and_then(|v| json_i64_by_keys(v, &["net_rx_bps", "network_in_speed"])),
-                net_tx_bps: parsed
-                    .as_ref()
-                    .and_then(|v| json_i64_by_keys(v, &["net_tx_bps", "network_out_speed"])),
-                network_in_total: parsed.as_ref().and_then(|v| network_total(v, "bytes_recv")),
-                network_out_total: parsed.as_ref().and_then(|v| network_total(v, "bytes_sent")),
-                uptime_seconds: parsed
-                    .as_ref()
-                    .and_then(|v| json_i64_by_keys(v, &["uptime_seconds", "uptime"])),
-            })
-        })
-        .collect())
+        servers.push(PublicServerView {
+            id: agent.id.0.to_string(),
+            name: agent.name,
+            remark: public_note.clone(),
+            public_note,
+            expires_at: row.expires_at.or_else(|| {
+                metadata_string(
+                    &[parsed_info.as_ref(), parsed.as_ref()],
+                    &["expires_at", "expired_at", "expire_at", "due_at", "end_at"],
+                )
+            }),
+            renewal_price: row.renewal_price.or_else(|| {
+                metadata_string(
+                    &[parsed_info.as_ref(), parsed.as_ref()],
+                    &[
+                        "renewal_price",
+                        "renew_price",
+                        "renewal",
+                        "price",
+                        "billing_price",
+                    ],
+                )
+            }),
+            price: dashboard.price,
+            currency: dashboard.currency,
+            billing_cycle: dashboard.billing_cycle,
+            auto_renew: dashboard.auto_renew,
+            traffic_quota_bytes: dashboard.traffic_quota_bytes,
+            traffic_quota_type: dashboard.traffic_quota_type,
+            provider: dashboard.provider,
+            region: dashboard.region,
+            country: location.as_ref().and_then(|item| item.country.clone()),
+            city: location.as_ref().and_then(|item| item.city.clone()),
+            latitude: location.as_ref().and_then(|item| item.latitude),
+            longitude: location.as_ref().and_then(|item| item.longitude),
+            location,
+            plan: dashboard.plan,
+            tags: dashboard.tags,
+            accent_color: dashboard.accent_color,
+            status: server_status(agent.last_seen_at, agent.revoked_at).to_string(),
+            last_seen_at: agent.last_seen_at.map(|t| t.to_rfc3339()),
+            cpu_percent: parsed
+                .as_ref()
+                .and_then(|v| v.get("cpu_percent"))
+                .and_then(|v| v.as_f64()),
+            memory_used: parsed
+                .as_ref()
+                .and_then(|v| v.get("memory_used"))
+                .and_then(|v| v.as_i64()),
+            memory_total: parsed
+                .as_ref()
+                .and_then(|v| v.get("memory_total"))
+                .and_then(|v| v.as_i64()),
+            load_1: parsed
+                .as_ref()
+                .and_then(|v| v.get("load_1"))
+                .and_then(|v| v.as_f64()),
+            net_rx_bps: parsed
+                .as_ref()
+                .and_then(|v| json_i64_by_keys(v, &["net_rx_bps", "network_in_speed"])),
+            net_tx_bps: parsed
+                .as_ref()
+                .and_then(|v| json_i64_by_keys(v, &["net_tx_bps", "network_out_speed"])),
+            network_in_total: parsed.as_ref().and_then(|v| network_total(v, "bytes_recv")),
+            network_out_total: parsed.as_ref().and_then(|v| network_total(v, "bytes_sent")),
+            uptime_seconds: parsed
+                .as_ref()
+                .and_then(|v| json_i64_by_keys(v, &["uptime_seconds", "uptime"])),
+        });
+    }
+    Ok(servers)
 }
 
 async fn ensure_public_site_enabled(state: &AppState) -> Result<(), AppError> {
@@ -1050,6 +1090,10 @@ struct DashboardMetadata {
     public_note: Option<String>,
     provider: Option<String>,
     region: Option<String>,
+    country: Option<String>,
+    city: Option<String>,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
     plan: Option<String>,
     price: Option<String>,
     currency: Option<String>,
@@ -1097,7 +1141,28 @@ fn dashboard_metadata(
         );
     }
     if out.region.is_none() {
-        out.region = metadata_string(fallback_sources, &["region", "location", "country", "city"]);
+        out.region = metadata_string(
+            fallback_sources,
+            &["region", "geo_region", "state", "province", "location"],
+        );
+    }
+    if out.country.is_none() {
+        out.country = metadata_string(
+            fallback_sources,
+            &["country", "geo_country", "country_name"],
+        );
+    }
+    if out.city.is_none() {
+        out.city = metadata_string(fallback_sources, &["city", "geo_city"]);
+    }
+    if out.latitude.is_none() {
+        out.latitude = metadata_f64(fallback_sources, &["latitude", "lat", "geo_latitude"]);
+    }
+    if out.longitude.is_none() {
+        out.longitude = metadata_f64(
+            fallback_sources,
+            &["longitude", "lon", "lng", "geo_longitude"],
+        );
     }
     if out.plan.is_none() {
         out.plan = metadata_string(
@@ -1152,6 +1217,40 @@ fn dashboard_metadata(
     }
     out.tags = normalize_tags(out.tags);
     out
+}
+
+fn public_server_location_view(
+    dashboard: &DashboardMetadata,
+    geoip: Option<AgentGeoLocation>,
+) -> Option<PublicServerLocationView> {
+    let manual_has_location = dashboard.country.is_some()
+        || dashboard.region.is_some()
+        || dashboard.city.is_some()
+        || dashboard.latitude.is_some()
+        || dashboard.longitude.is_some();
+    if manual_has_location {
+        return Some(PublicServerLocationView {
+            source: "manual".into(),
+            provider: None,
+            country: dashboard.country.clone(),
+            region: dashboard.region.clone(),
+            city: dashboard.city.clone(),
+            latitude: dashboard.latitude,
+            longitude: dashboard.longitude,
+            timezone: None,
+        });
+    }
+
+    geoip.map(|location| PublicServerLocationView {
+        source: location.source,
+        provider: Some(location.provider),
+        country: location.country,
+        region: location.region,
+        city: location.city,
+        latitude: location.latitude,
+        longitude: location.longitude,
+        timezone: location.timezone,
+    })
 }
 
 fn metadata_string(sources: &[Option<&serde_json::Value>], keys: &[&str]) -> Option<String> {
@@ -1210,6 +1309,40 @@ fn metadata_i64_from_value(value: &serde_json::Value, keys: &[&str]) -> Option<i
     }
 
     None
+}
+
+fn metadata_f64(sources: &[Option<&serde_json::Value>], keys: &[&str]) -> Option<f64> {
+    for source in sources.iter().flatten() {
+        if let Some(value) = metadata_f64_from_value(source, keys) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn metadata_f64_from_value(value: &serde_json::Value, keys: &[&str]) -> Option<f64> {
+    for key in keys {
+        if let Some(value) = value.get(*key).and_then(json_f64) {
+            return Some(value);
+        }
+    }
+
+    for container in ["geo", "location", "metadata", "custom", "network"] {
+        if let Some(child) = value.get(container) {
+            for key in keys {
+                if let Some(value) = child.get(*key).and_then(json_f64) {
+                    return Some(value);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn json_f64(value: &serde_json::Value) -> Option<f64> {
+    let value = value.as_f64().or_else(|| value.as_str()?.parse().ok())?;
+    value.is_finite().then_some(value)
 }
 
 fn metadata_tags(sources: &[Option<&serde_json::Value>]) -> Vec<String> {

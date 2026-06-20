@@ -22,8 +22,15 @@ pub struct ThemeDefinition {
     pub name: String,
     pub description: Option<String>,
     pub target: String,
+    #[serde(default)]
     pub variables: HashMap<String, String>,
+    #[serde(default)]
+    pub light_variables: HashMap<String, String>,
+    #[serde(default)]
+    pub dark_variables: HashMap<String, String>,
     pub custom_css: Option<String>,
+    pub light_custom_css: Option<String>,
+    pub dark_custom_css: Option<String>,
     pub builtin: bool,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
@@ -47,7 +54,11 @@ pub struct UpdateThemeRequest {
     pub description: Option<Option<String>>,
     pub target: Option<String>,
     pub variables: Option<HashMap<String, String>>,
+    pub light_variables: Option<HashMap<String, String>>,
+    pub dark_variables: Option<HashMap<String, String>>,
     pub custom_css: Option<Option<String>>,
+    pub light_custom_css: Option<Option<String>>,
+    pub dark_custom_css: Option<Option<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,7 +74,13 @@ pub struct ThemeDefinitionInput {
     pub target: Option<String>,
     #[serde(default)]
     pub variables: HashMap<String, String>,
+    #[serde(default)]
+    pub light_variables: HashMap<String, String>,
+    #[serde(default)]
+    pub dark_variables: HashMap<String, String>,
     pub custom_css: Option<String>,
+    pub light_custom_css: Option<String>,
+    pub dark_custom_css: Option<String>,
 }
 
 pub async fn list_themes(
@@ -117,8 +134,20 @@ pub async fn update_theme(
     if let Some(variables) = req.variables {
         theme.variables = normalize_theme_variables(variables)?;
     }
+    if let Some(variables) = req.light_variables {
+        theme.light_variables = normalize_theme_variables(variables)?;
+    }
+    if let Some(variables) = req.dark_variables {
+        theme.dark_variables = normalize_theme_variables(variables)?;
+    }
     if let Some(custom_css) = req.custom_css {
         theme.custom_css = normalize_optional_text(custom_css, 10_000, "custom_css")?;
+    }
+    if let Some(custom_css) = req.light_custom_css {
+        theme.light_custom_css = normalize_optional_text(custom_css, 10_000, "light_custom_css")?;
+    }
+    if let Some(custom_css) = req.dark_custom_css {
+        theme.dark_custom_css = normalize_optional_text(custom_css, 10_000, "dark_custom_css")?;
     }
     theme.updated_at = Some(Utc::now().to_rfc3339());
     let updated = theme.clone();
@@ -236,12 +265,36 @@ fn builtin_themes() -> Vec<ThemeDefinition> {
                 ("--btn-text", "#ffffff"),
                 ("--dot-color", "#e5e7eb"),
             ],
+            [
+                ("--bg-page", "#161318"),
+                ("--bg-card", "#231923"),
+                ("--text-main", "#fff7fb"),
+                ("--text-muted", "#d8b4c4"),
+                ("--border-color", "#f472b6"),
+                ("--accent-color", "#f472b6"),
+                ("--accent-bg", "#4a1934"),
+                ("--btn-bg", "#f472b6"),
+                ("--btn-text", "#180b12"),
+                ("--dot-color", "#5b2b43"),
+            ],
         ),
         builtin_theme_def(
             "midnight-green",
             "Midnight Green",
             "Dark operations console",
             "both",
+            [
+                ("--bg-page", "#f4fbf7"),
+                ("--bg-card", "#ffffff"),
+                ("--text-main", "#08231b"),
+                ("--text-muted", "#3f6658"),
+                ("--border-color", "#064e3b"),
+                ("--accent-color", "#059669"),
+                ("--accent-bg", "#d1fae5"),
+                ("--btn-bg", "#064e3b"),
+                ("--btn-text", "#ffffff"),
+                ("--dot-color", "#a7f3d0"),
+            ],
             [
                 ("--bg-page", "#121212"),
                 ("--bg-card", "#1e1e1e"),
@@ -272,6 +325,18 @@ fn builtin_themes() -> Vec<ThemeDefinition> {
                 ("--btn-text", "#ffffff"),
                 ("--dot-color", "#cbd5e1"),
             ],
+            [
+                ("--bg-page", "#0b1220"),
+                ("--bg-card", "#111827"),
+                ("--text-main", "#e5f0ff"),
+                ("--text-muted", "#9fb5d1"),
+                ("--border-color", "#60a5fa"),
+                ("--accent-color", "#60a5fa"),
+                ("--accent-bg", "#172554"),
+                ("--btn-bg", "#93c5fd"),
+                ("--btn-text", "#082f49"),
+                ("--dot-color", "#1e3a8a"),
+            ],
         ),
     ]
 }
@@ -285,35 +350,62 @@ fn builtin_theme_def<const N: usize>(
     name: &str,
     description: &str,
     target: &str,
-    variables: [(&str, &str); N],
+    light_variables: [(&str, &str); N],
+    dark_variables: [(&str, &str); N],
 ) -> ThemeDefinition {
+    let light_variables = theme_map(light_variables);
+    let dark_variables = theme_map(dark_variables);
     ThemeDefinition {
         id: id.to_string(),
         name: name.to_string(),
         description: Some(description.to_string()),
         target: target.to_string(),
-        variables: variables
-            .into_iter()
-            .map(|(key, value)| (key.to_string(), value.to_string()))
-            .collect(),
+        variables: light_variables.clone(),
+        light_variables,
+        dark_variables,
         custom_css: None,
+        light_custom_css: None,
+        dark_custom_css: None,
         builtin: true,
         created_at: None,
         updated_at: None,
     }
 }
 
+fn theme_map<const N: usize>(variables: [(&str, &str); N]) -> HashMap<String, String> {
+    variables
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
+
 fn normalize_theme_input(
     input: ThemeDefinitionInput,
     builtin: bool,
 ) -> Result<ThemeDefinition, AppError> {
+    let variables = normalize_theme_variables(input.variables)?;
+    let light_variables = if input.light_variables.is_empty() {
+        variables.clone()
+    } else {
+        normalize_theme_variables(input.light_variables)?
+    };
+    let dark_variables = normalize_theme_variables(input.dark_variables)?;
+
     Ok(ThemeDefinition {
         id: normalize_theme_id(&input.id)?,
         name: normalize_name(&input.name, "name")?,
         description: normalize_optional_text(input.description, 500, "description")?,
         target: normalize_target(input.target.as_deref().unwrap_or("both"))?,
-        variables: normalize_theme_variables(input.variables)?,
+        variables,
+        light_variables,
+        dark_variables,
         custom_css: normalize_optional_text(input.custom_css, 10_000, "custom_css")?,
+        light_custom_css: normalize_optional_text(
+            input.light_custom_css,
+            10_000,
+            "light_custom_css",
+        )?,
+        dark_custom_css: normalize_optional_text(input.dark_custom_css, 10_000, "dark_custom_css")?,
         builtin,
         created_at: None,
         updated_at: None,

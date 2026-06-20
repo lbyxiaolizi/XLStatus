@@ -12,6 +12,7 @@
 
 use crate::api::types::ApiResponse;
 use crate::api::v1::auth::{require_sensitive_totp, AppError, AppState};
+use crate::api::v1::geoip::{lookup_agent_geo_location, AgentGeoLocation};
 use crate::auth::middleware::AuthSession;
 use crate::auth::rbac::has_scope;
 use crate::db::{AgentRepository, DatabaseBackend, UserRepository};
@@ -62,6 +63,11 @@ pub struct ServerView {
     pub traffic_quota_type: Option<String>,
     pub provider: Option<String>,
     pub region: Option<String>,
+    pub country: Option<String>,
+    pub city: Option<String>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub location: Option<ServerLocationView>,
     pub plan: Option<String>,
     pub tags: Vec<String>,
     pub accent_color: Option<String>,
@@ -85,6 +91,18 @@ pub struct ServerView {
 pub struct ListServersResponse {
     pub servers: Vec<ServerView>,
     pub total: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ServerLocationView {
+    pub source: String,
+    pub provider: Option<String>,
+    pub country: Option<String>,
+    pub region: Option<String>,
+    pub city: Option<String>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub timezone: Option<String>,
 }
 
 pub async fn list_servers(
@@ -131,6 +149,10 @@ pub async fn list_servers(
             &[parsed_info.as_ref(), parsed.as_ref()],
         );
         let network_rates = network_rates_from_store(&state.metrics, agent.id.0);
+        let location = server_location_view(
+            &dashboard,
+            lookup_agent_geo_location(&state.db, agent.id).await,
+        );
         servers.push(ServerView {
             id: agent.id.0.to_string(),
             name: agent.name,
@@ -167,6 +189,11 @@ pub async fn list_servers(
             traffic_quota_type: dashboard.traffic_quota_type.clone(),
             provider: dashboard.provider,
             region: dashboard.region,
+            country: location.as_ref().and_then(|item| item.country.clone()),
+            city: location.as_ref().and_then(|item| item.city.clone()),
+            latitude: location.as_ref().and_then(|item| item.latitude),
+            longitude: location.as_ref().and_then(|item| item.longitude),
+            location,
             plan: dashboard.plan,
             tags: dashboard.tags,
             accent_color: dashboard.accent_color,
@@ -228,6 +255,11 @@ pub struct ServerDetailResponse {
     pub traffic_quota_type: Option<String>,
     pub provider: Option<String>,
     pub region: Option<String>,
+    pub country: Option<String>,
+    pub city: Option<String>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub location: Option<ServerLocationView>,
     pub plan: Option<String>,
     pub tags: Vec<String>,
     pub accent_color: Option<String>,
@@ -282,6 +314,10 @@ pub async fn get_server(
         row.dashboard_metadata_json.as_deref(),
         &[last_info.as_ref(), last_state.as_ref()],
     );
+    let location = server_location_view(
+        &dashboard,
+        lookup_agent_geo_location(&state.db, agent.id).await,
+    );
     Ok(Json(ApiResponse::success(ServerDetailResponse {
         id: agent.id.0.to_string(),
         name: agent.name,
@@ -318,6 +354,11 @@ pub async fn get_server(
         traffic_quota_type: dashboard.traffic_quota_type.clone(),
         provider: dashboard.provider,
         region: dashboard.region,
+        country: location.as_ref().and_then(|item| item.country.clone()),
+        city: location.as_ref().and_then(|item| item.city.clone()),
+        latitude: location.as_ref().and_then(|item| item.latitude),
+        longitude: location.as_ref().and_then(|item| item.longitude),
+        location,
         plan: dashboard.plan,
         tags: dashboard.tags,
         accent_color: dashboard.accent_color,
@@ -346,6 +387,10 @@ pub struct UpdateServerRequest {
     pub traffic_quota_type: Option<String>,
     pub provider: Option<String>,
     pub region: Option<String>,
+    pub country: Option<String>,
+    pub city: Option<String>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
     pub plan: Option<String>,
     #[serde(default)]
     pub tags: Option<Vec<String>>,
@@ -475,6 +520,10 @@ struct DashboardMetadata {
     public_note: Option<String>,
     provider: Option<String>,
     region: Option<String>,
+    country: Option<String>,
+    city: Option<String>,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
     plan: Option<String>,
     price: Option<String>,
     currency: Option<String>,
@@ -524,6 +573,10 @@ pub async fn update_server(
         public_note: normalize_optional_label(req.public_note),
         provider: normalize_optional_label(req.provider),
         region: normalize_optional_label(req.region),
+        country: normalize_optional_label(req.country),
+        city: normalize_optional_label(req.city),
+        latitude: normalize_optional_coordinate(req.latitude, "latitude", -90.0, 90.0)?,
+        longitude: normalize_optional_coordinate(req.longitude, "longitude", -180.0, 180.0)?,
         plan: normalize_optional_label(req.plan),
         price: normalize_optional_label(req.price),
         currency: normalize_optional_label(req.currency),
@@ -2403,6 +2456,11 @@ pub fn build_server_view(
         traffic_quota_type: None,
         provider: None,
         region: None,
+        country: None,
+        city: None,
+        latitude: None,
+        longitude: None,
+        location: None,
         plan: None,
         tags: Vec::new(),
         accent_color: None,
@@ -2571,6 +2629,39 @@ fn metadata_i64_from_value(value: &serde_json::Value, keys: &[&str]) -> Option<i
 
     None
 }
+fn metadata_f64(sources: &[Option<&serde_json::Value>], keys: &[&str]) -> Option<f64> {
+    for source in sources.iter().flatten() {
+        if let Some(value) = metadata_f64_from_value(source, keys) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn metadata_f64_from_value(value: &serde_json::Value, keys: &[&str]) -> Option<f64> {
+    for key in keys {
+        if let Some(value) = value.get(*key).and_then(json_f64) {
+            return Some(value);
+        }
+    }
+
+    for container in ["geo", "location", "metadata", "custom", "network"] {
+        if let Some(child) = value.get(container) {
+            for key in keys {
+                if let Some(value) = child.get(*key).and_then(json_f64) {
+                    return Some(value);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn json_f64(value: &serde_json::Value) -> Option<f64> {
+    let value = value.as_f64().or_else(|| value.as_str()?.parse().ok())?;
+    value.is_finite().then_some(value)
+}
 
 fn json_label(value: &serde_json::Value) -> Option<String> {
     match value {
@@ -2588,6 +2679,55 @@ fn normalize_optional_label(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn normalize_optional_coordinate(
+    value: Option<f64>,
+    field: &str,
+    min: f64,
+    max: f64,
+) -> Result<Option<f64>, AppError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if !value.is_finite() || value < min || value > max {
+        return Err(AppError::BadRequest(format!("{field} is invalid")));
+    }
+    Ok(Some((value * 1_000_000.0).round() / 1_000_000.0))
+}
+
+fn server_location_view(
+    dashboard: &DashboardMetadata,
+    geoip: Option<AgentGeoLocation>,
+) -> Option<ServerLocationView> {
+    let manual_has_location = dashboard.country.is_some()
+        || dashboard.region.is_some()
+        || dashboard.city.is_some()
+        || dashboard.latitude.is_some()
+        || dashboard.longitude.is_some();
+    if manual_has_location {
+        return Some(ServerLocationView {
+            source: "manual".into(),
+            provider: None,
+            country: dashboard.country.clone(),
+            region: dashboard.region.clone(),
+            city: dashboard.city.clone(),
+            latitude: dashboard.latitude,
+            longitude: dashboard.longitude,
+            timezone: None,
+        });
+    }
+
+    geoip.map(|location| ServerLocationView {
+        source: location.source,
+        provider: Some(location.provider),
+        country: location.country,
+        region: location.region,
+        city: location.city,
+        latitude: location.latitude,
+        longitude: location.longitude,
+        timezone: location.timezone,
+    })
 }
 
 fn dashboard_metadata(
@@ -2608,7 +2748,28 @@ fn dashboard_metadata(
         );
     }
     if out.region.is_none() {
-        out.region = metadata_string(fallback_sources, &["region", "location", "country", "city"]);
+        out.region = metadata_string(
+            fallback_sources,
+            &["region", "geo_region", "state", "province", "location"],
+        );
+    }
+    if out.country.is_none() {
+        out.country = metadata_string(
+            fallback_sources,
+            &["country", "geo_country", "country_name"],
+        );
+    }
+    if out.city.is_none() {
+        out.city = metadata_string(fallback_sources, &["city", "geo_city"]);
+    }
+    if out.latitude.is_none() {
+        out.latitude = metadata_f64(fallback_sources, &["latitude", "lat", "geo_latitude"]);
+    }
+    if out.longitude.is_none() {
+        out.longitude = metadata_f64(
+            fallback_sources,
+            &["longitude", "lon", "lng", "geo_longitude"],
+        );
     }
     if out.plan.is_none() {
         out.plan = metadata_string(

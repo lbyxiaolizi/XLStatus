@@ -45,6 +45,7 @@ export default function Navigation() {
   const user = useStoredUser();
   const { locale, locales, setLocale, t: copy } = useI18n();
   const [theme, setTheme] = useBoldTheme();
+  const [dashboardTheme, setDashboardTheme] = useState<ThemeDefinition | null>(null);
   const [open, setOpen] = useState(false);
   const [commandOpen, setCommandOpen] = useState(false);
   const [commandQuery, setCommandQuery] = useState("");
@@ -125,13 +126,19 @@ export default function Navigation() {
         const selected = response.data.themes.find(
           (item) => item.id === response.data?.selected_dashboard_theme_id,
         );
-        applyDashboardTheme(selected ?? null);
+        const nextTheme = selected ?? null;
+        setDashboardTheme(nextTheme);
+        applyDashboardTheme(nextTheme);
       }
     });
     return () => {
       cancelled = true;
     };
   }, [user]);
+
+  useEffect(() => {
+    applyDashboardTheme(dashboardTheme);
+  }, [dashboardTheme, theme]);
 
   const commandItems = useMemo(
     () => buildCommandItems(visibleNavigation, commandServers, commandQuery, copy),
@@ -524,6 +531,7 @@ function applyDashboardTheme(theme: ThemeDefinition | null) {
   if (typeof document === "undefined") return;
   const root = document.documentElement;
   const body = document.body;
+  root.dataset.xlstatusDashboardThemeId = theme?.id ?? "";
   const previousKeys = (root.dataset.xlstatusDashboardThemeVars || "")
     .split(",")
     .map((key) => key.trim())
@@ -538,8 +546,10 @@ function applyDashboardTheme(theme: ThemeDefinition | null) {
   document.getElementById(styleId)?.remove();
 
   if (!theme) return;
+  const isDark = root.classList.contains("dark-mode");
+  const activeVariables = themeVariablesForMode(theme, isDark);
   const nextKeys: string[] = [];
-  for (const [key, value] of Object.entries(theme.variables ?? {})) {
+  for (const [key, value] of Object.entries(activeVariables)) {
     if (!key.startsWith("--") || !value) continue;
     root.style.setProperty(key, value);
     body?.style.setProperty(key, value);
@@ -547,12 +557,24 @@ function applyDashboardTheme(theme: ThemeDefinition | null) {
   }
   root.dataset.xlstatusDashboardThemeVars = nextKeys.join(",");
 
-  if (theme.custom_css) {
+  if (theme.custom_css || theme.light_custom_css || theme.dark_custom_css) {
     const style = document.createElement("style");
     style.id = styleId;
-    style.textContent = theme.custom_css;
+    style.textContent = [
+      theme.custom_css,
+      isDark ? theme.dark_custom_css : theme.light_custom_css,
+    ]
+      .filter(Boolean)
+      .join("\n");
     document.head.appendChild(style);
   }
+}
+
+function themeVariablesForMode(theme: ThemeDefinition, isDark: boolean): Record<string, string> {
+  const base = theme.variables ?? {};
+  const light = Object.keys(theme.light_variables ?? {}).length ? theme.light_variables ?? {} : base;
+  const dark = Object.keys(theme.dark_variables ?? {}).length ? theme.dark_variables ?? {} : light;
+  return isDark ? { ...base, ...dark } : { ...base, ...light };
 }
 
 function NavLink({

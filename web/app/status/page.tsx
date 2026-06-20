@@ -29,6 +29,11 @@ interface Server {
   remark?: string | null;
   provider?: string | null;
   region?: string | null;
+  country?: string | null;
+  city?: string | null;
+  latitude?: number | null;
+  longitude?: number | null;
+  location?: ServerLocation | null;
   plan?: string | null;
   tags?: string[];
   accent_color?: string | null;
@@ -43,6 +48,17 @@ interface Server {
   network_out_total?: number | null;
   uptime_seconds?: number | null;
   last_seen_at?: string;
+}
+
+interface ServerLocation {
+  source?: string | null;
+  provider?: string | null;
+  country?: string | null;
+  region?: string | null;
+  city?: string | null;
+  latitude?: number | null;
+  longitude?: number | null;
+  timezone?: string | null;
 }
 
 interface Service {
@@ -84,7 +100,7 @@ interface PublicRegionPoint {
   label: string;
   x: number;
   y: number;
-  tokens: string[];
+  source: "manual" | "geoip" | "centroid";
 }
 
 export default function StatusPage() {
@@ -169,7 +185,7 @@ export default function StatusPage() {
   }
 
   return (
-    <div className="min-h-screen" style={publicPageStyle(site, theme)}>
+    <div className="min-h-screen" style={publicPageStyle(site, theme)} data-public-theme-root="true">
       <Navigation />
       <PageShell>
         <PageHeader
@@ -305,42 +321,37 @@ function PublicRegionMap({ servers }: { servers: Server[] }) {
               opacity="0.85"
             />
           ))}
-          {publicRegionPoints.map((point) => {
-            const bucket = active.find((item) => item.point.key === point.key);
-            const count = bucket?.servers.length ?? 0;
+          {active.map(({ point, servers: regionServers }) => {
+            const count = regionServers.length;
             const radius = count ? 7 + Math.min(18, (count / maxCount) * 12) : 3;
             return (
               <g key={point.key}>
-                {count ? (
-                  <circle
-                    cx={point.x}
-                    cy={point.y}
-                    r={radius + 7}
-                    fill="var(--accent-color)"
-                    opacity="0.16"
-                  />
-                ) : null}
+                <circle
+                  cx={point.x}
+                  cy={point.y}
+                  r={radius + 7}
+                  fill="var(--accent-color)"
+                  opacity="0.16"
+                />
                 <circle
                   cx={point.x}
                   cy={point.y}
                   r={radius}
-                  fill={count ? "var(--accent-color)" : "var(--text-muted)"}
+                  fill="var(--accent-color)"
                   stroke="var(--border-color)"
                   strokeWidth="3"
-                  opacity={count ? 1 : 0.28}
+                  opacity="1"
                 />
-                {count ? (
-                  <text
-                    x={point.x}
-                    y={point.y + 4}
-                    textAnchor="middle"
-                    fill="var(--text-main)"
-                    fontSize="11"
-                    fontWeight="900"
-                  >
-                    {count}
-                  </text>
-                ) : null}
+                <text
+                  x={point.x}
+                  y={point.y + 4}
+                  textAnchor="middle"
+                  fill="var(--text-main)"
+                  fontSize="11"
+                  fontWeight="900"
+                >
+                  {count}
+                </text>
               </g>
             );
           })}
@@ -394,7 +405,7 @@ function PublicRegionMap({ servers }: { servers: Server[] }) {
               </div>
             ))
           ) : (
-            <EmptyState title="暂无可识别地区" detail="公开资产字段匹配到地区后会显示分布。" />
+            <EmptyState title="暂无可识别地区" detail="GeoIP 或手动位置字段可用后会显示分布。" />
           )}
           {buckets.unmatched.length ? (
             <div className="border-2 border-black bg-[var(--bg-card)] p-3 shadow-[var(--shadow-brutal-sm)]">
@@ -568,57 +579,55 @@ function buildPublicRegionBuckets(servers: Server[]): {
   regions: Array<{ point: PublicRegionPoint; servers: Server[] }>;
   unmatched: Server[];
 } {
-  const buckets = new Map<string, Server[]>();
+  const buckets = new Map<string, { point: PublicRegionPoint; servers: Server[] }>();
   const unmatched: Server[] = [];
 
   for (const server of servers) {
-    const point = inferPublicServerRegion(server);
+    const point = publicServerLocationPoint(server);
     if (!point) {
       unmatched.push(server);
       continue;
     }
-    buckets.set(point.key, [...(buckets.get(point.key) ?? []), server]);
+    const current = buckets.get(point.key);
+    if (current) {
+      current.servers.push(server);
+    } else {
+      buckets.set(point.key, { point, servers: [server] });
+    }
   }
 
   return {
-    regions: publicRegionPoints
-      .map((point) => ({ point, servers: buckets.get(point.key) ?? [] }))
-      .filter((item) => item.servers.length > 0)
+    regions: Array.from(buckets.values())
       .sort((a, b) => b.servers.length - a.servers.length || a.point.label.localeCompare(b.point.label, "zh-CN")),
     unmatched,
   };
 }
 
-function inferPublicServerRegion(server: Server): PublicRegionPoint | null {
-  const haystack = publicRegionHaystack(server);
-  return publicRegionPoints.find((point) => point.tokens.some((token) => publicTokenMatches(haystack, token))) ?? null;
-}
-
-function publicRegionHaystack(server: Server): string {
-  return ` ${[
-    server.region,
-    server.provider,
-    server.name,
-    server.remark,
-    server.plan,
-    ...(server.tags ?? []),
-  ]
-    .filter(Boolean)
-    .join(" ")
-    .toLowerCase()
-    .replace(/[_.,/|()[\]{}:;]+/g, " ")} `;
-}
-
-function publicTokenMatches(haystack: string, token: string): boolean {
-  const needle = token.toLowerCase();
-  if (/^[a-z0-9]{1,3}$/.test(needle)) {
-    return new RegExp(`(^|\\s)${escapeRegExp(needle)}($|\\s)`).test(haystack);
+function publicServerLocationPoint(server: Server): PublicRegionPoint | null {
+  const location = server.location ?? null;
+  const latitude = numberOrNull(location?.latitude ?? server.latitude);
+  const longitude = numberOrNull(location?.longitude ?? server.longitude);
+  const label = locationLabel(location, server);
+  if (latitude !== null && longitude !== null) {
+    const projected = projectLonLat(longitude, latitude);
+    return {
+      key: `${roundCoordinate(latitude)},${roundCoordinate(longitude)}`,
+      label,
+      x: projected.x,
+      y: projected.y,
+      source: location?.source === "manual" ? "manual" : "geoip",
+    };
   }
-  return haystack.includes(needle);
-}
 
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const centroid = centroidForLocation(location, server);
+  if (!centroid) return null;
+  return {
+    key: centroid.key,
+    label: locationLabel(location, server, centroid.label),
+    x: centroid.x,
+    y: centroid.y,
+    source: "centroid",
+  };
 }
 
 function buildPublicServiceDays(results: PublicServiceResult[]): PublicServiceDay[] {
@@ -696,8 +705,8 @@ function initialPublicShowServices(): boolean {
 
 function publicPageStyle(site: PublicSiteBranding, theme?: ThemeDefinition | null): CSSProperties {
   const style: CSSProperties & Record<string, string> = {};
-  if (theme?.variables) {
-    for (const [key, value] of Object.entries(theme.variables)) {
+  if (theme) {
+    for (const [key, value] of Object.entries(themeVariablesForMode(theme, false))) {
       if (key.startsWith("--") && value) {
         style[key] = value;
       }
@@ -747,10 +756,17 @@ function applyPublicHead(site: PublicSiteBranding, theme?: ThemeDefinition | nul
       }
     });
   }
-  if (theme?.custom_css) {
+  if (theme) {
     const style = document.createElement("style");
     style.dataset.xlstatusCustomHead = "true";
-    style.textContent = theme.custom_css;
+    style.textContent = [
+      theme.custom_css,
+      theme.light_custom_css,
+      themeModeCss("[data-public-theme-root=\"true\"]", themeVariablesForMode(theme, true), ".dark-mode"),
+      theme.dark_custom_css,
+    ]
+      .filter(Boolean)
+      .join("\n");
     document.head.appendChild(style);
     created.push(style);
   }
@@ -760,6 +776,21 @@ function applyPublicHead(site: PublicSiteBranding, theme?: ThemeDefinition | nul
       node.remove();
     }
   };
+}
+
+function themeVariablesForMode(theme: ThemeDefinition, isDark: boolean): Record<string, string> {
+  const base = theme.variables ?? {};
+  const light = Object.keys(theme.light_variables ?? {}).length ? theme.light_variables ?? {} : base;
+  const dark = Object.keys(theme.dark_variables ?? {}).length ? theme.dark_variables ?? {} : light;
+  return isDark ? { ...base, ...dark } : { ...base, ...light };
+}
+
+function themeModeCss(selector: string, variables: Record<string, string>, prefix = ""): string {
+  const lines = Object.entries(variables)
+    .filter(([key, value]) => key.startsWith("--") && Boolean(value))
+    .map(([key, value]) => `${key}: ${value};`);
+  if (!lines.length) return "";
+  return `${prefix} ${selector} { ${lines.join(" ")} }`;
 }
 
 function initialPublicShowMap(): boolean {
@@ -812,26 +843,110 @@ const publicWorldShapes = [
   },
 ] as const;
 
-const publicRegionPoints: PublicRegionPoint[] = [
-  { key: "us-west", label: "美国西部", x: 165, y: 150, tokens: ["us-west", "us west", "sfo", "sjc", "lax", "la", "los angeles", "san jose", "california", "加州", "洛杉矶", "圣何塞"] },
-  { key: "us-central", label: "美国中部", x: 220, y: 150, tokens: ["us-central", "us central", "dal", "dfw", "chi", "chicago", "dallas", "texas", "芝加哥", "达拉斯", "德州"] },
-  { key: "us-east", label: "美国东部", x: 270, y: 142, tokens: ["us-east", "us east", "nyc", "ash", "iad", "new york", "virginia", "纽约", "弗吉尼亚", "美东"] },
-  { key: "ca", label: "加拿大", x: 210, y: 96, tokens: ["ca", "canada", "toronto", "yul", "yyz", "vancouver", "加拿大", "多伦多", "温哥华"] },
-  { key: "br", label: "巴西", x: 330, y: 300, tokens: ["br", "brazil", "sao paulo", "saopaulo", "巴西", "圣保罗"] },
-  { key: "gb", label: "英国", x: 448, y: 118, tokens: ["gb", "uk", "united kingdom", "london", "英国", "伦敦"] },
-  { key: "de", label: "德国", x: 482, y: 128, tokens: ["de", "germany", "frankfurt", "fra", "德国", "法兰克福"] },
-  { key: "fr", label: "法国", x: 466, y: 146, tokens: ["fr", "france", "paris", "法国", "巴黎"] },
-  { key: "nl", label: "荷兰", x: 472, y: 120, tokens: ["nl", "netherlands", "ams", "amsterdam", "荷兰", "阿姆斯特丹"] },
-  { key: "ru", label: "俄罗斯", x: 618, y: 96, tokens: ["ru", "russia", "moscow", "俄罗斯", "莫斯科"] },
-  { key: "tr", label: "土耳其", x: 530, y: 166, tokens: ["tr", "turkey", "istanbul", "土耳其", "伊斯坦布尔"] },
-  { key: "ae", label: "阿联酋", x: 570, y: 205, tokens: ["ae", "uae", "dubai", "阿联酋", "迪拜"] },
-  { key: "in", label: "印度", x: 626, y: 220, tokens: ["in", "india", "mumbai", "delhi", "印度", "孟买", "德里"] },
-  { key: "sg", label: "新加坡", x: 682, y: 270, tokens: ["sg", "sin", "singapore", "新加坡", "狮城"] },
-  { key: "hk", label: "香港", x: 690, y: 220, tokens: ["hk", "hkg", "hong kong", "hongkong", "香港"] },
-  { key: "cn", label: "中国大陆", x: 674, y: 190, tokens: ["cn", "china", "beijing", "shanghai", "guangzhou", "中国", "大陆", "北京", "上海", "广州", "深圳"] },
-  { key: "tw", label: "台湾", x: 717, y: 216, tokens: ["tw", "taiwan", "taipei", "台湾", "台北"] },
-  { key: "jp", label: "日本", x: 752, y: 178, tokens: ["jp", "japan", "tokyo", "osaka", "日本", "东京", "大阪"] },
-  { key: "kr", label: "韩国", x: 722, y: 178, tokens: ["kr", "korea", "seoul", "韩国", "首尔"] },
-  { key: "au", label: "澳大利亚", x: 762, y: 330, tokens: ["au", "australia", "sydney", "melbourne", "澳大利亚", "悉尼", "墨尔本"] },
-  { key: "za", label: "南非", x: 520, y: 338, tokens: ["za", "south africa", "johannesburg", "南非", "约翰内斯堡"] },
-];
+function numberOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function roundCoordinate(value: number): string {
+  return value.toFixed(3);
+}
+
+function projectLonLat(longitude: number, latitude: number): { x: number; y: number } {
+  return {
+    x: Math.max(24, Math.min(876, ((longitude + 180) / 360) * 900)),
+    y: Math.max(24, Math.min(396, ((90 - latitude) / 180) * 420)),
+  };
+}
+
+function locationLabel(location: ServerLocation | null, server: Server, fallback?: string): string {
+  return [location?.country ?? server.country, location?.region ?? server.region, location?.city ?? server.city]
+    .filter(Boolean)
+    .join(" / ") || fallback || server.region || server.name;
+}
+
+function centroidForLocation(location: ServerLocation | null, server: Server): LocationCentroid | null {
+  const keys = [
+    location?.country,
+    server.country,
+    location?.region,
+    server.region,
+    location?.city,
+    server.city,
+  ];
+  for (const value of keys) {
+    const key = normalizeLocationKey(value);
+    if (key && locationCentroids[key]) return locationCentroids[key];
+  }
+  return null;
+}
+
+function normalizeLocationKey(value?: string | null): string {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_.]+/g, "-");
+}
+
+interface LocationCentroid {
+  key: string;
+  label: string;
+  x: number;
+  y: number;
+}
+
+const centroidSeeds = [
+  ["us", "美国", -98.58, 39.83],
+  ["united-states", "美国", -98.58, 39.83],
+  ["美国", "美国", -98.58, 39.83],
+  ["ca", "加拿大", -106.35, 56.13],
+  ["canada", "加拿大", -106.35, 56.13],
+  ["加拿大", "加拿大", -106.35, 56.13],
+  ["br", "巴西", -51.93, -14.24],
+  ["brazil", "巴西", -51.93, -14.24],
+  ["gb", "英国", -3.44, 55.38],
+  ["uk", "英国", -3.44, 55.38],
+  ["united-kingdom", "英国", -3.44, 55.38],
+  ["de", "德国", 10.45, 51.17],
+  ["germany", "德国", 10.45, 51.17],
+  ["fr", "法国", 2.21, 46.23],
+  ["france", "法国", 2.21, 46.23],
+  ["nl", "荷兰", 5.29, 52.13],
+  ["netherlands", "荷兰", 5.29, 52.13],
+  ["ru", "俄罗斯", 105.32, 61.52],
+  ["russia", "俄罗斯", 105.32, 61.52],
+  ["tr", "土耳其", 35.24, 38.96],
+  ["turkey", "土耳其", 35.24, 38.96],
+  ["ae", "阿联酋", 53.85, 23.42],
+  ["uae", "阿联酋", 53.85, 23.42],
+  ["in", "印度", 78.96, 20.59],
+  ["india", "印度", 78.96, 20.59],
+  ["sg", "新加坡", 103.82, 1.35],
+  ["singapore", "新加坡", 103.82, 1.35],
+  ["新加坡", "新加坡", 103.82, 1.35],
+  ["hk", "香港", 114.17, 22.32],
+  ["hong-kong", "香港", 114.17, 22.32],
+  ["香港", "香港", 114.17, 22.32],
+  ["cn", "中国大陆", 104.2, 35.86],
+  ["china", "中国大陆", 104.2, 35.86],
+  ["中国", "中国大陆", 104.2, 35.86],
+  ["tw", "台湾", 120.96, 23.7],
+  ["taiwan", "台湾", 120.96, 23.7],
+  ["台湾", "台湾", 120.96, 23.7],
+  ["jp", "日本", 138.25, 36.2],
+  ["japan", "日本", 138.25, 36.2],
+  ["日本", "日本", 138.25, 36.2],
+  ["kr", "韩国", 127.77, 35.91],
+  ["korea", "韩国", 127.77, 35.91],
+  ["south-korea", "韩国", 127.77, 35.91],
+  ["au", "澳大利亚", 133.78, -25.27],
+  ["australia", "澳大利亚", 133.78, -25.27],
+  ["za", "南非", 22.94, -30.56],
+  ["south-africa", "南非", 22.94, -30.56],
+] as const;
+
+const locationCentroids: Record<string, LocationCentroid> = Object.fromEntries(
+  centroidSeeds.map(([key, label, longitude, latitude]) => {
+    const projected = projectLonLat(longitude, latitude);
+    return [normalizeLocationKey(key), { key: normalizeLocationKey(key), label, ...projected }];
+  }),
+);

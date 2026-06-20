@@ -47,6 +47,19 @@ pub struct GeoIpLookupResponse {
     pub raw: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentGeoLocation {
+    pub source: String,
+    pub provider: String,
+    pub ip: String,
+    pub country: Option<String>,
+    pub region: Option<String>,
+    pub city: Option<String>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub timezone: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct GeoIpMaintenanceResponse {
     pub action: String,
@@ -97,46 +110,50 @@ pub async fn test_geoip(
     if ip.parse::<std::net::IpAddr>().is_err() {
         return Err(AppError::BadRequest("ip is invalid".into()));
     }
-    let provider = query
-        .provider
-        .as_deref()
-        .map(normalize_geoip_provider)
-        .transpose()?
-        .unwrap_or(settings::geoip_provider(&state.db).await?);
-    let configured_ipinfo_token = if provider == "ipinfo" && query.token.is_none() {
-        settings::geoip_ipinfo_token(&state.db).await?
-    } else {
-        None
-    };
-    let ipinfo_token = query
-        .token
-        .as_deref()
-        .or(configured_ipinfo_token.as_deref());
-    let result = match provider.as_str() {
-        "empty" => GeoIpLookupResponse {
-            provider,
-            ip: ip.to_string(),
-            country: None,
-            region: None,
-            city: None,
-            latitude: None,
-            longitude: None,
-            isp: None,
-            organization: None,
-            timezone: None,
-            raw: serde_json::json!({ "ip": ip }),
-        },
-        "geojs" => lookup_geojs(ip).await?,
-        "ip-api" | "ipapi" => lookup_ip_api(ip).await?,
-        "ipinfo" => lookup_ipinfo(ip, ipinfo_token).await?,
-        "mmdb" => lookup_mmdb(ip)?,
-        _ => {
-            return Err(AppError::BadRequest(
-                "provider must be empty, geojs, ip-api, ipinfo, or mmdb".into(),
-            ));
+    let provider = query.provider.as_deref().map(str::trim);
+    let token = query.token.as_deref();
+    let result = lookup_ip_with_provider(&state.db, ip, provider, token).await?;
+    Ok(Json(ApiResponse::success(result)))
+}
+
+pub async fn lookup_agent_geo_location(
+    db: &DatabaseBackend,
+    agent_id: AgentId,
+) -> Option<AgentGeoLocation> {
+    let snapshot = match latest_agent_ip(db, agent_id).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            tracing::debug!("agent GeoIP snapshot lookup failed: {}", err);
+            return None;
         }
     };
-    Ok(Json(ApiResponse::success(result)))
+    let ip = snapshot.ipv4.or(snapshot.ipv6)?;
+    let lookup = match lookup_ip_with_provider(db, &ip, None, None).await {
+        Ok(lookup) => lookup,
+        Err(err) => {
+            tracing::debug!("agent GeoIP lookup failed for {}: {:?}", agent_id.0, err);
+            return None;
+        }
+    };
+    if lookup.country.is_none()
+        && lookup.region.is_none()
+        && lookup.city.is_none()
+        && lookup.latitude.is_none()
+        && lookup.longitude.is_none()
+    {
+        return None;
+    }
+    Some(AgentGeoLocation {
+        source: "geoip".into(),
+        provider: lookup.provider,
+        ip: lookup.ip,
+        country: lookup.country,
+        region: lookup.region,
+        city: lookup.city,
+        latitude: lookup.latitude,
+        longitude: lookup.longitude,
+        timezone: lookup.timezone,
+    })
 }
 
 pub async fn geoip_status(
@@ -279,6 +296,46 @@ async fn lookup_geojs(ip: &str) -> Result<GeoIpLookupResponse, AppError> {
         timezone: json_string(&raw, &["timezone"]),
         raw,
     })
+}
+
+async fn lookup_ip_with_provider(
+    db: &DatabaseBackend,
+    ip: &str,
+    provider: Option<&str>,
+    token: Option<&str>,
+) -> Result<GeoIpLookupResponse, AppError> {
+    let provider = provider
+        .map(normalize_geoip_provider)
+        .transpose()?
+        .unwrap_or(settings::geoip_provider(db).await?);
+    let configured_ipinfo_token = if provider == "ipinfo" && token.is_none() {
+        settings::geoip_ipinfo_token(db).await?
+    } else {
+        None
+    };
+    let ipinfo_token = token.or(configured_ipinfo_token.as_deref());
+    match provider.as_str() {
+        "empty" => Ok(GeoIpLookupResponse {
+            provider,
+            ip: ip.to_string(),
+            country: None,
+            region: None,
+            city: None,
+            latitude: None,
+            longitude: None,
+            isp: None,
+            organization: None,
+            timezone: None,
+            raw: serde_json::json!({ "ip": ip }),
+        }),
+        "geojs" => lookup_geojs(ip).await,
+        "ip-api" | "ipapi" => lookup_ip_api(ip).await,
+        "ipinfo" => lookup_ipinfo(ip, ipinfo_token).await,
+        "mmdb" => lookup_mmdb(ip),
+        _ => Err(AppError::BadRequest(
+            "provider must be empty, geojs, ip-api, ipinfo, or mmdb".into(),
+        )),
+    }
 }
 
 async fn lookup_ip_api(ip: &str) -> Result<GeoIpLookupResponse, AppError> {

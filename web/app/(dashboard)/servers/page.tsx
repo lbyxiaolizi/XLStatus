@@ -38,6 +38,11 @@ interface Server {
   price?: string | number | null;
   provider?: string | null;
   region?: string | null;
+  country?: string | null;
+  city?: string | null;
+  latitude?: number | null;
+  longitude?: number | null;
+  location?: ServerLocation | null;
   plan?: string | null;
   tags?: string[];
   accent_color?: string | null;
@@ -55,6 +60,17 @@ interface Server {
   uptime_seconds?: number | null;
   last_seen_at?: string;
   last_event_at?: string;
+}
+
+interface ServerLocation {
+  source?: string | null;
+  provider?: string | null;
+  country?: string | null;
+  region?: string | null;
+  city?: string | null;
+  latitude?: number | null;
+  longitude?: number | null;
+  timezone?: string | null;
 }
 
 interface LiveState {
@@ -122,7 +138,7 @@ interface RegionPoint {
   label: string;
   x: number;
   y: number;
-  tokens: string[];
+  source: "manual" | "geoip" | "centroid";
 }
 
 export default function ServersPage() {
@@ -705,42 +721,45 @@ export default function ServersPage() {
               <button type="button" onClick={toggleServices} className={buttonClass(showServices ? "primary" : "secondary")}>服务状态</button>
             </div>
           </div>
-          <div className="grid gap-3 border-2 border-black bg-[var(--bg-card)] p-3 shadow-[var(--shadow-brutal)]">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="border-2 border-black bg-[var(--accent-bg)] px-3 py-2 text-xs font-black uppercase shadow-[var(--shadow-brutal-sm)]">
-                  Server groups
-                </span>
+          <details className="border-2 border-black bg-[var(--bg-card)] shadow-[var(--shadow-brutal)]">
+            <summary className="flex cursor-pointer flex-wrap items-center justify-between gap-3 p-3 text-sm font-black uppercase">
+              <span className="flex flex-wrap items-center gap-2">
+                <span>Server groups</span>
                 <StatusBadge tone="blue">{serverGroups.length} 组</StatusBadge>
                 {selectedServerGroup ? <StatusBadge tone="gray">{selectedServerGroup.server_ids.length} 台</StatusBadge> : null}
+              </span>
+              <span className="text-xs text-[var(--text-muted)]">展开管理</span>
+            </summary>
+            <div className="grid gap-3 border-t-2 border-black p-3">
+              <div className="flex justify-end">
+                <button type="button" className={buttonClass("secondary")} onClick={() => void loadServerGroups()}>
+                  刷新组
+                </button>
               </div>
-              <button type="button" className={buttonClass("secondary")} onClick={() => void loadServerGroups()}>
-                刷新组
-              </button>
+              <div className="grid gap-3 xl:grid-cols-[minmax(12rem,1fr)_auto_minmax(12rem,1fr)_minmax(10rem,0.8fr)_7rem_7rem_auto_auto] xl:items-end">
+                <input value={newServerGroupName} onChange={(event) => setNewServerGroupName(event.target.value)} className={inputClass} placeholder="新服务器分组" />
+                <button type="button" className={buttonClass("secondary")} onClick={() => void createServerGroup()}>创建组</button>
+                <select value={selectedServerGroupId} onChange={(event) => selectServerGroup(event.target.value)} className={inputClass}>
+                  <option value="">选择服务器分组</option>
+                  {serverGroups.map((group) => (
+                    <option key={group.id} value={group.id}>{group.name}</option>
+                  ))}
+                </select>
+                <input value={serverGroupEdit.name} onChange={(event) => setServerGroupEdit((current) => ({ ...current, name: event.target.value }))} className={inputClass} placeholder="分组名称" disabled={!selectedServerGroupId} />
+                <input value={serverGroupEdit.displayOrder} onChange={(event) => setServerGroupEdit((current) => ({ ...current, displayOrder: event.target.value }))} className={inputClass} inputMode="numeric" placeholder="排序" disabled={!selectedServerGroupId} />
+                <input
+                  type="color"
+                  value={serverGroupEdit.color}
+                  onChange={(event) => setServerGroupEdit((current) => ({ ...current, color: event.target.value }))}
+                  className="h-11 w-full border-2 border-black bg-[var(--accent-bg)] p-1 shadow-[var(--shadow-brutal-sm)] disabled:opacity-60"
+                  disabled={!selectedServerGroupId}
+                  aria-label="分组颜色"
+                />
+                <button type="button" className={buttonClass("secondary")} onClick={() => void updateSelectedServerGroup()} disabled={!selectedServerGroupId}>保存组</button>
+                <button type="button" className={buttonClass("danger")} onClick={() => void deleteSelectedServerGroup()} disabled={!selectedServerGroupId}>删除组</button>
+              </div>
             </div>
-            <div className="grid gap-3 xl:grid-cols-[minmax(12rem,1fr)_auto_minmax(12rem,1fr)_minmax(10rem,0.8fr)_7rem_7rem_auto_auto] xl:items-end">
-              <input value={newServerGroupName} onChange={(event) => setNewServerGroupName(event.target.value)} className={inputClass} placeholder="新服务器分组" />
-              <button type="button" className={buttonClass("secondary")} onClick={() => void createServerGroup()}>创建组</button>
-              <select value={selectedServerGroupId} onChange={(event) => selectServerGroup(event.target.value)} className={inputClass}>
-                <option value="">选择服务器分组</option>
-                {serverGroups.map((group) => (
-                  <option key={group.id} value={group.id}>{group.name}</option>
-                ))}
-              </select>
-              <input value={serverGroupEdit.name} onChange={(event) => setServerGroupEdit((current) => ({ ...current, name: event.target.value }))} className={inputClass} placeholder="分组名称" disabled={!selectedServerGroupId} />
-              <input value={serverGroupEdit.displayOrder} onChange={(event) => setServerGroupEdit((current) => ({ ...current, displayOrder: event.target.value }))} className={inputClass} inputMode="numeric" placeholder="排序" disabled={!selectedServerGroupId} />
-              <input
-                type="color"
-                value={serverGroupEdit.color}
-                onChange={(event) => setServerGroupEdit((current) => ({ ...current, color: event.target.value }))}
-                className="h-11 w-full border-2 border-black bg-[var(--accent-bg)] p-1 shadow-[var(--shadow-brutal-sm)] disabled:opacity-60"
-                disabled={!selectedServerGroupId}
-                aria-label="分组颜色"
-              />
-              <button type="button" className={buttonClass("secondary")} onClick={() => void updateSelectedServerGroup()} disabled={!selectedServerGroupId}>保存组</button>
-              <button type="button" className={buttonClass("danger")} onClick={() => void deleteSelectedServerGroup()} disabled={!selectedServerGroupId}>删除组</button>
-            </div>
-          </div>
+          </details>
           {selectedIds.length ? (
             <div className="grid gap-3 border-2 border-black bg-[var(--bg-card)] p-3 shadow-[var(--shadow-brutal)]">
               <div className="flex flex-wrap items-center justify-between gap-3">
@@ -783,14 +802,25 @@ export default function ServersPage() {
             </div>
           ) : null}
           {canManageTransfers ? (
-            <OwnerTransferPanel
-              transfers={ownerTransfers}
-              loading={transfersLoading}
-              error={transferError}
-              onRefresh={() => void loadOwnerTransfers()}
-              onRetry={(transfer) => void retryOwnerTransfer(transfer)}
-              onCancel={(transfer) => void cancelOwnerTransfer(transfer)}
-            />
+            <details className="border-2 border-black bg-[var(--bg-card)] shadow-[var(--shadow-brutal)]">
+              <summary className="flex cursor-pointer flex-wrap items-center justify-between gap-3 p-3 text-sm font-black uppercase">
+                <span className="flex flex-wrap items-center gap-2">
+                  <span>所有权转移</span>
+                  <StatusBadge tone="blue">{ownerTransfers.length} 条</StatusBadge>
+                </span>
+                <span className="text-xs text-[var(--text-muted)]">展开处理</span>
+              </summary>
+              <div className="border-t-2 border-black p-3">
+                <OwnerTransferPanel
+                  transfers={ownerTransfers}
+                  loading={transfersLoading}
+                  error={transferError}
+                  onRefresh={() => void loadOwnerTransfers()}
+                  onRetry={(transfer) => void retryOwnerTransfer(transfer)}
+                  onCancel={(transfer) => void cancelOwnerTransfer(transfer)}
+                />
+              </div>
+            </details>
           ) : null}
         </div>
 
@@ -849,7 +879,7 @@ function OwnerTransferPanel({
   onCancel: (transfer: ServerOwnerTransfer) => void;
 }) {
   return (
-    <div className="grid gap-3 border-2 border-black bg-[var(--bg-card)] p-3 shadow-[var(--shadow-brutal)]">
+    <div className="grid gap-3">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-2">
           <span className="border-2 border-black bg-[var(--accent-bg)] px-3 py-2 text-xs font-black uppercase shadow-[var(--shadow-brutal-sm)]">
@@ -868,19 +898,19 @@ function OwnerTransferPanel({
       ) : (
         <div className="grid gap-2">
           {transfers.map((transfer) => (
-            <div key={transfer.id} className="grid gap-3 border-2 border-black bg-[var(--bg)] p-3 lg:grid-cols-[minmax(10rem,1fr)_minmax(10rem,1fr)_minmax(12rem,1.4fr)_auto] lg:items-center">
+            <div key={transfer.id} className="grid gap-3 border-2 border-black bg-[var(--bg-card)] p-3 lg:grid-cols-[minmax(10rem,1fr)_minmax(10rem,1fr)_minmax(12rem,1.4fr)_auto] lg:items-center">
               <div className="min-w-0">
                 <div className="flex flex-wrap items-center gap-2">
                   <StatusBadge tone={transferStatusTone(transfer.status)}>{transfer.status}</StatusBadge>
-                  <span className="text-xs font-black uppercase text-[var(--fg-muted)]">#{transfer.attempts}</span>
+                  <span className="text-xs font-black uppercase text-[var(--text-muted)]">#{transfer.attempts}</span>
                 </div>
                 <p className="mt-1 truncate text-sm font-black">{compactId(transfer.server_id)}</p>
               </div>
-              <div className="min-w-0 text-xs font-bold text-[var(--fg-muted)]">
+              <div className="min-w-0 text-xs font-bold text-[var(--text-muted)]">
                 <p className="truncate">from {compactId(transfer.from_user_id ?? "-")}</p>
                 <p className="truncate">to {compactId(transfer.to_user_id)}</p>
               </div>
-              <div className="min-w-0 text-xs font-bold text-[var(--fg-muted)]">
+              <div className="min-w-0 text-xs font-bold text-[var(--text-muted)]">
                 <p className="truncate">{formatDate(transfer.last_attempt_at)}</p>
                 {transfer.error ? <p className="truncate text-[var(--danger)]">{transfer.error}</p> : null}
               </div>
@@ -952,42 +982,37 @@ function ServerRegionMap({ servers }: { servers: Server[] }) {
               opacity="0.85"
             />
           ))}
-          {regionPoints.map((point) => {
-            const bucket = active.find((item) => item.point.key === point.key);
-            const count = bucket?.servers.length ?? 0;
+          {active.map(({ point, servers: regionServers }) => {
+            const count = regionServers.length;
             const radius = count ? 7 + Math.min(18, (count / maxCount) * 12) : 3;
             return (
               <g key={point.key}>
-                {count ? (
-                  <circle
-                    cx={point.x}
-                    cy={point.y}
-                    r={radius + 7}
-                    fill="var(--accent-color)"
-                    opacity="0.16"
-                  />
-                ) : null}
+                <circle
+                  cx={point.x}
+                  cy={point.y}
+                  r={radius + 7}
+                  fill="var(--accent-color)"
+                  opacity="0.16"
+                />
                 <circle
                   cx={point.x}
                   cy={point.y}
                   r={radius}
-                  fill={count ? "var(--accent-color)" : "var(--text-muted)"}
+                  fill="var(--accent-color)"
                   stroke="var(--border-color)"
                   strokeWidth="3"
-                  opacity={count ? 1 : 0.28}
+                  opacity="1"
                 />
-                {count ? (
-                  <text
-                    x={point.x}
-                    y={point.y + 4}
-                    textAnchor="middle"
-                    fill="var(--text-main)"
-                    fontSize="11"
-                    fontWeight="900"
-                  >
-                    {count}
-                  </text>
-                ) : null}
+                <text
+                  x={point.x}
+                  y={point.y + 4}
+                  textAnchor="middle"
+                  fill="var(--text-main)"
+                  fontSize="11"
+                  fontWeight="900"
+                >
+                  {count}
+                </text>
               </g>
             );
           })}
@@ -1041,7 +1066,7 @@ function ServerRegionMap({ servers }: { servers: Server[] }) {
               </div>
             ))
           ) : (
-            <EmptyState title="暂无可识别地区" detail="在服务器自定义信息里填写地区后会点亮地图。" />
+            <EmptyState title="暂无可识别地区" detail="GeoIP 或手动位置字段可用后会点亮地图。" />
           )}
           {buckets.unmatched.length ? (
             <div className="border-2 border-black bg-[var(--bg-card)] p-3 shadow-[var(--shadow-brutal-sm)]">
@@ -1359,58 +1384,55 @@ function buildRegionBuckets(servers: Server[]): {
   regions: Array<{ point: RegionPoint; servers: Server[] }>;
   unmatched: Server[];
 } {
-  const buckets = new Map<string, Server[]>();
+  const buckets = new Map<string, { point: RegionPoint; servers: Server[] }>();
   const unmatched: Server[] = [];
 
   for (const server of servers) {
-    const point = inferServerRegion(server);
+    const point = serverLocationPoint(server);
     if (!point) {
       unmatched.push(server);
       continue;
     }
-    buckets.set(point.key, [...(buckets.get(point.key) ?? []), server]);
+    const current = buckets.get(point.key);
+    if (current) {
+      current.servers.push(server);
+    } else {
+      buckets.set(point.key, { point, servers: [server] });
+    }
   }
 
   return {
-    regions: regionPoints
-      .map((point) => ({ point, servers: buckets.get(point.key) ?? [] }))
-      .filter((item) => item.servers.length > 0)
+    regions: Array.from(buckets.values())
       .sort((a, b) => b.servers.length - a.servers.length || a.point.label.localeCompare(b.point.label, "zh-CN")),
     unmatched,
   };
 }
 
-function inferServerRegion(server: Server): RegionPoint | null {
-  const haystack = regionHaystack(server);
-  return regionPoints.find((point) => point.tokens.some((token) => tokenMatches(haystack, token))) ?? null;
-}
-
-function regionHaystack(server: Server): string {
-  return ` ${[
-    server.region,
-    server.provider,
-    server.name,
-    server.remark,
-    server.note,
-    server.plan,
-    ...(server.tags ?? []),
-  ]
-    .filter(Boolean)
-    .join(" ")
-    .toLowerCase()
-    .replace(/[_.,/|()[\]{}:;]+/g, " ")} `;
-}
-
-function tokenMatches(haystack: string, token: string): boolean {
-  const needle = token.toLowerCase();
-  if (/^[a-z0-9]{1,3}$/.test(needle)) {
-    return new RegExp(`(^|\\s)${escapeRegExp(needle)}($|\\s)`).test(haystack);
+function serverLocationPoint(server: Server): RegionPoint | null {
+  const location = server.location ?? null;
+  const latitude = numberOrNull(location?.latitude ?? server.latitude);
+  const longitude = numberOrNull(location?.longitude ?? server.longitude);
+  const label = locationLabel(location, server);
+  if (latitude !== null && longitude !== null) {
+    const projected = projectLonLat(longitude, latitude);
+    return {
+      key: `${roundCoordinate(latitude)},${roundCoordinate(longitude)}`,
+      label,
+      x: projected.x,
+      y: projected.y,
+      source: location?.source === "manual" ? "manual" : "geoip",
+    };
   }
-  return haystack.includes(needle);
-}
 
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const centroid = centroidForLocation(location, server);
+  if (!centroid) return null;
+  return {
+    key: centroid.key,
+    label: locationLabel(location, server, centroid.label),
+    x: centroid.x,
+    y: centroid.y,
+    source: "centroid",
+  };
 }
 
 function serverMatchesQuery(server: Server, query: string): boolean {
@@ -1698,26 +1720,110 @@ const worldShapes = [
   },
 ] as const;
 
-const regionPoints: RegionPoint[] = [
-  { key: "us-west", label: "美国西部", x: 165, y: 150, tokens: ["us-west", "us west", "sfo", "sjc", "lax", "la", "los angeles", "san jose", "california", "加州", "洛杉矶", "圣何塞"] },
-  { key: "us-central", label: "美国中部", x: 220, y: 150, tokens: ["us-central", "us central", "dal", "dfw", "chi", "chicago", "dallas", "texas", "芝加哥", "达拉斯", "德州"] },
-  { key: "us-east", label: "美国东部", x: 270, y: 142, tokens: ["us-east", "us east", "nyc", "ash", "iad", "new york", "virginia", "纽约", "弗吉尼亚", "美东"] },
-  { key: "ca", label: "加拿大", x: 210, y: 96, tokens: ["ca", "canada", "toronto", "yul", "yyz", "vancouver", "加拿大", "多伦多", "温哥华"] },
-  { key: "br", label: "巴西", x: 330, y: 300, tokens: ["br", "brazil", "sao paulo", "saopaulo", "巴西", "圣保罗"] },
-  { key: "gb", label: "英国", x: 448, y: 118, tokens: ["gb", "uk", "united kingdom", "london", "英国", "伦敦"] },
-  { key: "de", label: "德国", x: 482, y: 128, tokens: ["de", "germany", "frankfurt", "fra", "德国", "法兰克福"] },
-  { key: "fr", label: "法国", x: 466, y: 146, tokens: ["fr", "france", "paris", "法国", "巴黎"] },
-  { key: "nl", label: "荷兰", x: 472, y: 120, tokens: ["nl", "netherlands", "ams", "amsterdam", "荷兰", "阿姆斯特丹"] },
-  { key: "ru", label: "俄罗斯", x: 618, y: 96, tokens: ["ru", "russia", "moscow", "俄罗斯", "莫斯科"] },
-  { key: "tr", label: "土耳其", x: 530, y: 166, tokens: ["tr", "turkey", "istanbul", "土耳其", "伊斯坦布尔"] },
-  { key: "ae", label: "阿联酋", x: 570, y: 205, tokens: ["ae", "uae", "dubai", "阿联酋", "迪拜"] },
-  { key: "in", label: "印度", x: 626, y: 220, tokens: ["in", "india", "mumbai", "delhi", "印度", "孟买", "德里"] },
-  { key: "sg", label: "新加坡", x: 682, y: 270, tokens: ["sg", "sin", "singapore", "新加坡", "狮城"] },
-  { key: "hk", label: "香港", x: 690, y: 220, tokens: ["hk", "hkg", "hong kong", "hongkong", "香港"] },
-  { key: "cn", label: "中国大陆", x: 674, y: 190, tokens: ["cn", "china", "beijing", "shanghai", "guangzhou", "中国", "大陆", "北京", "上海", "广州", "深圳"] },
-  { key: "tw", label: "台湾", x: 717, y: 216, tokens: ["tw", "taiwan", "taipei", "台湾", "台北"] },
-  { key: "jp", label: "日本", x: 752, y: 178, tokens: ["jp", "japan", "tokyo", "osaka", "日本", "东京", "大阪"] },
-  { key: "kr", label: "韩国", x: 722, y: 178, tokens: ["kr", "korea", "seoul", "韩国", "首尔"] },
-  { key: "au", label: "澳大利亚", x: 762, y: 330, tokens: ["au", "australia", "sydney", "melbourne", "澳大利亚", "悉尼", "墨尔本"] },
-  { key: "za", label: "南非", x: 520, y: 338, tokens: ["za", "south africa", "johannesburg", "南非", "约翰内斯堡"] },
-];
+function numberOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function roundCoordinate(value: number): string {
+  return value.toFixed(3);
+}
+
+function projectLonLat(longitude: number, latitude: number): { x: number; y: number } {
+  return {
+    x: Math.max(24, Math.min(876, ((longitude + 180) / 360) * 900)),
+    y: Math.max(24, Math.min(396, ((90 - latitude) / 180) * 420)),
+  };
+}
+
+function locationLabel(location: ServerLocation | null, server: Server, fallback?: string): string {
+  return [location?.country ?? server.country, location?.region ?? server.region, location?.city ?? server.city]
+    .filter(Boolean)
+    .join(" / ") || fallback || server.region || server.name;
+}
+
+function centroidForLocation(location: ServerLocation | null, server: Server): LocationCentroid | null {
+  const keys = [
+    location?.country,
+    server.country,
+    location?.region,
+    server.region,
+    location?.city,
+    server.city,
+  ];
+  for (const value of keys) {
+    const key = normalizeLocationKey(value);
+    if (key && locationCentroids[key]) return locationCentroids[key];
+  }
+  return null;
+}
+
+function normalizeLocationKey(value?: string | null): string {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_.]+/g, "-");
+}
+
+interface LocationCentroid {
+  key: string;
+  label: string;
+  x: number;
+  y: number;
+}
+
+const centroidSeeds = [
+  ["us", "美国", -98.58, 39.83],
+  ["united-states", "美国", -98.58, 39.83],
+  ["美国", "美国", -98.58, 39.83],
+  ["ca", "加拿大", -106.35, 56.13],
+  ["canada", "加拿大", -106.35, 56.13],
+  ["加拿大", "加拿大", -106.35, 56.13],
+  ["br", "巴西", -51.93, -14.24],
+  ["brazil", "巴西", -51.93, -14.24],
+  ["gb", "英国", -3.44, 55.38],
+  ["uk", "英国", -3.44, 55.38],
+  ["united-kingdom", "英国", -3.44, 55.38],
+  ["de", "德国", 10.45, 51.17],
+  ["germany", "德国", 10.45, 51.17],
+  ["fr", "法国", 2.21, 46.23],
+  ["france", "法国", 2.21, 46.23],
+  ["nl", "荷兰", 5.29, 52.13],
+  ["netherlands", "荷兰", 5.29, 52.13],
+  ["ru", "俄罗斯", 105.32, 61.52],
+  ["russia", "俄罗斯", 105.32, 61.52],
+  ["tr", "土耳其", 35.24, 38.96],
+  ["turkey", "土耳其", 35.24, 38.96],
+  ["ae", "阿联酋", 53.85, 23.42],
+  ["uae", "阿联酋", 53.85, 23.42],
+  ["in", "印度", 78.96, 20.59],
+  ["india", "印度", 78.96, 20.59],
+  ["sg", "新加坡", 103.82, 1.35],
+  ["singapore", "新加坡", 103.82, 1.35],
+  ["新加坡", "新加坡", 103.82, 1.35],
+  ["hk", "香港", 114.17, 22.32],
+  ["hong-kong", "香港", 114.17, 22.32],
+  ["香港", "香港", 114.17, 22.32],
+  ["cn", "中国大陆", 104.2, 35.86],
+  ["china", "中国大陆", 104.2, 35.86],
+  ["中国", "中国大陆", 104.2, 35.86],
+  ["tw", "台湾", 120.96, 23.7],
+  ["taiwan", "台湾", 120.96, 23.7],
+  ["台湾", "台湾", 120.96, 23.7],
+  ["jp", "日本", 138.25, 36.2],
+  ["japan", "日本", 138.25, 36.2],
+  ["日本", "日本", 138.25, 36.2],
+  ["kr", "韩国", 127.77, 35.91],
+  ["korea", "韩国", 127.77, 35.91],
+  ["south-korea", "韩国", 127.77, 35.91],
+  ["au", "澳大利亚", 133.78, -25.27],
+  ["australia", "澳大利亚", 133.78, -25.27],
+  ["za", "南非", 22.94, -30.56],
+  ["south-africa", "南非", 22.94, -30.56],
+] as const;
+
+const locationCentroids: Record<string, LocationCentroid> = Object.fromEntries(
+  centroidSeeds.map(([key, label, longitude, latitude]) => {
+    const projected = projectLonLat(longitude, latitude);
+    return [normalizeLocationKey(key), { key: normalizeLocationKey(key), label, ...projected }];
+  }),
+);

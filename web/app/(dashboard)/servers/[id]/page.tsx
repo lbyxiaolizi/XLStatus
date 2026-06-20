@@ -43,6 +43,10 @@ interface ServerDetail {
   traffic_quota_type?: string | null;
   provider?: string | null;
   region?: string | null;
+  country?: string | null;
+  city?: string | null;
+  latitude?: number | null;
+  longitude?: number | null;
   plan?: string | null;
   tags?: string[];
   accent_color?: string | null;
@@ -118,6 +122,10 @@ interface ServerMetadataForm {
   traffic_quota_type: string;
   provider: string;
   region: string;
+  country: string;
+  city: string;
+  latitude: string;
+  longitude: string;
   plan: string;
   tags: string;
   accent_color: string;
@@ -160,6 +168,10 @@ const blankMetadataForm: ServerMetadataForm = {
   traffic_quota_type: "",
   provider: "",
   region: "",
+  country: "",
+  city: "",
+  latitude: "",
+  longitude: "",
   plan: "",
   tags: "",
   accent_color: "#db2777",
@@ -222,7 +234,11 @@ export default function ServerDetailPage({ params }: PageProps) {
         traffic_quota_bytes: detail.traffic_quota_bytes === null || detail.traffic_quota_bytes === undefined ? "" : String(detail.traffic_quota_bytes),
         traffic_quota_type: detail.traffic_quota_type || metadataFromRecord(detail.last_info ?? {}, ["traffic_quota_type", "quota_type", "traffic_type", "bandwidth_type"]) || "",
         provider: detail.provider || metadataFromRecord(detail.last_info ?? {}, ["provider", "vendor", "datacenter", "isp"]) || "",
-        region: detail.region || metadataFromRecord(detail.last_info ?? {}, ["region", "location", "country", "city"]) || "",
+        region: detail.region || metadataFromRecord(detail.last_info ?? {}, ["region", "geo_region", "state", "province", "location"]) || "",
+        country: detail.country || metadataFromRecord(detail.last_info ?? {}, ["country", "geo_country", "country_name"]) || "",
+        city: detail.city || metadataFromRecord(detail.last_info ?? {}, ["city", "geo_city"]) || "",
+        latitude: detail.latitude === null || detail.latitude === undefined ? metadataFromRecord(detail.last_info ?? {}, ["latitude", "lat", "geo_latitude"]) || "" : String(detail.latitude),
+        longitude: detail.longitude === null || detail.longitude === undefined ? metadataFromRecord(detail.last_info ?? {}, ["longitude", "lon", "lng", "geo_longitude"]) || "" : String(detail.longitude),
         plan: detail.plan || metadataFromRecord(detail.last_info ?? {}, ["plan", "package", "sku", "product", "instance_type"]) || "",
         tags: Array.isArray(detail.tags) ? detail.tags.join(", ") : "",
         accent_color: detail.accent_color || "#db2777",
@@ -527,6 +543,10 @@ export default function ServerDetailPage({ params }: PageProps) {
       traffic_quota_type: metadataForm.traffic_quota_type.trim() || null,
       provider: metadataForm.provider.trim() || null,
       region: metadataForm.region.trim() || null,
+      country: metadataForm.country.trim() || null,
+      city: metadataForm.city.trim() || null,
+      latitude: metadataForm.latitude.trim() ? Number(metadataForm.latitude) : null,
+      longitude: metadataForm.longitude.trim() ? Number(metadataForm.longitude) : null,
       plan: metadataForm.plan.trim() || null,
       tags: splitTags(metadataForm.tags),
       accent_color: metadataForm.accent_color.trim() || null,
@@ -1373,6 +1393,20 @@ function ServerMetadataEditor({
           </Field>
           <Field label="套餐">
             <input className={inputClass} value={form.plan} onChange={(event) => onChange({ ...form, plan: event.target.value })} placeholder="Dedicated" />
+          </Field>
+        </div>
+        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+          <Field label="国家">
+            <input className={inputClass} value={form.country} onChange={(event) => onChange({ ...form, country: event.target.value })} placeholder="Hong Kong" />
+          </Field>
+          <Field label="城市">
+            <input className={inputClass} value={form.city} onChange={(event) => onChange({ ...form, city: event.target.value })} placeholder="Hong Kong" />
+          </Field>
+          <Field label="纬度">
+            <input type="number" min="-90" max="90" step="0.000001" className={inputClass} value={form.latitude} onChange={(event) => onChange({ ...form, latitude: event.target.value })} placeholder="22.3193" />
+          </Field>
+          <Field label="经度">
+            <input type="number" min="-180" max="180" step="0.000001" className={inputClass} value={form.longitude} onChange={(event) => onChange({ ...form, longitude: event.target.value })} placeholder="114.1694" />
           </Field>
         </div>
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">

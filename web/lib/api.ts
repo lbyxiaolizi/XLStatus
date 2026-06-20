@@ -108,7 +108,11 @@ export interface ThemeDefinition {
   description?: string | null;
   target: "public" | "dashboard" | "both" | string;
   variables: Record<string, string>;
+  light_variables?: Record<string, string>;
+  dark_variables?: Record<string, string>;
   custom_css?: string | null;
+  light_custom_css?: string | null;
+  dark_custom_css?: string | null;
   builtin: boolean;
   created_at?: string | null;
   updated_at?: string | null;
@@ -127,7 +131,11 @@ export interface ImportThemeRequest {
     description?: string | null;
     target?: "public" | "dashboard" | "both" | string;
     variables?: Record<string, string>;
+    light_variables?: Record<string, string>;
+    dark_variables?: Record<string, string>;
     custom_css?: string | null;
+    light_custom_css?: string | null;
+    dark_custom_css?: string | null;
   };
 }
 
