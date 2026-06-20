@@ -311,16 +311,7 @@ function PublicRegionMap({ servers }: { servers: Server[] }) {
           aria-label="公开服务器地理分布地图"
         >
           <rect width="900" height="420" fill="var(--bg-page)" />
-          {publicWorldShapes.map((shape) => (
-            <path
-              key={shape.id}
-              d={shape.d}
-              fill="var(--bg-card)"
-              stroke="var(--border-color)"
-              strokeWidth="3"
-              opacity="0.85"
-            />
-          ))}
+          <image href="/world-land-110m.svg" x="0" y="0" width="900" height="420" opacity="0.88" />
           {active.map(({ point, servers: regionServers }) => {
             const count = regionServers.length;
             const radius = count ? 7 + Math.min(18, (count / maxCount) * 12) : 3;
@@ -815,33 +806,6 @@ function startOfDay(date: Date): Date {
 function dayKey(date: Date): string {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
 }
-
-const publicWorldShapes = [
-  {
-    id: "north-america",
-    d: "M95 110 L175 70 L270 96 L315 145 L285 208 L215 226 L155 198 L96 166 Z",
-  },
-  {
-    id: "south-america",
-    d: "M275 235 L330 263 L350 326 L315 390 L276 354 L248 292 Z",
-  },
-  {
-    id: "europe",
-    d: "M420 100 L478 80 L540 112 L524 165 L455 170 L405 138 Z",
-  },
-  {
-    id: "africa",
-    d: "M446 174 L538 175 L585 240 L544 335 L470 325 L428 245 Z",
-  },
-  {
-    id: "asia",
-    d: "M535 108 L650 78 L792 128 L818 205 L732 250 L640 214 L548 172 Z",
-  },
-  {
-    id: "australia",
-    d: "M692 300 L770 286 L830 326 L792 366 L710 350 Z",
-  },
-] as const;
 
 function numberOrNull(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
