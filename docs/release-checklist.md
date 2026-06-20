@@ -35,6 +35,7 @@ GitHub Actions 会在 `main` 和 PR 上运行 Rust/Web 检查，并在 tag `v*` 
 - `install-agent.sh`
 
 Server 后台生成的 Agent 一键安装链接会从 GitHub Release 下载 `install-agent.sh`。
+发布前确认 `deploy/install*.sh`、Server bootstrap 默认版本、Web 设置页默认 Agent 版本和文档示例使用同一个 tag。
 
 Linux x86_64 smoke：
 
@@ -69,6 +70,7 @@ timeout 8s env \
 - 从源码构建包含后端、Agent 和前端步骤。
 - CORS、`config.toml`、SQLite 创建行为、PostgreSQL 新站初始化均有说明。
 - Agent 安装说明包含后台带参数链接和 GitHub Release 脚本来源。
+- README 只保留当前入口和文档索引，不引用历史规划目录作为主路径。
 
 ## 安全
 

@@ -491,7 +491,7 @@ fn backoff_with_jitter(attempt: u32) -> Duration {
 const HEARTBEAT_INTERVAL_SECS: u64 = 15;
 const REPORT_INTERVAL_SECS: u64 = 3;
 /// M2: refresh the agent JWT every 4 min, well inside the
-/// server-issued 5 min window. See plan/02-architecture.md.
+/// server-issued 5 min window. See docs/architecture.md.
 const JWT_REFRESH_SECS: u64 = 240;
 
 async fn handle_io_frame(

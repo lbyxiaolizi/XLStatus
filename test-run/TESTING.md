@@ -314,5 +314,5 @@ rm -rf test-run
 
 ---
 
-**测试人员**: Claude (Opus 4.8)
+**维护者**: XLStatus maintainers
 **最后更新**: 2026-06-17 02:30 UTC

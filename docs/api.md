@@ -141,13 +141,13 @@ Agent gRPC 服务定义在 `proto/xlstatus/v1/agent.proto`，生成代码在 `cr
 | `grpc_server` | Agent gRPC 地址 |
 | `enrollment_token` | enrollment token |
 | `agent_name` | Agent 名称；默认 `$(hostname)` |
-| `version` | GitHub Release 版本，默认 `v0.1.0-alpha.2` |
+| `version` | GitHub Release 版本，默认 `v0.1.0-alpha.3` |
 | `script_url` | 可选，自定义 GitHub 脚本地址 |
 
 示例：
 
 ```bash
-curl -fsSL 'http://dashboard.example.com:8080/api/v1/agents/install.sh?server_url=http%3A%2F%2Fdashboard.example.com%3A8080&grpc_server=http%3A%2F%2Fdashboard.example.com%3A50051&enrollment_token=xle_...&agent_name=%24(hostname)&version=v0.1.0-alpha.2' | sudo bash
+curl -fsSL 'http://dashboard.example.com:8080/api/v1/agents/install.sh?server_url=http%3A%2F%2Fdashboard.example.com%3A8080&grpc_server=http%3A%2F%2Fdashboard.example.com%3A50051&enrollment_token=xle_...&agent_name=%24(hostname)&version=v0.1.0-alpha.3' | sudo bash
 ```
 
 `enrollment_token` 会进入 URL，建议使用短有效期 token。

@@ -50,6 +50,18 @@ xlstatus-agent run --config /etc/xlstatus-agent/agent.json
 
 ## systemd 安装
 
+使用当前 Release 安装脚本：
+
+```bash
+sudo SERVER_URL=http://dashboard.example.com:8080 \
+  GRPC_SERVER=http://dashboard.example.com:50051 \
+  ENROLLMENT_TOKEN=xle_... \
+  AGENT_NAME="$(hostname)" \
+  bash -c 'curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.3/install-agent.sh | bash'
+```
+
+使用本地构建产物安装：
+
 ```bash
 sudo BINARY_PATH=target/release/xlstatus-agent \
   SERVER_URL=http://dashboard.example.com:8080 \
@@ -77,7 +89,7 @@ curl -fsSL 'http://dashboard.example.com:8080/api/v1/agents/install.sh?...' | su
 这个链接由 Server 负责注入参数，真正执行的安装脚本来自 GitHub Release：
 
 ```text
-https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.2/install-agent.sh
+https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.3/install-agent.sh
 ```
 
 生成链接时会包含 enrollment token；这个 token 建议设置短有效期，并只发给受信任主机。
