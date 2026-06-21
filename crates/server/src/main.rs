@@ -1,9 +1,9 @@
 use anyhow::Context;
 use axum::{
     extract::Query,
-    http::{header, HeaderName, HeaderValue, Method},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     middleware,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
     Router,
 };
@@ -749,7 +749,41 @@ struct AgentInstallQuery {
     version: Option<String>,
 }
 
-async fn install_agent_script(Query(query): Query<AgentInstallQuery>) -> impl IntoResponse {
+async fn install_agent_script(
+    headers: HeaderMap,
+    Query(query): Query<AgentInstallQuery>,
+) -> Response {
+    match build_install_agent_script(&headers, query) {
+        Ok(body) => (
+            [
+                (
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("text/x-shellscript; charset=utf-8"),
+                ),
+                (
+                    header::CONTENT_DISPOSITION,
+                    HeaderValue::from_static("attachment; filename=\"install-agent.sh\""),
+                ),
+            ],
+            body,
+        )
+            .into_response(),
+        Err(message) => (
+            StatusCode::BAD_REQUEST,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            )],
+            message,
+        )
+            .into_response(),
+    }
+}
+
+fn build_install_agent_script(
+    headers: &HeaderMap,
+    query: AgentInstallQuery,
+) -> Result<String, String> {
     let requested_version = query
         .version
         .as_deref()
@@ -763,16 +797,19 @@ async fn install_agent_script(Query(query): Query<AgentInstallQuery>) -> impl In
     let script_url = format!(
         "https://github.com/lbyxiaolizi/XLStatus/releases/download/{version}/install-agent.sh"
     );
-    let server_url = query
-        .server_url
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("http://localhost:8080");
-    let grpc_server = query
-        .grpc_server
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("http://localhost:50051");
+    let request_authority = request_authority(headers);
+    let request_host = request_authority.as_deref().and_then(authority_hostname);
+    let server_url = normalize_install_control_url(
+        query.server_url.as_deref(),
+        request_host.as_deref(),
+        request_authority.as_deref(),
+        "server_url",
+    )?;
+    let grpc_server = normalize_install_grpc_url(
+        query.grpc_server.as_deref(),
+        &server_url,
+        request_host.as_deref(),
+    )?;
     let grpc_tls_ca_path = query
         .grpc_tls_ca_path
         .as_deref()
@@ -816,7 +853,7 @@ SCRIPT_URL="https://github.com/lbyxiaolizi/XLStatus/releases/download/${VERSION}
     } else {
         format!("SCRIPT_URL={}", shell_quote(&script_url))
     };
-    let body = format!(
+    Ok(format!(
         r#"#!/bin/bash
 set -e
 
@@ -840,8 +877,8 @@ fi
 curl -fsSL "$SCRIPT_URL" | bash
 "#,
         version = shell_quote(version),
-        server_url = shell_quote(server_url),
-        grpc_server = shell_quote(grpc_server),
+        server_url = shell_quote(&server_url),
+        grpc_server = shell_quote(&grpc_server),
         grpc_tls_ca_path_line = optional_export_line("GRPC_TLS_CA_PATH", grpc_tls_ca_path),
         grpc_tls_domain_name_line =
             optional_export_line("GRPC_TLS_DOMAIN_NAME", grpc_tls_domain_name),
@@ -852,21 +889,7 @@ curl -fsSL "$SCRIPT_URL" | bash
         enrollment_token = shell_quote(enrollment_token),
         agent_name_line = agent_name_line,
         script_url_block = script_url_block,
-    );
-
-    (
-        [
-            (
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("text/x-shellscript; charset=utf-8"),
-            ),
-            (
-                header::CONTENT_DISPOSITION,
-                HeaderValue::from_static("attachment; filename=\"install-agent.sh\""),
-            ),
-        ],
-        body,
-    )
+    ))
 }
 
 fn optional_export_line(name: &str, value: Option<&str>) -> String {
@@ -882,6 +905,137 @@ fn valid_release_version(value: &str) -> bool {
             && value
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')))
+}
+
+fn request_authority(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| {
+            let url = reqwest::Url::parse(&format!("http://{value}")).ok()?;
+            Some(url_origin_authority(&url))
+        })
+}
+
+fn normalize_install_control_url(
+    value: Option<&str>,
+    request_host: Option<&str>,
+    request_authority: Option<&str>,
+    field: &str,
+) -> Result<String, String> {
+    if request_host.is_none()
+        && value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some()
+    {
+        return Err(format!("{field} requires a Host header for validation"));
+    }
+    let raw = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| request_authority.map(|authority| format!("http://{authority}")))
+        .unwrap_or_else(|| "http://localhost:8080".to_string());
+    let url = parse_install_endpoint_url(&raw, field)?;
+    if let Some(host) = request_host {
+        ensure_install_url_host(&url, host, field)?;
+    }
+    Ok(url_origin(&url))
+}
+
+fn normalize_install_grpc_url(
+    value: Option<&str>,
+    server_url: &str,
+    request_host: Option<&str>,
+) -> Result<String, String> {
+    if request_host.is_none()
+        && value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some()
+    {
+        return Err("grpc_server requires a Host header for validation".to_string());
+    }
+    let server = reqwest::Url::parse(server_url)
+        .map_err(|e| format!("server_url is invalid after normalization: {e}"))?;
+    let raw = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| default_grpc_endpoint(&server));
+    let url = parse_install_endpoint_url(&raw, "grpc_server")?;
+    if let Some(host) = request_host {
+        ensure_install_url_host(&url, host, "grpc_server")?;
+    } else if let Some(server_host) = server.host_str() {
+        ensure_install_url_host(&url, server_host, "grpc_server")?;
+    }
+    Ok(url_origin(&url))
+}
+
+fn parse_install_endpoint_url(value: &str, field: &str) -> Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(value).map_err(|e| format!("{field} is invalid: {e}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!("{field} must use http or https"));
+    }
+    if url.host_str().is_none() {
+        return Err(format!("{field} must include a host"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(format!("{field} must not include userinfo"));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(format!("{field} must not include query or fragment"));
+    }
+    if !matches!(url.path(), "" | "/") {
+        return Err(format!("{field} must be an origin URL without a path"));
+    }
+    Ok(url)
+}
+
+fn ensure_install_url_host(
+    url: &reqwest::Url,
+    expected_host: &str,
+    field: &str,
+) -> Result<(), String> {
+    let Some(host) = url.host_str() else {
+        return Err(format!("{field} must include a host"));
+    };
+    if host.eq_ignore_ascii_case(expected_host) {
+        Ok(())
+    } else {
+        Err(format!("{field} host must match this XLStatus server host"))
+    }
+}
+
+fn authority_hostname(authority: &str) -> Option<String> {
+    let url = reqwest::Url::parse(&format!("http://{authority}")).ok()?;
+    url.host_str().map(|host| host.to_ascii_lowercase())
+}
+
+fn url_origin(url: &reqwest::Url) -> String {
+    format!("{}://{}", url.scheme(), url_origin_authority(url))
+}
+
+fn url_origin_authority(url: &reqwest::Url) -> String {
+    let host = url.host_str().expect("validated URL has host");
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    }
+}
+
+fn default_grpc_endpoint(server: &reqwest::Url) -> String {
+    let mut url = server.clone();
+    let _ = url.set_port(Some(50051));
+    url_origin(&url)
 }
 
 fn shell_quote(value: &str) -> String {
@@ -956,4 +1110,115 @@ async fn seed_admin_user(db: &DatabaseBackend) -> anyhow::Result<()> {
     .await?;
     tracing::info!("Seeded admin user '{}'", username);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers_with_host(host: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_str(host).unwrap());
+        headers
+    }
+
+    fn install_query(server_url: Option<&str>, grpc_server: Option<&str>) -> AgentInstallQuery {
+        AgentInstallQuery {
+            server_url: server_url.map(str::to_string),
+            grpc_server: grpc_server.map(str::to_string),
+            grpc_tls_ca_path: None,
+            grpc_tls_domain_name: None,
+            grpc_tls_client_cert_path: None,
+            grpc_tls_client_key_path: None,
+            enrollment_token: Some(format!("xle_{}", "a".repeat(64))),
+            agent_name: Some("$(hostname)".into()),
+            version: Some(DEFAULT_AGENT_INSTALL_VERSION.into()),
+        }
+    }
+
+    #[test]
+    fn install_bootstrap_rejects_cross_host_control_urls() {
+        let headers = headers_with_host("status.example.com");
+
+        let err = build_install_agent_script(
+            &headers,
+            install_query(Some("https://evil.example.com"), None),
+        )
+        .unwrap_err();
+        assert!(err.contains("server_url host must match"));
+
+        let err = build_install_agent_script(
+            &headers,
+            install_query(
+                Some("https://status.example.com"),
+                Some("https://evil.example.com:50051"),
+            ),
+        )
+        .unwrap_err();
+        assert!(err.contains("grpc_server host must match"));
+    }
+
+    #[test]
+    fn install_bootstrap_requires_host_header_for_explicit_urls() {
+        let headers = HeaderMap::new();
+        let err = build_install_agent_script(
+            &headers,
+            install_query(Some("https://evil.example.com"), None),
+        )
+        .unwrap_err();
+        assert!(err.contains("server_url requires a Host header"));
+    }
+
+    #[test]
+    fn install_bootstrap_defaults_to_request_host() {
+        let headers = headers_with_host("status.example.com");
+        let body = build_install_agent_script(&headers, install_query(None, None)).unwrap();
+
+        assert!(body.contains("export SERVER_URL='http://status.example.com'"));
+        assert!(body.contains("export GRPC_SERVER='http://status.example.com:50051'"));
+    }
+
+    #[test]
+    fn install_bootstrap_default_server_url_preserves_request_host_port() {
+        let headers = headers_with_host("status.example.com:8080");
+        let body = build_install_agent_script(&headers, install_query(None, None)).unwrap();
+
+        assert!(body.contains("export SERVER_URL='http://status.example.com:8080'"));
+        assert!(body.contains("export GRPC_SERVER='http://status.example.com:50051'"));
+    }
+
+    #[test]
+    fn install_bootstrap_allows_same_host_different_control_ports() {
+        let headers = headers_with_host("status.example.com");
+        let body = build_install_agent_script(
+            &headers,
+            install_query(
+                Some("https://status.example.com:8443"),
+                Some("https://status.example.com:50051"),
+            ),
+        )
+        .unwrap();
+
+        assert!(body.contains("export SERVER_URL='https://status.example.com:8443'"));
+        assert!(body.contains("export GRPC_SERVER='https://status.example.com:50051'"));
+    }
+
+    #[test]
+    fn install_bootstrap_rejects_url_paths_and_userinfo() {
+        let headers = headers_with_host("status.example.com");
+
+        let err = build_install_agent_script(
+            &headers,
+            install_query(Some("https://status.example.com/path"), None),
+        )
+        .unwrap_err();
+        assert!(err.contains("without a path"));
+
+        let err = build_install_agent_script(
+            &headers,
+            install_query(Some("https://user:pass@status.example.com"), None),
+        )
+        .unwrap_err();
+        assert!(err.contains("must not include userinfo"));
+    }
 }

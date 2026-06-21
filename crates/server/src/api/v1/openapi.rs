@@ -29,7 +29,7 @@ const ROUTES: &[RouteSpec] = &[
     RouteSpec {
         method: "get",
         path: "/api/v1/agents/install.sh",
-        summary: "Parameterized Agent install script",
+        summary: "Parameterized Agent install script with same-host control endpoints",
         protected: false,
     },
     RouteSpec {
@@ -1058,5 +1058,16 @@ mod tests {
 
         assert!(geoip_test["post"].get("security").is_some());
         assert!(geoip_test["get"].is_null());
+    }
+
+    #[test]
+    fn openapi_mentions_same_host_agent_install_bootstrap() {
+        let doc = openapi_document();
+        let install = &doc["paths"]["/api/v1/agents/install.sh"]["get"]["summary"];
+
+        assert!(install
+            .as_str()
+            .unwrap()
+            .contains("same-host control endpoints"));
     }
 }

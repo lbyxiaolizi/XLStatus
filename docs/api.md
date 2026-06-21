@@ -135,12 +135,14 @@ Agent gRPC 服务定义在 `proto/xlstatus/v1/agent.proto`，生成代码在 `cr
 
 `GET /api/v1/agents/install.sh` 接收查询参数并返回一个很小的 bootstrap shell 脚本。真正的 `install-agent.sh` 放在 GitHub Release 资产中，bootstrap 只负责导出参数并下载执行 GitHub 脚本。
 
+安全约束：`server_url` 与 `grpc_server` 只能是 `http` / `https` origin URL，不能包含 path、query、fragment 或 userinfo；若显式传入，host 必须与本次请求的 `Host` 相同，端口可以不同。未传 `server_url` 时使用当前请求 Host；未传 `grpc_server` 时在同 Host 上推导 `:50051`。
+
 支持的参数：
 
 | 参数 | 说明 |
 |---|---|
-| `server_url` | Dashboard HTTP API 地址 |
-| `grpc_server` | Agent gRPC 地址 |
+| `server_url` | Dashboard HTTP API origin，必须与请求 Host 同主机 |
+| `grpc_server` | Agent gRPC origin，必须与请求 Host 同主机，端口可不同 |
 | `grpc_tls_ca_path` | 可选，Agent 侧用于验证 gRPC 服务端的 PEM CA 路径 |
 | `grpc_tls_domain_name` | 可选，Agent 侧 gRPC TLS 证书校验的服务名覆盖 |
 | `grpc_tls_client_cert_path` | 可选，Agent 侧 mTLS 客户端 PEM 证书路径 |
@@ -155,7 +157,7 @@ Agent gRPC 服务定义在 `proto/xlstatus/v1/agent.proto`，生成代码在 `cr
 curl -fsSL 'http://dashboard.example.com:8080/api/v1/agents/install.sh?server_url=http%3A%2F%2Fdashboard.example.com%3A8080&grpc_server=http%3A%2F%2Fdashboard.example.com%3A50051&enrollment_token=xle_...&agent_name=%24(hostname)&version=v0.1.0-alpha.3' | sudo bash
 ```
 
-`enrollment_token` 会进入 URL，建议使用短有效期 token。
+`enrollment_token` 会进入 URL，建议使用短有效期 token。若需要让 Agent 连接到不同主机名的控制面，不要使用这个公开 bootstrap 端点；请直接从 GitHub Release 下载 `install-agent.sh` 并通过环境变量传入 `SERVER_URL` / `GRPC_SERVER`。
 
 ## CORS 和 Cookie
 

@@ -289,6 +289,8 @@ sudo journalctl -u xlstatus-agent -n 100 --no-pager
 
 后台“设置”页可以生成 enrollment token，并给出完整安装命令。真正的 Agent 安装脚本放在 GitHub Release 中，Server 只生成带参数的 bootstrap 链接，把 `SERVER_URL`、`GRPC_SERVER`、`ENROLLMENT_TOKEN`、`AGENT_NAME` 和 `VERSION` 注入后再拉取 GitHub 脚本。
 
+带参数 bootstrap 是公开端点，因此 `SERVER_URL` 和 `GRPC_SERVER` 只能指向与本次请求 `Host` 相同的主机，端口可以不同。需要连接到不同主机名时，请直接使用 GitHub Release 中的 `install-agent.sh`，通过环境变量传入控制面地址。
+
 Server 提供的带参数入口：
 
 ```text
