@@ -15,6 +15,7 @@ use axum::{
 };
 use chrono::Utc;
 use maxminddb::{geoip2, Reader};
+use reqwest::header::{HeaderValue, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use std::collections::HashMap;
@@ -282,7 +283,7 @@ pub async fn handle_agent_ip_report(
 
 async fn lookup_geojs(ip: &str) -> Result<GeoIpLookupResponse, AppError> {
     let url = format!("https://get.geojs.io/v1/ip/geo/{ip}.json");
-    let raw = fetch_json(&url).await?;
+    let raw = fetch_json(&url, None).await?;
     Ok(GeoIpLookupResponse {
         provider: "geojs".into(),
         ip: json_string(&raw, &["ip"]).unwrap_or_else(|| ip.to_string()),
@@ -342,7 +343,7 @@ async fn lookup_ip_api(ip: &str) -> Result<GeoIpLookupResponse, AppError> {
     let url = format!(
         "http://ip-api.com/json/{ip}?fields=status,message,country,regionName,city,lat,lon,isp,org,as,timezone,query"
     );
-    let raw = fetch_json(&url).await?;
+    let raw = fetch_json(&url, None).await?;
     if raw.get("status").and_then(|value| value.as_str()) == Some("fail") {
         let message =
             json_string(&raw, &["message"]).unwrap_or_else(|| "ip-api lookup failed".into());
@@ -364,12 +365,8 @@ async fn lookup_ip_api(ip: &str) -> Result<GeoIpLookupResponse, AppError> {
 }
 
 async fn lookup_ipinfo(ip: &str, token: Option<&str>) -> Result<GeoIpLookupResponse, AppError> {
-    let mut url = reqwest::Url::parse(&format!("https://ipinfo.io/{ip}/json"))
-        .map_err(|e| AppError::BadRequest(format!("invalid ipinfo URL: {e}")))?;
-    if let Some(token) = token.filter(|value| !value.trim().is_empty()) {
-        url.query_pairs_mut().append_pair("token", token.trim());
-    }
-    let raw = fetch_json(url.as_str()).await?;
+    let url = ipinfo_lookup_url(ip)?;
+    let raw = fetch_json(url.as_str(), token).await?;
     let (latitude, longitude) = raw
         .get("loc")
         .and_then(|value| value.as_str())
@@ -391,12 +388,19 @@ async fn lookup_ipinfo(ip: &str, token: Option<&str>) -> Result<GeoIpLookupRespo
     })
 }
 
-async fn fetch_json(url: &str) -> Result<serde_json::Value, AppError> {
-    let response = reqwest::Client::builder()
+async fn fetch_json(url: &str, bearer_token: Option<&str>) -> Result<serde_json::Value, AppError> {
+    let validated = validate_outbound_url_resolved(url, "GeoIP lookup")
+        .await
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let mut request = secure_reqwest_client_builder(&validated)
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| AppError::BadRequest(format!("GeoIP client init failed: {e}")))?
-        .get(url)
+        .get(validated.url.clone());
+    if let Some(header) = geoip_bearer_auth_header(bearer_token)? {
+        request = request.header(AUTHORIZATION, header);
+    }
+    let response = request
         .send()
         .await
         .map_err(|e| AppError::BadRequest(format!("GeoIP lookup failed: {e}")))?;
@@ -410,6 +414,20 @@ async fn fetch_json(url: &str) -> Result<serde_json::Value, AppError> {
         .json::<serde_json::Value>()
         .await
         .map_err(|e| AppError::BadRequest(format!("GeoIP response is invalid: {e}")))
+}
+
+fn ipinfo_lookup_url(ip: &str) -> Result<reqwest::Url, AppError> {
+    reqwest::Url::parse(&format!("https://ipinfo.io/{ip}/json"))
+        .map_err(|e| AppError::BadRequest(format!("invalid ipinfo URL: {e}")))
+}
+
+fn geoip_bearer_auth_header(token: Option<&str>) -> Result<Option<HeaderValue>, AppError> {
+    let Some(token) = token.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    HeaderValue::from_str(&format!("Bearer {token}"))
+        .map(Some)
+        .map_err(|_| AppError::BadRequest("ipinfo token contains invalid header bytes".into()))
 }
 
 fn lookup_mmdb(ip: &str) -> Result<GeoIpLookupResponse, AppError> {
@@ -1033,6 +1051,32 @@ mod tests {
         let value = serde_json::json!({ "lat": "12.5", "lon": 35.0 });
         assert_eq!(json_f64(&value, &["lat"]), Some(12.5));
         assert_eq!(json_f64(&value, &["lon"]), Some(35.0));
+    }
+
+    #[test]
+    fn ipinfo_lookup_does_not_put_token_in_url_query() {
+        let url = ipinfo_lookup_url("1.1.1.1").expect("ipinfo url");
+
+        assert_eq!(url.as_str(), "https://ipinfo.io/1.1.1.1/json");
+        assert!(url.query().is_none());
+    }
+
+    #[test]
+    fn ipinfo_token_uses_bearer_authorization_header() {
+        let header = geoip_bearer_auth_header(Some(" token-value ")).expect("valid bearer header");
+
+        assert_eq!(
+            header.and_then(|value| value.to_str().ok().map(str::to_string)),
+            Some("Bearer token-value".into())
+        );
+        assert!(geoip_bearer_auth_header(Some("")).unwrap().is_none());
+    }
+
+    #[test]
+    fn ipinfo_token_rejects_invalid_header_bytes() {
+        let err = geoip_bearer_auth_header(Some("bad\r\nvalue")).unwrap_err();
+
+        assert!(matches!(err, AppError::BadRequest(_)));
     }
 
     #[test]
