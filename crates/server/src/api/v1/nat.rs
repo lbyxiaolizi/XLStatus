@@ -2,7 +2,7 @@
 #![allow(unused_imports)]
 
 use axum::{
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
@@ -13,13 +13,29 @@ use serde::{Deserialize, Serialize};
 use crate::api::types::ApiResponse;
 use crate::api::v1::auth::AppState;
 use crate::auth::middleware::{AuthKind, AuthSession, AuthUser};
-use crate::auth::rbac::{can_access_server, has_scope};
+use crate::auth::rbac::has_scope;
 use crate::db::repository::NatMappingRepository;
 use crate::db::AgentRepository;
 use crate::db::Db;
 use crate::nat::tunnel::nat_public_port_allowed;
 use std::net::IpAddr;
 use xlstatus_shared::nat::*;
+
+const NAT_API_MAX_BODY_BYTES: usize = 64 * 1024;
+const NAT_MAX_AGENT_ID_BYTES: usize = 64;
+const NAT_MAX_LOCAL_HOST_BYTES: usize = 253;
+const NAT_MAX_PROTOCOL_BYTES: usize = 16;
+const NAT_MAX_DESCRIPTION_BYTES: usize = 1024;
+const NAT_MAX_ALLOWED_SOURCES_BYTES: usize = 4096;
+const NAT_MAX_ALLOWED_SOURCE_ENTRIES: usize = 64;
+const NAT_MAX_ALLOWED_SOURCE_ENTRY_BYTES: usize = 128;
+const NAT_MAX_ACTIVE_TUNNELS_PER_MAPPING: u32 = 1024;
+const NAT_MAX_IDLE_TIMEOUT_SECONDS: u32 = 24 * 60 * 60;
+const NAT_MAX_BYTES_PER_TUNNEL: u64 = 1024 * 1024 * 1024 * 1024;
+const NAT_MAX_BANDWIDTH_BYTES_PER_SECOND: u64 = 1024 * 1024 * 1024;
+const NAT_MAX_RATE_LIMIT_WINDOW_SECONDS: u32 = 24 * 60 * 60;
+const NAT_MAX_CONNECTIONS_PER_WINDOW: u32 = 100_000;
+const NAT_MAX_BYTES_PER_WINDOW: u64 = 1024 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateNatMappingRequest {
@@ -68,6 +84,46 @@ pub struct NatMappingListResponse {
     pub total: usize,
 }
 
+#[derive(Debug)]
+struct NormalizedCreateNatMappingRequest {
+    agent_id: String,
+    local_host: String,
+    local_port: u16,
+    public_port: u16,
+    protocol: Protocol,
+    description: Option<String>,
+    allowed_sources: Option<String>,
+    max_active_tunnels: Option<u32>,
+    idle_timeout_seconds: Option<u32>,
+    max_bytes_per_tunnel: Option<u64>,
+    max_bandwidth_bytes_per_second: Option<u64>,
+    rate_limit_window_seconds: Option<u32>,
+    max_connections_per_window: Option<u32>,
+    max_bytes_per_window: Option<u64>,
+}
+
+#[derive(Debug)]
+struct NormalizedUpdateNatMappingRequest {
+    local_host: Option<String>,
+    local_port: Option<u16>,
+    public_port: Option<u16>,
+    protocol: Option<Protocol>,
+    enabled: Option<bool>,
+    description: Option<Option<String>>,
+    allowed_sources: Option<Option<String>>,
+    max_active_tunnels: Option<u32>,
+    idle_timeout_seconds: Option<u32>,
+    max_bytes_per_tunnel: Option<u64>,
+    max_bandwidth_bytes_per_second: Option<u64>,
+    rate_limit_window_seconds: Option<u32>,
+    max_connections_per_window: Option<u32>,
+    max_bytes_per_window: Option<u64>,
+}
+
+pub fn nat_body_limit() -> DefaultBodyLimit {
+    DefaultBodyLimit::max(NAT_API_MAX_BODY_BYTES)
+}
+
 /// Create a new NAT mapping
 pub async fn create_nat_mapping(
     State(state): State<AppState>,
@@ -77,31 +133,11 @@ pub async fn create_nat_mapping(
     let db = state.db.clone();
 
     require_scope_or_403(&auth_user, "nat:write")?;
+    let req = normalize_create_nat_mapping_request(req).map_err(bad_request_with)?;
     validate_nat_agent_or_403(&db, &auth_user, &req.agent_id).await?;
     validate_nat_local_target_or_403(&req.local_host)?;
+    validate_local_port_or_403(req.local_port)?;
     validate_public_port_or_403(req.public_port)?;
-    let allowed_sources = normalize_allowed_sources_or_403(req.allowed_sources.as_deref())?;
-    validate_positive_i32_or_403(req.max_active_tunnels, "max_active_tunnels")?;
-    validate_positive_i32_or_403(req.idle_timeout_seconds, "idle_timeout_seconds")?;
-    validate_positive_i64_or_403(req.max_bytes_per_tunnel, "max_bytes_per_tunnel")?;
-    validate_positive_i64_or_403(
-        req.max_bandwidth_bytes_per_second,
-        "max_bandwidth_bytes_per_second",
-    )?;
-    validate_positive_i32_or_403(req.rate_limit_window_seconds, "rate_limit_window_seconds")?;
-    validate_positive_i32_or_403(req.max_connections_per_window, "max_connections_per_window")?;
-    validate_positive_i64_or_403(req.max_bytes_per_window, "max_bytes_per_window")?;
-    // Validate protocol
-    let protocol = Protocol::from_str(&req.protocol).ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ApiResponse {
-                success: false,
-                data: None,
-                error: Some("Invalid protocol, must be 'tcp' or 'udp'".to_string()),
-            }),
-        )
-    })?;
 
     // Check if public port is already in use
     if let Ok(Some(_)) = NatMappingRepository::get_by_public_port(&db, req.public_port).await {
@@ -122,10 +158,10 @@ pub async fn create_nat_mapping(
         local_host: req.local_host,
         local_port: req.local_port,
         public_port: req.public_port,
-        protocol,
+        protocol: req.protocol,
         enabled: true,
         description: req.description,
-        allowed_sources,
+        allowed_sources: req.allowed_sources,
         max_active_tunnels: req.max_active_tunnels,
         idle_timeout_seconds: req.idle_timeout_seconds,
         max_bytes_per_tunnel: req.max_bytes_per_tunnel,
@@ -215,6 +251,7 @@ pub async fn list_nat_mappings(
     let db = state.db.clone();
 
     require_scope_or_403(&auth_user, "nat:read")?;
+    let agent_id = normalize_nat_agent_id(agent_id).map_err(bad_request_with)?;
     validate_nat_agent_or_403(&db, &auth_user, &agent_id).await?;
     let mappings = NatMappingRepository::list_by_agent(&db, &agent_id)
         .await
@@ -277,6 +314,7 @@ pub async fn update_nat_mapping(
     let db = state.db.clone();
 
     require_scope_or_403(&auth_user, "nat:write")?;
+    let req = normalize_update_nat_mapping_request(req).map_err(bad_request_with)?;
     let mut mapping = NatMappingRepository::get_by_id(&db, &mapping_id)
         .await
         .map_err(|e| {
@@ -300,12 +338,15 @@ pub async fn update_nat_mapping(
             )
         })?;
 
+    require_nat_agent_or_403(&db, &auth_user, &mapping.agent_id).await?;
+
     // Apply updates
     if let Some(local_host) = req.local_host {
         validate_nat_local_target_or_403(&local_host)?;
         mapping.local_host = local_host;
     }
     if let Some(local_port) = req.local_port {
+        validate_local_port_or_403(local_port)?;
         mapping.local_port = local_port;
     }
     if let Some(public_port) = req.public_port {
@@ -325,63 +366,42 @@ pub async fn update_nat_mapping(
         }
         mapping.public_port = public_port;
     }
-    if let Some(protocol_str) = req.protocol {
-        let protocol = Protocol::from_str(&protocol_str).ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(ApiResponse {
-                    success: false,
-                    data: None,
-                    error: Some("Invalid protocol".to_string()),
-                }),
-            )
-        })?;
+    if let Some(protocol) = req.protocol {
         mapping.protocol = protocol;
     }
     if let Some(enabled) = req.enabled {
         mapping.enabled = enabled;
     }
-    if req.description.is_some() {
-        mapping.description = req.description;
+    if let Some(description) = req.description {
+        mapping.description = description;
     }
-    if req.allowed_sources.is_some() {
-        mapping.allowed_sources = normalize_allowed_sources_or_403(req.allowed_sources.as_deref())?;
+    if let Some(allowed_sources) = req.allowed_sources {
+        mapping.allowed_sources = allowed_sources;
     }
-    if req.max_active_tunnels.is_some() {
-        validate_positive_i32_or_403(req.max_active_tunnels, "max_active_tunnels")?;
-        mapping.max_active_tunnels = req.max_active_tunnels;
+    if let Some(max_active_tunnels) = req.max_active_tunnels {
+        mapping.max_active_tunnels = Some(max_active_tunnels);
     }
-    if req.idle_timeout_seconds.is_some() {
-        validate_positive_i32_or_403(req.idle_timeout_seconds, "idle_timeout_seconds")?;
-        mapping.idle_timeout_seconds = req.idle_timeout_seconds;
+    if let Some(idle_timeout_seconds) = req.idle_timeout_seconds {
+        mapping.idle_timeout_seconds = Some(idle_timeout_seconds);
     }
-    if req.max_bytes_per_tunnel.is_some() {
-        validate_positive_i64_or_403(req.max_bytes_per_tunnel, "max_bytes_per_tunnel")?;
-        mapping.max_bytes_per_tunnel = req.max_bytes_per_tunnel;
+    if let Some(max_bytes_per_tunnel) = req.max_bytes_per_tunnel {
+        mapping.max_bytes_per_tunnel = Some(max_bytes_per_tunnel);
     }
-    if req.max_bandwidth_bytes_per_second.is_some() {
-        validate_positive_i64_or_403(
-            req.max_bandwidth_bytes_per_second,
-            "max_bandwidth_bytes_per_second",
-        )?;
-        mapping.max_bandwidth_bytes_per_second = req.max_bandwidth_bytes_per_second;
+    if let Some(max_bandwidth_bytes_per_second) = req.max_bandwidth_bytes_per_second {
+        mapping.max_bandwidth_bytes_per_second = Some(max_bandwidth_bytes_per_second);
     }
-    if req.rate_limit_window_seconds.is_some() {
-        validate_positive_i32_or_403(req.rate_limit_window_seconds, "rate_limit_window_seconds")?;
-        mapping.rate_limit_window_seconds = req.rate_limit_window_seconds;
+    if let Some(rate_limit_window_seconds) = req.rate_limit_window_seconds {
+        mapping.rate_limit_window_seconds = Some(rate_limit_window_seconds);
     }
-    if req.max_connections_per_window.is_some() {
-        validate_positive_i32_or_403(req.max_connections_per_window, "max_connections_per_window")?;
-        mapping.max_connections_per_window = req.max_connections_per_window;
+    if let Some(max_connections_per_window) = req.max_connections_per_window {
+        mapping.max_connections_per_window = Some(max_connections_per_window);
     }
-    if req.max_bytes_per_window.is_some() {
-        validate_positive_i64_or_403(req.max_bytes_per_window, "max_bytes_per_window")?;
-        mapping.max_bytes_per_window = req.max_bytes_per_window;
+    if let Some(max_bytes_per_window) = req.max_bytes_per_window {
+        mapping.max_bytes_per_window = Some(max_bytes_per_window);
     }
 
     mapping.updated_at = Utc::now().to_rfc3339();
 
-    require_nat_agent_or_403(&db, &auth_user, &mapping.agent_id).await?;
     NatMappingRepository::update(&db, &mapping)
         .await
         .map_err(|e| {
@@ -549,6 +569,15 @@ fn validate_public_port_or_403(port: u16) -> Result<(), (StatusCode, Json<ApiRes
     ))
 }
 
+fn validate_local_port_or_403(port: u16) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
+    if port > 0 {
+        return Ok(());
+    }
+    Err(bad_request_with(
+        "local_port must be greater than zero".to_string(),
+    ))
+}
+
 fn validate_nat_local_target_or_403(host: &str) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
     if nat_private_targets_allowed() || nat_local_target_is_loopback(host) {
         return Ok(());
@@ -584,12 +613,220 @@ fn nat_private_targets_allowed() -> bool {
     })
 }
 
-fn normalize_allowed_sources_or_403(
-    value: Option<&str>,
-) -> Result<Option<String>, (StatusCode, Json<ApiResponse<()>>)> {
+fn normalize_create_nat_mapping_request(
+    req: CreateNatMappingRequest,
+) -> Result<NormalizedCreateNatMappingRequest, String> {
+    Ok(NormalizedCreateNatMappingRequest {
+        agent_id: normalize_nat_agent_id(req.agent_id)?,
+        local_host: normalize_required_nat_text(
+            req.local_host,
+            NAT_MAX_LOCAL_HOST_BYTES,
+            "local_host",
+        )?,
+        local_port: req.local_port,
+        public_port: req.public_port,
+        protocol: normalize_nat_protocol(&req.protocol)?,
+        description: normalize_optional_nat_text(
+            req.description,
+            NAT_MAX_DESCRIPTION_BYTES,
+            "description",
+        )?,
+        allowed_sources: normalize_allowed_sources(req.allowed_sources.as_deref())?,
+        max_active_tunnels: normalize_bounded_u32(
+            req.max_active_tunnels,
+            NAT_MAX_ACTIVE_TUNNELS_PER_MAPPING,
+            "max_active_tunnels",
+        )?,
+        idle_timeout_seconds: normalize_bounded_u32(
+            req.idle_timeout_seconds,
+            NAT_MAX_IDLE_TIMEOUT_SECONDS,
+            "idle_timeout_seconds",
+        )?,
+        max_bytes_per_tunnel: normalize_bounded_u64(
+            req.max_bytes_per_tunnel,
+            NAT_MAX_BYTES_PER_TUNNEL,
+            "max_bytes_per_tunnel",
+        )?,
+        max_bandwidth_bytes_per_second: normalize_bounded_u64(
+            req.max_bandwidth_bytes_per_second,
+            NAT_MAX_BANDWIDTH_BYTES_PER_SECOND,
+            "max_bandwidth_bytes_per_second",
+        )?,
+        rate_limit_window_seconds: normalize_bounded_u32(
+            req.rate_limit_window_seconds,
+            NAT_MAX_RATE_LIMIT_WINDOW_SECONDS,
+            "rate_limit_window_seconds",
+        )?,
+        max_connections_per_window: normalize_bounded_u32(
+            req.max_connections_per_window,
+            NAT_MAX_CONNECTIONS_PER_WINDOW,
+            "max_connections_per_window",
+        )?,
+        max_bytes_per_window: normalize_bounded_u64(
+            req.max_bytes_per_window,
+            NAT_MAX_BYTES_PER_WINDOW,
+            "max_bytes_per_window",
+        )?,
+    })
+}
+
+fn normalize_update_nat_mapping_request(
+    req: UpdateNatMappingRequest,
+) -> Result<NormalizedUpdateNatMappingRequest, String> {
+    Ok(NormalizedUpdateNatMappingRequest {
+        local_host: req
+            .local_host
+            .map(|value| normalize_required_nat_text(value, NAT_MAX_LOCAL_HOST_BYTES, "local_host"))
+            .transpose()?,
+        local_port: req.local_port,
+        public_port: req.public_port,
+        protocol: req
+            .protocol
+            .as_deref()
+            .map(normalize_nat_protocol)
+            .transpose()?,
+        enabled: req.enabled,
+        description: match req.description {
+            Some(value) => Some(normalize_optional_nat_text(
+                Some(value),
+                NAT_MAX_DESCRIPTION_BYTES,
+                "description",
+            )?),
+            None => None,
+        },
+        allowed_sources: match req.allowed_sources {
+            Some(value) => Some(normalize_allowed_sources(Some(&value))?),
+            None => None,
+        },
+        max_active_tunnels: normalize_bounded_u32(
+            req.max_active_tunnels,
+            NAT_MAX_ACTIVE_TUNNELS_PER_MAPPING,
+            "max_active_tunnels",
+        )?,
+        idle_timeout_seconds: normalize_bounded_u32(
+            req.idle_timeout_seconds,
+            NAT_MAX_IDLE_TIMEOUT_SECONDS,
+            "idle_timeout_seconds",
+        )?,
+        max_bytes_per_tunnel: normalize_bounded_u64(
+            req.max_bytes_per_tunnel,
+            NAT_MAX_BYTES_PER_TUNNEL,
+            "max_bytes_per_tunnel",
+        )?,
+        max_bandwidth_bytes_per_second: normalize_bounded_u64(
+            req.max_bandwidth_bytes_per_second,
+            NAT_MAX_BANDWIDTH_BYTES_PER_SECOND,
+            "max_bandwidth_bytes_per_second",
+        )?,
+        rate_limit_window_seconds: normalize_bounded_u32(
+            req.rate_limit_window_seconds,
+            NAT_MAX_RATE_LIMIT_WINDOW_SECONDS,
+            "rate_limit_window_seconds",
+        )?,
+        max_connections_per_window: normalize_bounded_u32(
+            req.max_connections_per_window,
+            NAT_MAX_CONNECTIONS_PER_WINDOW,
+            "max_connections_per_window",
+        )?,
+        max_bytes_per_window: normalize_bounded_u64(
+            req.max_bytes_per_window,
+            NAT_MAX_BYTES_PER_WINDOW,
+            "max_bytes_per_window",
+        )?,
+    })
+}
+
+fn normalize_nat_agent_id(value: String) -> Result<String, String> {
+    normalize_required_nat_text(value, NAT_MAX_AGENT_ID_BYTES, "agent_id").and_then(|value| {
+        uuid::Uuid::parse_str(&value)
+            .map(|value| value.to_string())
+            .map_err(|_| "agent_id must be a UUID".to_string())
+    })
+}
+
+fn normalize_nat_protocol(value: &str) -> Result<Protocol, String> {
+    let value = normalize_required_nat_text(value.to_string(), NAT_MAX_PROTOCOL_BYTES, "protocol")?;
+    Protocol::from_str(&value).ok_or_else(|| "protocol must be tcp or udp".to_string())
+}
+
+fn normalize_required_nat_text(
+    value: String,
+    max_bytes: usize,
+    field: &str,
+) -> Result<String, String> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return Err(format!("{field} is required"));
+    }
+    if value.len() > max_bytes {
+        return Err(format!("{field} must be at most {max_bytes} bytes"));
+    }
+    Ok(value)
+}
+
+fn normalize_optional_nat_text(
+    value: Option<String>,
+    max_bytes: usize,
+    field: &str,
+) -> Result<Option<String>, String> {
+    let Some(value) = value.map(|value| value.trim().to_string()) else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() > max_bytes {
+        return Err(format!("{field} must be at most {max_bytes} bytes"));
+    }
+    Ok(Some(value))
+}
+
+fn normalize_bounded_u32(
+    value: Option<u32>,
+    max_value: u32,
+    field: &str,
+) -> Result<Option<u32>, String> {
     let Some(value) = value else {
         return Ok(None);
     };
+    if value == 0 {
+        return Err(format!("{field} must be greater than zero"));
+    }
+    if value > max_value {
+        return Err(format!("{field} must be less than or equal to {max_value}"));
+    }
+    Ok(Some(value))
+}
+
+fn normalize_bounded_u64(
+    value: Option<u64>,
+    max_value: u64,
+    field: &str,
+) -> Result<Option<u64>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value == 0 {
+        return Err(format!("{field} must be greater than zero"));
+    }
+    if value > max_value {
+        return Err(format!("{field} must be less than or equal to {max_value}"));
+    }
+    Ok(Some(value))
+}
+
+fn normalize_allowed_sources(value: Option<&str>) -> Result<Option<String>, String> {
+    let Some(value) = value.map(str::trim) else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() > NAT_MAX_ALLOWED_SOURCES_BYTES {
+        return Err(format!(
+            "allowed_sources must be at most {NAT_MAX_ALLOWED_SOURCES_BYTES} bytes"
+        ));
+    }
     let entries: Vec<String> = value
         .split([',', ' ', '\n', '\t'])
         .map(str::trim)
@@ -599,50 +836,22 @@ fn normalize_allowed_sources_or_403(
     if entries.is_empty() {
         return Ok(None);
     }
+    if entries.len() > NAT_MAX_ALLOWED_SOURCE_ENTRIES {
+        return Err(format!(
+            "allowed_sources must contain at most {NAT_MAX_ALLOWED_SOURCE_ENTRIES} entries"
+        ));
+    }
     for entry in &entries {
+        if entry.len() > NAT_MAX_ALLOWED_SOURCE_ENTRY_BYTES {
+            return Err(format!(
+                "allowed source entry must be at most {NAT_MAX_ALLOWED_SOURCE_ENTRY_BYTES} bytes"
+            ));
+        }
         if !crate::nat::tunnel::nat_source_entry_valid(entry) {
-            return Err(bad_request_with(format!(
-                "invalid NAT allowed source CIDR or IP: {entry}"
-            )));
+            return Err(format!("invalid NAT allowed source CIDR or IP: {entry}"));
         }
     }
     Ok(Some(entries.join(",")))
-}
-
-fn validate_positive_i32_or_403(
-    value: Option<u32>,
-    field: &str,
-) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
-    if matches!(value, Some(0)) {
-        return Err(bad_request_with(format!(
-            "{field} must be greater than zero"
-        )));
-    }
-    if value.map(|value| value > i32::MAX as u32).unwrap_or(false) {
-        return Err(bad_request_with(format!(
-            "{field} must be less than or equal to {}",
-            i32::MAX
-        )));
-    }
-    Ok(())
-}
-
-fn validate_positive_i64_or_403(
-    value: Option<u64>,
-    field: &str,
-) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
-    if matches!(value, Some(0)) {
-        return Err(bad_request_with(format!(
-            "{field} must be greater than zero"
-        )));
-    }
-    if value.map(|value| value > i64::MAX as u64).unwrap_or(false) {
-        return Err(bad_request_with(format!(
-            "{field} must be less than or equal to {}",
-            i64::MAX
-        )));
-    }
-    Ok(())
 }
 
 async fn validate_nat_agent_or_403(
@@ -650,40 +859,23 @@ async fn validate_nat_agent_or_403(
     auth_user: &AuthUser,
     agent_id: &str,
 ) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
+    let agent_id = normalize_nat_agent_id(agent_id.to_string()).map_err(bad_request_with)?;
     let session = session_of(auth_user);
-    if !can_access_server(&session, agent_id) {
+    if !nat_server_id_allowed(session.server_ids.as_deref(), &agent_id) {
         return Err(forbidden_with(
             "agent is outside PAT server allowlist".to_string(),
         ));
     }
 
-    if auth_user.is_pat() {
-        // PAT callers cannot target agents they don't own.
-        let repo = AgentRepository::new(db.clone());
-        let agent = repo
-            .find_by_id(xlstatus_shared::AgentId(
-                uuid::Uuid::parse_str(agent_id)
-                    .map_err(|_| bad_request_with("invalid agent_id".to_string()))?,
-            ))
-            .await
-            .map_err(|e| internal_with(e.to_string()))?
-            .ok_or_else(|| forbidden_with("agent not found".to_string()))?;
-        if agent.owner_user_id != auth_user.user.id {
-            return Err(forbidden_with(
-                "agent is not owned by the calling user".to_string(),
-            ));
-        }
-    } else if !auth_user.user.role.is_admin() {
-        // Non-admin cookie users can only NAT their own agents.
-        let repo = AgentRepository::new(db.clone());
-        let agent = repo
-            .find_by_id(xlstatus_shared::AgentId(
-                uuid::Uuid::parse_str(agent_id)
-                    .map_err(|_| bad_request_with("invalid agent_id".to_string()))?,
-            ))
-            .await
-            .map_err(|e| internal_with(e.to_string()))?
-            .ok_or_else(|| forbidden_with("agent not found".to_string()))?;
+    let agent_uuid = uuid::Uuid::parse_str(&agent_id)
+        .map_err(|_| bad_request_with("invalid agent_id".to_string()))?;
+    let repo = AgentRepository::new(db.clone());
+    let agent = repo
+        .find_by_id(xlstatus_shared::AgentId(agent_uuid))
+        .await
+        .map_err(|e| internal_with(e.to_string()))?
+        .ok_or_else(|| forbidden_with("agent not found".to_string()))?;
+    if auth_user.is_pat() || !auth_user.user.role.is_admin() {
         if agent.owner_user_id != auth_user.user.id {
             return Err(forbidden_with(
                 "agent is not owned by the calling user".to_string(),
@@ -692,6 +884,21 @@ async fn validate_nat_agent_or_403(
     }
 
     Ok(())
+}
+
+fn nat_server_id_allowed(allowed: Option<&[String]>, agent_id: &str) -> bool {
+    let Some(allowed) = allowed else {
+        return true;
+    };
+    let Ok(agent_uuid) = uuid::Uuid::parse_str(agent_id) else {
+        return false;
+    };
+    allowed.iter().any(|allowed_id| {
+        allowed_id == agent_id
+            || uuid::Uuid::parse_str(allowed_id)
+                .map(|allowed_uuid| allowed_uuid == agent_uuid)
+                .unwrap_or(false)
+    })
 }
 
 async fn require_nat_agent_or_403(
@@ -722,7 +929,7 @@ mod tests {
     #[test]
     fn nat_allowed_sources_normalizes_valid_entries() {
         let normalized =
-            normalize_allowed_sources_or_403(Some("127.0.0.1, 203.0.113.0/24\n::1/128")).unwrap();
+            normalize_allowed_sources(Some("127.0.0.1, 203.0.113.0/24\n::1/128")).unwrap();
 
         assert_eq!(
             normalized.as_deref(),
@@ -732,7 +939,163 @@ mod tests {
 
     #[test]
     fn nat_allowed_sources_rejects_invalid_entries() {
-        assert!(normalize_allowed_sources_or_403(Some("not-a-cidr")).is_err());
+        assert!(normalize_allowed_sources(Some("not-a-cidr")).is_err());
+    }
+
+    #[test]
+    fn nat_mapping_resource_limits_are_explicit() {
+        assert_eq!(NAT_API_MAX_BODY_BYTES, 64 * 1024);
+        assert_eq!(NAT_MAX_AGENT_ID_BYTES, 64);
+        assert_eq!(NAT_MAX_LOCAL_HOST_BYTES, 253);
+        assert_eq!(NAT_MAX_PROTOCOL_BYTES, 16);
+        assert_eq!(NAT_MAX_DESCRIPTION_BYTES, 1024);
+        assert_eq!(NAT_MAX_ALLOWED_SOURCES_BYTES, 4096);
+        assert_eq!(NAT_MAX_ALLOWED_SOURCE_ENTRIES, 64);
+        assert_eq!(NAT_MAX_ALLOWED_SOURCE_ENTRY_BYTES, 128);
+        assert_eq!(NAT_MAX_ACTIVE_TUNNELS_PER_MAPPING, 1024);
+        assert_eq!(NAT_MAX_IDLE_TIMEOUT_SECONDS, 24 * 60 * 60);
+        assert_eq!(NAT_MAX_BYTES_PER_TUNNEL, 1024 * 1024 * 1024 * 1024);
+        assert_eq!(NAT_MAX_BANDWIDTH_BYTES_PER_SECOND, 1024 * 1024 * 1024);
+        assert_eq!(NAT_MAX_RATE_LIMIT_WINDOW_SECONDS, 24 * 60 * 60);
+        assert_eq!(NAT_MAX_CONNECTIONS_PER_WINDOW, 100_000);
+        assert_eq!(NAT_MAX_BYTES_PER_WINDOW, 1024 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn nat_agent_id_and_protocol_are_normalized() {
+        let agent_id = uuid::Uuid::from_bytes([4; 16]);
+
+        assert_eq!(
+            normalize_nat_agent_id(format!(" {} ", agent_id.simple())).unwrap(),
+            agent_id.to_string()
+        );
+        assert!(normalize_nat_agent_id("server-a".into()).is_err());
+        assert!(normalize_nat_agent_id("a".repeat(NAT_MAX_AGENT_ID_BYTES + 1)).is_err());
+
+        assert!(matches!(
+            normalize_nat_protocol(" TCP ").unwrap(),
+            Protocol::Tcp
+        ));
+        assert!(normalize_nat_protocol("icmp").is_err());
+        assert!(normalize_nat_protocol(&"a".repeat(NAT_MAX_PROTOCOL_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn nat_text_and_allowed_sources_are_bounded() {
+        assert!(normalize_required_nat_text(
+            "127.0.0.1".into(),
+            NAT_MAX_LOCAL_HOST_BYTES,
+            "local_host"
+        )
+        .is_ok());
+        assert!(normalize_required_nat_text(
+            "a".repeat(NAT_MAX_LOCAL_HOST_BYTES + 1),
+            NAT_MAX_LOCAL_HOST_BYTES,
+            "local_host"
+        )
+        .is_err());
+        assert!(normalize_optional_nat_text(
+            Some("a".repeat(NAT_MAX_DESCRIPTION_BYTES + 1)),
+            NAT_MAX_DESCRIPTION_BYTES,
+            "description"
+        )
+        .is_err());
+
+        let entries = (0..NAT_MAX_ALLOWED_SOURCE_ENTRIES)
+            .map(|idx| format!("203.0.113.{idx}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(normalize_allowed_sources(Some(&entries)).is_ok());
+
+        let too_many_entries = (0..=NAT_MAX_ALLOWED_SOURCE_ENTRIES)
+            .map(|idx| format!("203.0.113.{idx}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(normalize_allowed_sources(Some(&too_many_entries)).is_err());
+        assert!(
+            normalize_allowed_sources(Some(&"a".repeat(NAT_MAX_ALLOWED_SOURCES_BYTES + 1)))
+                .is_err()
+        );
+        assert!(normalize_allowed_sources(Some("not-a-cidr")).is_err());
+    }
+
+    #[test]
+    fn nat_policy_values_are_bounded() {
+        assert!(normalize_bounded_u32(
+            Some(1),
+            NAT_MAX_ACTIVE_TUNNELS_PER_MAPPING,
+            "max_active_tunnels"
+        )
+        .is_ok());
+        assert!(normalize_bounded_u32(
+            Some(0),
+            NAT_MAX_ACTIVE_TUNNELS_PER_MAPPING,
+            "max_active_tunnels"
+        )
+        .is_err());
+        assert!(normalize_bounded_u32(
+            Some(NAT_MAX_ACTIVE_TUNNELS_PER_MAPPING + 1),
+            NAT_MAX_ACTIVE_TUNNELS_PER_MAPPING,
+            "max_active_tunnels"
+        )
+        .is_err());
+        assert!(
+            normalize_bounded_u64(Some(1), NAT_MAX_BYTES_PER_TUNNEL, "max_bytes_per_tunnel")
+                .is_ok()
+        );
+        assert!(
+            normalize_bounded_u64(Some(0), NAT_MAX_BYTES_PER_TUNNEL, "max_bytes_per_tunnel")
+                .is_err()
+        );
+        assert!(normalize_bounded_u64(
+            Some(NAT_MAX_BYTES_PER_TUNNEL + 1),
+            NAT_MAX_BYTES_PER_TUNNEL,
+            "max_bytes_per_tunnel"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn nat_create_request_normalizes_inputs() {
+        let agent_id = uuid::Uuid::from_bytes([5; 16]);
+        let mut req = create_nat_request(agent_id);
+        req.agent_id = format!(" {} ", agent_id.simple());
+        req.local_host = " 127.0.0.1 ".into();
+        req.protocol = " TCP ".into();
+        req.description = Some(" demo ".into());
+        req.allowed_sources = Some("127.0.0.1, ::1/128".into());
+        req.max_active_tunnels = Some(2);
+
+        let normalized = normalize_create_nat_mapping_request(req).unwrap();
+
+        assert_eq!(normalized.agent_id, agent_id.to_string());
+        assert_eq!(normalized.local_host, "127.0.0.1");
+        assert!(matches!(normalized.protocol, Protocol::Tcp));
+        assert_eq!(normalized.description.as_deref(), Some("demo"));
+        assert_eq!(
+            normalized.allowed_sources.as_deref(),
+            Some("127.0.0.1,::1/128")
+        );
+        assert_eq!(normalized.max_active_tunnels, Some(2));
+    }
+
+    #[test]
+    fn nat_server_allowlist_uses_uuid_semantics() {
+        let agent_id = uuid::Uuid::from_bytes([6; 16]);
+
+        assert!(nat_server_id_allowed(None, &agent_id.to_string()));
+        assert!(nat_server_id_allowed(
+            Some(&[agent_id.simple().to_string()]),
+            &agent_id.to_string()
+        ));
+        assert!(!nat_server_id_allowed(
+            Some(&[uuid::Uuid::from_bytes([7; 16]).to_string()]),
+            &agent_id.to_string()
+        ));
+        assert!(!nat_server_id_allowed(
+            Some(&["server-a".into()]),
+            &agent_id.to_string()
+        ));
     }
 
     #[test]
@@ -763,37 +1126,106 @@ mod tests {
 
     #[test]
     fn nat_mapping_tunnel_limit_rejects_zero() {
-        assert!(validate_positive_i32_or_403(Some(0), "max_active_tunnels").is_err());
-        assert!(validate_positive_i32_or_403(Some(1), "max_active_tunnels").is_ok());
-        assert!(validate_positive_i32_or_403(None, "max_active_tunnels").is_ok());
+        assert!(normalize_bounded_u32(
+            Some(0),
+            NAT_MAX_ACTIVE_TUNNELS_PER_MAPPING,
+            "max_active_tunnels"
+        )
+        .is_err());
+        assert!(normalize_bounded_u32(
+            Some(1),
+            NAT_MAX_ACTIVE_TUNNELS_PER_MAPPING,
+            "max_active_tunnels"
+        )
+        .is_ok());
+        assert!(normalize_bounded_u32(
+            None,
+            NAT_MAX_ACTIVE_TUNNELS_PER_MAPPING,
+            "max_active_tunnels"
+        )
+        .is_ok());
     }
 
     #[test]
     fn nat_idle_timeout_and_byte_limit_reject_zero() {
-        assert!(validate_positive_i32_or_403(Some(0), "idle_timeout_seconds").is_err());
-        assert!(validate_positive_i64_or_403(Some(0), "max_bytes_per_tunnel").is_err());
-        assert!(validate_positive_i64_or_403(Some(0), "max_bandwidth_bytes_per_second").is_err());
-        assert!(validate_positive_i32_or_403(Some(30), "idle_timeout_seconds").is_ok());
-        assert!(validate_positive_i64_or_403(Some(1024), "max_bytes_per_tunnel").is_ok());
-        assert!(validate_positive_i64_or_403(Some(1024), "max_bandwidth_bytes_per_second").is_ok());
+        assert!(normalize_bounded_u32(
+            Some(0),
+            NAT_MAX_IDLE_TIMEOUT_SECONDS,
+            "idle_timeout_seconds"
+        )
+        .is_err());
+        assert!(
+            normalize_bounded_u64(Some(0), NAT_MAX_BYTES_PER_TUNNEL, "max_bytes_per_tunnel")
+                .is_err()
+        );
+        assert!(normalize_bounded_u64(
+            Some(0),
+            NAT_MAX_BANDWIDTH_BYTES_PER_SECOND,
+            "max_bandwidth_bytes_per_second"
+        )
+        .is_err());
+        assert!(normalize_bounded_u32(
+            Some(30),
+            NAT_MAX_IDLE_TIMEOUT_SECONDS,
+            "idle_timeout_seconds"
+        )
+        .is_ok());
+        assert!(normalize_bounded_u64(
+            Some(1024),
+            NAT_MAX_BYTES_PER_TUNNEL,
+            "max_bytes_per_tunnel"
+        )
+        .is_ok());
+        assert!(normalize_bounded_u64(
+            Some(1024),
+            NAT_MAX_BANDWIDTH_BYTES_PER_SECOND,
+            "max_bandwidth_bytes_per_second"
+        )
+        .is_ok());
     }
 
     #[test]
     fn nat_rate_window_limits_reject_zero_and_overflow() {
-        assert!(validate_positive_i32_or_403(Some(0), "rate_limit_window_seconds").is_err());
-        assert!(validate_positive_i32_or_403(
-            Some(i32::MAX as u32 + 1),
+        assert!(normalize_bounded_u32(
+            Some(0),
+            NAT_MAX_RATE_LIMIT_WINDOW_SECONDS,
             "rate_limit_window_seconds"
         )
         .is_err());
-        assert!(validate_positive_i64_or_403(Some(0), "max_bytes_per_window").is_err());
+        assert!(normalize_bounded_u32(
+            Some(NAT_MAX_RATE_LIMIT_WINDOW_SECONDS + 1),
+            NAT_MAX_RATE_LIMIT_WINDOW_SECONDS,
+            "rate_limit_window_seconds"
+        )
+        .is_err());
         assert!(
-            validate_positive_i64_or_403(Some(i64::MAX as u64 + 1), "max_bytes_per_window")
+            normalize_bounded_u64(Some(0), NAT_MAX_BYTES_PER_WINDOW, "max_bytes_per_window")
                 .is_err()
         );
-        assert!(validate_positive_i32_or_403(Some(60), "rate_limit_window_seconds").is_ok());
-        assert!(validate_positive_i32_or_403(Some(10), "max_connections_per_window").is_ok());
-        assert!(validate_positive_i64_or_403(Some(1024), "max_bytes_per_window").is_ok());
+        assert!(normalize_bounded_u64(
+            Some(NAT_MAX_BYTES_PER_WINDOW + 1),
+            NAT_MAX_BYTES_PER_WINDOW,
+            "max_bytes_per_window"
+        )
+        .is_err());
+        assert!(normalize_bounded_u32(
+            Some(60),
+            NAT_MAX_RATE_LIMIT_WINDOW_SECONDS,
+            "rate_limit_window_seconds"
+        )
+        .is_ok());
+        assert!(normalize_bounded_u32(
+            Some(10),
+            NAT_MAX_CONNECTIONS_PER_WINDOW,
+            "max_connections_per_window"
+        )
+        .is_ok());
+        assert!(normalize_bounded_u64(
+            Some(1024),
+            NAT_MAX_BYTES_PER_WINDOW,
+            "max_bytes_per_window"
+        )
+        .is_ok());
     }
 
     fn auth_user(auth_kind: AuthKind, role: UserRole) -> AuthUser {
@@ -813,6 +1245,25 @@ mod tests {
             scopes: vec!["nat:read".into()],
             server_ids: None,
             pat_id: None,
+        }
+    }
+
+    fn create_nat_request(agent_id: uuid::Uuid) -> CreateNatMappingRequest {
+        CreateNatMappingRequest {
+            agent_id: agent_id.to_string(),
+            local_host: "127.0.0.1".into(),
+            local_port: 8080,
+            public_port: 18080,
+            protocol: "tcp".into(),
+            description: None,
+            allowed_sources: None,
+            max_active_tunnels: None,
+            idle_timeout_seconds: None,
+            max_bytes_per_tunnel: None,
+            max_bandwidth_bytes_per_second: None,
+            rate_limit_window_seconds: None,
+            max_connections_per_window: None,
+            max_bytes_per_window: None,
         }
     }
 }

@@ -61,7 +61,7 @@ use api::v1::mcp::{
 };
 use api::v1::nat::{
     create_nat_mapping, delete_nat_mapping, get_nat_mapping, list_all_nat_mappings,
-    list_nat_mappings, update_nat_mapping,
+    list_nat_mappings, nat_body_limit, update_nat_mapping,
 };
 use api::v1::notifications::{
     add_notification_group_member, create_notification, create_notification_group,
@@ -577,14 +577,20 @@ async fn main() -> anyhow::Result<()> {
                 .route("/api/v1/terminal/sessions", post(create_terminal_session))
                 .route("/ws/terminal/:session_id", get(ws_terminal))
                 // NAT
-                .route("/api/v1/nat/mappings", post(create_nat_mapping))
+                .route(
+                    "/api/v1/nat/mappings",
+                    post(create_nat_mapping).layer(nat_body_limit()),
+                )
                 .route("/api/v1/nat/mappings/all", get(list_all_nat_mappings))
                 .route(
                     "/api/v1/nat/mappings/agent/:agent_id",
                     get(list_nat_mappings),
                 )
                 .route("/api/v1/nat/mappings/:id", get(get_nat_mapping))
-                .route("/api/v1/nat/mappings/:id", post(update_nat_mapping))
+                .route(
+                    "/api/v1/nat/mappings/:id",
+                    post(update_nat_mapping).layer(nat_body_limit()),
+                )
                 .route("/api/v1/nat/mappings/:id", delete(delete_nat_mapping))
                 .route_layer(middleware::from_fn_with_state(
                     state.clone(),
