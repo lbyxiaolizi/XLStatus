@@ -21,7 +21,7 @@ use xlstatus_shared::{
 use crate::api::types::ApiResponse;
 use crate::api::v1::auth::{AppError, AppState};
 use crate::api::v1::servers::{ensure_agent_visible, server_visible};
-use crate::auth::middleware::AuthSession;
+use crate::auth::middleware::{AuthKind, AuthSession};
 use crate::auth::rbac::has_scope;
 use crate::db::AgentRepository;
 
@@ -37,6 +37,10 @@ pub struct TerminalSessionRegistry {
 pub struct TerminalSession {
     pub id: String,
     pub agent_id: AgentId,
+    pub created_by_user_id: xlstatus_shared::UserId,
+    pub created_auth_kind: AuthKind,
+    pub created_session_id: Option<String>,
+    pub created_pat_id: Option<String>,
     pub cols: u16,
     pub rows: u16,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -82,7 +86,12 @@ pub async fn create_terminal_session(
     }
     let session = state
         .terminal_sessions
-        .create(agent_id, sanitize_cols(req.cols), sanitize_rows(req.rows))
+        .create(
+            &auth,
+            agent_id,
+            sanitize_cols(req.cols),
+            sanitize_rows(req.rows),
+        )
         .await?;
     Ok(Json(ApiResponse::success(CreateTerminalSessionResponse {
         session_id: session.id.clone(),
@@ -105,23 +114,54 @@ pub async fn ws_terminal(
     if !has_scope(&auth, "server:exec") {
         return Err(AppError::Forbidden("missing scope: server:exec".into()));
     }
-    let Some(session) = state.terminal_sessions.get(&session_id).await else {
-        return Err(AppError::NotFound("terminal session not found".into()));
+    let session = match state
+        .terminal_sessions
+        .take_for_auth(&session_id, &auth)
+        .await?
+    {
+        Some(session) => session,
+        None => return Err(AppError::NotFound("terminal session not found".into())),
     };
     if !server_visible(&auth, &session.agent_id) {
+        state.terminal_sessions.restore(session).await;
         return Err(AppError::Forbidden("agent not in scope".into()));
     }
-    let agent = AgentRepository::new(state.db.clone())
+    let agent = match AgentRepository::new(state.db.clone())
         .find_by_id(session.agent_id)
         .await?
-        .ok_or(AppError::NotFound("agent not found".into()))?;
-    ensure_agent_visible(&auth, &agent)?;
+    {
+        Some(agent) => agent,
+        None => {
+            state.terminal_sessions.restore(session).await;
+            return Err(AppError::NotFound("agent not found".into()));
+        }
+    };
+    if let Err(err) = ensure_agent_visible(&auth, &agent) {
+        state.terminal_sessions.restore(session).await;
+        return Err(err);
+    }
 
     let io_registry = state.io_registry.clone();
     let terminal_sessions = state.terminal_sessions.clone();
     Ok(ws.on_upgrade(move |socket| async move {
         let _ = handle_terminal_socket(socket, io_registry, terminal_sessions, session).await;
     }))
+}
+
+fn terminal_session_created_by_auth(session: &TerminalSession, auth: &AuthSession) -> bool {
+    session.created_by_user_id == auth.user_id
+        && matches!(
+            (&session.created_auth_kind, &auth.auth_kind),
+            (AuthKind::Session, AuthKind::Session)
+                | (AuthKind::PersonalAccessToken, AuthKind::PersonalAccessToken)
+        )
+        && match auth.auth_kind {
+            AuthKind::Session => session.created_session_id.as_deref() == Some(&auth.session_id),
+            AuthKind::PersonalAccessToken => {
+                let pat_id = auth.pat_id.as_deref().unwrap_or(&auth.session_id);
+                session.created_pat_id.as_deref() == Some(pat_id)
+            }
+        }
 }
 
 async fn handle_terminal_socket(
@@ -379,6 +419,7 @@ impl TerminalSessionRegistry {
 
     pub async fn create(
         &self,
+        auth: &AuthSession,
         agent_id: AgentId,
         cols: u16,
         rows: u16,
@@ -386,6 +427,15 @@ impl TerminalSessionRegistry {
         let session = TerminalSession {
             id: uuid::Uuid::now_v7().to_string(),
             agent_id,
+            created_by_user_id: auth.user_id,
+            created_auth_kind: auth.auth_kind.clone(),
+            created_session_id: matches!(auth.auth_kind, AuthKind::Session)
+                .then_some(auth.session_id.clone()),
+            created_pat_id: matches!(auth.auth_kind, AuthKind::PersonalAccessToken).then(|| {
+                auth.pat_id
+                    .clone()
+                    .unwrap_or_else(|| auth.session_id.clone())
+            }),
             cols,
             rows,
             created_at: chrono::Utc::now(),
@@ -401,10 +451,41 @@ impl TerminalSessionRegistry {
         Ok(session)
     }
 
+    #[cfg(test)]
     pub async fn get(&self, session_id: &str) -> Option<TerminalSession> {
         let mut sessions = self.inner.write().await;
         prune_expired_terminal_sessions(&mut sessions, chrono::Utc::now());
         sessions.get(session_id).cloned()
+    }
+
+    pub async fn take_for_auth(
+        &self,
+        session_id: &str,
+        auth: &AuthSession,
+    ) -> Result<Option<TerminalSession>, AppError> {
+        let mut sessions = self.inner.write().await;
+        prune_expired_terminal_sessions(&mut sessions, chrono::Utc::now());
+        let Some(session) = sessions.get(session_id) else {
+            return Ok(None);
+        };
+        if !terminal_session_created_by_auth(session, auth) {
+            return Err(AppError::Forbidden(
+                "terminal session was created by another credential".into(),
+            ));
+        }
+        Ok(sessions.remove(session_id))
+    }
+
+    pub async fn restore(&self, session: TerminalSession) {
+        let mut sessions = self.inner.write().await;
+        prune_expired_terminal_sessions(&mut sessions, chrono::Utc::now());
+        if chrono::Utc::now()
+            .signed_duration_since(session.created_at)
+            .num_seconds()
+            <= TERMINAL_SESSION_TTL_SECONDS
+        {
+            sessions.insert(session.id.clone(), session);
+        }
     }
 
     pub async fn remove(&self, session_id: &str) {
@@ -424,18 +505,62 @@ fn prune_expired_terminal_sessions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xlstatus_shared::{UserId, UserRole};
+
+    fn test_auth_session(session_id: &str) -> AuthSession {
+        AuthSession {
+            session_id: session_id.into(),
+            user_id: UserId(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()),
+            username: "admin".into(),
+            role: UserRole::Admin,
+            csrf_token: "csrf".into(),
+            auth_kind: AuthKind::Session,
+            scopes: Vec::new(),
+            server_ids: None,
+            pat_id: None,
+        }
+    }
+
+    fn test_pat_auth(pat_id: &str) -> AuthSession {
+        AuthSession {
+            session_id: pat_id.into(),
+            user_id: UserId(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()),
+            username: "pat".into(),
+            role: UserRole::Admin,
+            csrf_token: "csrf".into(),
+            auth_kind: AuthKind::PersonalAccessToken,
+            scopes: vec!["server:exec".into()],
+            server_ids: None,
+            pat_id: Some(pat_id.into()),
+        }
+    }
+
+    fn terminal_session(id: &str, auth: &AuthSession) -> TerminalSession {
+        TerminalSession {
+            id: id.into(),
+            agent_id: AgentId(uuid::Uuid::now_v7()),
+            created_by_user_id: auth.user_id,
+            created_auth_kind: auth.auth_kind.clone(),
+            created_session_id: matches!(auth.auth_kind, AuthKind::Session)
+                .then_some(auth.session_id.clone()),
+            created_pat_id: matches!(auth.auth_kind, AuthKind::PersonalAccessToken).then(|| {
+                auth.pat_id
+                    .clone()
+                    .unwrap_or_else(|| auth.session_id.clone())
+            }),
+            cols: 80,
+            rows: 24,
+            created_at: chrono::Utc::now(),
+        }
+    }
 
     #[tokio::test]
     async fn terminal_registry_prunes_expired_sessions() {
         let registry = TerminalSessionRegistry::new();
-        let expired = TerminalSession {
-            id: "expired".into(),
-            agent_id: AgentId(uuid::Uuid::now_v7()),
-            cols: 80,
-            rows: 24,
-            created_at: chrono::Utc::now()
-                - chrono::Duration::seconds(TERMINAL_SESSION_TTL_SECONDS + 1),
-        };
+        let auth = test_auth_session("sess-1");
+        let mut expired = terminal_session("expired", &auth);
+        expired.created_at =
+            chrono::Utc::now() - chrono::Duration::seconds(TERMINAL_SESSION_TTL_SECONDS + 1);
         registry
             .inner
             .write()
@@ -448,14 +573,9 @@ mod tests {
     #[tokio::test]
     async fn terminal_registry_limits_pending_sessions() {
         let registry = TerminalSessionRegistry::new();
+        let auth = test_auth_session("sess-1");
         for index in 0..MAX_PENDING_TERMINAL_SESSIONS {
-            let session = TerminalSession {
-                id: format!("session-{index}"),
-                agent_id: AgentId(uuid::Uuid::now_v7()),
-                cols: 80,
-                rows: 24,
-                created_at: chrono::Utc::now(),
-            };
+            let session = terminal_session(&format!("session-{index}"), &auth);
             registry
                 .inner
                 .write()
@@ -464,10 +584,67 @@ mod tests {
         }
 
         let err = registry
-            .create(AgentId(uuid::Uuid::now_v7()), 80, 24)
+            .create(&auth, AgentId(uuid::Uuid::now_v7()), 80, 24)
             .await
             .unwrap_err();
 
         assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn terminal_session_take_is_bound_to_creator_and_one_time() {
+        let registry = TerminalSessionRegistry::new();
+        let creator = test_auth_session("creator-session");
+        let other_session = test_auth_session("other-session");
+        let pat = test_pat_auth("pat-id");
+        let created = registry
+            .create(&creator, AgentId(uuid::Uuid::now_v7()), 80, 24)
+            .await
+            .unwrap();
+
+        let err = registry
+            .take_for_auth(&created.id, &other_session)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Forbidden(_)));
+        assert!(registry.get(&created.id).await.is_some());
+
+        let err = registry.take_for_auth(&created.id, &pat).await.unwrap_err();
+        assert!(matches!(err, AppError::Forbidden(_)));
+        assert!(registry.get(&created.id).await.is_some());
+
+        let taken = registry
+            .take_for_auth(&created.id, &creator)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(taken.id, created.id);
+        assert!(registry
+            .take_for_auth(&created.id, &creator)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_session_pat_binding_uses_pat_id() {
+        let registry = TerminalSessionRegistry::new();
+        let creator = test_pat_auth("pat-1");
+        let same_session_different_pat = test_pat_auth("pat-2");
+        let created = registry
+            .create(&creator, AgentId(uuid::Uuid::now_v7()), 80, 24)
+            .await
+            .unwrap();
+
+        assert!(registry
+            .take_for_auth(&created.id, &same_session_different_pat)
+            .await
+            .is_err());
+        assert!(registry.get(&created.id).await.is_some());
+        assert!(registry
+            .take_for_auth(&created.id, &creator)
+            .await
+            .unwrap()
+            .is_some());
     }
 }
