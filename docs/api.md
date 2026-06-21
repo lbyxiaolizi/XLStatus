@@ -26,6 +26,8 @@
 
 Agent 注册、JWT challenge 和 JWT 签发请求体上限为 4KiB。JWT nonce 为 32 字节 hex，signature 为 64 字节 hex；JWT challenge 只有在 Agent 签名验证通过后才会被消费。
 
+OAuth/OIDC callback 公开参数有协议级长度边界：`state` 最长 4096 字节，`code` 最长 4096 字节，`error` / `error_description` 最长 1024 字节。OAuth start 的 `return_to` 只接受本地路径且最长 1024 字节。OIDC token response 最多读取 16KiB，`access_token` 最长 8192 字节；userinfo response 最多读取 64KiB，`sub`、`email`、`name`、`preferred_username` 等归一化 claim 最长 1024 字节。
+
 公开状态页只返回显式公开服务器和归属于公开服务器的服务结果。公开服务历史在 SQL 层按公开 `server_id` 过滤，每个服务最多返回最近 240 条结果；公开服务器详情监控图表最多返回 240 个采样点。
 
 ## 需要登录的接口

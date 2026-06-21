@@ -32,6 +32,14 @@ type HmacSha256 = Hmac<Sha256>;
 const OAUTH_STATE_COOKIE_NAME: &str = "xlstatus_oauth_state";
 const OAUTH_STATE_COOKIE_PATH: &str = "/api/v1/oauth2";
 const OAUTH_STATE_TTL_SECONDS: i64 = 10 * 60;
+const OAUTH_MAX_STATE_BYTES: usize = 4096;
+const OAUTH_MAX_RETURN_TO_BYTES: usize = 1024;
+const OAUTH_MAX_CODE_BYTES: usize = 4096;
+const OAUTH_MAX_ERROR_BYTES: usize = 1024;
+const OAUTH_MAX_TOKEN_RESPONSE_BYTES: usize = 16 * 1024;
+const OAUTH_MAX_USERINFO_RESPONSE_BYTES: usize = 64 * 1024;
+const OAUTH_MAX_ACCESS_TOKEN_BYTES: usize = 8192;
+const OAUTH_MAX_CLAIM_BYTES: usize = 1024;
 
 #[derive(Debug, Serialize)]
 pub struct OAuthProviderView {
@@ -227,6 +235,20 @@ pub async fn oauth_callback(
         return Err(AppError::Forbidden(
             "IP temporarily blocked by WAF".to_string(),
         ));
+    }
+    if let Some(code) = query.code.as_deref() {
+        ensure_oauth_text_size(code, 1, OAUTH_MAX_CODE_BYTES, "OAuth code")?;
+    }
+    if let Some(error) = query.error.as_deref() {
+        ensure_oauth_text_size(error, 1, OAUTH_MAX_ERROR_BYTES, "OAuth error")?;
+    }
+    if let Some(error_description) = query.error_description.as_deref() {
+        ensure_oauth_text_size(
+            error_description,
+            0,
+            OAUTH_MAX_ERROR_BYTES,
+            "OAuth error_description",
+        )?;
     }
     let oauth_state = match decode_state(&state.config.security.session_secret, &query.state) {
         Ok(state) => state,
@@ -593,10 +615,19 @@ async fn exchange_code(
             response.status()
         )));
     }
-    response
-        .json::<TokenResponse>()
-        .await
-        .map_err(|e| AppError::BadRequest(format!("OAuth token response is invalid: {e}")))
+    let token = parse_limited_json_response::<TokenResponse>(
+        response,
+        OAUTH_MAX_TOKEN_RESPONSE_BYTES,
+        "OAuth token response",
+    )
+    .await?;
+    ensure_oauth_text_size(
+        &token.access_token,
+        1,
+        OAUTH_MAX_ACCESS_TOKEN_BYTES,
+        "OAuth access_token",
+    )?;
+    Ok(token)
 }
 
 async fn fetch_userinfo(
@@ -632,24 +663,71 @@ async fn fetch_userinfo(
             response.status()
         )));
     }
-    let raw = response
-        .json::<JsonValue>()
-        .await
-        .map_err(|e| AppError::BadRequest(format!("OIDC userinfo response is invalid: {e}")))?;
+    let raw = parse_limited_json_response::<JsonValue>(
+        response,
+        OAUTH_MAX_USERINFO_RESPONSE_BYTES,
+        "OIDC userinfo response",
+    )
+    .await?;
     normalize_userinfo(provider, &raw)
+}
+
+async fn parse_limited_json_response<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    max_bytes: usize,
+    label: &str,
+) -> Result<T, AppError> {
+    if response
+        .content_length()
+        .map(|length| length > max_bytes as u64)
+        .unwrap_or(false)
+    {
+        return Err(AppError::BadRequest(format!(
+            "{label} exceeds {max_bytes} bytes"
+        )));
+    }
+    let mut response = response;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("{label} read failed: {e}")))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(AppError::BadRequest(format!(
+                "{label} exceeds {max_bytes} bytes"
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    parse_limited_json_bytes(&bytes, max_bytes, label)
+}
+
+fn parse_limited_json_bytes<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+    max_bytes: usize,
+    label: &str,
+) -> Result<T, AppError> {
+    if bytes.len() > max_bytes {
+        return Err(AppError::BadRequest(format!(
+            "{label} exceeds {max_bytes} bytes"
+        )));
+    }
+    serde_json::from_slice(bytes)
+        .map_err(|e| AppError::BadRequest(format!("{label} is invalid: {e}")))
 }
 
 fn normalize_userinfo(
     provider: &OidcProviderConfig,
     raw: &JsonValue,
 ) -> Result<OidcUserInfo, AppError> {
-    let sub = userinfo_field(raw, &provider.subject_field)
+    let sub = userinfo_field(raw, &provider.subject_field, "OIDC subject")?
         .ok_or(AppError::BadRequest("OIDC userinfo missing subject".into()))?;
     let userinfo = OidcUserInfo {
         sub,
-        email: userinfo_field(raw, &provider.email_field),
-        name: userinfo_field(raw, &provider.name_field),
-        preferred_username: userinfo_field(raw, &provider.username_field),
+        email: userinfo_field(raw, &provider.email_field, "OIDC email")?,
+        name: userinfo_field(raw, &provider.name_field, "OIDC name")?,
+        preferred_username: userinfo_field(raw, &provider.username_field, "OIDC username")?,
     };
     if userinfo.sub.trim().is_empty() {
         return Err(AppError::BadRequest("OIDC userinfo missing subject".into()));
@@ -657,25 +735,34 @@ fn normalize_userinfo(
     Ok(userinfo)
 }
 
-fn userinfo_field(raw: &JsonValue, field: &str) -> Option<String> {
+fn userinfo_field(raw: &JsonValue, field: &str, label: &str) -> Result<Option<String>, AppError> {
     let field = field.trim();
     if field.is_empty() {
-        return None;
+        return Ok(None);
     }
     let value = if field.starts_with('/') {
-        raw.pointer(field)?
+        match raw.pointer(field) {
+            Some(value) => value,
+            None => return Ok(None),
+        }
     } else {
         let mut current = raw;
         for part in field.split('.') {
             let part = part.trim();
             if part.is_empty() {
-                return None;
+                return Ok(None);
             }
-            current = current.get(part)?;
+            current = match current.get(part) {
+                Some(value) => value,
+                None => return Ok(None),
+            };
         }
         current
     };
-    json_scalar(value)
+    match json_scalar(value) {
+        Some(value) => normalize_oauth_claim(value, label).map(Some),
+        None => Ok(None),
+    }
 }
 
 fn json_scalar(value: &JsonValue) -> Option<String> {
@@ -692,6 +779,15 @@ fn json_scalar(value: &JsonValue) -> Option<String> {
         JsonValue::Bool(value) => Some(value.to_string()),
         _ => None,
     }
+}
+
+fn normalize_oauth_claim(value: String, label: &str) -> Result<String, AppError> {
+    let trimmed = value.trim().to_string();
+    if trimmed.is_empty() {
+        return Err(AppError::BadRequest(format!("{label} is empty")));
+    }
+    ensure_oauth_text_size(&trimmed, 1, OAUTH_MAX_CLAIM_BYTES, label)?;
+    Ok(trimmed)
 }
 
 fn parse_token_auth_method(value: &str) -> Result<TokenAuthMethod, AppError> {
@@ -1046,9 +1142,18 @@ fn encode_state(secret: &str, state: &OAuthState) -> Result<String, AppError> {
 }
 
 fn decode_state(secret: &str, encoded: &str) -> Result<OAuthState, AppError> {
+    ensure_oauth_text_size(encoded, 1, OAUTH_MAX_STATE_BYTES, "OAuth state")?;
     let Some((payload_hex, signature)) = encoded.split_once('.') else {
         return Err(AppError::BadRequest("OAuth state is invalid".into()));
     };
+    if payload_hex.len() > OAUTH_MAX_STATE_BYTES || signature.len() != 64 {
+        return Err(AppError::BadRequest("OAuth state is invalid".into()));
+    }
+    if !payload_hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !signature.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(AppError::BadRequest("OAuth state is invalid".into()));
+    }
     let expected = sign_state(secret, payload_hex.as_bytes())?;
     if !constant_time_eq(signature.as_bytes(), expected.as_bytes()) {
         return Err(AppError::BadRequest(
@@ -1063,6 +1168,21 @@ fn decode_state(secret: &str, encoded: &str) -> Result<OAuthState, AppError> {
         return Err(AppError::BadRequest("OAuth state has expired".into()));
     }
     Ok(state)
+}
+
+fn ensure_oauth_text_size(
+    value: &str,
+    min_bytes: usize,
+    max_bytes: usize,
+    field: &str,
+) -> Result<(), AppError> {
+    let len = value.len();
+    if len < min_bytes || len > max_bytes {
+        return Err(AppError::BadRequest(format!(
+            "{field} must be between {min_bytes} and {max_bytes} bytes"
+        )));
+    }
+    Ok(())
 }
 
 fn sign_state(secret: &str, payload: &[u8]) -> Result<String, AppError> {
@@ -1084,7 +1204,11 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 
 fn sanitize_return_to(value: Option<String>) -> String {
     value
-        .filter(|item| item.starts_with('/') && !item.starts_with("//"))
+        .filter(|item| {
+            item.starts_with('/')
+                && !item.starts_with("//")
+                && item.len() <= OAUTH_MAX_RETURN_TO_BYTES
+        })
         .unwrap_or_else(|| "/dashboard".to_string())
 }
 
@@ -1172,6 +1296,54 @@ mod tests {
     }
 
     #[test]
+    fn rejects_oversized_or_malformed_state_before_decoding() {
+        let oversized = "a".repeat(OAUTH_MAX_STATE_BYTES + 1);
+        let oversized_err = decode_state("secret", &oversized).unwrap_err();
+        assert!(matches!(
+            oversized_err,
+            AppError::BadRequest(message) if message.contains("OAuth state")
+        ));
+
+        assert!(decode_state(
+            "secret",
+            "not-hex.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        )
+        .is_err());
+        assert!(decode_state("secret", "00.not-hex").is_err());
+        assert!(decode_state("secret", "00.aa").is_err());
+    }
+
+    #[test]
+    fn parses_limited_oauth_json_bytes() {
+        let parsed: TokenResponse = parse_limited_json_bytes(
+            br#"{"access_token":"abc"}"#,
+            OAUTH_MAX_TOKEN_RESPONSE_BYTES,
+            "OAuth token response",
+        )
+        .unwrap();
+        assert_eq!(parsed.access_token, "abc");
+
+        let oversized = vec![b' '; OAUTH_MAX_TOKEN_RESPONSE_BYTES + 1];
+        let err = parse_limited_json_bytes::<TokenResponse>(
+            &oversized,
+            OAUTH_MAX_TOKEN_RESPONSE_BYTES,
+            "OAuth token response",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::BadRequest(message) if message.contains("exceeds")
+        ));
+    }
+
+    #[test]
+    fn validates_oauth_text_size_boundaries() {
+        assert!(ensure_oauth_text_size("abc", 1, 3, "field").is_ok());
+        assert!(ensure_oauth_text_size("", 1, 3, "field").is_err());
+        assert!(ensure_oauth_text_size("abcd", 1, 3, "field").is_err());
+    }
+
+    #[test]
     fn return_to_must_be_local_path() {
         assert_eq!(sanitize_return_to(Some("/settings".into())), "/settings");
         assert_eq!(
@@ -1179,6 +1351,10 @@ mod tests {
             "/dashboard"
         );
         assert_eq!(sanitize_return_to(Some("//x.test".into())), "/dashboard");
+        assert_eq!(
+            sanitize_return_to(Some(format!("/{}", "a".repeat(OAUTH_MAX_RETURN_TO_BYTES)))),
+            "/dashboard"
+        );
     }
 
     #[test]
@@ -1262,6 +1438,29 @@ mod tests {
         assert_eq!(userinfo.email.as_deref(), Some("alice@example.com"));
         assert_eq!(userinfo.name.as_deref(), Some("Alice"));
         assert_eq!(userinfo.preferred_username.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn rejects_oversized_userinfo_claims() {
+        let provider = test_provider();
+        let raw = serde_json::json!({
+            "sub": "user-1",
+            "email": "a".repeat(OAUTH_MAX_CLAIM_BYTES + 1)
+        });
+        let err = normalize_userinfo(&provider, &raw).unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::BadRequest(message) if message.contains("OIDC email")
+        ));
+
+        let raw = serde_json::json!({
+            "sub": "a".repeat(OAUTH_MAX_CLAIM_BYTES + 1)
+        });
+        let err = normalize_userinfo(&provider, &raw).unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::BadRequest(message) if message.contains("OIDC subject")
+        ));
     }
 
     #[test]
