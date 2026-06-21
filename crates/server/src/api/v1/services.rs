@@ -502,7 +502,7 @@ pub async fn test_probe(
     auth: AuthSession,
     Json(req): Json<ProbeTestRequest>,
 ) -> Result<Json<ApiResponse<ProbeTestResponse>>, AppError> {
-    require_scope(&auth, "service:read")?;
+    require_probe_test_scope(&auth)?;
 
     let timeout = req.timeout_seconds.unwrap_or(10).max(1) as u64;
 
@@ -1381,6 +1381,10 @@ fn require_scope(auth: &AuthSession, scope: &str) -> Result<(), AppError> {
     }
 }
 
+fn require_probe_test_scope(auth: &AuthSession) -> Result<(), AppError> {
+    require_scope(auth, "service:write")
+}
+
 fn db_err(err: sqlx::Error) -> AppError {
     AppError::Database(anyhow::anyhow!(err))
 }
@@ -1541,6 +1545,17 @@ mod tests {
         assert!(matches!(err, AppError::Forbidden(_)));
     }
 
+    #[test]
+    fn probe_test_requires_service_write_scope() {
+        let admin = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let read_only = admin_pat_session_with_scopes(admin, vec!["service:read".into()]);
+        let writer = admin_pat_session_with_scopes(admin, vec!["service:write".into()]);
+
+        let err = require_probe_test_scope(&read_only).unwrap_err();
+        assert!(matches!(err, AppError::Forbidden(_)));
+        assert!(require_probe_test_scope(&writer).is_ok());
+    }
+
     async fn test_db() -> DatabaseBackend {
         let db = DatabaseBackend::connect("sqlite::memory:", true)
             .await
@@ -1573,6 +1588,20 @@ mod tests {
             auth_kind: AuthKind::PersonalAccessToken,
             scopes: vec!["service:read".into()],
             server_ids: Some(server_ids),
+            pat_id: Some("pat".into()),
+        }
+    }
+
+    fn admin_pat_session_with_scopes(user_id: Uuid, scopes: Vec<String>) -> AuthSession {
+        AuthSession {
+            session_id: "sess".into(),
+            user_id: UserId(user_id),
+            username: "admin".into(),
+            role: UserRole::Admin,
+            csrf_token: "csrf".into(),
+            auth_kind: AuthKind::PersonalAccessToken,
+            scopes,
+            server_ids: None,
             pat_id: Some("pat".into()),
         }
     }
