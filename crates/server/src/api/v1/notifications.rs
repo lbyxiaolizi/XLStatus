@@ -1052,6 +1052,49 @@ async fn ensure_group_exists(db: &DatabaseBackend, id: &str, owner: Uuid) -> Res
     }
 }
 
+pub(crate) async fn ensure_notification_group_owned_by(
+    db: &DatabaseBackend,
+    owner: Uuid,
+    group_id: Option<&str>,
+) -> Result<(), AppError> {
+    let Some(group_id) = group_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    let exists = match db {
+        DatabaseBackend::Sqlite(pool) => {
+            let row: Option<(i64,)> = sqlx::query_as(
+                "SELECT 1 FROM notification_groups WHERE id = ? AND owner_user_id = ?",
+            )
+            .bind(group_id)
+            .bind(owner.to_string())
+            .fetch_optional(pool)
+            .await
+            .map_err(db_err)?;
+            row.is_some()
+        }
+        DatabaseBackend::Postgres(pool) => {
+            let parsed_group_id = Uuid::parse_str(group_id)
+                .map_err(|e| AppError::BadRequest(format!("invalid notification_group_id: {e}")))?;
+            let row: Option<(i64,)> = sqlx::query_as(
+                "SELECT 1::BIGINT FROM notification_groups WHERE id = $1 AND owner_user_id = $2",
+            )
+            .bind(parsed_group_id)
+            .bind(owner)
+            .fetch_optional(pool)
+            .await
+            .map_err(db_err)?;
+            row.is_some()
+        }
+    };
+    if exists {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest(
+            "notification_group_id does not exist or is not owned by current user".into(),
+        ))
+    }
+}
+
 async fn ensure_notification_exists(
     db: &DatabaseBackend,
     id: &str,

@@ -79,7 +79,7 @@ async fn login_me_refresh_logout_flow() {
     let client = reqwest::Client::new();
 
     let resp = client.post(format!("{}/api/v1/auth/login", app.addr))
-        .json(&json!({"username": "admin", "password": "admin123"}))
+        .json(&json!({"username": "admin", "password": "replace-with-a-strong-initial-password"}))
         .send().await.unwrap();
     assert_eq!(resp.status(), 200);
 

@@ -1491,7 +1491,7 @@ function getCookie(name: string): string | null {
 }
 
 function hasBrowserSessionSignal(): boolean {
-  return Boolean(getCookie("xlstatus_csrf") || window.localStorage.getItem("session_token"));
+  return Boolean(getCookie("xlstatus_csrf"));
 }
 
 function buildWsUrl(): string {

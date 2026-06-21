@@ -3,7 +3,7 @@
 
 use axum::{
     async_trait,
-    extract::{FromRequestParts, Request, State},
+    extract::{connect_info::ConnectInfo, FromRequestParts, Request, State},
     http::{header, request::Parts, HeaderMap, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -11,11 +11,13 @@ use axum::{
 use axum_extra::extract::CookieJar;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use xlstatus_shared::{UserId, UserRole};
 
 use crate::api::v1::auth::{active_waf_ban, record_waf_event, register_pat_failure, AppState};
 use crate::auth::{hash_token, SessionRepository};
 use crate::db::{PATRepository, User, UserRepository};
+use crate::security::client_ip_from_headers_and_peer;
 
 pub const SESSION_COOKIE_NAME: &str = "xlstatus_session";
 pub const CSRF_COOKIE_NAME: &str = "xlstatus_csrf";
@@ -52,6 +54,20 @@ pub struct AuthUser {
 }
 
 impl AuthUser {
+    pub fn auth_session(&self) -> AuthSession {
+        AuthSession {
+            session_id: self.session_id.clone(),
+            user_id: self.user.id,
+            username: self.user.username.clone(),
+            role: self.user.role,
+            csrf_token: self.csrf_token.clone(),
+            auth_kind: self.auth_kind.clone(),
+            scopes: self.scopes.clone(),
+            server_ids: self.server_ids.clone(),
+            pat_id: self.pat_id.clone(),
+        }
+    }
+
     pub fn is_pat(&self) -> bool {
         matches!(self.auth_kind, AuthKind::PersonalAccessToken)
     }
@@ -73,17 +89,20 @@ impl AuthUser {
     }
 
     pub fn has_scope(&self, required_scope: &str) -> bool {
-        if !self.is_pat() {
-            return true;
-        }
-
-        let Some((namespace, _)) = required_scope.split_once(':') else {
-            return self.scopes.iter().any(|scope| scope == required_scope);
-        };
-
-        self.scopes.iter().any(|scope| {
-            scope == required_scope || scope == "*" || scope == &format!("{}:*", namespace)
-        })
+        crate::auth::rbac::has_scope(
+            &AuthSession {
+                session_id: self.session_id.clone(),
+                user_id: self.user.id,
+                username: self.user.username.clone(),
+                role: self.user.role,
+                csrf_token: self.csrf_token.clone(),
+                auth_kind: self.auth_kind.clone(),
+                scopes: self.scopes.clone(),
+                server_ids: self.server_ids.clone(),
+                pat_id: self.pat_id.clone(),
+            },
+            required_scope,
+        )
     }
 
     pub fn require_scope(&self, required_scope: &str) -> Result<(), StatusCode> {
@@ -154,7 +173,11 @@ pub async fn session_middleware(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let client_ip = client_ip_from_headers(request.headers());
+    let peer_addr = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| *addr);
+    let client_ip = client_ip_from_headers_and_peer(request.headers(), peer_addr);
     let bearer_token = request
         .headers()
         .get(header::AUTHORIZATION)
@@ -192,7 +215,7 @@ pub async fn session_middleware(
                 let is_expired = pat
                     .expires_at
                     .map(|expires_at| expires_at <= Utc::now())
-                    .unwrap_or(false);
+                    .unwrap_or(true);
                 if is_expired {
                     let _ =
                         register_pat_failure(&state.db, &client_ip, Some(&pat.id), "expired token")
@@ -201,20 +224,37 @@ pub async fn session_middleware(
                     let user_repo = UserRepository::new(state.db.clone());
                     match user_repo.find_by_id(pat.user_id).await {
                         Ok(Some(user)) => {
-                            let auth_session = AuthSession {
-                                session_id: pat.id.clone(),
-                                user_id: user.id,
-                                username: user.username.clone(),
-                                role: user.role,
-                                csrf_token: String::new(),
-                                auth_kind: AuthKind::PersonalAccessToken,
-                                scopes: pat.scopes.clone(),
-                                server_ids: pat.server_ids.clone(),
-                                pat_id: Some(pat.id.clone()),
-                            };
-                            let _ = pat_repo.mark_used(&pat.id, Some(&client_ip)).await;
-                            request.extensions_mut().insert(auth_session);
-                            request.extensions_mut().insert(user);
+                            match crate::auth::rbac::validate_pat_runtime(
+                                &pat.scopes,
+                                user.role.is_admin(),
+                                pat.server_ids.as_deref(),
+                            ) {
+                                Ok(()) => {
+                                    let auth_session = AuthSession {
+                                        session_id: pat.id.clone(),
+                                        user_id: user.id,
+                                        username: user.username.clone(),
+                                        role: user.role,
+                                        csrf_token: String::new(),
+                                        auth_kind: AuthKind::PersonalAccessToken,
+                                        scopes: pat.scopes.clone(),
+                                        server_ids: pat.server_ids.clone(),
+                                        pat_id: Some(pat.id.clone()),
+                                    };
+                                    let _ = pat_repo.mark_used(&pat.id, Some(&client_ip)).await;
+                                    request.extensions_mut().insert(auth_session);
+                                    request.extensions_mut().insert(user);
+                                }
+                                Err(reason) => {
+                                    let _ = register_pat_failure(
+                                        &state.db,
+                                        &client_ip,
+                                        Some(&pat.id),
+                                        &format!("invalid token policy: {reason}"),
+                                    )
+                                    .await;
+                                }
+                            }
                         }
                         Ok(None) => {
                             let _ = register_pat_failure(
@@ -326,13 +366,7 @@ pub fn derive_csrf_token(token_hash: &str) -> String {
 }
 
 fn client_ip_from_headers(headers: &HeaderMap) -> String {
-    header_value(headers, "x-forwarded-for")
-        .and_then(|value| value.split(',').next().map(str::trim).map(str::to_string))
-        .or_else(|| header_value(headers, "x-real-ip"))
-        .or_else(|| header_value(headers, "cf-connecting-ip"))
-        .map(|value| value.chars().take(128).collect::<String>())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "unknown".to_string())
+    crate::security::client_ip_from_headers(headers)
 }
 
 fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {

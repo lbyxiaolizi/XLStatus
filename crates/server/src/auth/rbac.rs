@@ -44,6 +44,39 @@ pub const KNOWN_SCOPES: &[&str] = &[
     "admin:*",
 ];
 
+pub const NON_ADMIN_PAT_DENIED_SCOPES: &[&str] = &[
+    "server:write",
+    "server:delete",
+    "server:exec",
+    "task:write",
+    "task:delete",
+    "task:exec",
+    "nat:write",
+    "nat:delete",
+    "transfer:write",
+];
+
+pub const SERVER_SCOPED_PAT_NAMESPACES: &[&str] =
+    &["server", "service", "alert", "task", "nat", "transfer"];
+
+fn known_scope_namespace(namespace: &str) -> bool {
+    KNOWN_SCOPES.iter().any(|scope| {
+        scope
+            .split_once(':')
+            .map(|(known_namespace, _)| known_namespace == namespace)
+            .unwrap_or(false)
+    })
+}
+
+fn namespace_contains_non_admin_denied_scope(namespace: &str) -> bool {
+    NON_ADMIN_PAT_DENIED_SCOPES.iter().any(|scope| {
+        scope
+            .split_once(':')
+            .map(|(denied_namespace, _)| denied_namespace == namespace)
+            .unwrap_or(false)
+    })
+}
+
 /// Validate that a list of PAT scopes only contains known scope names and is
 /// well-formed. `admin:*` is only usable by Admin users.
 pub fn validate_pat_scopes(scopes: &[String], is_admin: bool) -> Result<(), String> {
@@ -63,10 +96,23 @@ pub fn validate_pat_scopes(scopes: &[String], is_admin: bool) -> Result<(), Stri
             continue;
         }
 
+        if !is_admin && NON_ADMIN_PAT_DENIED_SCOPES.contains(&scope.as_str()) {
+            return Err(format!("scope {scope} requires admin role"));
+        }
+
         match scope.split_once(':') {
             Some((namespace, action)) => {
                 if namespace.is_empty() || action.is_empty() {
                     return Err(format!("invalid scope format: {}", scope));
+                }
+                if action == "*" {
+                    if !known_scope_namespace(namespace) {
+                        return Err(format!("unknown scope namespace: {}", namespace));
+                    }
+                    if !is_admin && namespace_contains_non_admin_denied_scope(namespace) {
+                        return Err(format!("scope {scope} includes admin-only permissions"));
+                    }
+                    continue;
                 }
                 if !KNOWN_SCOPES.contains(&scope.as_str()) {
                     return Err(format!("unknown scope: {}", scope));
@@ -84,6 +130,73 @@ pub fn validate_pat_scopes(scopes: &[String], is_admin: bool) -> Result<(), Stri
     Ok(())
 }
 
+fn pat_scope_grants(stored_scope: &str, required_scope: &str, is_admin: bool) -> bool {
+    if stored_scope == "*" || validate_pat_scopes(&[stored_scope.to_string()], is_admin).is_err() {
+        return false;
+    }
+
+    if stored_scope == required_scope {
+        return true;
+    }
+
+    let Some((stored_namespace, stored_action)) = stored_scope.split_once(':') else {
+        return false;
+    };
+    if stored_action != "*" {
+        return false;
+    }
+
+    required_scope
+        .split_once(':')
+        .map(|(required_namespace, _)| required_namespace == stored_namespace)
+        .unwrap_or(false)
+}
+
+pub fn pat_scopes_require_server_allowlist(scopes: &[String]) -> bool {
+    scopes.iter().any(|scope| {
+        scope
+            .split_once(':')
+            .map(|(namespace, _)| SERVER_SCOPED_PAT_NAMESPACES.contains(&namespace))
+            .unwrap_or(false)
+    })
+}
+
+pub fn validate_pat_runtime(
+    scopes: &[String],
+    is_admin: bool,
+    server_ids: Option<&[String]>,
+) -> Result<(), String> {
+    validate_pat_scopes(scopes, is_admin)?;
+    validate_server_ids(server_ids)?;
+
+    if !is_admin
+        && pat_scopes_require_server_allowlist(scopes)
+        && server_ids.map(|ids| ids.is_empty()).unwrap_or(true)
+    {
+        return Err(
+            "non-admin PATs with server-scoped permissions require a non-empty server allowlist"
+                .to_string(),
+        );
+    }
+
+    Ok(())
+}
+
+pub fn member_cookie_scope_allowed(required_scope: &str) -> bool {
+    matches!(
+        required_scope,
+        "inventory:read"
+            | "server:read"
+            | "service:read"
+            | "alert:read"
+            | "task:read"
+            | "ddns:read"
+            | "nat:read"
+            | "notification:read"
+            | "transfer:read"
+    )
+}
+
 /// Validate that a PAT server allowlist only contains valid UUIDs.
 pub fn validate_server_ids(server_ids: Option<&[String]>) -> Result<(), String> {
     let Some(ids) = server_ids else {
@@ -98,27 +211,25 @@ pub fn validate_server_ids(server_ids: Option<&[String]>) -> Result<(), String> 
 }
 
 /// Check if a session/pat has a given scope.
-/// Cookie sessions (full admin) implicitly satisfy every scope check; PATs must
-/// have the scope (or a namespace wildcard like `task:*`).
-pub fn has_scope(_session: &AuthSession, _required_scope: &str) -> bool {
+/// Admin cookie sessions satisfy every scope; member cookie sessions are
+/// limited to read-only scopes; PATs must have the exact scope or a supported
+/// namespace scope like `task:*`. A bare `*` is never honored at runtime.
+pub fn has_scope(session: &AuthSession, required_scope: &str) -> bool {
     if !matches!(
-        _session.auth_kind,
+        session.auth_kind,
         crate::auth::middleware::AuthKind::PersonalAccessToken
     ) {
-        return true;
+        return session.role.is_admin() || member_cookie_scope_allowed(required_scope);
     }
 
-    let Some((namespace, _)) = _required_scope.split_once(':') else {
-        return _session
-            .scopes
-            .iter()
-            .any(|s| s == _required_scope || s == "*");
+    let Some((_namespace, _)) = required_scope.split_once(':') else {
+        return session.scopes.iter().any(|s| s == required_scope);
     };
 
-    _session
+    session
         .scopes
         .iter()
-        .any(|s| s == _required_scope || s == "*" || s == &format!("{}:*", namespace))
+        .any(|s| pat_scope_grants(s, required_scope, session.role.is_admin()))
 }
 
 /// Check that a session/pat can access a single server id (PAT allowlist).
@@ -210,12 +321,12 @@ mod tests {
         }
     }
 
-    fn cookie_session() -> AuthSession {
+    fn cookie_session(role: UserRole) -> AuthSession {
         AuthSession {
             session_id: "sess".into(),
             user_id: UserId(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()),
             username: "u".into(),
-            role: UserRole::Admin,
+            role,
             csrf_token: "csrf".into(),
             auth_kind: AuthKind::Session,
             scopes: vec![],
@@ -269,10 +380,68 @@ mod tests {
     }
 
     #[test]
+    fn validate_pat_scopes_accepts_admin_namespace_wildcard() {
+        let s = vec!["task:*".to_string()];
+        assert!(validate_pat_scopes(&s, true).is_ok());
+    }
+
+    #[test]
+    fn validate_pat_scopes_rejects_non_admin_namespace_wildcard_with_denied_actions() {
+        let s = vec!["task:*".to_string()];
+        assert!(validate_pat_scopes(&s, false).is_err());
+    }
+
+    #[test]
+    fn validate_pat_scopes_accepts_non_admin_read_only_namespace_wildcard() {
+        let s = vec!["notification:*".to_string()];
+        assert!(validate_pat_scopes(&s, false).is_ok());
+    }
+
+    #[test]
+    fn validate_pat_scopes_rejects_unknown_namespace_wildcard() {
+        let s = vec!["unknown:*".to_string()];
+        assert!(validate_pat_scopes(&s, true).is_err());
+    }
+
+    #[test]
     fn validate_pat_scopes_admin_star_requires_admin() {
         let s = vec!["admin:*".to_string()];
         assert!(validate_pat_scopes(&s, false).is_err());
         assert!(validate_pat_scopes(&s, true).is_ok());
+    }
+
+    #[test]
+    fn validate_pat_scopes_rejects_high_risk_scope_for_non_admin() {
+        let s = vec!["server:exec".to_string()];
+        assert!(validate_pat_scopes(&s, false).is_err());
+        assert!(validate_pat_scopes(&s, true).is_ok());
+    }
+
+    #[test]
+    fn pat_scopes_require_server_allowlist_for_server_scoped_scopes() {
+        let server_scoped = vec!["server:read".to_string(), "task:read".to_string()];
+        let global = vec!["notification:read".to_string()];
+        assert!(pat_scopes_require_server_allowlist(&server_scoped));
+        assert!(!pat_scopes_require_server_allowlist(&global));
+    }
+
+    #[test]
+    fn validate_pat_runtime_rejects_legacy_bare_wildcard() {
+        let scopes = vec!["*".to_string()];
+        assert!(validate_pat_runtime(&scopes, true, None).is_err());
+    }
+
+    #[test]
+    fn validate_pat_runtime_rejects_legacy_non_admin_denied_scope() {
+        let scopes = vec!["server:exec".to_string()];
+        let server_ids = vec!["00000000-0000-0000-0000-000000000001".to_string()];
+        assert!(validate_pat_runtime(&scopes, false, Some(&server_ids)).is_err());
+    }
+
+    #[test]
+    fn validate_pat_runtime_rejects_non_admin_server_scoped_without_allowlist() {
+        let scopes = vec!["server:read".to_string()];
+        assert!(validate_pat_runtime(&scopes, false, None).is_err());
     }
 
     // ---- validate_server_ids ----
@@ -329,10 +498,20 @@ mod tests {
     // ---- has_scope ----
 
     #[test]
-    fn has_scope_cookie_session_always_true() {
-        let s = cookie_session();
+    fn has_scope_admin_cookie_session_allows_all() {
+        let s = cookie_session(UserRole::Admin);
         assert!(has_scope(&s, "task:read"));
         assert!(has_scope(&s, "admin:write"));
+    }
+
+    #[test]
+    fn has_scope_member_cookie_session_allows_only_read_scopes() {
+        let s = cookie_session(UserRole::Member);
+        assert!(has_scope(&s, "task:read"));
+        assert!(has_scope(&s, "server:read"));
+        assert!(!has_scope(&s, "task:exec"));
+        assert!(!has_scope(&s, "server:write"));
+        assert!(!has_scope(&s, "admin:write"));
     }
 
     #[test]
@@ -343,18 +522,26 @@ mod tests {
     }
 
     #[test]
-    fn has_scope_pat_with_namespace_wildcard() {
-        let s = pat_session(vec!["task:*"], None);
+    fn has_scope_admin_pat_with_namespace_wildcard() {
+        let mut s = pat_session(vec!["task:*"], None);
+        s.role = UserRole::Admin;
         assert!(has_scope(&s, "task:read"));
         assert!(has_scope(&s, "task:write"));
         assert!(!has_scope(&s, "nat:read"));
     }
 
     #[test]
-    fn has_scope_pat_with_bare_wildcard() {
+    fn has_scope_non_admin_pat_rejects_denied_namespace_wildcard_at_runtime() {
+        let s = pat_session(vec!["task:*"], None);
+        assert!(!has_scope(&s, "task:read"));
+        assert!(!has_scope(&s, "task:write"));
+    }
+
+    #[test]
+    fn has_scope_pat_rejects_bare_wildcard_at_runtime() {
         let s = pat_session(vec!["*"], None);
-        assert!(has_scope(&s, "task:read"));
-        assert!(has_scope(&s, "nat:delete"));
+        assert!(!has_scope(&s, "task:read"));
+        assert!(!has_scope(&s, "nat:delete"));
     }
 
     #[test]

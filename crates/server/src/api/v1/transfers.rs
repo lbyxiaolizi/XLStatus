@@ -1,20 +1,29 @@
 use axum::{
     body::Bytes,
-    extract::{DefaultBodyLimit, Query, State},
+    extract::{connect_info::ConnectInfo, DefaultBodyLimit, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
-use serde::Deserialize;
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use xlstatus_proto_gen::xlstatus::v1::{
-    server_task::Spec, FileReadTask, FileWriteTask, ServerTask, TaskOutcome, TaskType,
+    server_task::Spec, FileReadTask, FileWriteTask, ServerTask, TaskOutcome, TaskResult, TaskType,
 };
 use xlstatus_shared::AgentId;
 
 use crate::api::types::ApiResponse;
 use crate::api::v1::auth::AppState;
-use crate::mcp::executor::{percent_decode, validate_temporary_url_token};
+use crate::auth::hash_token;
+use crate::auth::middleware::{AuthKind, AuthSession};
+use crate::auth::rbac::has_scope;
+use crate::auth::SessionRepository;
+use crate::db::{
+    AgentRepository, PATRepository, TemporaryTransferToken, TemporaryTransferTokenRepository,
+    UserRepository,
+};
 
 const TEMP_TRANSFER_MAX_BYTES: usize = 100 * 1024 * 1024;
 const DOWNLOAD_TIMEOUT_SECS: u64 = 60;
@@ -28,28 +37,185 @@ static TEMP_TRANSFER_RATE_STATE: once_cell::sync::Lazy<
 
 #[derive(Debug, Deserialize)]
 pub struct TempTransferQuery {
+    pub token: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListTemporaryTransfersQuery {
+    #[serde(default = "default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+}
+
+fn default_limit() -> i64 {
+    50
+}
+
+#[derive(Debug, Serialize)]
+pub struct TemporaryTransferTokenView {
+    pub id: String,
     pub server_id: String,
     pub path: String,
-    pub expires_at: i64,
-    pub token: String,
+    pub op: String,
+    pub issued_by_user_id: String,
+    pub auth_kind: String,
+    pub session_id: Option<String>,
+    pub api_token_id: Option<String>,
+    pub scope: String,
+    pub expires_at: String,
+    pub used_at: Option<String>,
+    pub used_ip: Option<String>,
+    pub used_status: Option<String>,
+    pub used_error: Option<String>,
+    pub agent_task_id: Option<String>,
+    pub revoked_at: Option<String>,
+    pub created_at: String,
+    pub created_ip: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TemporaryTransferTokenListResponse {
+    pub tokens: Vec<TemporaryTransferTokenView>,
+    pub total: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RevokeTemporaryTransferResponse {
+    pub id: String,
+    pub revoked: bool,
+}
+
+pub async fn list_temporary_transfers(
+    State(state): State<AppState>,
+    auth: AuthSession,
+    Query(q): Query<ListTemporaryTransfersQuery>,
+) -> Result<Json<ApiResponse<TemporaryTransferTokenListResponse>>, crate::api::v1::auth::AppError> {
+    require_transfer_scope_app(&auth, "transfer:read")?;
+    let limit = q.limit.clamp(1, 500);
+    let offset = q.offset.max(0);
+    let repo = TemporaryTransferTokenRepository::new(state.db.clone());
+    let (tokens, total) = if auth.role.is_admin() && auth.server_ids.is_none() {
+        repo.list(limit, offset).await?
+    } else if let Some(server_ids) = auth.server_ids.as_deref() {
+        repo.list_for_owner_server_ids(auth.user_id, server_ids, limit, offset)
+            .await?
+    } else {
+        repo.list_for_owner(auth.user_id, limit, offset).await?
+    };
+    Ok(Json(ApiResponse::success(
+        TemporaryTransferTokenListResponse {
+            tokens: tokens
+                .into_iter()
+                .map(temporary_transfer_token_view)
+                .collect(),
+            total,
+        },
+    )))
+}
+
+pub async fn revoke_temporary_transfer(
+    State(state): State<AppState>,
+    auth: AuthSession,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<RevokeTemporaryTransferResponse>>, crate::api::v1::auth::AppError> {
+    require_transfer_scope_app(&auth, "transfer:write")?;
+    let repo = TemporaryTransferTokenRepository::new(state.db.clone());
+    let record = repo
+        .find_by_id(&id)
+        .await?
+        .ok_or(crate::api::v1::auth::AppError::NotFound(
+            "temporary transfer token not found".into(),
+        ))?;
+    if !temporary_transfer_visible_to_auth(&state, &auth, &record).await? {
+        return Err(crate::api::v1::auth::AppError::Forbidden(
+            "temporary transfer token not in scope".into(),
+        ));
+    }
+    let revoked = repo.revoke(&id).await?;
+    Ok(Json(ApiResponse::success(
+        RevokeTemporaryTransferResponse { id, revoked },
+    )))
 }
 
 pub async fn temp_download(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Query(query): Query<TempTransferQuery>,
 ) -> Response {
-    match run_temp_download(state, query).await {
+    let client_ip = crate::security::client_ip_from_headers_and_peer(&headers, Some(peer_addr));
+    match run_temp_download(state, query, client_ip).await {
         Ok(response) => response,
         Err((status, message)) => json_error(status, message),
     }
 }
 
+fn temporary_transfer_token_view(token: TemporaryTransferToken) -> TemporaryTransferTokenView {
+    TemporaryTransferTokenView {
+        id: token.id,
+        server_id: token.server_id.0.to_string(),
+        path: token.path,
+        op: token.op,
+        issued_by_user_id: token.issued_by_user_id.0.to_string(),
+        auth_kind: token.auth_kind,
+        session_id: token.session_id,
+        api_token_id: token.api_token_id,
+        scope: token.scope,
+        expires_at: token.expires_at.to_rfc3339(),
+        used_at: token.used_at.map(|ts| ts.to_rfc3339()),
+        used_ip: token.used_ip,
+        used_status: token.used_status,
+        used_error: token.used_error,
+        agent_task_id: token.agent_task_id,
+        revoked_at: token.revoked_at.map(|ts| ts.to_rfc3339()),
+        created_at: token.created_at.to_rfc3339(),
+        created_ip: token.created_ip,
+    }
+}
+
+async fn temporary_transfer_visible_to_auth(
+    state: &AppState,
+    auth: &AuthSession,
+    token: &TemporaryTransferToken,
+) -> Result<bool, crate::api::v1::auth::AppError> {
+    if auth.role.is_admin() && auth.server_ids.is_none() {
+        return Ok(true);
+    }
+    if token.issued_by_user_id != auth.user_id {
+        return Ok(false);
+    }
+    let agent = AgentRepository::new(state.db.clone())
+        .find_by_id(token.server_id)
+        .await?
+        .ok_or(crate::api::v1::auth::AppError::NotFound(
+            "agent not found".into(),
+        ))?;
+    Ok(crate::api::v1::servers::agent_visible(auth, &agent))
+}
+
+fn require_transfer_scope_app(
+    auth: &AuthSession,
+    scope: &str,
+) -> Result<(), crate::api::v1::auth::AppError> {
+    if has_scope(auth, scope) {
+        Ok(())
+    } else {
+        Err(crate::api::v1::auth::AppError::Forbidden(format!(
+            "missing scope: {scope}"
+        )))
+    }
+}
+
 pub async fn temp_upload(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Query(query): Query<TempTransferQuery>,
     body: Bytes,
 ) -> Response {
-    match run_temp_upload(state, query, body).await {
+    let client_ip = crate::security::client_ip_from_headers_and_peer(&headers, Some(peer_addr));
+    match run_temp_upload(state, query, client_ip, body).await {
         Ok(response) => response,
         Err((status, message)) => json_error(status, message),
     }
@@ -58,20 +224,16 @@ pub async fn temp_upload(
 async fn run_temp_download(
     state: AppState,
     query: TempTransferQuery,
+    client_ip: String,
 ) -> Result<Response, (StatusCode, String)> {
-    let path = decode_path(&query.path)?;
-    validate_query(
-        &state,
-        &query.server_id,
-        &path,
-        "download",
-        query.expires_at,
-        &query.token,
-    )?;
+    let transfer = validate_temporary_transfer(&state, &query.token, "download").await?;
+    let path = transfer.path;
+    let server_id = transfer.server_id;
     check_rate_limit(&query.token)?;
-    let result = dispatch_server_task(
+    consume_temporary_transfer(&state, &transfer.token_id, Some(&client_ip)).await?;
+    let dispatched = match dispatch_server_task(
         &state,
-        &query.server_id,
+        &server_id,
         ServerTask {
             task_id: String::new(),
             task_type: TaskType::FileRead as i32,
@@ -83,20 +245,66 @@ async fn run_temp_download(
         },
         DOWNLOAD_TIMEOUT_SECS,
     )
-    .await?;
-    ensure_task_success(&result)?;
-
-    let data = base64_decode(result.stdout.trim()).map_err(|e| {
-        (
-            StatusCode::BAD_GATEWAY,
-            format!("agent returned invalid base64 file data: {e}"),
+    .await
+    {
+        Ok(dispatched) => dispatched,
+        Err(err) => {
+            let task_id = err.agent_task_id.as_deref();
+            record_temporary_transfer_result(
+                &state,
+                &transfer.token_id,
+                "failed",
+                task_id,
+                Some(&err.message),
+            )
+            .await;
+            return Err(err.into_response_error());
+        }
+    };
+    if let Err(err) = ensure_task_success(&dispatched.result) {
+        record_temporary_transfer_result(
+            &state,
+            &transfer.token_id,
+            "failed",
+            Some(&dispatched.run_id),
+            Some(&err.1),
         )
-    })?;
+        .await;
+        return Err(err);
+    }
+
+    let data = match base64_decode(dispatched.result.stdout.trim()) {
+        Ok(data) => data,
+        Err(e) => {
+            let err = (
+                StatusCode::BAD_GATEWAY,
+                format!("agent returned invalid base64 file data: {e}"),
+            );
+            record_temporary_transfer_result(
+                &state,
+                &transfer.token_id,
+                "failed",
+                Some(&dispatched.run_id),
+                Some(&err.1),
+            )
+            .await;
+            return Err(err);
+        }
+    };
     if data.len() > TEMP_TRANSFER_MAX_BYTES {
-        return Err((
+        let err = (
             StatusCode::PAYLOAD_TOO_LARGE,
             format!("file is larger than {} bytes", TEMP_TRANSFER_MAX_BYTES),
-        ));
+        );
+        record_temporary_transfer_result(
+            &state,
+            &transfer.token_id,
+            "failed",
+            Some(&dispatched.run_id),
+            Some(&err.1),
+        )
+        .await;
+        return Err(err);
     }
 
     let filename = path
@@ -110,17 +318,51 @@ async fn run_temp_download(
     );
     headers.insert(
         header::CONTENT_LENGTH,
-        HeaderValue::from_str(&data.len().to_string())
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+        match HeaderValue::from_str(&data.len().to_string()) {
+            Ok(value) => value,
+            Err(e) => {
+                let err = (StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+                record_temporary_transfer_result(
+                    &state,
+                    &transfer.token_id,
+                    "failed",
+                    Some(&dispatched.run_id),
+                    Some(&err.1),
+                )
+                .await;
+                return Err(err);
+            }
+        },
     );
     headers.insert(
         header::CONTENT_DISPOSITION,
-        HeaderValue::from_str(&format!(
+        match HeaderValue::from_str(&format!(
             "attachment; filename=\"{}\"",
             sanitize_filename(filename)
-        ))
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+        )) {
+            Ok(value) => value,
+            Err(e) => {
+                let err = (StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+                record_temporary_transfer_result(
+                    &state,
+                    &transfer.token_id,
+                    "failed",
+                    Some(&dispatched.run_id),
+                    Some(&err.1),
+                )
+                .await;
+                return Err(err);
+            }
+        },
     );
+    record_temporary_transfer_result(
+        &state,
+        &transfer.token_id,
+        "success",
+        Some(&dispatched.run_id),
+        None,
+    )
+    .await;
     Ok((StatusCode::OK, headers, data).into_response())
 }
 
@@ -131,17 +373,12 @@ pub fn upload_body_limit() -> DefaultBodyLimit {
 async fn run_temp_upload(
     state: AppState,
     query: TempTransferQuery,
+    client_ip: String,
     body: Bytes,
 ) -> Result<Response, (StatusCode, String)> {
-    let path = decode_path(&query.path)?;
-    validate_query(
-        &state,
-        &query.server_id,
-        &path,
-        "upload",
-        query.expires_at,
-        &query.token,
-    )?;
+    let transfer = validate_temporary_transfer(&state, &query.token, "upload").await?;
+    let path = transfer.path;
+    let server_id = transfer.server_id;
     check_rate_limit(&query.token)?;
     if body.len() > TEMP_TRANSFER_MAX_BYTES {
         return Err((
@@ -149,9 +386,10 @@ async fn run_temp_upload(
             format!("upload is larger than {} bytes", TEMP_TRANSFER_MAX_BYTES),
         ));
     }
-    let result = dispatch_server_task(
+    consume_temporary_transfer(&state, &transfer.token_id, Some(&client_ip)).await?;
+    let dispatched = match dispatch_server_task(
         &state,
-        &query.server_id,
+        &server_id,
         ServerTask {
             task_id: String::new(),
             task_type: TaskType::FileWrite as i32,
@@ -164,55 +402,316 @@ async fn run_temp_upload(
         },
         UPLOAD_TIMEOUT_SECS,
     )
-    .await?;
-    ensure_task_success(&result)?;
-    let written = result.stdout.trim().parse::<usize>().map_err(|_| {
-        (
-            StatusCode::BAD_GATEWAY,
-            "agent returned invalid byte count".to_string(),
+    .await
+    {
+        Ok(dispatched) => dispatched,
+        Err(err) => {
+            let task_id = err.agent_task_id.as_deref();
+            record_temporary_transfer_result(
+                &state,
+                &transfer.token_id,
+                "failed",
+                task_id,
+                Some(&err.message),
+            )
+            .await;
+            return Err(err.into_response_error());
+        }
+    };
+    if let Err(err) = ensure_task_success(&dispatched.result) {
+        record_temporary_transfer_result(
+            &state,
+            &transfer.token_id,
+            "failed",
+            Some(&dispatched.run_id),
+            Some(&err.1),
         )
-    })?;
+        .await;
+        return Err(err);
+    }
+    let written = match dispatched.result.stdout.trim().parse::<usize>() {
+        Ok(written) => written,
+        Err(_) => {
+            let err = (
+                StatusCode::BAD_GATEWAY,
+                "agent returned invalid byte count".to_string(),
+            );
+            record_temporary_transfer_result(
+                &state,
+                &transfer.token_id,
+                "failed",
+                Some(&dispatched.run_id),
+                Some(&err.1),
+            )
+            .await;
+            return Err(err);
+        }
+    };
     if written != body.len() {
-        return Err((
+        let err = (
             StatusCode::BAD_GATEWAY,
             format!("agent wrote {} bytes, expected {}", written, body.len()),
-        ));
+        );
+        record_temporary_transfer_result(
+            &state,
+            &transfer.token_id,
+            "failed",
+            Some(&dispatched.run_id),
+            Some(&err.1),
+        )
+        .await;
+        return Err(err);
     }
+    record_temporary_transfer_result(
+        &state,
+        &transfer.token_id,
+        "success",
+        Some(&dispatched.run_id),
+        None,
+    )
+    .await;
     Ok(Json(ApiResponse::success(serde_json::json!({
-        "server_id": query.server_id,
+        "server_id": server_id,
         "path": path,
         "bytes_written": written,
     })))
     .into_response())
 }
 
-fn validate_query(
+#[derive(Debug)]
+struct ValidatedTemporaryTransfer {
+    token_id: String,
+    server_id: String,
+    path: String,
+}
+
+async fn validate_temporary_transfer(
     state: &AppState,
-    server_id: &str,
-    path: &str,
-    op: &str,
-    expires_at: i64,
     token: &str,
-) -> Result<(), (StatusCode, String)> {
-    uuid::Uuid::parse_str(server_id)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid server_id".to_string()))?;
-    if !path.starts_with('/') {
-        return Err((StatusCode::BAD_REQUEST, "path must be absolute".to_string()));
+    op: &str,
+) -> Result<ValidatedTemporaryTransfer, (StatusCode, String)> {
+    if !valid_temporary_token_shape(token) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "invalid or expired temporary URL".to_string(),
+        ));
     }
-    if !validate_temporary_url_token(
-        &state.config.security.session_secret,
-        server_id,
-        path,
-        op,
-        expires_at,
-        token,
-    ) {
+    let token_hash = hash_token(token);
+    let repo = TemporaryTransferTokenRepository::new(state.db.clone());
+    let Some(record) = repo
+        .find_by_token_hash(&token_hash)
+        .await
+        .map_err(internal_error)?
+    else {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "invalid or expired temporary URL".to_string(),
+        ));
+    };
+    validate_transfer_record_state(&record, op)?;
+    validate_transfer_issuer(state, &record).await?;
+    Ok(ValidatedTemporaryTransfer {
+        token_id: record.id,
+        server_id: record.server_id.0.to_string(),
+        path: record.path,
+    })
+}
+
+fn validate_transfer_record_state(
+    record: &TemporaryTransferToken,
+    op: &str,
+) -> Result<(), (StatusCode, String)> {
+    if record.op != op
+        || record.expires_at <= Utc::now()
+        || record.used_at.is_some()
+        || record.revoked_at.is_some()
+        || !record.path.starts_with('/')
+    {
         return Err((
             StatusCode::FORBIDDEN,
             "invalid or expired temporary URL".to_string(),
         ));
     }
     Ok(())
+}
+
+async fn validate_transfer_issuer(
+    state: &AppState,
+    record: &TemporaryTransferToken,
+) -> Result<(), (StatusCode, String)> {
+    let user = UserRepository::new(state.db.clone())
+        .find_by_id(record.issued_by_user_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::FORBIDDEN,
+                "temporary URL issuer is invalid".to_string(),
+            )
+        })?;
+    let auth = match record.auth_kind.as_str() {
+        "session" => {
+            let session_id = record.session_id.as_deref().ok_or_else(|| {
+                (
+                    StatusCode::FORBIDDEN,
+                    "temporary URL issuer is invalid".to_string(),
+                )
+            })?;
+            let session = SessionRepository::new(state.db.clone())
+                .find_by_id(session_id)
+                .await
+                .map_err(internal_error)?
+                .ok_or_else(|| {
+                    (
+                        StatusCode::FORBIDDEN,
+                        "temporary URL issuer is invalid".to_string(),
+                    )
+                })?;
+            if session.user_id != record.issued_by_user_id {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "temporary URL issuer is invalid".to_string(),
+                ));
+            }
+            AuthSession {
+                session_id: session.id,
+                user_id: user.id,
+                username: user.username.clone(),
+                role: user.role,
+                csrf_token: String::new(),
+                auth_kind: AuthKind::Session,
+                scopes: Vec::new(),
+                server_ids: None,
+                pat_id: None,
+            }
+        }
+        "pat" => {
+            let pat_id = record.api_token_id.as_deref().ok_or_else(|| {
+                (
+                    StatusCode::FORBIDDEN,
+                    "temporary URL issuer is invalid".to_string(),
+                )
+            })?;
+            let pat = PATRepository::new(state.db.clone())
+                .find_by_id(pat_id)
+                .await
+                .map_err(internal_error)?
+                .ok_or_else(|| {
+                    (
+                        StatusCode::FORBIDDEN,
+                        "temporary URL issuer is invalid".to_string(),
+                    )
+                })?;
+            if pat.user_id != record.issued_by_user_id
+                || pat.revoked_at.is_some()
+                || pat.expires_at.map(|ts| ts <= Utc::now()).unwrap_or(true)
+                || crate::auth::rbac::validate_pat_runtime(
+                    &pat.scopes,
+                    user.role.is_admin(),
+                    pat.server_ids.as_deref(),
+                )
+                .is_err()
+            {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "temporary URL issuer is invalid".to_string(),
+                ));
+            }
+            AuthSession {
+                session_id: pat.id.clone(),
+                user_id: user.id,
+                username: user.username.clone(),
+                role: user.role,
+                csrf_token: String::new(),
+                auth_kind: AuthKind::PersonalAccessToken,
+                scopes: pat.scopes,
+                server_ids: pat.server_ids,
+                pat_id: Some(pat.id),
+            }
+        }
+        _ => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "temporary URL issuer is invalid".to_string(),
+            ));
+        }
+    };
+    if !has_scope(&auth, &record.scope) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "temporary URL issuer no longer has permission".to_string(),
+        ));
+    }
+    let agent = AgentRepository::new(state.db.clone())
+        .find_by_id(record.server_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::FORBIDDEN,
+                "temporary URL server is invalid".to_string(),
+            )
+        })?;
+    if !crate::api::v1::servers::agent_visible(&auth, &agent) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "temporary URL issuer no longer has server access".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn consume_temporary_transfer(
+    state: &AppState,
+    token_id: &str,
+    used_ip: Option<&str>,
+) -> Result<(), (StatusCode, String)> {
+    if TemporaryTransferTokenRepository::new(state.db.clone())
+        .mark_used_once(token_id, used_ip)
+        .await
+        .map_err(internal_error)?
+    {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            "invalid or already used temporary URL".to_string(),
+        ))
+    }
+}
+
+async fn record_temporary_transfer_result(
+    state: &AppState,
+    token_id: &str,
+    status: &str,
+    agent_task_id: Option<&str>,
+    error: Option<&str>,
+) {
+    if let Err(err) = TemporaryTransferTokenRepository::new(state.db.clone())
+        .record_use_result(token_id, status, agent_task_id, error)
+        .await
+    {
+        tracing::warn!(
+            token_id = %token_id,
+            status = %status,
+            "failed to record temporary transfer usage result: {err}"
+        );
+    }
+}
+
+fn valid_temporary_token_shape(token: &str) -> bool {
+    token
+        .strip_prefix("xlt_")
+        .map(|body| body.len() == 64 && body.bytes().all(|b| b.is_ascii_hexdigit()))
+        .unwrap_or(false)
+}
+
+fn internal_error(err: anyhow::Error) -> (StatusCode, String) {
+    tracing::warn!("temporary transfer validation failed: {}", err);
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "temporary transfer validation failed".to_string(),
+    )
 }
 
 fn check_rate_limit(token: &str) -> Result<(), (StatusCode, String)> {
@@ -244,12 +743,17 @@ async fn dispatch_server_task(
     server_id: &str,
     mut task: ServerTask,
     timeout_seconds: u64,
-) -> Result<xlstatus_proto_gen::xlstatus::v1::TaskResult, (StatusCode, String)> {
-    let agent_uuid = uuid::Uuid::parse_str(server_id)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid server_id".to_string()))?;
+) -> Result<DispatchedServerTaskResult, DispatchServerTaskError> {
+    let agent_uuid = uuid::Uuid::parse_str(server_id).map_err(|_| {
+        DispatchServerTaskError::new(StatusCode::BAD_REQUEST, "invalid server_id", None)
+    })?;
     let agent_id = AgentId(agent_uuid);
     if !state.session_registry.is_online(&agent_id).await {
-        return Err((StatusCode::BAD_GATEWAY, "agent is offline".to_string()));
+        return Err(DispatchServerTaskError::new(
+            StatusCode::BAD_GATEWAY,
+            "agent is offline",
+            None,
+        ));
     }
     let response_registry = crate::current_task_response_registry();
     let run_id = uuid::Uuid::now_v7().to_string();
@@ -261,27 +765,56 @@ async fn dispatch_server_task(
         .await
     {
         response_registry.cancel(&run_id).await;
-        return Err((StatusCode::BAD_GATEWAY, e));
+        return Err(DispatchServerTaskError::new(
+            StatusCode::BAD_GATEWAY,
+            e,
+            Some(run_id),
+        ));
     }
     match tokio::time::timeout(std::time::Duration::from_secs(timeout_seconds), rx).await {
-        Ok(Ok(result)) => Ok(result),
-        Ok(Err(_)) => Err((
+        Ok(Ok(result)) => Ok(DispatchedServerTaskResult { run_id, result }),
+        Ok(Err(_)) => Err(DispatchServerTaskError::new(
             StatusCode::BAD_GATEWAY,
-            "agent disconnected before reply".to_string(),
+            "agent disconnected before reply",
+            Some(run_id),
         )),
         Err(_) => {
             response_registry.cancel(&run_id).await;
-            Err((
+            Err(DispatchServerTaskError::new(
                 StatusCode::GATEWAY_TIMEOUT,
-                "temporary transfer timed out".to_string(),
+                "temporary transfer timed out",
+                Some(run_id),
             ))
         }
     }
 }
 
-fn ensure_task_success(
-    result: &xlstatus_proto_gen::xlstatus::v1::TaskResult,
-) -> Result<(), (StatusCode, String)> {
+struct DispatchedServerTaskResult {
+    run_id: String,
+    result: TaskResult,
+}
+
+struct DispatchServerTaskError {
+    status: StatusCode,
+    message: String,
+    agent_task_id: Option<String>,
+}
+
+impl DispatchServerTaskError {
+    fn new(status: StatusCode, message: impl Into<String>, agent_task_id: Option<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+            agent_task_id,
+        }
+    }
+
+    fn into_response_error(self) -> (StatusCode, String) {
+        (self.status, self.message)
+    }
+}
+
+fn ensure_task_success(result: &TaskResult) -> Result<(), (StatusCode, String)> {
     let outcome = TaskOutcome::try_from(result.status).unwrap_or(TaskOutcome::Unspecified);
     if outcome == TaskOutcome::Success && result.exit_code == 0 {
         return Ok(());
@@ -294,10 +827,6 @@ fn ensure_task_success(
         format!("agent command failed with exit code {}", result.exit_code)
     };
     Err((StatusCode::BAD_GATEWAY, detail))
-}
-
-fn decode_path(path: &str) -> Result<String, (StatusCode, String)> {
-    percent_decode(path).map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid path: {e}")))
 }
 
 fn sanitize_filename(filename: &str) -> String {
@@ -358,4 +887,45 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+    use xlstatus_shared::UserId;
+
+    #[test]
+    fn temporary_transfer_view_does_not_expose_token_hash() {
+        let now = Utc::now();
+        let view = temporary_transfer_token_view(TemporaryTransferToken {
+            id: "tok-id".into(),
+            token_hash: "secret-hash".into(),
+            server_id: AgentId(uuid::Uuid::from_bytes([1; 16])),
+            path: "/tmp/file.txt".into(),
+            op: "download".into(),
+            issued_by_user_id: UserId(uuid::Uuid::from_bytes([2; 16])),
+            auth_kind: "session".into(),
+            session_id: Some("sess".into()),
+            api_token_id: None,
+            scope: "transfer:read".into(),
+            expires_at: now + Duration::minutes(5),
+            used_at: None,
+            used_ip: Some("203.0.113.10".into()),
+            used_status: Some("success".into()),
+            used_error: None,
+            agent_task_id: Some("task-1".into()),
+            revoked_at: None,
+            created_at: now,
+            created_ip: Some("127.0.0.1".into()),
+        });
+
+        let serialized = serde_json::to_value(view).unwrap();
+        assert!(serialized.get("token_hash").is_none());
+        assert_eq!(serialized["id"], "tok-id");
+        assert_eq!(serialized["path"], "/tmp/file.txt");
+        assert_eq!(serialized["used_ip"], "203.0.113.10");
+        assert_eq!(serialized["used_status"], "success");
+        assert_eq!(serialized["agent_task_id"], "task-1");
+    }
 }

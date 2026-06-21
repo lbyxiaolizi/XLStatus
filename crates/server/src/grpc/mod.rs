@@ -346,14 +346,11 @@ fn bearer_token_from_grpc_request<T>(request: &Request<T>) -> Option<&str> {
 }
 
 fn client_ip_from_grpc_request<T>(request: &Request<T>) -> String {
-    grpc_metadata_value(request, "x-forwarded-for")
-        .and_then(|value| value.split(',').next().map(str::trim).map(str::to_string))
-        .or_else(|| grpc_metadata_value(request, "x-real-ip"))
-        .or_else(|| grpc_metadata_value(request, "cf-connecting-ip"))
-        .or_else(|| request.remote_addr().map(|addr| addr.ip().to_string()))
-        .map(|value| value.chars().take(128).collect::<String>())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "unknown".to_string())
+    crate::security::forwarded_client_ip_with_peer(
+        |name| grpc_metadata_value(request, name),
+        request.remote_addr().map(|addr| addr.ip().to_string()),
+        request.remote_addr().map(|addr| addr.ip()),
+    )
 }
 
 fn grpc_metadata_value<T>(request: &Request<T>, name: &str) -> Option<String> {

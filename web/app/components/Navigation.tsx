@@ -557,17 +557,6 @@ function applyDashboardTheme(theme: ThemeDefinition | null) {
   }
   root.dataset.xlstatusDashboardThemeVars = nextKeys.join(",");
 
-  if (theme.custom_css || theme.light_custom_css || theme.dark_custom_css) {
-    const style = document.createElement("style");
-    style.id = styleId;
-    style.textContent = [
-      theme.custom_css,
-      isDark ? theme.dark_custom_css : theme.light_custom_css,
-    ]
-      .filter(Boolean)
-      .join("\n");
-    document.head.appendChild(style);
-  }
 }
 
 function themeVariablesForMode(theme: ThemeDefinition, isDark: boolean): Record<string, string> {

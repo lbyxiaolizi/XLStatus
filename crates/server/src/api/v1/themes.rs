@@ -2,7 +2,7 @@
 
 use crate::api::types::ApiResponse;
 use crate::api::v1::auth::{AppError, AppState};
-use crate::auth::middleware::AuthSession;
+use crate::auth::middleware::{AuthKind, AuthSession};
 use crate::db::DatabaseBackend;
 use axum::{
     extract::{Path, State},
@@ -78,9 +78,6 @@ pub struct ThemeDefinitionInput {
     pub light_variables: HashMap<String, String>,
     #[serde(default)]
     pub dark_variables: HashMap<String, String>,
-    pub custom_css: Option<String>,
-    pub light_custom_css: Option<String>,
-    pub dark_custom_css: Option<String>,
 }
 
 pub async fn list_themes(
@@ -97,7 +94,7 @@ pub async fn import_theme(
     auth: AuthSession,
     Json(req): Json<ImportThemeRequest>,
 ) -> Result<Json<ApiResponse<ThemeDefinition>>, AppError> {
-    require_admin(&auth)?;
+    require_admin_cookie_session(&auth)?;
     let mut theme = normalize_theme_input(req.theme, false)?;
     let now = Utc::now().to_rfc3339();
     theme.created_at = Some(now.clone());
@@ -112,7 +109,7 @@ pub async fn update_theme(
     Path(id): Path<String>,
     Json(req): Json<UpdateThemeRequest>,
 ) -> Result<Json<ApiResponse<ThemeDefinition>>, AppError> {
-    require_admin(&auth)?;
+    require_admin_cookie_session(&auth)?;
     if builtin_theme(&id).is_some() {
         return Err(AppError::BadRequest(
             "builtin themes cannot be edited; import a custom copy instead".into(),
@@ -140,14 +137,14 @@ pub async fn update_theme(
     if let Some(variables) = req.dark_variables {
         theme.dark_variables = normalize_theme_variables(variables)?;
     }
-    if let Some(custom_css) = req.custom_css {
-        theme.custom_css = normalize_optional_text(custom_css, 10_000, "custom_css")?;
+    if req.custom_css.is_some() {
+        theme.custom_css = None;
     }
-    if let Some(custom_css) = req.light_custom_css {
-        theme.light_custom_css = normalize_optional_text(custom_css, 10_000, "light_custom_css")?;
+    if req.light_custom_css.is_some() {
+        theme.light_custom_css = None;
     }
-    if let Some(custom_css) = req.dark_custom_css {
-        theme.dark_custom_css = normalize_optional_text(custom_css, 10_000, "dark_custom_css")?;
+    if req.dark_custom_css.is_some() {
+        theme.dark_custom_css = None;
     }
     theme.updated_at = Some(Utc::now().to_rfc3339());
     let updated = theme.clone();
@@ -161,7 +158,7 @@ pub async fn select_theme(
     Path(id): Path<String>,
     Json(req): Json<SelectThemeRequest>,
 ) -> Result<Json<ApiResponse<ThemeListResponse>>, AppError> {
-    require_admin(&auth)?;
+    require_admin_cookie_session(&auth)?;
     let target = normalize_select_target(&req.target)?;
     let all = all_themes(&state.db).await?;
     let theme = all
@@ -196,7 +193,7 @@ pub async fn delete_theme(
     auth: AuthSession,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
-    require_admin(&auth)?;
+    require_admin_cookie_session(&auth)?;
     if builtin_theme(&id).is_some() {
         return Err(AppError::BadRequest(
             "builtin themes cannot be deleted".into(),
@@ -383,29 +380,34 @@ fn normalize_theme_input(
     input: ThemeDefinitionInput,
     builtin: bool,
 ) -> Result<ThemeDefinition, AppError> {
-    let variables = normalize_theme_variables(input.variables)?;
-    let light_variables = if input.light_variables.is_empty() {
-        variables.clone()
-    } else {
-        normalize_theme_variables(input.light_variables)?
-    };
-    let dark_variables = normalize_theme_variables(input.dark_variables)?;
-
-    Ok(ThemeDefinition {
-        id: normalize_theme_id(&input.id)?,
-        name: normalize_name(&input.name, "name")?,
-        description: normalize_optional_text(input.description, 500, "description")?,
-        target: normalize_target(input.target.as_deref().unwrap_or("both"))?,
+    let ThemeDefinitionInput {
+        id,
+        name,
+        description,
+        target,
         variables,
         light_variables,
         dark_variables,
-        custom_css: normalize_optional_text(input.custom_css, 10_000, "custom_css")?,
-        light_custom_css: normalize_optional_text(
-            input.light_custom_css,
-            10_000,
-            "light_custom_css",
-        )?,
-        dark_custom_css: normalize_optional_text(input.dark_custom_css, 10_000, "dark_custom_css")?,
+    } = input;
+    let variables = normalize_theme_variables(variables)?;
+    let light_variables = if light_variables.is_empty() {
+        variables.clone()
+    } else {
+        normalize_theme_variables(light_variables)?
+    };
+    let dark_variables = normalize_theme_variables(dark_variables)?;
+
+    Ok(ThemeDefinition {
+        id: normalize_theme_id(&id)?,
+        name: normalize_name(&name, "name")?,
+        description: normalize_optional_text(description, 500, "description")?,
+        target: normalize_target(target.as_deref().unwrap_or("both"))?,
+        variables,
+        light_variables,
+        dark_variables,
+        custom_css: None,
+        light_custom_css: None,
+        dark_custom_css: None,
         builtin,
         created_at: None,
         updated_at: None,
@@ -512,16 +514,28 @@ async fn custom_themes(db: &DatabaseBackend) -> Result<Vec<ThemeDefinition>, App
     let Some(raw) = get_string_setting(db, CUSTOM_THEMES_KEY).await? else {
         return Ok(Vec::new());
     };
-    serde_json::from_str::<Vec<ThemeDefinition>>(&raw)
-        .map_err(|e| AppError::BadRequest(format!("stored theme catalog is invalid: {e}")))
+    let mut themes = serde_json::from_str::<Vec<ThemeDefinition>>(&raw)
+        .map_err(|e| AppError::BadRequest(format!("stored theme catalog is invalid: {e}")))?;
+    for theme in &mut themes {
+        clear_custom_theme_css(theme);
+    }
+    Ok(themes)
 }
 
 async fn upsert_custom_theme(db: &DatabaseBackend, theme: ThemeDefinition) -> Result<(), AppError> {
     let mut themes = custom_themes(db).await?;
+    let mut theme = theme;
+    clear_custom_theme_css(&mut theme);
     themes.retain(|item| item.id != theme.id);
     themes.push(theme);
     themes.sort_by(|a, b| a.name.cmp(&b.name));
     set_custom_themes(db, &themes).await
+}
+
+fn clear_custom_theme_css(theme: &mut ThemeDefinition) {
+    theme.custom_css = None;
+    theme.light_custom_css = None;
+    theme.dark_custom_css = None;
 }
 
 async fn set_custom_themes(
@@ -614,9 +628,18 @@ fn require_admin(auth: &AuthSession) -> Result<(), AppError> {
     }
 }
 
+fn require_admin_cookie_session(auth: &AuthSession) -> Result<(), AppError> {
+    require_admin(auth)?;
+    if matches!(auth.auth_kind, AuthKind::PersonalAccessToken) {
+        return Err(AppError::Forbidden("Cookie session required".into()));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xlstatus_shared::{UserId, UserRole};
 
     #[test]
     fn rejects_unsafe_theme_variable_values() {
@@ -626,5 +649,55 @@ mod tests {
         )]))
         .unwrap_err();
         assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn theme_admin_mutations_reject_admin_pat() {
+        let auth = auth_session(AuthKind::PersonalAccessToken);
+        let err = require_admin_cookie_session(&auth).unwrap_err();
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[test]
+    fn theme_admin_mutations_allow_admin_cookie_session() {
+        let auth = auth_session(AuthKind::Session);
+        assert!(require_admin_cookie_session(&auth).is_ok());
+    }
+
+    #[test]
+    fn stored_custom_theme_css_is_cleared() {
+        let mut theme = ThemeDefinition {
+            id: "custom".into(),
+            name: "Custom".into(),
+            description: None,
+            target: "both".into(),
+            variables: HashMap::from([("--accent-color".into(), "#16a34a".into())]),
+            light_variables: HashMap::new(),
+            dark_variables: HashMap::new(),
+            custom_css: Some("body{background:url(https://example.com/x)}".into()),
+            light_custom_css: Some("*{display:none}".into()),
+            dark_custom_css: Some("@import url(https://example.com/x.css);".into()),
+            builtin: false,
+            created_at: None,
+            updated_at: None,
+        };
+        clear_custom_theme_css(&mut theme);
+        assert!(theme.custom_css.is_none());
+        assert!(theme.light_custom_css.is_none());
+        assert!(theme.dark_custom_css.is_none());
+    }
+
+    fn auth_session(auth_kind: AuthKind) -> AuthSession {
+        AuthSession {
+            session_id: "session".into(),
+            user_id: UserId(uuid::Uuid::from_bytes([1; 16])),
+            username: "admin".into(),
+            role: UserRole::Admin,
+            csrf_token: "csrf".into(),
+            auth_kind,
+            scopes: vec!["admin:*".into()],
+            server_ids: None,
+            pat_id: None,
+        }
     }
 }

@@ -12,6 +12,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::time::{interval, Duration};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::MetadataValue;
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tonic::Request;
 use xlstatus_proto_gen::xlstatus::v1::agent_message::Payload;
 use xlstatus_proto_gen::xlstatus::v1::agent_service_client::AgentServiceClient;
@@ -49,6 +50,21 @@ fn default_ip_report_interval_seconds() -> u64 {
     60
 }
 
+fn default_file_allowed_roots() -> Vec<String> {
+    #[cfg(unix)]
+    {
+        vec!["/var/lib/xlstatus/files".to_string()]
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::temp_dir()
+            .join("xlstatus-files")
+            .to_str()
+            .map(|path| vec![path.to_string()])
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "xlstatus-agent")]
 #[command(about = "XLStatus monitoring agent", long_about = None)]
@@ -68,6 +84,22 @@ enum Commands {
         /// gRPC server URL
         #[arg(long)]
         grpc_server: Option<String>,
+
+        /// PEM CA bundle used to verify the gRPC server when using https://
+        #[arg(long)]
+        grpc_tls_ca_path: Option<String>,
+
+        /// TLS server name override for gRPC certificate verification
+        #[arg(long)]
+        grpc_tls_domain_name: Option<String>,
+
+        /// PEM client certificate for gRPC mTLS
+        #[arg(long)]
+        grpc_tls_client_cert_path: Option<String>,
+
+        /// PEM client private key for gRPC mTLS
+        #[arg(long)]
+        grpc_tls_client_key_path: Option<String>,
 
         /// Enrollment token
         #[arg(long)]
@@ -93,6 +125,14 @@ enum Commands {
 struct AgentConfig {
     server: String,
     grpc_server: String,
+    #[serde(default)]
+    grpc_tls_ca_path: Option<String>,
+    #[serde(default)]
+    grpc_tls_domain_name: Option<String>,
+    #[serde(default)]
+    grpc_tls_client_cert_path: Option<String>,
+    #[serde(default)]
+    grpc_tls_client_key_path: Option<String>,
     agent_id: String,
     name: String,
     public_key: String,
@@ -112,6 +152,16 @@ struct AgentConfig {
     disable_nat: bool,
     #[serde(default)]
     disable_send_query: bool,
+    #[serde(default = "default_file_allowed_roots")]
+    file_allowed_roots: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AgentTlsConfigInput {
+    ca_path: Option<String>,
+    domain_name: Option<String>,
+    client_cert_path: Option<String>,
+    client_key_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,12 +200,29 @@ async fn main() -> anyhow::Result<()> {
         Commands::Enroll {
             server,
             grpc_server,
+            grpc_tls_ca_path,
+            grpc_tls_domain_name,
+            grpc_tls_client_cert_path,
+            grpc_tls_client_key_path,
             token,
             name,
             config,
         } => {
             tracing::info!("Enrolling agent with server: {}", server);
-            enroll_agent(server, grpc_server, token, name, PathBuf::from(config)).await
+            enroll_agent(
+                server,
+                grpc_server,
+                AgentTlsConfigInput {
+                    ca_path: grpc_tls_ca_path,
+                    domain_name: grpc_tls_domain_name,
+                    client_cert_path: grpc_tls_client_cert_path,
+                    client_key_path: grpc_tls_client_key_path,
+                },
+                token,
+                name,
+                PathBuf::from(config),
+            )
+            .await
         }
         Commands::Run { config } => {
             tracing::info!("Starting agent with config: {}", config);
@@ -167,6 +234,7 @@ async fn main() -> anyhow::Result<()> {
 async fn enroll_agent(
     server: String,
     grpc_server: Option<String>,
+    tls: AgentTlsConfigInput,
     token: String,
     name: String,
     config_path: PathBuf,
@@ -206,6 +274,10 @@ async fn enroll_agent(
     let config = AgentConfig {
         server,
         grpc_server,
+        grpc_tls_ca_path: normalize_optional_string(tls.ca_path),
+        grpc_tls_domain_name: normalize_optional_string(tls.domain_name),
+        grpc_tls_client_cert_path: normalize_optional_string(tls.client_cert_path),
+        grpc_tls_client_key_path: normalize_optional_string(tls.client_key_path),
         agent_id: enrolled.agent_id,
         name: enrolled.name,
         public_key,
@@ -217,6 +289,7 @@ async fn enroll_agent(
         disable_command_execute: false,
         disable_nat: false,
         disable_send_query: false,
+        file_allowed_roots: default_file_allowed_roots(),
     };
 
     let serialized = serde_json::to_string_pretty(&config)?;
@@ -270,14 +343,90 @@ async fn run_agent(config_path: PathBuf) -> anyhow::Result<()> {
     }
 }
 
+async fn connect_grpc_channel(config: &AgentConfig) -> anyhow::Result<Channel> {
+    let mut endpoint = Endpoint::new(config.grpc_server.clone())?;
+    if let Some(tls_config) = build_grpc_client_tls_config(config).await? {
+        endpoint = endpoint
+            .tls_config(tls_config)
+            .map_err(|e| anyhow::anyhow!("failed to configure gRPC TLS: {}", e))?;
+    }
+    endpoint
+        .connect()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to connect gRPC server: {}", e))
+}
+
+async fn build_grpc_client_tls_config(
+    config: &AgentConfig,
+) -> anyhow::Result<Option<ClientTlsConfig>> {
+    let ca_path = non_empty_config_path(&config.grpc_tls_ca_path);
+    let domain_name = non_empty_config_path(&config.grpc_tls_domain_name);
+    let client_cert_path = non_empty_config_path(&config.grpc_tls_client_cert_path);
+    let client_key_path = non_empty_config_path(&config.grpc_tls_client_key_path);
+
+    if ca_path.is_none()
+        && domain_name.is_none()
+        && client_cert_path.is_none()
+        && client_key_path.is_none()
+    {
+        return Ok(None);
+    }
+
+    if !config.grpc_server.starts_with("https://") {
+        anyhow::bail!("custom gRPC TLS settings require grpc_server to use https://");
+    }
+
+    let mut tls_config = ClientTlsConfig::new().with_enabled_roots();
+    if let Some(domain_name) = domain_name {
+        tls_config = tls_config.domain_name(domain_name.to_string());
+    }
+    if let Some(ca_path) = ca_path {
+        let ca = tokio::fs::read(ca_path)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to read gRPC TLS CA from {ca_path}: {e}"))?;
+        tls_config = tls_config.ca_certificate(Certificate::from_pem(ca));
+    }
+
+    match (client_cert_path, client_key_path) {
+        (None, None) => {}
+        (Some(cert_path), Some(key_path)) => {
+            let cert = tokio::fs::read(cert_path).await.map_err(|e| {
+                anyhow::anyhow!("failed to read gRPC mTLS client certificate from {cert_path}: {e}")
+            })?;
+            let key = tokio::fs::read(key_path).await.map_err(|e| {
+                anyhow::anyhow!("failed to read gRPC mTLS client private key from {key_path}: {e}")
+            })?;
+            tls_config = tls_config.identity(Identity::from_pem(cert, key));
+        }
+        _ => {
+            anyhow::bail!(
+                "grpc_tls_client_cert_path and grpc_tls_client_key_path must be configured together"
+            );
+        }
+    }
+
+    Ok(Some(tls_config))
+}
+
+fn non_empty_config_path(value: &Option<String>) -> Option<&str> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn normalize_optional_string(value: Option<String>) -> Option<String> {
+    value.and_then(|value| non_empty_string(&value))
+}
+
 /// One gRPC session: connect -> heartbeat / HostState / HostInfo ->
-/// JWT auto-refresh every 4 minutes -> wait for the server to close
-/// the stream or send ForceDisconnect. The returned enum tells the
-/// outer loop whether to reconnect or exit.
+/// wait for the server to close the stream or send ForceDisconnect.
+/// The returned enum tells the outer loop whether to reconnect or exit.
 async fn run_agent_session(runtime: RuntimeContext) -> anyhow::Result<SessionExit> {
     let initial = runtime.config.lock().await.clone();
-    let mut jwt = fetch_agent_jwt(&initial).await?;
-    let mut client = AgentServiceClient::connect(initial.grpc_server.clone()).await?;
+    let jwt = fetch_agent_jwt(&initial).await?;
+    let channel = connect_grpc_channel(&initial).await?;
+    let mut client = AgentServiceClient::new(channel);
     client = client
         .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
         .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
@@ -377,38 +526,15 @@ async fn run_agent_session(runtime: RuntimeContext) -> anyhow::Result<SessionExi
         }
     });
 
-    // M2: JWT auto-refresh every `JWT_REFRESH_SECS` (4 min), well
-    // before the 5 min server-side expiry. We just re-run the
-    // challenge/signature flow; the in-memory `jwt` is reused on the
-    // next reconnect cycle (the gRPC stream itself is not
-    // re-authenticated, server-side JWT verification happens on the
-    // initial connect).
-    let mut refresh_tick = interval(Duration::from_secs(JWT_REFRESH_SECS));
-    refresh_tick.tick().await; // skip the immediate first tick
-
     println!(
-        "Agent {} connected (heartbeat {}s, report {}s, jwt refresh {}s)",
+        "Agent {} connected (heartbeat {}s, report {}s)",
         initial.agent_id,
         HEARTBEAT_INTERVAL_SECS,
-        initial.report_interval_seconds.max(1),
-        JWT_REFRESH_SECS
+        initial.report_interval_seconds.max(1)
     );
 
     loop {
         tokio::select! {
-            biased;
-            _ = refresh_tick.tick() => {
-                let cfg = runtime.config.lock().await.clone();
-                match fetch_agent_jwt(&cfg).await {
-                    Ok(fresh) => {
-                        tracing::debug!("agent jwt refreshed");
-                        jwt = fresh;
-                    }
-                    Err(e) => {
-                        tracing::warn!("agent jwt refresh failed: {}", e);
-                    }
-                }
-            }
             message = response_stream.message() => {
                 let Some(message) = message.map_err(|e| anyhow::anyhow!("gRPC recv: {e}"))? else {
                     return Ok(SessionExit::StreamClosed);
@@ -490,9 +616,6 @@ fn backoff_with_jitter(attempt: u32) -> Duration {
 
 const HEARTBEAT_INTERVAL_SECS: u64 = 15;
 const REPORT_INTERVAL_SECS: u64 = 3;
-/// M2: refresh the agent JWT every 4 min, well inside the
-/// server-issued 5 min window. See docs/architecture.md.
-const JWT_REFRESH_SECS: u64 = 240;
 
 async fn handle_io_frame(
     agent_id: &str,
@@ -1436,7 +1559,7 @@ async fn run_server_task(
                 result.finished_at = finished();
                 return result;
             }
-            match executor::files::list_files(&spec.path).await {
+            match executor::files::list_files(&spec.path, &cfg.file_allowed_roots).await {
                 Ok(entries) => {
                     result.status = TaskOutcome::Success as i32;
                     let entries = entries
@@ -1473,7 +1596,14 @@ async fn run_server_task(
                 result.finished_at = finished();
                 return result;
             }
-            match executor::files::read_file(&spec.path, spec.offset, spec.length).await {
+            match executor::files::read_file(
+                &spec.path,
+                spec.offset,
+                spec.length,
+                &cfg.file_allowed_roots,
+            )
+            .await
+            {
                 Ok(data) => {
                     result.status = TaskOutcome::Success as i32;
                     result.stdout = base64_encode(&data);
@@ -1502,6 +1632,7 @@ async fn run_server_task(
                     Some(spec.mode)
                 },
                 spec.create_dirs,
+                &cfg.file_allowed_roots,
             )
             .await
             {
@@ -1524,7 +1655,9 @@ async fn run_server_task(
                 result.finished_at = finished();
                 return result;
             }
-            match executor::files::delete_path(&spec.path, spec.recursive).await {
+            match executor::files::delete_path(&spec.path, spec.recursive, &cfg.file_allowed_roots)
+                .await
+            {
                 Ok(()) => {
                     result.status = TaskOutcome::Success as i32;
                     result.stdout = "deleted".to_string();
@@ -1772,6 +1905,15 @@ fn base64_encode(data: &[u8]) -> String {
     out
 }
 
+fn non_empty_string(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
 async fn apply_remote_config(
     runtime: &RuntimeContext,
     update: &ConfigUpdate,
@@ -1786,6 +1928,24 @@ async fn apply_remote_config(
     }
     if let Some(v) = patch.get("grpc_server").and_then(|v| v.as_str()) {
         current.grpc_server = v.to_string();
+    }
+    if let Some(v) = patch.get("grpc_tls_ca_path").and_then(|v| v.as_str()) {
+        current.grpc_tls_ca_path = non_empty_string(v);
+    }
+    if let Some(v) = patch.get("grpc_tls_domain_name").and_then(|v| v.as_str()) {
+        current.grpc_tls_domain_name = non_empty_string(v);
+    }
+    if let Some(v) = patch
+        .get("grpc_tls_client_cert_path")
+        .and_then(|v| v.as_str())
+    {
+        current.grpc_tls_client_cert_path = non_empty_string(v);
+    }
+    if let Some(v) = patch
+        .get("grpc_tls_client_key_path")
+        .and_then(|v| v.as_str())
+    {
+        current.grpc_tls_client_key_path = non_empty_string(v);
     }
     if let Some(v) = patch.get("agent_id").and_then(|v| v.as_str()) {
         current.agent_id = v.to_string();
@@ -1825,6 +1985,17 @@ async fn apply_remote_config(
     }
     if let Some(v) = patch.get("disable_send_query").and_then(|v| v.as_bool()) {
         current.disable_send_query = v;
+    }
+    if let Some(v) = patch.get("file_allowed_roots").and_then(|v| v.as_array()) {
+        let roots = v
+            .iter()
+            .filter_map(|value| value.as_str().map(str::trim))
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        if !roots.is_empty() {
+            current.file_allowed_roots = roots;
+        }
     }
     current.private_key = read_private_key(&runtime.config_path)?;
     persist_agent_config(&runtime.config_path, &current)?;

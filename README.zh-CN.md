@@ -32,7 +32,7 @@ curl -fsS http://localhost:8080/healthz
 - API：`http://localhost:8080`
 - 公开状态页：`http://localhost:3000/status`
 
-本地默认账号是 `admin` / `admin123`。对外暴露前请先修改。
+首次启动前请设置 `XLSTATUS_SEED_ADMIN_PASSWORD` 为强初始密码。
 
 PostgreSQL 版本：
 
@@ -52,7 +52,7 @@ Agent：
 
 ```bash
 sudo SERVER_URL=http://dashboard.example.com:8080 \
-  GRPC_SERVER=http://dashboard.example.com:50051 \
+  GRPC_SERVER=https://grpc.dashboard.example.com:50051 \
   ENROLLMENT_TOKEN=xle_... \
   AGENT_NAME="$(hostname)" \
   bash -c 'curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.3/install-agent.sh | bash'

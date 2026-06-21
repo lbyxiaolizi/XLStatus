@@ -4,7 +4,7 @@ services:
     container_name: xlstatus-postgres
     environment:
       - POSTGRES_USER=xlstatus
-      - POSTGRES_PASSWORD=xlstatus_password
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
       - POSTGRES_DB=xlstatus
     volumes:
       - postgres_data:/var/lib/postgresql/data
@@ -23,17 +23,17 @@ services:
       dockerfile: Dockerfile.server
     container_name: xlstatus-server
     ports:
-      - "8080:8080"
-      - "50051:50051"
+      - "127.0.0.1:8080:8080"
     environment:
-      - DATABASE_URL=postgresql://xlstatus:xlstatus_password@postgres:5432/xlstatus
+      - DATABASE_URL=postgresql://xlstatus:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/xlstatus
       - RUST_LOG=info
       - HTTP_BIND=0.0.0.0:8080
       - GRPC_BIND=0.0.0.0:50051
       - CORS_ALLOWED_ORIGINS=${XLSTATUS_CORS_ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
-      - SESSION_SECRET=change-me-in-production
-      - XLSTATUS_SEED_ADMIN_USERNAME=admin
-      - XLSTATUS_SEED_ADMIN_PASSWORD=admin123
+      - SESSION_SECRET=${SESSION_SECRET:?set SESSION_SECRET to a long random value}
+      - SECRET_ENCRYPTION_KEY=${SECRET_ENCRYPTION_KEY:-}
+      - XLSTATUS_SEED_ADMIN_USERNAME=${XLSTATUS_SEED_ADMIN_USERNAME:-admin}
+      - XLSTATUS_SEED_ADMIN_PASSWORD=${XLSTATUS_SEED_ADMIN_PASSWORD:?set XLSTATUS_SEED_ADMIN_PASSWORD}
     depends_on:
       postgres:
         condition: service_healthy
@@ -53,7 +53,7 @@ services:
         NEXT_PUBLIC_API_URL: ${XLSTATUS_PUBLIC_API_URL:-}
     container_name: xlstatus-web
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
       - NEXT_PUBLIC_API_URL=${XLSTATUS_PUBLIC_API_URL:-}
     depends_on:

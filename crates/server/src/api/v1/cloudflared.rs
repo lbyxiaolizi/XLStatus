@@ -5,7 +5,7 @@ use crate::api::v1::auth::{require_sensitive_totp, AppError, AppState};
 use crate::api::v1::settings::{
     cloudflared_token, cloudflared_token_configured, set_cloudflared_token,
 };
-use crate::auth::middleware::AuthSession;
+use crate::auth::middleware::{AuthKind, AuthSession};
 use axum::{extract::State, http::HeaderMap, Json};
 use chrono::Utc;
 use once_cell::sync::Lazy;
@@ -53,7 +53,7 @@ pub async fn cloudflared_status(
     State(state): State<AppState>,
     auth: AuthSession,
 ) -> Result<Json<ApiResponse<CloudflaredStatusResponse>>, AppError> {
-    require_admin(&auth)?;
+    require_admin_cookie_session(&auth)?;
     let mut process = CLOUDFLARED.lock().await;
     Ok(Json(ApiResponse::success(
         current_status(&state, &mut process).await?,
@@ -66,7 +66,7 @@ pub async fn save_cloudflared_token(
     headers: HeaderMap,
     Json(req): Json<CloudflaredTokenRequest>,
 ) -> Result<Json<ApiResponse<CloudflaredActionResponse>>, AppError> {
-    require_admin(&auth)?;
+    require_admin_cookie_session(&auth)?;
     require_sensitive_totp(&state.db, auth.user_id, &headers).await?;
     set_cloudflared_token(&state.db, req.token).await?;
     let mut process = CLOUDFLARED.lock().await;
@@ -84,7 +84,7 @@ pub async fn start_cloudflared(
     auth: AuthSession,
     headers: HeaderMap,
 ) -> Result<Json<ApiResponse<CloudflaredActionResponse>>, AppError> {
-    require_admin(&auth)?;
+    require_admin_cookie_session(&auth)?;
     require_sensitive_totp(&state.db, auth.user_id, &headers).await?;
     let token = cloudflared_token(&state.db)
         .await?
@@ -136,7 +136,7 @@ pub async fn stop_cloudflared(
     auth: AuthSession,
     headers: HeaderMap,
 ) -> Result<Json<ApiResponse<CloudflaredActionResponse>>, AppError> {
-    require_admin(&auth)?;
+    require_admin_cookie_session(&auth)?;
     require_sensitive_totp(&state.db, auth.user_id, &headers).await?;
     let mut process = CLOUDFLARED.lock().await;
     if let Some(mut child) = process.child.take() {
@@ -221,5 +221,52 @@ fn require_admin(auth: &AuthSession) -> Result<(), AppError> {
         Ok(())
     } else {
         Err(AppError::Forbidden("Admin role required".into()))
+    }
+}
+
+fn require_admin_cookie_session(auth: &AuthSession) -> Result<(), AppError> {
+    require_admin(auth)?;
+    if matches!(auth.auth_kind, AuthKind::PersonalAccessToken) {
+        return Err(AppError::Forbidden(
+            "Cloudflared control requires an admin cookie session".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xlstatus_shared::{UserId, UserRole};
+
+    #[test]
+    fn cloudflared_control_allows_admin_cookie_session() {
+        let auth = auth_session(AuthKind::Session);
+
+        assert!(require_admin_cookie_session(&auth).is_ok());
+    }
+
+    #[test]
+    fn cloudflared_control_rejects_admin_pat_session() {
+        let auth = auth_session(AuthKind::PersonalAccessToken);
+
+        assert!(matches!(
+            require_admin_cookie_session(&auth),
+            Err(AppError::Forbidden(_))
+        ));
+    }
+
+    fn auth_session(auth_kind: AuthKind) -> AuthSession {
+        AuthSession {
+            session_id: "sess".into(),
+            user_id: UserId(uuid::Uuid::from_bytes([1; 16])),
+            username: "admin".into(),
+            role: UserRole::Admin,
+            csrf_token: "csrf".into(),
+            auth_kind,
+            scopes: vec!["admin:*".into()],
+            server_ids: None,
+            pat_id: None,
+        }
     }
 }

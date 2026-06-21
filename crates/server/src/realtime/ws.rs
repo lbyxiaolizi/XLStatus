@@ -21,6 +21,7 @@ use axum::{
 };
 use futures::{SinkExt, StreamExt};
 use serde::Serialize;
+use tokio::time::{interval, Duration};
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -63,24 +64,42 @@ async fn handle_socket(socket: WebSocket, hub: BroadcastHub) {
     // Spawn a task that drains broadcast -> ws, and select on either
     // a client close or a broadcast error so we tear down cleanly.
     let mut send_task = tokio::spawn(async move {
+        let mut ping_tick = interval(Duration::from_secs(30));
         loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    let msg = WsOutbound::Event { event };
+            tokio::select! {
+                biased;
+                _ = ping_tick.tick() => {
+                    let msg = WsOutbound::Ping {
+                        ts: chrono::Utc::now(),
+                    };
                     let text = match serde_json::to_string(&msg) {
                         Ok(s) => s,
-                        Err(_) => continue,
+                        Err(_) => break,
                     };
                     if sender.send(Message::Text(text)).await.is_err() {
                         break;
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    // Slow consumer: skip missed messages and keep going.
-                    continue;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    break;
+                event = rx.recv() => {
+                    match event {
+                        Ok(event) => {
+                            let msg = WsOutbound::Event { event };
+                            let text = match serde_json::to_string(&msg) {
+                                Ok(s) => s,
+                                Err(_) => continue,
+                            };
+                            if sender.send(Message::Text(text)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            // Slow consumer: skip missed messages and keep going.
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            break;
+                        }
+                    };
                 }
             }
         }

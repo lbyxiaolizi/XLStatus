@@ -9,12 +9,13 @@ INSTALL_DIR="${INSTALL_DIR:-/opt/xlstatus}"
 DATA_DIR="${DATA_DIR:-/var/lib/xlstatus}"
 BINARY_PATH="${BINARY_PATH:-}"  # User can provide compiled binary path
 CONFIG_FILE="${CONFIG_FILE:-/etc/xlstatus/server.toml}"
-HTTP_BIND="${HTTP_BIND:-0.0.0.0:8080}"
-GRPC_BIND="${GRPC_BIND:-0.0.0.0:50051}"
+HTTP_BIND="${HTTP_BIND:-127.0.0.1:8080}"
+GRPC_BIND="${GRPC_BIND:-127.0.0.1:50051}"
 DATABASE_URL="${DATABASE_URL:-sqlite://$DATA_DIR/xlstatus.db?mode=rwc}"
 DATABASE_CREATE_IF_MISSING="${DATABASE_CREATE_IF_MISSING:-true}"
 CORS_ALLOWED_ORIGINS="${CORS_ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}"
 SESSION_SECRET="${SESSION_SECRET:-}"
+SECRET_ENCRYPTION_KEY="${SECRET_ENCRYPTION_KEY:-}"
 ADMIN_USERNAME="${ADMIN_USERNAME:-admin}"
 ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"
 INSTALL_DEPS="${INSTALL_DEPS:-true}"
@@ -53,6 +54,32 @@ trim() {
 
 toml_escape() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+systemd_env_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/%/%%/g'
+}
+
+reject_multiline_value() {
+  local name="$1"
+  local value="$2"
+  if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+    echo "❌ $name must not contain newline characters" >&2
+    exit 1
+  fi
+}
+
+generate_secret() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 32
+    return
+  fi
+  if [ -r /dev/urandom ]; then
+    od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
+    return
+  fi
+  echo "❌ Unable to generate a secure random secret. Install openssl or provide SESSION_SECRET and SECRET_ENCRYPTION_KEY." >&2
+  exit 1
 }
 
 cors_origins_toml() {
@@ -235,6 +262,11 @@ configure_interactively() {
   else
     prompt_secret SESSION_SECRET "Session secret; leave empty to keep current value"
   fi
+  if [ -z "$SECRET_ENCRYPTION_KEY" ]; then
+    prompt_secret SECRET_ENCRYPTION_KEY "Secret encryption key; leave empty to generate one"
+  else
+    prompt_secret SECRET_ENCRYPTION_KEY "Secret encryption key; leave empty to keep current value"
+  fi
 
   prompt_value ADMIN_USERNAME "Seed admin username"
   if [ -z "$ADMIN_PASSWORD" ]; then
@@ -353,26 +385,45 @@ fi
 echo ""
 echo "⚙️  Creating configuration..."
 if [ -z "$SESSION_SECRET" ]; then
-  if command -v openssl >/dev/null 2>&1; then
-    SESSION_SECRET="$(openssl rand -hex 32)"
-  else
-    SESSION_SECRET="$(date +%s)-$(hostname)-change-me"
-  fi
+  SESSION_SECRET="$(generate_secret)"
 fi
+if [ -z "$SECRET_ENCRYPTION_KEY" ]; then
+  SECRET_ENCRYPTION_KEY="$(generate_secret)"
+fi
+reject_multiline_value DATABASE_URL "$DATABASE_URL"
+reject_multiline_value HTTP_BIND "$HTTP_BIND"
+reject_multiline_value GRPC_BIND "$GRPC_BIND"
+reject_multiline_value CORS_ALLOWED_ORIGINS "$CORS_ALLOWED_ORIGINS"
+reject_multiline_value SESSION_SECRET "$SESSION_SECRET"
+reject_multiline_value SECRET_ENCRYPTION_KEY "$SECRET_ENCRYPTION_KEY"
+reject_multiline_value DATA_DIR "$DATA_DIR"
+reject_multiline_value CONFIG_FILE "$CONFIG_FILE"
+reject_multiline_value ADMIN_USERNAME "$ADMIN_USERNAME"
+reject_multiline_value ADMIN_PASSWORD "$ADMIN_PASSWORD"
 CORS_ALLOWED_ORIGINS_TOML="$(cors_origins_toml "$CORS_ALLOWED_ORIGINS")"
+DATABASE_URL_TOML="$(toml_escape "$DATABASE_URL")"
+HTTP_BIND_TOML="$(toml_escape "$HTTP_BIND")"
+GRPC_BIND_TOML="$(toml_escape "$GRPC_BIND")"
+SESSION_SECRET_TOML="$(toml_escape "$SESSION_SECRET")"
+SECRET_ENCRYPTION_KEY_TOML="$(toml_escape "$SECRET_ENCRYPTION_KEY")"
+DATA_DIR_SYSTEMD="$(systemd_env_escape "$DATA_DIR")"
+CONFIG_FILE_SYSTEMD="$(systemd_env_escape "$CONFIG_FILE")"
+ADMIN_USERNAME_SYSTEMD="$(systemd_env_escape "$ADMIN_USERNAME")"
+ADMIN_PASSWORD_SYSTEMD="$(systemd_env_escape "$ADMIN_PASSWORD")"
 
 cat > "$CONFIG_FILE" << EOF
 [database]
-url = "$DATABASE_URL"
+url = "$DATABASE_URL_TOML"
 create_if_missing = $DATABASE_CREATE_IF_MISSING
 
 [server]
-http_bind = "$HTTP_BIND"
-grpc_bind = "$GRPC_BIND"
+http_bind = "$HTTP_BIND_TOML"
+grpc_bind = "$GRPC_BIND_TOML"
 cors_allowed_origins = $CORS_ALLOWED_ORIGINS_TOML
 
 [security]
-session_secret = "$SESSION_SECRET"
+session_secret = "$SESSION_SECRET_TOML"
+secret_encryption_key = "$SECRET_ENCRYPTION_KEY_TOML"
 session_ttl_hours = 24
 EOF
 
@@ -392,15 +443,15 @@ After=network.target
 Type=simple
 User=xlstatus
 Group=xlstatus
-WorkingDirectory=$DATA_DIR
+WorkingDirectory=$DATA_DIR_SYSTEMD
 ExecStart=/usr/local/bin/xlstatus-server
 Restart=on-failure
 RestartSec=5s
 
-Environment="CONFIG_FILE=$CONFIG_FILE"
+Environment="CONFIG_FILE=$CONFIG_FILE_SYSTEMD"
 Environment="RUST_LOG=info"
-Environment="XLSTATUS_SEED_ADMIN_USERNAME=$ADMIN_USERNAME"
-$(if [ -n "$ADMIN_PASSWORD" ]; then printf 'Environment="XLSTATUS_SEED_ADMIN_PASSWORD=%s"\n' "$ADMIN_PASSWORD"; fi)
+Environment="XLSTATUS_SEED_ADMIN_USERNAME=$ADMIN_USERNAME_SYSTEMD"
+$(if [ -n "$ADMIN_PASSWORD" ]; then printf 'Environment="XLSTATUS_SEED_ADMIN_PASSWORD=%s"\n' "$ADMIN_PASSWORD_SYSTEMD"; fi)
 
 StandardOutput=journal
 StandardError=journal

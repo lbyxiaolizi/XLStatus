@@ -90,6 +90,62 @@ impl DatabaseBackend {
                 sqlx::query(include_str!("../../migrations/sqlite/004_nat.sql"))
                     .execute(pool)
                     .await?;
+                sqlite_add_column_if_missing(
+                    pool,
+                    "nat_mappings",
+                    "allowed_sources",
+                    "allowed_sources TEXT",
+                )
+                .await?;
+                sqlite_add_column_if_missing(
+                    pool,
+                    "nat_mappings",
+                    "max_active_tunnels",
+                    "max_active_tunnels INTEGER",
+                )
+                .await?;
+                sqlite_add_column_if_missing(
+                    pool,
+                    "nat_mappings",
+                    "idle_timeout_seconds",
+                    "idle_timeout_seconds INTEGER",
+                )
+                .await?;
+                sqlite_add_column_if_missing(
+                    pool,
+                    "nat_mappings",
+                    "max_bytes_per_tunnel",
+                    "max_bytes_per_tunnel INTEGER",
+                )
+                .await?;
+                sqlite_add_column_if_missing(
+                    pool,
+                    "nat_mappings",
+                    "max_bandwidth_bytes_per_second",
+                    "max_bandwidth_bytes_per_second INTEGER",
+                )
+                .await?;
+                sqlite_add_column_if_missing(
+                    pool,
+                    "nat_mappings",
+                    "rate_limit_window_seconds",
+                    "rate_limit_window_seconds INTEGER",
+                )
+                .await?;
+                sqlite_add_column_if_missing(
+                    pool,
+                    "nat_mappings",
+                    "max_connections_per_window",
+                    "max_connections_per_window INTEGER",
+                )
+                .await?;
+                sqlite_add_column_if_missing(
+                    pool,
+                    "nat_mappings",
+                    "max_bytes_per_window",
+                    "max_bytes_per_window INTEGER",
+                )
+                .await?;
                 sqlx::query(include_str!("../../migrations/sqlite/005_tasks.sql"))
                     .execute(pool)
                     .await?;
@@ -235,6 +291,44 @@ impl DatabaseBackend {
                 ))
                 .execute(pool)
                 .await?;
+                sqlx::query(include_str!(
+                    "../../migrations/sqlite/020_temporary_transfer_tokens.sql"
+                ))
+                .execute(pool)
+                .await?;
+                sqlx::query(include_str!(
+                    "../../migrations/sqlite/021_pat_expiration_backfill.sql"
+                ))
+                .execute(pool)
+                .await?;
+                sqlite_add_column_if_missing(
+                    pool,
+                    "temporary_transfer_tokens",
+                    "used_ip",
+                    "used_ip TEXT",
+                )
+                .await?;
+                sqlite_add_column_if_missing(
+                    pool,
+                    "temporary_transfer_tokens",
+                    "used_status",
+                    "used_status TEXT",
+                )
+                .await?;
+                sqlite_add_column_if_missing(
+                    pool,
+                    "temporary_transfer_tokens",
+                    "used_error",
+                    "used_error TEXT",
+                )
+                .await?;
+                sqlite_add_column_if_missing(
+                    pool,
+                    "temporary_transfer_tokens",
+                    "agent_task_id",
+                    "agent_task_id TEXT",
+                )
+                .await?;
                 Ok(())
             }
             DatabaseBackend::Postgres(pool) => {
@@ -246,7 +340,7 @@ impl DatabaseBackend {
                 // raw_sql calls causes "foreign key constraint cannot be implemented"
                 // errors on later files.
                 let batch = format!(
-                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
                     include_str!("../../migrations/postgres/001_initial.sql"),
                     include_str!("../../migrations/postgres/002_agents.sql"),
                     include_str!("../../migrations/postgres/003_services.sql"),
@@ -266,6 +360,8 @@ impl DatabaseBackend {
                     include_str!("../../migrations/postgres/017_system_settings.sql"),
                     include_str!("../../migrations/postgres/018_trigger_task_ids.sql"),
                     include_str!("../../migrations/postgres/019_server_owner_transfers.sql"),
+                    include_str!("../../migrations/postgres/020_temporary_transfer_tokens.sql"),
+                    include_str!("../../migrations/postgres/021_pat_expiration_backfill.sql"),
                 );
                 sqlx::raw_sql(batch.as_str()).execute(pool).await?;
                 Ok(())
@@ -374,6 +470,8 @@ fn confirm_create_sqlite_database(path: &Path) -> anyhow::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::{is_special_sqlite_path, sqlite_url_has_create_mode, DatabaseBackend};
+    use chrono::{DateTime, Duration, Utc};
+    use sqlx::Row;
     use std::path::Path;
     use uuid::Uuid;
 
@@ -411,6 +509,67 @@ mod tests {
         db.run_migrations().await.unwrap();
         drop(db);
 
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn sqlite_migration_backfills_legacy_pat_expiration() {
+        let db_path =
+            std::env::temp_dir().join(format!("xlstatus-pat-expiration-{}.db", Uuid::now_v7()));
+        let url = format!("sqlite://{}?mode=rwc", db_path.to_string_lossy());
+        let db = DatabaseBackend::connect(&url, true).await.unwrap();
+        db.run_migrations().await.unwrap();
+
+        let DatabaseBackend::Sqlite(pool) = &db else {
+            unreachable!();
+        };
+        let user_id = Uuid::now_v7().to_string();
+        let pat_id = Uuid::now_v7().to_string();
+        let created_at = "2026-06-21T12:00:00Z";
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, role, created_at, updated_at)
+             VALUES (?, ?, ?, 'admin', ?, ?)",
+        )
+        .bind(&user_id)
+        .bind(format!("user-{user_id}"))
+        .bind("hash")
+        .bind(created_at)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO personal_access_tokens
+             (id, user_id, name, token_hash, scopes, created_at)
+             VALUES (?, ?, 'legacy', ?, '[\"server:read\"]', ?)",
+        )
+        .bind(&pat_id)
+        .bind(&user_id)
+        .bind(format!("hash-{pat_id}"))
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        db.run_migrations().await.unwrap();
+
+        let row = sqlx::query("SELECT expires_at FROM personal_access_tokens WHERE id = ?")
+            .bind(&pat_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let expires_at: String = row.try_get("expires_at").unwrap();
+        let parsed = DateTime::parse_from_rfc3339(&expires_at)
+            .unwrap()
+            .with_timezone(&Utc);
+        let expected = DateTime::parse_from_rfc3339(created_at)
+            .unwrap()
+            .with_timezone(&Utc)
+            + Duration::days(90);
+
+        assert_eq!(parsed, expected);
+
+        drop(db);
         let _ = std::fs::remove_file(&db_path);
     }
 }

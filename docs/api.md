@@ -4,8 +4,8 @@
 
 ## 基础
 
-- HTTP API 默认监听：`0.0.0.0:8080`
-- Agent gRPC 默认监听：`0.0.0.0:50051`
+- HTTP API 默认监听：`127.0.0.1:8080`
+- Agent gRPC 默认监听：`127.0.0.1:50051`
 - 健康检查：`GET /healthz`
 - 认证方式：Dashboard 使用 Cookie 会话和 CSRF；Agent 使用注册后的密钥和 JWT 流程。
 
@@ -40,7 +40,7 @@
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `POST` | `/api/v1/enrollment-tokens` | 创建 enrollment token |
+| `POST` | `/api/v1/enrollment-tokens` | 创建 enrollment token，`expires_in_hours` 限制为 1 到 24 |
 | `POST` | `/api/v1/agents/:id/revoke` | 撤销 Agent |
 | `GET` | `/api/v1/servers` | 服务器列表 |
 | `GET` | `/api/v1/servers/:id` | 服务器详情 |
@@ -116,6 +116,8 @@
 | `GET` | `/api/v1/mcp/tools` | MCP 工具列表 |
 | `POST` | `/api/v1/mcp/execute` | 执行 MCP 工具 |
 | `GET` | `/api/v1/mcp/info` | MCP 信息 |
+
+NAT 创建/更新支持安全策略字段：`allowed_sources`、`max_active_tunnels`、`idle_timeout_seconds`、`max_bytes_per_tunnel`、`max_bandwidth_bytes_per_second`、`rate_limit_window_seconds`、`max_connections_per_window`、`max_bytes_per_window`。窗口字段按 mapping 和来源 IP 计数，用于限制窗口内连接数和累计双向流量。
 | `POST` | `/mcp` | MCP JSON-RPC |
 
 ## gRPC
@@ -139,10 +141,13 @@ Agent gRPC 服务定义在 `proto/xlstatus/v1/agent.proto`，生成代码在 `cr
 |---|---|
 | `server_url` | Dashboard HTTP API 地址 |
 | `grpc_server` | Agent gRPC 地址 |
+| `grpc_tls_ca_path` | 可选，Agent 侧用于验证 gRPC 服务端的 PEM CA 路径 |
+| `grpc_tls_domain_name` | 可选，Agent 侧 gRPC TLS 证书校验的服务名覆盖 |
+| `grpc_tls_client_cert_path` | 可选，Agent 侧 mTLS 客户端 PEM 证书路径 |
+| `grpc_tls_client_key_path` | 可选，Agent 侧 mTLS 客户端 PEM 私钥路径 |
 | `enrollment_token` | enrollment token |
 | `agent_name` | Agent 名称；默认 `$(hostname)` |
 | `version` | GitHub Release 版本，默认 `v0.1.0-alpha.3`；后台设置页默认会从 GitHub Releases 获取最新非草稿版本后传入 |
-| `script_url` | 可选，自定义 GitHub 脚本地址 |
 
 示例：
 

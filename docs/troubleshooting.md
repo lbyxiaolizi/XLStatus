@@ -25,7 +25,7 @@ sudo ss -tlnp | grep -E ':(8080|50051)\b' || true
 ```text
 Error: gRPC server failed
 Caused by:
-  failed to bind gRPC server to 0.0.0.0:50051
+  failed to bind gRPC server to 127.0.0.1:50051
 ```
 
 systemd：

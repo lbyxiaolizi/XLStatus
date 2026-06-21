@@ -669,7 +669,7 @@ async fn send_task_dispatch_notification(
         return Ok(());
     }
 
-    let channels = notification_channels_for_group(db, group_id).await?;
+    let channels = notification_channels_for_group(db, group_id, &task.owner_user_id).await?;
     if channels.is_empty() {
         return Ok(());
     }
@@ -726,6 +726,7 @@ async fn send_task_dispatch_notification(
 async fn notification_channels_for_group(
     db: &Db,
     group_id: &str,
+    owner_user_id: &str,
 ) -> Result<Vec<NotificationChannel>> {
     let rows: Vec<(
         String,
@@ -738,14 +739,19 @@ async fn notification_channels_for_group(
         bool,
     )> = match db {
         crate::db::DatabaseBackend::Sqlite(pool) => {
-            sqlx::query_as("SELECT n.id, n.name, n.url, n.request_method, n.request_type, n.headers_json, n.body_template, n.verify_tls FROM notifications n JOIN notification_group_members ngm ON ngm.notification_id = n.id WHERE ngm.group_id = ?")
+            sqlx::query_as("SELECT n.id, n.name, n.url, n.request_method, n.request_type, n.headers_json, n.body_template, n.verify_tls FROM notifications n JOIN notification_group_members ngm ON ngm.notification_id = n.id JOIN notification_groups ng ON ng.id = ngm.group_id WHERE ngm.group_id = ? AND ng.owner_user_id = ? AND n.owner_user_id = ?")
                 .bind(group_id)
+                .bind(owner_user_id)
+                .bind(owner_user_id)
                 .fetch_all(pool)
                 .await?
         }
         crate::db::DatabaseBackend::Postgres(pool) => {
-            sqlx::query_as("SELECT n.id::text, n.name, n.url, n.request_method, n.request_type, n.headers_json, n.body_template, n.verify_tls FROM notifications n JOIN notification_group_members ngm ON ngm.notification_id = n.id WHERE ngm.group_id = $1")
-                .bind(group_id)
+            let group_uuid = uuid::Uuid::parse_str(group_id)?;
+            let owner_uuid = uuid::Uuid::parse_str(owner_user_id)?;
+            sqlx::query_as("SELECT n.id::text, n.name, n.url, n.request_method, n.request_type, n.headers_json, n.body_template, n.verify_tls FROM notifications n JOIN notification_group_members ngm ON ngm.notification_id = n.id JOIN notification_groups ng ON ng.id = ngm.group_id WHERE ngm.group_id = $1 AND ng.owner_user_id = $2 AND n.owner_user_id = $2")
+                .bind(group_uuid)
+                .bind(owner_uuid)
                 .fetch_all(pool)
                 .await?
         }

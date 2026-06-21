@@ -11,7 +11,8 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::api::types::ApiResponse;
-use crate::api::v1::auth::AppState;
+use crate::api::v1::auth::{AppError, AppState};
+use crate::api::v1::notifications::ensure_notification_group_owned_by;
 use crate::auth::middleware::{AuthSession, AuthUser};
 use crate::auth::rbac::{can_access_servers, has_scope};
 use crate::db::repository::tasks::{TaskRepository, TaskRunRepository};
@@ -84,6 +85,8 @@ pub async fn create_task(
 
     require_scope_or_403(&auth_user, "task:write")?;
     validate_task_selector_or_403(&auth_user, &req.server_selector_json)?;
+    let notification_group_id = normalize_optional_id(req.notification_group_id);
+    ensure_task_notification_group_owned(&db, &auth_user, notification_group_id.as_deref()).await?;
     // Validate schedule if present
     if let Some(ref schedule) = req.schedule {
         if parse_task_schedule(schedule).is_err() {
@@ -110,7 +113,7 @@ pub async fn create_task(
         cover_mode: req.cover_mode,
         server_selector_json: req.server_selector_json,
         push_successful: req.push_successful,
-        notification_group_id: req.notification_group_id,
+        notification_group_id,
         last_executed_at: None,
         last_result: None,
         enabled: true,
@@ -166,6 +169,10 @@ pub async fn list_tasks(
         )
     })?;
 
+    let tasks = tasks
+        .into_iter()
+        .filter(|task| task_visible_to_auth(&auth_user, task))
+        .collect::<Vec<_>>();
     let total = tasks.len();
 
     Ok(Json(ApiResponse {
@@ -218,6 +225,7 @@ pub async fn get_task(
             }),
         ));
     }
+    ensure_task_visible_to_auth(&auth_user, &task)?;
 
     Ok(Json(ApiResponse {
         success: true,
@@ -270,6 +278,7 @@ pub async fn update_task(
             }),
         ));
     }
+    ensure_task_visible_to_auth(&auth_user, &task)?;
 
     // Apply updates
     if let Some(name) = req.name {
@@ -299,20 +308,20 @@ pub async fn update_task(
         task.cover_mode = cover_mode;
     }
     if let Some(server_selector_json) = req.server_selector_json {
-        validate_task_selector_or_403(&auth_user, &server_selector_json)?;
         task.server_selector_json = server_selector_json;
     }
     if let Some(push_successful) = req.push_successful {
         task.push_successful = push_successful;
     }
     if let Some(notification_group_id) = req.notification_group_id {
-        task.notification_group_id = notification_group_id
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
+        task.notification_group_id = normalize_optional_id(notification_group_id);
     }
     if let Some(enabled) = req.enabled {
         task.enabled = enabled;
     }
+    validate_task_selector_or_403(&auth_user, &task.server_selector_json)?;
+    ensure_task_notification_group_owned(&db, &auth_user, task.notification_group_id.as_deref())
+        .await?;
 
     task.updated_at = Utc::now().to_rfc3339();
 
@@ -377,6 +386,7 @@ pub async fn delete_task(
             }),
         ));
     }
+    ensure_task_visible_to_auth(&auth_user, &task)?;
 
     TaskRepository::delete(&db, &task_id).await.map_err(|e| {
         (
@@ -449,7 +459,7 @@ pub async fn run_task(
         ));
     }
 
-    validate_task_selector_or_403(&auth_user, &task.server_selector_json)?;
+    ensure_task_visible_to_auth(&auth_user, &task)?;
 
     let report = dispatch_task_to_agents(
         &db,
@@ -520,8 +530,9 @@ pub async fn get_task_runs(
             }),
         ));
     }
+    ensure_task_visible_to_auth(&auth_user, &task)?;
 
-    let runs = TaskRunRepository::list_by_task(&db, &task_id, query.limit, query.offset)
+    let mut runs = TaskRunRepository::list_by_task(&db, &task_id, query.limit, query.offset)
         .await
         .map_err(|e| {
             (
@@ -533,6 +544,7 @@ pub async fn get_task_runs(
                 }),
             )
         })?;
+    filter_task_runs_for_auth(&auth_user, &mut runs);
 
     let total = runs.len();
 
@@ -547,27 +559,12 @@ fn require_scope_or_403(
     auth_user: &AuthUser,
     required_scope: &str,
 ) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
-    let session = AuthSession {
-        session_id: auth_user.session_id.clone(),
-        user_id: auth_user.user.id,
-        username: auth_user.user.username.clone(),
-        role: auth_user.user.role,
-        csrf_token: auth_user.csrf_token.clone(),
-        auth_kind: auth_user.auth_kind.clone(),
-        scopes: auth_user.scopes.clone(),
-        server_ids: auth_user.server_ids.clone(),
-        pat_id: auth_user.pat_id.clone(),
-    };
-    if has_scope(&session, required_scope) {
+    if has_scope(&auth_user.auth_session(), required_scope) {
         Ok(())
     } else {
-        Err((
+        Err(api_error(
             StatusCode::FORBIDDEN,
-            Json(ApiResponse {
-                success: false,
-                data: None,
-                error: Some(format!("missing required scope: {}", required_scope)),
-            }),
+            format!("missing required scope: {}", required_scope),
         ))
     }
 }
@@ -579,44 +576,225 @@ fn validate_task_selector_or_403(
     let selector: ServerSelector = match serde_json::from_str(selector_json) {
         Ok(s) => s,
         Err(_) => {
-            return Err((
+            return Err(api_error(
                 StatusCode::BAD_REQUEST,
-                Json(ApiResponse {
-                    success: false,
-                    data: None,
-                    error: Some("server_selector_json is not valid JSON".to_string()),
-                }),
+                "server_selector_json is not valid JSON",
             ));
         }
     };
 
     let mut scoped_server_ids = selector.server_ids.clone();
     scoped_server_ids.extend(selector.exclude_server_ids.clone());
-    if !scoped_server_ids.is_empty() {
-        let session = AuthSession {
-            session_id: auth_user.session_id.clone(),
-            user_id: auth_user.user.id,
-            username: auth_user.user.username.clone(),
-            role: auth_user.user.role,
-            csrf_token: auth_user.csrf_token.clone(),
-            auth_kind: auth_user.auth_kind.clone(),
-            scopes: auth_user.scopes.clone(),
-            server_ids: auth_user.server_ids.clone(),
-            pat_id: auth_user.pat_id.clone(),
-        };
-        if !can_access_servers(&session, &scoped_server_ids) {
-            return Err((
+    let session = auth_user.auth_session();
+
+    if auth_user.server_ids.is_some() {
+        let has_dynamic_selector = selector.source_server
+            || !selector.group_ids.is_empty()
+            || !selector.tag_names.is_empty()
+            || !selector.tags.is_empty();
+        if has_dynamic_selector || selector.server_ids.is_empty() {
+            return Err(api_error(
                 StatusCode::FORBIDDEN,
-                Json(ApiResponse {
-                    success: false,
-                    data: None,
-                    error: Some(
-                        "server_selector_json contains servers outside PAT allowlist".to_string(),
-                    ),
-                }),
+                "PAT-scoped tasks must target explicit servers in the allowlist",
             ));
         }
+        if !can_access_servers(&session, &scoped_server_ids) {
+            return Err(api_error(
+                StatusCode::FORBIDDEN,
+                "server_selector_json contains servers outside PAT allowlist",
+            ));
+        }
+    } else if !scoped_server_ids.is_empty() && !can_access_servers(&session, &scoped_server_ids) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "server_selector_json contains servers outside PAT allowlist",
+        ));
     }
 
     Ok(())
+}
+
+fn ensure_task_visible_to_auth(
+    auth_user: &AuthUser,
+    task: &Task,
+) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
+    validate_task_selector_or_403(auth_user, &task.server_selector_json)
+}
+
+fn task_visible_to_auth(auth_user: &AuthUser, task: &Task) -> bool {
+    ensure_task_visible_to_auth(auth_user, task).is_ok()
+}
+
+fn filter_task_runs_for_auth(auth_user: &AuthUser, runs: &mut Vec<TaskRun>) {
+    let Some(allowed) = auth_user.server_ids.as_ref() else {
+        return;
+    };
+    runs.retain(|run| allowed.iter().any(|server_id| server_id == &run.server_id));
+}
+
+async fn ensure_task_notification_group_owned(
+    db: &Db,
+    auth_user: &AuthUser,
+    group_id: Option<&str>,
+) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
+    ensure_notification_group_owned_by(db, auth_user.user.id.0, group_id)
+        .await
+        .map_err(app_error_to_api)
+}
+
+fn normalize_optional_id(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn app_error_to_api(err: AppError) -> (StatusCode, Json<ApiResponse<()>>) {
+    match err {
+        AppError::Database(e) => {
+            tracing::error!("Database error: {}", e);
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+        }
+        AppError::Unauthorized(message) => api_error(StatusCode::UNAUTHORIZED, message),
+        AppError::Forbidden(message) => api_error(StatusCode::FORBIDDEN, message),
+        AppError::BadRequest(message) => api_error(StatusCode::BAD_REQUEST, message),
+        AppError::TooManyRequests(message) => api_error(StatusCode::TOO_MANY_REQUESTS, message),
+        AppError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+    }
+}
+
+fn api_error(
+    status: StatusCode,
+    message: impl Into<String>,
+) -> (StatusCode, Json<ApiResponse<()>>) {
+    (
+        status,
+        Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(message.into()),
+        }),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::middleware::AuthKind;
+    use crate::db::User;
+    use chrono::Utc;
+    use serde_json::json;
+    use xlstatus_shared::{UserId, UserRole};
+
+    #[test]
+    fn scoped_pat_rejects_task_all_selector_without_explicit_servers() {
+        let auth = pat_with_servers(vec!["server-a"]);
+        let selector = json!({}).to_string();
+
+        let err = validate_task_selector_or_403(&auth, &selector).unwrap_err();
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn scoped_pat_rejects_task_dynamic_selector() {
+        let auth = pat_with_servers(vec!["server-a"]);
+        let selector = json!({ "group_ids": ["group-a"] }).to_string();
+
+        let err = validate_task_selector_or_403(&auth, &selector).unwrap_err();
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn scoped_pat_rejects_task_selector_outside_allowlist() {
+        let auth = pat_with_servers(vec!["server-a"]);
+        let selector = json!({ "server_ids": ["server-b"] }).to_string();
+
+        let err = validate_task_selector_or_403(&auth, &selector).unwrap_err();
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn scoped_pat_accepts_explicit_allowed_task_selector() {
+        let auth = pat_with_servers(vec!["server-a"]);
+        let selector = json!({ "server_ids": ["server-a"] }).to_string();
+
+        assert!(validate_task_selector_or_403(&auth, &selector).is_ok());
+    }
+
+    #[test]
+    fn scoped_pat_task_visibility_rejects_existing_broad_task() {
+        let auth = pat_with_servers(vec!["server-a"]);
+        let task = task(CoverMode::All, json!({}));
+
+        assert!(!task_visible_to_auth(&auth, &task));
+    }
+
+    #[test]
+    fn scoped_pat_filters_task_runs_to_allowlist() {
+        let auth = pat_with_servers(vec!["server-a"]);
+        let mut runs = vec![task_run("server-a"), task_run("server-b")];
+
+        filter_task_runs_for_auth(&auth, &mut runs);
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].server_id, "server-a");
+    }
+
+    fn pat_with_servers(server_ids: Vec<&str>) -> AuthUser {
+        let now = Utc::now();
+        AuthUser {
+            user: User {
+                id: UserId(uuid::Uuid::from_bytes([1; 16])),
+                username: "owner".into(),
+                password_hash: "x".into(),
+                role: UserRole::Admin,
+                token_version: 0,
+                created_at: now,
+                updated_at: now,
+            },
+            session_id: "pat-session".into(),
+            csrf_token: "csrf".into(),
+            auth_kind: AuthKind::PersonalAccessToken,
+            scopes: vec!["task:read".into(), "task:write".into(), "task:exec".into()],
+            server_ids: Some(server_ids.into_iter().map(str::to_string).collect()),
+            pat_id: Some("pat".into()),
+        }
+    }
+
+    fn task(cover_mode: CoverMode, selector: serde_json::Value) -> Task {
+        Task {
+            id: "task".into(),
+            owner_user_id: uuid::Uuid::from_bytes([1; 16]).to_string(),
+            name: "task".into(),
+            task_type: TaskType::Shell,
+            schedule: None,
+            command: Some("true".into()),
+            payload_json: None,
+            cover_mode,
+            server_selector_json: selector.to_string(),
+            push_successful: false,
+            notification_group_id: None,
+            last_executed_at: None,
+            last_result: None,
+            enabled: true,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    fn task_run(server_id: &str) -> TaskRun {
+        TaskRun {
+            id: format!("run-{server_id}"),
+            task_id: "task".into(),
+            server_id: server_id.into(),
+            status: TaskStatus::Success,
+            delay_ms: Some(1),
+            output: None,
+            output_truncated: false,
+            error: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
 }

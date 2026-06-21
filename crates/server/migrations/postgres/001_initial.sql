@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS personal_access_tokens (
     token_hash VARCHAR(255) NOT NULL UNIQUE,
     scopes JSONB NOT NULL,
     server_ids JSONB,
-    expires_at TIMESTAMPTZ,
+    expires_at TIMESTAMPTZ NOT NULL,
     last_used_at TIMESTAMPTZ,
     last_used_ip VARCHAR(255),
     created_at TIMESTAMPTZ NOT NULL,

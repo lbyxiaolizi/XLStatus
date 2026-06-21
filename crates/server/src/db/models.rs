@@ -53,6 +53,44 @@ pub struct EnrollmentToken {
 }
 
 #[derive(Debug, Clone)]
+pub struct TemporaryTransferToken {
+    pub id: String,
+    pub token_hash: String,
+    pub server_id: AgentId,
+    pub path: String,
+    pub op: String,
+    pub issued_by_user_id: UserId,
+    pub auth_kind: String,
+    pub session_id: Option<String>,
+    pub api_token_id: Option<String>,
+    pub scope: String,
+    pub expires_at: DateTime<Utc>,
+    pub used_at: Option<DateTime<Utc>>,
+    pub used_ip: Option<String>,
+    pub used_status: Option<String>,
+    pub used_error: Option<String>,
+    pub agent_task_id: Option<String>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub created_ip: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateTemporaryTransferTokenInput {
+    pub token_hash: String,
+    pub server_id: AgentId,
+    pub path: String,
+    pub op: String,
+    pub issued_by_user_id: UserId,
+    pub auth_kind: String,
+    pub session_id: Option<String>,
+    pub api_token_id: Option<String>,
+    pub scope: String,
+    pub expires_at: DateTime<Utc>,
+    pub created_ip: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct Agent {
     pub id: AgentId,
     pub name: String,

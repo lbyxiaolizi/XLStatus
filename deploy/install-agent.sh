@@ -7,6 +7,10 @@ set -e
 VERSION="${VERSION:-v0.1.0-alpha.3}"
 SERVER_URL="${SERVER_URL:-http://localhost:8080}"
 GRPC_SERVER="${GRPC_SERVER:-}"
+GRPC_TLS_CA_PATH="${GRPC_TLS_CA_PATH:-}"
+GRPC_TLS_DOMAIN_NAME="${GRPC_TLS_DOMAIN_NAME:-}"
+GRPC_TLS_CLIENT_CERT_PATH="${GRPC_TLS_CLIENT_CERT_PATH:-}"
+GRPC_TLS_CLIENT_KEY_PATH="${GRPC_TLS_CLIENT_KEY_PATH:-}"
 AGENT_NAME="${AGENT_NAME:-$(hostname)}"
 BINARY_PATH="${BINARY_PATH:-}"  # User can provide compiled binary path
 CONFIG_FILE="${CONFIG_FILE:-/etc/xlstatus-agent/agent.json}"
@@ -149,20 +153,29 @@ fi
 # Enroll and create config. The agent writes JSON and stores the Ed25519 keypair.
 echo ""
 echo "🔐 Enrolling agent..."
+ENROLL_ARGS=(
+  enroll
+  --server "$SERVER_URL"
+  --token "$ENROLLMENT_TOKEN"
+  --name "$AGENT_NAME"
+  --config "$CONFIG_FILE"
+)
 if [ -n "$GRPC_SERVER" ]; then
-  /usr/local/bin/xlstatus-agent enroll \
-    --server "$SERVER_URL" \
-    --grpc-server "$GRPC_SERVER" \
-    --token "$ENROLLMENT_TOKEN" \
-    --name "$AGENT_NAME" \
-    --config "$CONFIG_FILE"
-else
-  /usr/local/bin/xlstatus-agent enroll \
-    --server "$SERVER_URL" \
-    --token "$ENROLLMENT_TOKEN" \
-    --name "$AGENT_NAME" \
-    --config "$CONFIG_FILE"
+  ENROLL_ARGS+=(--grpc-server "$GRPC_SERVER")
 fi
+if [ -n "$GRPC_TLS_CA_PATH" ]; then
+  ENROLL_ARGS+=(--grpc-tls-ca-path "$GRPC_TLS_CA_PATH")
+fi
+if [ -n "$GRPC_TLS_DOMAIN_NAME" ]; then
+  ENROLL_ARGS+=(--grpc-tls-domain-name "$GRPC_TLS_DOMAIN_NAME")
+fi
+if [ -n "$GRPC_TLS_CLIENT_CERT_PATH" ]; then
+  ENROLL_ARGS+=(--grpc-tls-client-cert-path "$GRPC_TLS_CLIENT_CERT_PATH")
+fi
+if [ -n "$GRPC_TLS_CLIENT_KEY_PATH" ]; then
+  ENROLL_ARGS+=(--grpc-tls-client-key-path "$GRPC_TLS_CLIENT_KEY_PATH")
+fi
+/usr/local/bin/xlstatus-agent "${ENROLL_ARGS[@]}"
 
 chown root:root "$CONFIG_FILE"
 chmod 600 "$CONFIG_FILE"

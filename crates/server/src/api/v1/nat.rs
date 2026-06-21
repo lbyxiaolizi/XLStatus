@@ -12,11 +12,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::types::ApiResponse;
 use crate::api::v1::auth::AppState;
-use crate::auth::middleware::{AuthSession, AuthUser};
+use crate::auth::middleware::{AuthKind, AuthSession, AuthUser};
 use crate::auth::rbac::{can_access_server, has_scope};
 use crate::db::repository::NatMappingRepository;
 use crate::db::AgentRepository;
 use crate::db::Db;
+use crate::nat::tunnel::nat_public_port_allowed;
 use xlstatus_shared::nat::*;
 
 #[derive(Debug, Deserialize)]
@@ -27,6 +28,14 @@ pub struct CreateNatMappingRequest {
     pub public_port: u16,
     pub protocol: String,
     pub description: Option<String>,
+    pub allowed_sources: Option<String>,
+    pub max_active_tunnels: Option<u32>,
+    pub idle_timeout_seconds: Option<u32>,
+    pub max_bytes_per_tunnel: Option<u64>,
+    pub max_bandwidth_bytes_per_second: Option<u64>,
+    pub rate_limit_window_seconds: Option<u32>,
+    pub max_connections_per_window: Option<u32>,
+    pub max_bytes_per_window: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -37,6 +46,14 @@ pub struct UpdateNatMappingRequest {
     pub protocol: Option<String>,
     pub enabled: Option<bool>,
     pub description: Option<String>,
+    pub allowed_sources: Option<String>,
+    pub max_active_tunnels: Option<u32>,
+    pub idle_timeout_seconds: Option<u32>,
+    pub max_bytes_per_tunnel: Option<u64>,
+    pub max_bandwidth_bytes_per_second: Option<u64>,
+    pub rate_limit_window_seconds: Option<u32>,
+    pub max_connections_per_window: Option<u32>,
+    pub max_bytes_per_window: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -60,6 +77,18 @@ pub async fn create_nat_mapping(
 
     require_scope_or_403(&auth_user, "nat:write")?;
     validate_nat_agent_or_403(&db, &auth_user, &req.agent_id).await?;
+    validate_public_port_or_403(req.public_port)?;
+    let allowed_sources = normalize_allowed_sources_or_403(req.allowed_sources.as_deref())?;
+    validate_positive_i32_or_403(req.max_active_tunnels, "max_active_tunnels")?;
+    validate_positive_i32_or_403(req.idle_timeout_seconds, "idle_timeout_seconds")?;
+    validate_positive_i64_or_403(req.max_bytes_per_tunnel, "max_bytes_per_tunnel")?;
+    validate_positive_i64_or_403(
+        req.max_bandwidth_bytes_per_second,
+        "max_bandwidth_bytes_per_second",
+    )?;
+    validate_positive_i32_or_403(req.rate_limit_window_seconds, "rate_limit_window_seconds")?;
+    validate_positive_i32_or_403(req.max_connections_per_window, "max_connections_per_window")?;
+    validate_positive_i64_or_403(req.max_bytes_per_window, "max_bytes_per_window")?;
     // Validate protocol
     let protocol = Protocol::from_str(&req.protocol).ok_or_else(|| {
         (
@@ -94,6 +123,14 @@ pub async fn create_nat_mapping(
         protocol,
         enabled: true,
         description: req.description,
+        allowed_sources,
+        max_active_tunnels: req.max_active_tunnels,
+        idle_timeout_seconds: req.idle_timeout_seconds,
+        max_bytes_per_tunnel: req.max_bytes_per_tunnel,
+        max_bandwidth_bytes_per_second: req.max_bandwidth_bytes_per_second,
+        rate_limit_window_seconds: req.rate_limit_window_seconds,
+        max_connections_per_window: req.max_connections_per_window,
+        max_bytes_per_window: req.max_bytes_per_window,
         created_at: now.clone(),
         updated_at: now,
     };
@@ -207,6 +244,7 @@ pub async fn list_all_nat_mappings(
     let db = state.db.clone();
 
     require_scope_or_403(&auth_user, "nat:read")?;
+    require_admin_cookie_session_or_403(&auth_user)?;
     let mappings = NatMappingRepository::list_enabled(&db).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -268,6 +306,7 @@ pub async fn update_nat_mapping(
         mapping.local_port = local_port;
     }
     if let Some(public_port) = req.public_port {
+        validate_public_port_or_403(public_port)?;
         // Check if new public port is available
         if public_port != mapping.public_port {
             if let Ok(Some(_)) = NatMappingRepository::get_by_public_port(&db, public_port).await {
@@ -301,6 +340,40 @@ pub async fn update_nat_mapping(
     }
     if req.description.is_some() {
         mapping.description = req.description;
+    }
+    if req.allowed_sources.is_some() {
+        mapping.allowed_sources = normalize_allowed_sources_or_403(req.allowed_sources.as_deref())?;
+    }
+    if req.max_active_tunnels.is_some() {
+        validate_positive_i32_or_403(req.max_active_tunnels, "max_active_tunnels")?;
+        mapping.max_active_tunnels = req.max_active_tunnels;
+    }
+    if req.idle_timeout_seconds.is_some() {
+        validate_positive_i32_or_403(req.idle_timeout_seconds, "idle_timeout_seconds")?;
+        mapping.idle_timeout_seconds = req.idle_timeout_seconds;
+    }
+    if req.max_bytes_per_tunnel.is_some() {
+        validate_positive_i64_or_403(req.max_bytes_per_tunnel, "max_bytes_per_tunnel")?;
+        mapping.max_bytes_per_tunnel = req.max_bytes_per_tunnel;
+    }
+    if req.max_bandwidth_bytes_per_second.is_some() {
+        validate_positive_i64_or_403(
+            req.max_bandwidth_bytes_per_second,
+            "max_bandwidth_bytes_per_second",
+        )?;
+        mapping.max_bandwidth_bytes_per_second = req.max_bandwidth_bytes_per_second;
+    }
+    if req.rate_limit_window_seconds.is_some() {
+        validate_positive_i32_or_403(req.rate_limit_window_seconds, "rate_limit_window_seconds")?;
+        mapping.rate_limit_window_seconds = req.rate_limit_window_seconds;
+    }
+    if req.max_connections_per_window.is_some() {
+        validate_positive_i32_or_403(req.max_connections_per_window, "max_connections_per_window")?;
+        mapping.max_connections_per_window = req.max_connections_per_window;
+    }
+    if req.max_bytes_per_window.is_some() {
+        validate_positive_i64_or_403(req.max_bytes_per_window, "max_bytes_per_window")?;
+        mapping.max_bytes_per_window = req.max_bytes_per_window;
     }
 
     mapping.updated_at = Utc::now().to_rfc3339();
@@ -438,6 +511,102 @@ fn session_of(auth_user: &AuthUser) -> AuthSession {
     }
 }
 
+fn require_admin_or_403(auth_user: &AuthUser) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
+    if auth_user.user.role.is_admin() {
+        Ok(())
+    } else {
+        Err(forbidden_with("admin role required".to_string()))
+    }
+}
+
+fn require_admin_cookie_session_or_403(
+    auth_user: &AuthUser,
+) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
+    require_admin_or_403(auth_user)?;
+    if matches!(auth_user.auth_kind, AuthKind::PersonalAccessToken) {
+        return Err(forbidden_with("Cookie session required".to_string()));
+    }
+    Ok(())
+}
+
+fn validate_public_port_or_403(port: u16) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
+    if nat_public_port_allowed(port) {
+        return Ok(());
+    }
+    Err((
+        StatusCode::BAD_REQUEST,
+        Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(format!(
+                "public_port {} is below the configured NAT public port minimum",
+                port
+            )),
+        }),
+    ))
+}
+
+fn normalize_allowed_sources_or_403(
+    value: Option<&str>,
+) -> Result<Option<String>, (StatusCode, Json<ApiResponse<()>>)> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let entries: Vec<String> = value
+        .split([',', ' ', '\n', '\t'])
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect();
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    for entry in &entries {
+        if !crate::nat::tunnel::nat_source_entry_valid(entry) {
+            return Err(bad_request_with(format!(
+                "invalid NAT allowed source CIDR or IP: {entry}"
+            )));
+        }
+    }
+    Ok(Some(entries.join(",")))
+}
+
+fn validate_positive_i32_or_403(
+    value: Option<u32>,
+    field: &str,
+) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
+    if matches!(value, Some(0)) {
+        return Err(bad_request_with(format!(
+            "{field} must be greater than zero"
+        )));
+    }
+    if value.map(|value| value > i32::MAX as u32).unwrap_or(false) {
+        return Err(bad_request_with(format!(
+            "{field} must be less than or equal to {}",
+            i32::MAX
+        )));
+    }
+    Ok(())
+}
+
+fn validate_positive_i64_or_403(
+    value: Option<u64>,
+    field: &str,
+) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
+    if matches!(value, Some(0)) {
+        return Err(bad_request_with(format!(
+            "{field} must be greater than zero"
+        )));
+    }
+    if value.map(|value| value > i64::MAX as u64).unwrap_or(false) {
+        return Err(bad_request_with(format!(
+            "{field} must be less than or equal to {}",
+            i64::MAX
+        )));
+    }
+    Ok(())
+}
+
 async fn validate_nat_agent_or_403(
     db: &Db,
     auth_user: &AuthUser,
@@ -493,6 +662,95 @@ async fn require_nat_agent_or_403(
     agent_id: &str,
 ) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
     validate_nat_agent_or_403(db, auth_user, agent_id).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xlstatus_shared::{UserId, UserRole};
+
+    #[test]
+    fn nat_global_list_rejects_admin_pat() {
+        let auth = auth_user(AuthKind::PersonalAccessToken, UserRole::Admin);
+        assert!(require_admin_cookie_session_or_403(&auth).is_err());
+    }
+
+    #[test]
+    fn nat_global_list_allows_admin_cookie_session() {
+        let auth = auth_user(AuthKind::Session, UserRole::Admin);
+        assert!(require_admin_cookie_session_or_403(&auth).is_ok());
+    }
+
+    #[test]
+    fn nat_allowed_sources_normalizes_valid_entries() {
+        let normalized =
+            normalize_allowed_sources_or_403(Some("127.0.0.1, 203.0.113.0/24\n::1/128")).unwrap();
+
+        assert_eq!(
+            normalized.as_deref(),
+            Some("127.0.0.1,203.0.113.0/24,::1/128")
+        );
+    }
+
+    #[test]
+    fn nat_allowed_sources_rejects_invalid_entries() {
+        assert!(normalize_allowed_sources_or_403(Some("not-a-cidr")).is_err());
+    }
+
+    #[test]
+    fn nat_mapping_tunnel_limit_rejects_zero() {
+        assert!(validate_positive_i32_or_403(Some(0), "max_active_tunnels").is_err());
+        assert!(validate_positive_i32_or_403(Some(1), "max_active_tunnels").is_ok());
+        assert!(validate_positive_i32_or_403(None, "max_active_tunnels").is_ok());
+    }
+
+    #[test]
+    fn nat_idle_timeout_and_byte_limit_reject_zero() {
+        assert!(validate_positive_i32_or_403(Some(0), "idle_timeout_seconds").is_err());
+        assert!(validate_positive_i64_or_403(Some(0), "max_bytes_per_tunnel").is_err());
+        assert!(validate_positive_i64_or_403(Some(0), "max_bandwidth_bytes_per_second").is_err());
+        assert!(validate_positive_i32_or_403(Some(30), "idle_timeout_seconds").is_ok());
+        assert!(validate_positive_i64_or_403(Some(1024), "max_bytes_per_tunnel").is_ok());
+        assert!(validate_positive_i64_or_403(Some(1024), "max_bandwidth_bytes_per_second").is_ok());
+    }
+
+    #[test]
+    fn nat_rate_window_limits_reject_zero_and_overflow() {
+        assert!(validate_positive_i32_or_403(Some(0), "rate_limit_window_seconds").is_err());
+        assert!(validate_positive_i32_or_403(
+            Some(i32::MAX as u32 + 1),
+            "rate_limit_window_seconds"
+        )
+        .is_err());
+        assert!(validate_positive_i64_or_403(Some(0), "max_bytes_per_window").is_err());
+        assert!(
+            validate_positive_i64_or_403(Some(i64::MAX as u64 + 1), "max_bytes_per_window")
+                .is_err()
+        );
+        assert!(validate_positive_i32_or_403(Some(60), "rate_limit_window_seconds").is_ok());
+        assert!(validate_positive_i32_or_403(Some(10), "max_connections_per_window").is_ok());
+        assert!(validate_positive_i64_or_403(Some(1024), "max_bytes_per_window").is_ok());
+    }
+
+    fn auth_user(auth_kind: AuthKind, role: UserRole) -> AuthUser {
+        AuthUser {
+            user: crate::db::User {
+                id: UserId(uuid::Uuid::from_bytes([8; 16])),
+                username: "admin".into(),
+                password_hash: "hash".into(),
+                role,
+                token_version: 0,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            session_id: "session".into(),
+            csrf_token: "csrf".into(),
+            auth_kind,
+            scopes: vec!["nat:read".into()],
+            server_ids: None,
+            pat_id: None,
+        }
+    }
 }
 
 fn forbidden_with(msg: String) -> (StatusCode, Json<ApiResponse<()>>) {

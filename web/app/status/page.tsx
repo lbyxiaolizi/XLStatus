@@ -4,7 +4,6 @@ import Link from "next/link";
 import type { CSSProperties } from "react";
 import { useEffect, useMemo, useState } from "react";
 import Navigation from "@/app/components/Navigation";
-import { WorldServerMap } from "@/app/components/WorldServerMap";
 import {
   BrutalCard,
   EmptyState,
@@ -28,44 +27,35 @@ interface Server {
   id: string;
   name: string;
   remark?: string | null;
-  provider?: string | null;
-  region?: string | null;
-  country?: string | null;
-  city?: string | null;
-  latitude?: number | null;
-  longitude?: number | null;
-  location?: ServerLocation | null;
-  plan?: string | null;
-  tags?: string[];
+  public_note?: string | null;
   accent_color?: string | null;
   status: string;
-  cpu_percent?: number;
-  memory_used?: number;
-  memory_total?: number;
-  load_1?: number;
+  last_seen_at?: string;
+  resources?: PublicServerResources | null;
+}
+
+interface PublicServerResources {
+  cpu_percent?: number | null;
+  memory_used?: number | null;
+  memory_total?: number | null;
+  memory_percent?: number | null;
+  disk_used?: number | null;
+  disk_total?: number | null;
+  disk_percent?: number | null;
+  load_1?: number | null;
   net_rx_bps?: number | null;
   net_tx_bps?: number | null;
   network_in_total?: number | null;
   network_out_total?: number | null;
   uptime_seconds?: number | null;
-  last_seen_at?: string;
-}
-
-interface ServerLocation {
-  source?: string | null;
-  provider?: string | null;
-  country?: string | null;
-  region?: string | null;
-  city?: string | null;
-  latitude?: number | null;
-  longitude?: number | null;
-  timezone?: string | null;
+  tcp_connections?: number | null;
+  udp_connections?: number | null;
+  process_count?: number | null;
 }
 
 interface Service {
   id: string;
   name: string;
-  target: string;
   last_status?: string;
   last_check_at?: string;
   kind?: string;
@@ -105,7 +95,6 @@ export default function StatusPage() {
   const [site, setSite] = useState<PublicSiteBranding>(defaultSiteBranding);
   const [theme, setTheme] = useState<ThemeDefinition | null>(null);
   const [showServices, setShowServices] = useState(() => initialPublicShowServices());
-  const [showMap, setShowMap] = useState(() => initialPublicShowMap());
   const [serverViewMode, setServerViewMode] = useState<PublicServerViewMode>(() => initialPublicServerViewMode());
 
   useEffect(() => {
@@ -169,14 +158,6 @@ export default function StatusPage() {
     });
   }
 
-  function toggleMap() {
-    setShowMap((current) => {
-      const next = !current;
-      window.localStorage.setItem("xlstatus_public_show_map", next ? "1" : "0");
-      return next;
-    });
-  }
-
   return (
     <div className="min-h-screen" style={publicPageStyle(site, theme)} data-public-theme-root="true">
       <Navigation />
@@ -213,21 +194,11 @@ export default function StatusPage() {
           <div className="flex flex-wrap gap-2">
             <button type="button" onClick={() => changeServerViewMode("cards")} className={buttonClass(serverViewMode === "cards" ? "primary" : "secondary")}>卡片</button>
             <button type="button" onClick={() => changeServerViewMode("compact")} className={buttonClass(serverViewMode === "compact" ? "primary" : "secondary")}>紧凑</button>
-            <button type="button" onClick={toggleMap} className={buttonClass(showMap ? "primary" : "secondary")}>地图</button>
           </div>
           <button type="button" onClick={toggleServices} className={buttonClass(showServices ? "primary" : "secondary")}>
             {showServices ? "隐藏服务" : "显示服务"}
           </button>
         </div>
-
-        {showMap ? (
-          <WorldServerMap
-            servers={servers}
-            title="地理分布"
-            ariaLabel="公开服务器国家和地区分布地图"
-            serverHref={(server) => `/status/servers/${encodeURIComponent(server.id)}`}
-          />
-        ) : null}
 
         <div className={`grid gap-6 ${showServices ? "lg:grid-cols-2" : ""}`}>
           <section>
@@ -262,7 +233,6 @@ export default function StatusPage() {
                     <div className="flex items-start justify-between gap-3">
                       <div>
                         <h3 className="text-xl font-black">{service.name}</h3>
-                        <p className="mt-1 text-xs font-bold text-[var(--text-muted)]">{service.target}</p>
                       </div>
                       <StatusBadge tone={serviceTone(service.last_status)}>{statusLabel(service.last_status)}</StatusBadge>
                     </div>
@@ -277,9 +247,6 @@ export default function StatusPage() {
             )}
           </section> : null}
         </div>
-        {site.custom_body ? (
-          <div className="mt-6" dangerouslySetInnerHTML={{ __html: site.custom_body }} />
-        ) : null}
       </PageShell>
     </div>
   );
@@ -317,8 +284,7 @@ function PublicServiceHistory({ service }: { service: Service }) {
 }
 
 function PublicServerCard({ server }: { server: Server }) {
-  const memoryPercent = memoryPercentValue(server);
-  const tags = Array.isArray(server.tags) ? server.tags.filter(Boolean) : [];
+  const note = server.public_note || server.remark || "公开服务器";
   return (
     <Link
       href={`/status/servers/${encodeURIComponent(server.id)}`}
@@ -331,30 +297,16 @@ function PublicServerCard({ server }: { server: Server }) {
           <h3 className="break-words text-xl font-black uppercase">{server.name}</h3>
           <p className="mt-1 break-all font-mono text-xs font-bold text-[var(--text-muted)]">{server.id}</p>
           <p className="mt-2 text-sm font-bold text-[var(--text-muted)]">
-            {[server.provider, server.region, server.plan].filter(Boolean).join(" / ") || server.remark || "公开服务器"}
+            {note}
           </p>
         </div>
         <StatusBadge tone={serverTone(server.status)}>{statusLabel(server.status)}</StatusBadge>
       </div>
-      {tags.length ? (
-        <div className="mt-3 flex flex-wrap gap-2">
-          {tags.map((tag) => (
-            <span key={tag} className="border-2 border-black bg-[var(--accent-bg)] px-2 py-1 text-[11px] font-black shadow-[var(--shadow-brutal-sm)]">
-              {tag}
-            </span>
-          ))}
-        </div>
-      ) : null}
-      <div className="mt-4 grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
-        <Metric label="CPU" value={formatPercent(server.cpu_percent)} />
-        <Metric label="内存" value={memoryPercent === null ? t.common.notAvailable : `${memoryPercent.toFixed(1)}%`} />
-        <Metric label="负载" value={server.load_1 !== undefined ? server.load_1.toFixed(2) : t.common.notAvailable} />
-        <Metric label="运行" value={durationLabel(server.uptime_seconds)} />
-        <Metric label="上传" value={formatRate(server.net_tx_bps)} />
-        <Metric label="下载" value={formatRate(server.net_rx_bps)} />
-        <Metric label="累计上传" value={formatBytes(server.network_out_total)} />
-        <Metric label="累计下载" value={formatBytes(server.network_in_total)} />
+      <div className="mt-4 grid grid-cols-2 gap-3 text-sm">
+        <Metric label="状态" value={statusLabel(server.status)} />
+        <Metric label="最后上报" value={formatDate(server.last_seen_at)} />
       </div>
+      {server.resources ? <PublicServerResourceStrip resources={server.resources} /> : null}
     </Link>
   );
 }
@@ -363,7 +315,7 @@ function PublicCompactServerRow({ server }: { server: Server }) {
   return (
     <Link
       href={`/status/servers/${encodeURIComponent(server.id)}`}
-      className="grid gap-3 border-2 border-black bg-[var(--bg-card)] p-3 text-[var(--text-main)] shadow-[var(--shadow-brutal-sm)] transition hover:-translate-x-0.5 hover:-translate-y-0.5 hover:shadow-[var(--shadow-brutal)] md:grid-cols-[minmax(10rem,1.3fr)_repeat(5,minmax(5rem,1fr))]"
+      className="grid gap-3 border-2 border-black bg-[var(--bg-card)] p-3 text-[var(--text-main)] shadow-[var(--shadow-brutal-sm)] transition hover:-translate-x-0.5 hover:-translate-y-0.5 hover:shadow-[var(--shadow-brutal)] md:grid-cols-[minmax(10rem,1.3fr)_minmax(5rem,1fr)_minmax(10rem,1fr)]"
       aria-label={`查看公开服务器 ${server.name}`}
     >
       <div className="min-w-0">
@@ -374,11 +326,29 @@ function PublicCompactServerRow({ server }: { server: Server }) {
         <div className="mt-1 truncate font-mono text-[11px] font-bold text-[var(--text-muted)]">{compactId(server.id)}</div>
       </div>
       <Metric label="状态" value={statusLabel(server.status)} />
-      <Metric label="CPU" value={formatPercent(server.cpu_percent)} />
-      <Metric label="内存" value={memoryLabel(server)} />
-      <Metric label="上传" value={formatRate(server.net_tx_bps)} />
-      <Metric label="下载" value={formatRate(server.net_rx_bps)} />
+      <Metric label="最后上报" value={formatDate(server.last_seen_at)} />
+      {server.resources ? (
+        <div className="grid grid-cols-2 gap-2 text-xs md:col-span-3 md:grid-cols-4">
+          <CompactMetric label="CPU" value={formatPercent(server.resources.cpu_percent)} />
+          <CompactMetric label="内存" value={formatPercent(resourceMemoryPercent(server.resources))} />
+          <CompactMetric label="下载" value={formatRate(server.resources.net_rx_bps)} />
+          <CompactMetric label="上传" value={formatRate(server.resources.net_tx_bps)} />
+        </div>
+      ) : null}
     </Link>
+  );
+}
+
+function PublicServerResourceStrip({ resources }: { resources: PublicServerResources }) {
+  return (
+    <div className="mt-4 border-t-2 border-black pt-3">
+      <div className="grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
+        <Metric label="CPU" value={formatPercent(resources.cpu_percent)} />
+        <Metric label="内存" value={resourceBytes(resources.memory_used, resources.memory_total, resources.memory_percent)} />
+        <Metric label="磁盘" value={resourceBytes(resources.disk_used, resources.disk_total, resources.disk_percent)} />
+        <Metric label="下载/上传" value={`${formatRate(resources.net_rx_bps)} / ${formatRate(resources.net_tx_bps)}`} />
+      </div>
+    </div>
   );
 }
 
@@ -399,6 +369,37 @@ function Metric({ label, value }: { label: string; value: string }) {
       <div className="mt-1 font-black">{value}</div>
     </div>
   );
+}
+
+function CompactMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0">
+      <div className="text-[10px] font-black uppercase text-[var(--text-muted)]">{label}</div>
+      <div className="truncate font-black">{value}</div>
+    </div>
+  );
+}
+
+function resourceMemoryPercent(resources: PublicServerResources): number | null | undefined {
+  return resources.memory_percent ?? percentFromUsedTotal(resources.memory_used, resources.memory_total);
+}
+
+function resourceBytes(used?: number | null, total?: number | null, percent?: number | null): string {
+  if (used !== undefined && used !== null && total !== undefined && total !== null && total > 0) {
+    return `${formatBytes(used)} / ${formatBytes(total)}`;
+  }
+  if (percent !== undefined && percent !== null) return formatPercent(percent);
+  return "N/A";
+}
+
+function percentFromUsedTotal(used?: number | null, total?: number | null): number | undefined {
+  if (used === undefined || used === null || !total) return undefined;
+  return (used / total) * 100;
+}
+
+function formatRate(value?: number | null): string {
+  if (value === undefined || value === null || Number.isNaN(value)) return "N/A";
+  return `${formatBytes(value)}/s`;
 }
 
 function serverTone(status: string): "green" | "red" | "yellow" | "gray" {
@@ -478,31 +479,6 @@ function averageDelay(results: PublicServiceResult[]): number | undefined {
   return values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : undefined;
 }
 
-function memoryLabel(server: Server): string {
-  const percent = memoryPercentValue(server);
-  return percent === null ? t.common.notAvailable : `${percent.toFixed(1)}%`;
-}
-
-function memoryPercentValue(server: Server): number | null {
-  if (server.memory_used === undefined || server.memory_used === null || !server.memory_total) return null;
-  return (server.memory_used / server.memory_total) * 100;
-}
-
-function formatRate(value?: number | null): string {
-  if (value === undefined || value === null || Number.isNaN(value)) return t.common.notAvailable;
-  return `${formatBytes(value)}/s`;
-}
-
-function durationLabel(value?: number | null): string {
-  if (value === undefined || value === null || Number.isNaN(value)) return t.common.notAvailable;
-  const days = Math.floor(value / 86400);
-  const hours = Math.floor((value % 86400) / 3600);
-  const minutes = Math.floor((value % 3600) / 60);
-  if (days > 0) return `${days} 天 ${hours} 小时`;
-  if (hours > 0) return `${hours} 小时 ${minutes} 分钟`;
-  return `${minutes} 分钟`;
-}
-
 function initialPublicShowServices(): boolean {
   if (typeof window === "undefined") return false;
   return window.localStorage.getItem("xlstatus_public_show_services") === "1";
@@ -549,26 +525,11 @@ function applyPublicHead(site: PublicSiteBranding, theme?: ThemeDefinition | nul
     document.head.appendChild(theme);
     created.push(theme);
   }
-  if (site.custom_head) {
-    const template = document.createElement("template");
-    template.innerHTML = site.custom_head;
-    template.content.childNodes.forEach((node) => {
-      const next = node.cloneNode(true);
-      if (next instanceof Element) {
-        next.setAttribute("data-xlstatus-custom-head", "true");
-        document.head.appendChild(next);
-        created.push(next);
-      }
-    });
-  }
   if (theme) {
     const style = document.createElement("style");
     style.dataset.xlstatusCustomHead = "true";
     style.textContent = [
-      theme.custom_css,
-      theme.light_custom_css,
       themeModeCss("[data-public-theme-root=\"true\"]", themeVariablesForMode(theme, true), ".dark-mode"),
-      theme.dark_custom_css,
     ]
       .filter(Boolean)
       .join("\n");
@@ -596,11 +557,6 @@ function themeModeCss(selector: string, variables: Record<string, string>, prefi
     .map(([key, value]) => `${key}: ${value};`);
   if (!lines.length) return "";
   return `${prefix} ${selector} { ${lines.join(" ")} }`;
-}
-
-function initialPublicShowMap(): boolean {
-  if (typeof window === "undefined") return false;
-  return window.localStorage.getItem("xlstatus_public_show_map") === "1";
 }
 
 function initialPublicServerViewMode(): PublicServerViewMode {

@@ -5,7 +5,7 @@ use crate::auth::{generate_session_token, hash_token};
 use crate::config::Config;
 use crate::db::{CreateSessionInput, CreateUserInput, DatabaseBackend, UserRepository};
 use axum::{
-    extract::{Path, Query, State},
+    extract::{connect_info::ConnectInfo, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{AppendHeaders, IntoResponse, Response},
     Json,
@@ -14,7 +14,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     sync::Arc,
 };
 use tokio::sync::RwLock;
@@ -50,10 +50,11 @@ pub struct AppState {
 
 pub async fn login(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<Response, AppError> {
-    let client_ip = client_ip_from_headers(&headers);
+    let client_ip = crate::security::client_ip_from_headers_and_peer(&headers, Some(peer_addr));
     let user_agent = header_value(&headers, header::USER_AGENT.as_str());
     if active_waf_ban(&state.db, &client_ip).await?.is_some() {
         record_waf_event(
@@ -87,7 +88,6 @@ pub async fn login(
         let Some(totp_code) = req.totp_code.as_deref() else {
             return Ok(Json(ApiResponse::success(LoginResponse {
                 user: None,
-                session_token: None,
                 mfa_required: true,
             }))
             .into_response());
@@ -130,19 +130,22 @@ pub async fn login(
     .await?;
 
     let csrf_token = derive_csrf_token(&token_hash);
+    let secure_attr = cookie_secure_attr(state.config.security.cookie_secure);
     let session_cookie = format!(
-        "{}={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}",
+        "{}={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}{}",
         SESSION_COOKIE_NAME,
         session_token,
-        state.config.security.session_ttl_hours * 3600
+        state.config.security.session_ttl_hours * 3600,
+        secure_attr
     );
     let session_cookie = HeaderValue::from_str(&session_cookie)
         .map_err(|e| AppError::BadRequest(format!("Invalid session cookie: {}", e)))?;
     let csrf_cookie = format!(
-        "{}={}; SameSite=Lax; Path=/; Max-Age={}",
+        "{}={}; SameSite=Lax; Path=/; Max-Age={}{}",
         CSRF_COOKIE_NAME,
         csrf_token,
-        state.config.security.session_ttl_hours * 3600
+        state.config.security.session_ttl_hours * 3600,
+        secure_attr
     );
     let csrf_cookie = HeaderValue::from_str(&csrf_cookie)
         .map_err(|e| AppError::BadRequest(format!("Invalid session cookie: {}", e)))?;
@@ -160,7 +163,6 @@ pub async fn login(
                 created_at: None,
                 updated_at: None,
             }),
-            session_token: Some(session_token),
             mfa_required: false,
         })),
     )
@@ -173,13 +175,17 @@ pub async fn logout(
 ) -> Result<impl IntoResponse, AppError> {
     let session_repo = crate::auth::SessionRepository::new(state.db.clone());
     session_repo.delete(&auth_user.session_id).await?;
+    let secure_attr = cookie_secure_attr(state.config.security.cookie_secure);
     let session_cookie = format!(
-        "{}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0",
-        SESSION_COOKIE_NAME
+        "{}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{}",
+        SESSION_COOKIE_NAME, secure_attr
     );
     let session_cookie = HeaderValue::from_str(&session_cookie)
         .map_err(|e| AppError::BadRequest(format!("Invalid session cookie: {}", e)))?;
-    let csrf_cookie = format!("{}=; SameSite=Lax; Path=/; Max-Age=0", CSRF_COOKIE_NAME);
+    let csrf_cookie = format!(
+        "{}=; SameSite=Lax; Path=/; Max-Age=0{}",
+        CSRF_COOKIE_NAME, secure_attr
+    );
     let csrf_cookie = HeaderValue::from_str(&csrf_cookie)
         .map_err(|e| AppError::BadRequest(format!("Invalid session cookie: {}", e)))?;
 
@@ -198,9 +204,7 @@ pub async fn create_user(
     headers: HeaderMap,
     Json(req): Json<CreateUserRequest>,
 ) -> Result<Json<ApiResponse<UserInfo>>, AppError> {
-    if !auth_user.user.role.is_admin() {
-        return Err(AppError::Forbidden("Admin role required".to_string()));
-    }
+    require_admin_cookie_session(&auth_user)?;
     require_sensitive_totp(&state.db, auth_user.user.id, &headers).await?;
 
     let user_repo = UserRepository::new(state.db.clone());
@@ -246,7 +250,7 @@ pub async fn list_users(
     auth_user: AuthUser,
     Query(q): Query<ListUsersQuery>,
 ) -> Result<Json<ApiResponse<ListUsersResponse>>, AppError> {
-    require_admin(&auth_user)?;
+    require_admin_cookie_session(&auth_user)?;
     let user_repo = UserRepository::new(state.db.clone());
     let (users, total) = user_repo
         .list(q.limit.clamp(1, 500), q.offset.max(0))
@@ -264,7 +268,7 @@ pub async fn update_user(
     Path(id): Path<String>,
     Json(req): Json<UpdateUserRequest>,
 ) -> Result<Json<ApiResponse<UserInfo>>, AppError> {
-    require_admin(&auth_user)?;
+    require_admin_cookie_session(&auth_user)?;
     require_sensitive_totp(&state.db, auth_user.user.id, &headers).await?;
     let target_id = parse_user_id(&id)?;
     let user_repo = UserRepository::new(state.db.clone());
@@ -318,7 +322,7 @@ pub async fn delete_user(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
-    require_admin(&auth_user)?;
+    require_admin_cookie_session(&auth_user)?;
     require_sensitive_totp(&state.db, auth_user.user.id, &headers).await?;
     let target_id = parse_user_id(&id)?;
     if target_id == auth_user.user.id {
@@ -376,9 +380,24 @@ pub async fn get_totp_status(
 pub async fn setup_totp(
     State(state): State<AppState>,
     auth_user: AuthUser,
+    req: Option<Json<TotpCodeRequest>>,
 ) -> Result<Json<ApiResponse<TotpSetupResponse>>, AppError> {
     require_cookie_session(&auth_user)?;
     let user_repo = UserRepository::new(state.db.clone());
+    let (existing_secret, enabled) = user_repo.totp_config(auth_user.user.id).await?;
+    if enabled {
+        let existing_secret =
+            existing_secret.ok_or(AppError::BadRequest("TOTP secret is missing".to_string()))?;
+        let code = req
+            .as_ref()
+            .and_then(|Json(req)| req.code.as_deref())
+            .ok_or(AppError::BadRequest(
+                "Current TOTP code is required".to_string(),
+            ))?;
+        if !verify_totp_code(&existing_secret, code, Utc::now()) {
+            return Err(AppError::BadRequest("Invalid TOTP code".to_string()));
+        }
+    }
     let secret = generate_totp_secret();
     user_repo
         .set_totp_secret(auth_user.user.id, &secret, false)
@@ -476,9 +495,10 @@ pub async fn list_sessions(
     auth_user: AuthUser,
     Query(q): Query<ListSessionsQuery>,
 ) -> Result<Json<ApiResponse<ListSessionsResponse>>, AppError> {
+    require_cookie_session(&auth_user)?;
     let limit = q.limit.clamp(1, 500);
     let offset = q.offset.max(0);
-    let admin = auth_user.user.role.is_admin();
+    let admin = auth_user.user.role.is_admin() && !auth_user.is_pat();
     let now = Utc::now();
     let (sessions, total) = match &state.db {
         DatabaseBackend::Sqlite(pool) => {
@@ -634,6 +654,7 @@ pub async fn delete_session(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
+    require_cookie_session(&auth_user)?;
     if !auth_user.user.role.is_admin() && id != auth_user.session_id {
         return Err(AppError::Forbidden(
             "cannot delete another user's session".into(),
@@ -693,7 +714,7 @@ pub async fn list_waf_bans(
     auth_user: AuthUser,
     Query(q): Query<ListWafBansQuery>,
 ) -> Result<Json<ApiResponse<ListWafBansResponse>>, AppError> {
-    require_admin(&auth_user)?;
+    require_admin_cookie_session(&auth_user)?;
     let limit = q.limit.clamp(1, 500);
     let offset = q.offset.max(0);
     let now = Utc::now();
@@ -758,7 +779,7 @@ pub async fn create_waf_bans(
     headers: HeaderMap,
     Json(req): Json<CreateWafBansRequest>,
 ) -> Result<Json<ApiResponse<CreateWafBansResponse>>, AppError> {
-    require_admin(&auth_user)?;
+    require_admin_cookie_session(&auth_user)?;
     require_sensitive_totp(&state.db, auth_user.user.id, &headers).await?;
     let ips = parse_manual_ban_ips(req.ips)?;
     if ips.is_empty() {
@@ -799,7 +820,7 @@ pub async fn delete_waf_ban(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
-    require_admin(&auth_user)?;
+    require_admin_cookie_session(&auth_user)?;
     require_sensitive_totp(&state.db, auth_user.user.id, &headers).await?;
     let affected = match &state.db {
         DatabaseBackend::Sqlite(pool) => sqlx::query("DELETE FROM waf_bans WHERE id = ?")
@@ -833,6 +854,19 @@ fn require_cookie_session(auth_user: &AuthUser) -> Result<(), AppError> {
         return Err(AppError::Forbidden("Cookie session required".to_string()));
     }
     Ok(())
+}
+
+fn require_admin_cookie_session(auth_user: &AuthUser) -> Result<(), AppError> {
+    require_admin(auth_user)?;
+    require_cookie_session(auth_user)
+}
+
+pub(crate) fn cookie_secure_attr(enabled: bool) -> &'static str {
+    if enabled {
+        "; Secure"
+    } else {
+        ""
+    }
 }
 
 pub(crate) async fn require_sensitive_totp(
@@ -924,8 +958,16 @@ fn parse_manual_ban_ips(values: Vec<String>) -> Result<Vec<String>, AppError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_manual_ban_ips, sensitive_totp_code_from_headers, SENSITIVE_TOTP_HEADER};
+    use super::{
+        parse_manual_ban_ips, require_admin_cookie_session, sensitive_totp_code_from_headers,
+        AppError, SENSITIVE_TOTP_HEADER,
+    };
+    use crate::api::types::{ApiResponse, LoginResponse, UserInfo};
+    use crate::auth::middleware::{AuthKind, AuthUser};
+    use crate::db::User;
     use axum::http::{HeaderMap, HeaderValue};
+    use chrono::Utc;
+    use xlstatus_shared::{UserId, UserRole};
 
     #[test]
     fn parses_manual_ban_ips_with_deduplication() {
@@ -951,6 +993,60 @@ mod tests {
             sensitive_totp_code_from_headers(&headers).as_deref(),
             Some("123456")
         );
+    }
+
+    #[test]
+    fn login_response_does_not_serialize_session_token() {
+        let response = ApiResponse::success(LoginResponse {
+            user: Some(UserInfo {
+                id: "user-id".into(),
+                username: "alice".into(),
+                role: "admin".into(),
+                created_at: None,
+                updated_at: None,
+            }),
+            mfa_required: false,
+        });
+        let value = serde_json::to_value(response).unwrap();
+        assert!(value.pointer("/data/session_token").is_none());
+    }
+
+    #[test]
+    fn account_admin_helpers_allow_cookie_session() {
+        let auth = auth_user(AuthKind::Session);
+
+        assert!(require_admin_cookie_session(&auth).is_ok());
+    }
+
+    #[test]
+    fn account_admin_helpers_reject_pat_session() {
+        let auth = auth_user(AuthKind::PersonalAccessToken);
+
+        assert!(matches!(
+            require_admin_cookie_session(&auth),
+            Err(AppError::Forbidden(_))
+        ));
+    }
+
+    fn auth_user(auth_kind: AuthKind) -> AuthUser {
+        let now = Utc::now();
+        AuthUser {
+            user: User {
+                id: UserId(uuid::Uuid::from_bytes([1; 16])),
+                username: "admin".into(),
+                password_hash: "x".into(),
+                role: UserRole::Admin,
+                token_version: 0,
+                created_at: now,
+                updated_at: now,
+            },
+            session_id: "sess".into(),
+            csrf_token: "csrf".into(),
+            auth_kind,
+            scopes: vec!["admin:*".into()],
+            server_ids: None,
+            pat_id: Some("pat".into()),
+        }
     }
 }
 
@@ -1234,16 +1330,6 @@ fn waf_ban_from_row(
     }
 }
 
-fn client_ip_from_headers(headers: &HeaderMap) -> String {
-    header_value(headers, "x-forwarded-for")
-        .and_then(|value| value.split(',').next().map(str::trim).map(str::to_string))
-        .or_else(|| header_value(headers, "x-real-ip"))
-        .or_else(|| header_value(headers, "cf-connecting-ip"))
-        .map(|value| value.chars().take(128).collect::<String>())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
 fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get(name)
@@ -1260,6 +1346,7 @@ pub enum AppError {
     Unauthorized(String),
     Forbidden(String),
     BadRequest(String),
+    TooManyRequests(String),
     NotFound(String),
 }
 
@@ -1276,6 +1363,7 @@ impl IntoResponse for AppError {
             AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg.clone()),
             AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone()),
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
+            AppError::TooManyRequests(msg) => (StatusCode::TOO_MANY_REQUESTS, msg.clone()),
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
         };
 

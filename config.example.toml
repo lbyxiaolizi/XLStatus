@@ -8,12 +8,20 @@ url = "sqlite:///var/lib/xlstatus/xlstatus.db?mode=rwc"
 # `?mode=rwc` in the URL also enables creation.
 create_if_missing = true
 # PostgreSQL example:
-# url = "postgresql://xlstatus:xlstatus_password@localhost:5432/xlstatus"
+# url = "postgresql://xlstatus:replace-with-a-strong-db-password@localhost:5432/xlstatus"
 # create_if_missing = false
 
 [server]
-http_bind = "0.0.0.0:8080"
-grpc_bind = "0.0.0.0:50051"
+http_bind = "127.0.0.1:8080"
+grpc_bind = "127.0.0.1:50051"
+# Optional gRPC TLS/mTLS. When cert/key are both set the Agent gRPC listener
+# serves TLS. When client_ca_path is also set, Agents must present a client
+# certificate signed by that CA.
+# grpc_tls_cert_path = "/etc/xlstatus/tls/grpc-server.crt"
+# grpc_tls_key_path = "/etc/xlstatus/tls/grpc-server.key"
+# grpc_tls_client_ca_path = "/etc/xlstatus/tls/agent-ca.crt"
+# Keep reflection disabled unless you are debugging on a trusted network.
+grpc_reflection_enabled = false
 # Exact browser origins allowed to call the API. Required when the Web UI
 # runs on a different origin such as http://localhost:3000.
 cors_allowed_origins = [
@@ -25,4 +33,10 @@ cors_allowed_origins = [
 # Generate a production secret with:
 # openssl rand -base64 32
 session_secret = "replace-with-a-long-random-secret"
+# Optional separate master key for database-at-rest encryption of third-party
+# tokens and TOTP secrets. If omitted, session_secret is used as the master.
+# Generate with: openssl rand -base64 32
+secret_encryption_key = "replace-with-a-different-long-random-secret"
 session_ttl_hours = 24
+# Set false only for local HTTP development.
+cookie_secure = true

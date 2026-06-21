@@ -13,13 +13,13 @@
 use crate::api::types::ApiResponse;
 use crate::api::v1::auth::{require_sensitive_totp, AppError, AppState};
 use crate::api::v1::geoip::{lookup_agent_geo_location, AgentGeoLocation};
-use crate::auth::middleware::AuthSession;
+use crate::auth::middleware::{AuthKind, AuthSession};
 use crate::auth::rbac::has_scope;
-use crate::db::{AgentRepository, DatabaseBackend, UserRepository};
+use crate::db::{Agent, AgentRepository, DatabaseBackend, UserRepository};
 
 pub use crate::realtime::ws::ws_servers;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{connect_info::ConnectInfo, Path, Query, State},
     http::HeaderMap,
     Json,
 };
@@ -29,6 +29,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Row};
 use std::collections::HashSet;
+use std::net::SocketAddr;
 use uuid::Uuid;
 use xlstatus_shared::{AgentId, UserId};
 use xlstatus_tsdb::{MetricSeries, QueryRange};
@@ -117,11 +118,22 @@ pub async fn list_servers(
     let offset = q.offset.max(0);
 
     let agent_repo = AgentRepository::new(state.db.clone());
-    let (rows, total) = agent_repo.list_with_state(limit, offset).await?;
+    let (rows, total) = if let Some(server_ids) = auth.server_ids.as_deref() {
+        let owner_filter = (!auth.role.is_admin()).then_some(auth.user_id);
+        agent_repo
+            .list_with_state_by_server_ids(owner_filter, server_ids, limit, offset)
+            .await?
+    } else if auth.role.is_admin() {
+        agent_repo.list_with_state(limit, offset).await?
+    } else {
+        agent_repo
+            .list_with_state_by_owner(auth.user_id, limit, offset)
+            .await?
+    };
     let now = Utc::now();
     let mut servers = Vec::with_capacity(rows.len());
     for row in rows.into_iter() {
-        if !server_visible(&auth, &row.agent.id) {
+        if !agent_visible(&auth, &row.agent) {
             continue;
         }
         let agent = row.agent;
@@ -281,14 +293,12 @@ pub async fn get_server(
         return Err(AppError::Forbidden("missing scope: server:read".into()));
     }
     let agent_id = parse_agent_id(&id)?;
-    if !server_visible(&auth, &agent_id) {
-        return Err(AppError::Forbidden("agent not in scope".into()));
-    }
     let agent_repo = AgentRepository::new(state.db.clone());
     let row = agent_repo
         .find_by_id_with_state(agent_id)
         .await?
         .ok_or(AppError::NotFound("agent not found".to_string()))?;
+    ensure_agent_visible(&auth, &row.agent)?;
     let agent = row.agent;
     let now = Utc::now();
     let last_seen_age = agent
@@ -549,9 +559,11 @@ pub async fn update_server(
         return Err(AppError::Forbidden("missing scope: server:write".into()));
     }
     let agent_id = parse_agent_id(&id)?;
-    if !server_visible(&auth, &agent_id) {
-        return Err(AppError::Forbidden("agent not in scope".into()));
-    }
+    let agent = AgentRepository::new(state.db.clone())
+        .find_by_id(agent_id)
+        .await?
+        .ok_or(AppError::NotFound("agent not found".into()))?;
+    ensure_agent_visible(&auth, &agent)?;
     let name = req
         .name
         .as_deref()
@@ -613,6 +625,7 @@ pub async fn update_server(
 pub async fn batch_update_servers(
     State(state): State<AppState>,
     auth: AuthSession,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(req): Json<BatchUpdateServersRequest>,
 ) -> Result<Json<ApiResponse<BatchUpdateServersResponse>>, AppError> {
@@ -640,6 +653,7 @@ pub async fn batch_update_servers(
                 "admin role required for ownership transfer".into(),
             ));
         }
+        require_admin_cookie_session(&auth)?;
         let owner = req
             .owner_user_id
             .as_deref()
@@ -676,7 +690,7 @@ pub async fn batch_update_servers(
     }
 
     let agent_repo = AgentRepository::new(state.db.clone());
-    let actor_ip = client_ip_from_headers(&headers);
+    let actor_ip = client_ip_from_headers(&headers, peer_addr);
     let mut results = Vec::new();
     for id in dedupe_ids(req.server_ids) {
         let result = match apply_batch_action(
@@ -745,6 +759,7 @@ pub async fn list_server_owner_transfers(
 pub async fn retry_server_owner_transfer(
     State(state): State<AppState>,
     auth: AuthSession,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<ServerOwnerTransferView>>, AppError> {
@@ -777,7 +792,7 @@ pub async fn retry_server_owner_transfer(
         }
     };
 
-    let actor_ip = client_ip_from_headers(&headers);
+    let actor_ip = client_ip_from_headers(&headers, peer_addr);
     let result = if row.agent.owner_user_id == target_owner {
         mark_server_owner_transfer_completed(&state.db, &id, row.agent.owner_user_id, &auth, true)
             .await
@@ -836,6 +851,7 @@ pub async fn retry_server_owner_transfer(
 pub async fn cancel_server_owner_transfer(
     State(state): State<AppState>,
     auth: AuthSession,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<ServerOwnerTransferView>>, AppError> {
@@ -853,7 +869,7 @@ pub async fn cancel_server_owner_transfer(
     }
     ensure_transfer_server_scope(&auth, &transfer.server_id)?;
     mark_server_owner_transfer_cancelled(&state.db, &id).await?;
-    let actor_ip = client_ip_from_headers(&headers);
+    let actor_ip = client_ip_from_headers(&headers, peer_addr);
     warn_if_audit_failed(
         record_server_transfer_audit(
             &state.db,
@@ -885,7 +901,7 @@ pub async fn list_server_groups(
     let offset = q.offset.max(0);
     let (mut groups, total) = load_server_groups(&state.db, &auth, limit, offset).await?;
     for group in &mut groups {
-        group.server_ids = filter_visible_server_ids(&auth, std::mem::take(&mut group.server_ids));
+        group.server_ids = filter_visible_server_ids(&auth, &group.server_ids);
     }
     Ok(Json(ApiResponse::success(ServerGroupListResponse {
         groups,
@@ -997,6 +1013,7 @@ pub async fn delete_server_group(
     if !has_scope(&auth, "server:write") {
         return Err(AppError::Forbidden("missing scope: server:write".into()));
     }
+    load_server_group(&state.db, &auth, &id).await?;
     let affected = match &state.db {
         DatabaseBackend::Sqlite(pool) => {
             sqlx::query("DELETE FROM server_groups WHERE id = ? AND owner_user_id = ?")
@@ -1086,9 +1103,7 @@ pub async fn delete_server_group_member(
         return Err(AppError::Forbidden("missing scope: server:write".into()));
     }
     load_server_group(&state.db, &auth, &id).await?;
-    if !server_visible(&auth, &parse_agent_id(&server_id)?) {
-        return Err(AppError::Forbidden("agent not in scope".into()));
-    }
+    ensure_group_server_access(&state.db, &auth, &server_id).await?;
     match &state.db {
         DatabaseBackend::Sqlite(pool) => {
             sqlx::query("DELETE FROM server_group_members WHERE group_id = ? AND agent_id = ?")
@@ -1136,9 +1151,11 @@ pub async fn get_server_metrics(
         return Err(AppError::Forbidden("missing scope: server:read".into()));
     }
     let agent_id = parse_agent_id(&id)?;
-    if !server_visible(&auth, &agent_id) {
-        return Err(AppError::Forbidden("agent not in scope".into()));
-    }
+    let agent = AgentRepository::new(state.db.clone())
+        .find_by_id(agent_id)
+        .await?
+        .ok_or(AppError::NotFound("agent not found".into()))?;
+    ensure_agent_visible(&auth, &agent)?;
     let range = QueryRange::parse(&q.range).ok_or(AppError::BadRequest(format!(
         "unsupported range: {}",
         q.range
@@ -1177,40 +1194,63 @@ async fn load_server_groups(
 ) -> Result<(Vec<ServerGroupView>, i64), AppError> {
     match db {
         DatabaseBackend::Sqlite(pool) => {
-            let total: (i64,) =
-                sqlx::query_as("SELECT COUNT(*) FROM server_groups WHERE owner_user_id = ?")
-                    .bind(auth.user_id.0.to_string())
-                    .fetch_one(pool)
-                    .await?;
-            let rows = sqlx::query(
+            let paged = auth.server_ids.is_none();
+            let total = if paged {
+                let row: (i64,) =
+                    sqlx::query_as("SELECT COUNT(*) FROM server_groups WHERE owner_user_id = ?")
+                        .bind(auth.user_id.0.to_string())
+                        .fetch_one(pool)
+                        .await?;
+                row.0
+            } else {
+                0
+            };
+            let sql = if paged {
                 r#"
                 SELECT id, owner_user_id, name, color, display_order, created_at, updated_at
                 FROM server_groups
                 WHERE owner_user_id = ?
                 ORDER BY COALESCE(display_order, 999999), created_at ASC
                 LIMIT ? OFFSET ?
-                "#,
-            )
-            .bind(auth.user_id.0.to_string())
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(pool)
-            .await?;
+                "#
+            } else {
+                r#"
+                SELECT id, owner_user_id, name, color, display_order, created_at, updated_at
+                FROM server_groups
+                WHERE owner_user_id = ?
+                ORDER BY COALESCE(display_order, 999999), created_at ASC
+                "#
+            };
+            let mut query = sqlx::query(sql).bind(auth.user_id.0.to_string());
+            if paged {
+                query = query.bind(limit).bind(offset);
+            }
+            let rows = query.fetch_all(pool).await?;
             let mut groups = Vec::with_capacity(rows.len());
             for row in rows {
                 let mut group = server_group_from_sqlite_row(row)?;
                 group.server_ids = load_server_group_members(db, &group.id).await?;
                 groups.push(group);
             }
-            Ok((groups, total.0))
+            if paged {
+                Ok((groups, total))
+            } else {
+                Ok(visible_server_groups_page(auth, groups, limit, offset))
+            }
         }
         DatabaseBackend::Postgres(pool) => {
-            let total: (i64,) =
-                sqlx::query_as("SELECT COUNT(*) FROM server_groups WHERE owner_user_id = $1")
-                    .bind(auth.user_id.0)
-                    .fetch_one(pool)
-                    .await?;
-            let rows = sqlx::query(
+            let paged = auth.server_ids.is_none();
+            let total = if paged {
+                let row: (i64,) =
+                    sqlx::query_as("SELECT COUNT(*) FROM server_groups WHERE owner_user_id = $1")
+                        .bind(auth.user_id.0)
+                        .fetch_one(pool)
+                        .await?;
+                row.0
+            } else {
+                0
+            };
+            let sql = if paged {
                 r#"
                 SELECT id::text AS id, owner_user_id::text AS owner_user_id, name, color,
                        display_order::bigint AS display_order, created_at::text AS created_at,
@@ -1219,20 +1259,33 @@ async fn load_server_groups(
                 WHERE owner_user_id = $1
                 ORDER BY COALESCE(display_order, 999999), created_at ASC
                 LIMIT $2 OFFSET $3
-                "#,
-            )
-            .bind(auth.user_id.0)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(pool)
-            .await?;
+                "#
+            } else {
+                r#"
+                SELECT id::text AS id, owner_user_id::text AS owner_user_id, name, color,
+                       display_order::bigint AS display_order, created_at::text AS created_at,
+                       updated_at::text AS updated_at
+                FROM server_groups
+                WHERE owner_user_id = $1
+                ORDER BY COALESCE(display_order, 999999), created_at ASC
+                "#
+            };
+            let mut query = sqlx::query(sql).bind(auth.user_id.0);
+            if paged {
+                query = query.bind(limit).bind(offset);
+            }
+            let rows = query.fetch_all(pool).await?;
             let mut groups = Vec::with_capacity(rows.len());
             for row in rows {
                 let mut group = server_group_from_pg_row(row)?;
                 group.server_ids = load_server_group_members(db, &group.id).await?;
                 groups.push(group);
             }
-            Ok((groups, total.0))
+            if paged {
+                Ok((groups, total))
+            } else {
+                Ok(visible_server_groups_page(auth, groups, limit, offset))
+            }
         }
     }
 }
@@ -1260,7 +1313,8 @@ async fn load_server_group(
                 .transpose()?
                 .ok_or(AppError::NotFound("server group not found".into()))?;
             group.server_ids = load_server_group_members(db, &group.id).await?;
-            group.server_ids = filter_visible_server_ids(auth, group.server_ids);
+            ensure_server_group_visible(auth, &group.server_ids)?;
+            group.server_ids = filter_visible_server_ids(auth, &group.server_ids);
             Ok(group)
         }
         DatabaseBackend::Postgres(pool) => {
@@ -1282,7 +1336,8 @@ async fn load_server_group(
                 .transpose()?
                 .ok_or(AppError::NotFound("server group not found".into()))?;
             group.server_ids = load_server_group_members(db, &group.id).await?;
-            group.server_ids = filter_visible_server_ids(auth, group.server_ids);
+            ensure_server_group_visible(auth, &group.server_ids)?;
+            group.server_ids = filter_visible_server_ids(auth, &group.server_ids);
             Ok(group)
         }
     }
@@ -1340,15 +1395,52 @@ fn server_group_from_pg_row(row: sqlx::postgres::PgRow) -> Result<ServerGroupVie
     })
 }
 
-fn filter_visible_server_ids(auth: &AuthSession, server_ids: Vec<String>) -> Vec<String> {
+fn filter_visible_server_ids(auth: &AuthSession, server_ids: &[String]) -> Vec<String> {
     server_ids
-        .into_iter()
+        .iter()
         .filter(|id| {
             Uuid::parse_str(id)
                 .map(|uuid| server_visible(auth, &AgentId(uuid)))
                 .unwrap_or(false)
         })
+        .cloned()
         .collect()
+}
+
+fn server_group_visible(auth: &AuthSession, server_ids: &[String]) -> bool {
+    auth.server_ids.is_none()
+        || server_ids.iter().all(|id| {
+            Uuid::parse_str(id)
+                .map(|uuid| server_visible(auth, &AgentId(uuid)))
+                .unwrap_or(false)
+        })
+}
+
+fn ensure_server_group_visible(auth: &AuthSession, server_ids: &[String]) -> Result<(), AppError> {
+    if server_group_visible(auth, server_ids) {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden("server group not in scope".into()))
+    }
+}
+
+fn visible_server_groups_page(
+    auth: &AuthSession,
+    groups: Vec<ServerGroupView>,
+    limit: i64,
+    offset: i64,
+) -> (Vec<ServerGroupView>, i64) {
+    let visible: Vec<_> = groups
+        .into_iter()
+        .filter(|group| server_group_visible(auth, &group.server_ids))
+        .collect();
+    let total = visible.len() as i64;
+    let start = offset.max(0) as usize;
+    let end = (start + limit.clamp(1, 500) as usize).min(visible.len());
+    if start >= visible.len() {
+        return (Vec::new(), total);
+    }
+    (visible[start..end].to_vec(), total)
 }
 
 async fn ensure_group_server_access(
@@ -1357,17 +1449,11 @@ async fn ensure_group_server_access(
     server_id: &str,
 ) -> Result<(), AppError> {
     let agent_id = parse_agent_id(server_id)?;
-    if !server_visible(auth, &agent_id) {
-        return Err(AppError::Forbidden("agent not in scope".into()));
-    }
     let agent = AgentRepository::new(db.clone())
         .find_by_id(agent_id)
         .await?
         .ok_or(AppError::NotFound("agent not found".into()))?;
-    if !auth.role.is_admin() && agent.owner_user_id != auth.user_id {
-        return Err(AppError::Forbidden("agent is owned by another user".into()));
-    }
-    Ok(())
+    ensure_agent_visible(auth, &agent)
 }
 
 fn normalize_group_name(value: &str) -> Result<String, AppError> {
@@ -1394,14 +1480,12 @@ async fn apply_batch_action(
     target_group_id: Option<&str>,
 ) -> Result<(), String> {
     let agent_id = parse_agent_id(id).map_err(error_message)?;
-    if !server_visible(auth, &agent_id) {
-        return Err("agent not in scope".into());
-    }
     let row = agent_repo
         .find_by_id_with_state(agent_id)
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "agent not found".to_string())?;
+    ensure_agent_visible(auth, &row.agent).map_err(error_message)?;
 
     match action {
         ServerBatchAction::Delete => {
@@ -1563,6 +1647,21 @@ fn require_transfer_admin(auth: &AuthSession) -> Result<(), AppError> {
         return Err(AppError::Forbidden(
             "admin role required for ownership transfer".into(),
         ));
+    }
+    if matches!(auth.auth_kind, AuthKind::PersonalAccessToken) {
+        return Err(AppError::Forbidden(
+            "Cookie session required for ownership transfer".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_admin_cookie_session(auth: &AuthSession) -> Result<(), AppError> {
+    if !auth.role.is_admin() {
+        return Err(AppError::Forbidden("admin role required".into()));
+    }
+    if matches!(auth.auth_kind, AuthKind::PersonalAccessToken) {
+        return Err(AppError::Forbidden("Cookie session required".into()));
     }
     Ok(())
 }
@@ -2389,6 +2488,7 @@ fn error_message(error: AppError) -> String {
         AppError::Unauthorized(message)
         | AppError::Forbidden(message)
         | AppError::BadRequest(message)
+        | AppError::TooManyRequests(message)
         | AppError::NotFound(message) => message,
     }
 }
@@ -2397,32 +2497,14 @@ fn db_err(err: sqlx::Error) -> AppError {
     AppError::Database(anyhow::anyhow!(err))
 }
 
-fn client_ip_from_headers(headers: &HeaderMap) -> String {
-    header_value(headers, "x-forwarded-for")
-        .and_then(|value| {
-            value
-                .split(',')
-                .next()
-                .map(str::trim)
-                .map(ToString::to_string)
-        })
-        .filter(|value| !value.is_empty())
-        .or_else(|| header_value(headers, "x-real-ip"))
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
-fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
+fn client_ip_from_headers(headers: &HeaderMap, peer_addr: SocketAddr) -> String {
+    crate::security::client_ip_from_headers_and_peer(headers, Some(peer_addr))
 }
 
 /// Helper used by tests and the public docs: build a ServerView from
 /// (agent, parsed_state). Pulled out of the route so the offline/online
 /// decision is unit-testable in isolation.
+#[cfg(test)]
 pub fn build_server_view(
     agent_id: AgentId,
     name: String,
@@ -2915,12 +2997,253 @@ pub fn server_visible(auth: &AuthSession, agent_id: &AgentId) -> bool {
     }
 }
 
+pub fn agent_visible(auth: &AuthSession, agent: &Agent) -> bool {
+    server_visible(auth, &agent.id) && (auth.role.is_admin() || agent.owner_user_id == auth.user_id)
+}
+
+pub fn ensure_agent_visible(auth: &AuthSession, agent: &Agent) -> Result<(), AppError> {
+    if agent_visible(auth, agent) {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden("agent not in scope".into()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Utc;
     use serde_json::json;
-    use xlstatus_shared::AgentId;
+    use std::sync::Arc;
+    use uuid::Uuid;
+    use xlstatus_shared::{AgentId, UserId, UserRole};
+
+    fn auth_session(auth_kind: AuthKind, role: UserRole) -> AuthSession {
+        AuthSession {
+            session_id: "session".into(),
+            user_id: UserId(uuid::Uuid::from_bytes([9; 16])),
+            username: "admin".into(),
+            role,
+            csrf_token: "csrf".into(),
+            auth_kind,
+            scopes: vec!["server:read".into(), "server:write".into()],
+            server_ids: None,
+            pat_id: None,
+        }
+    }
+
+    async fn test_db() -> DatabaseBackend {
+        let db = DatabaseBackend::connect("sqlite::memory:", true)
+            .await
+            .unwrap();
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    fn test_state(db: DatabaseBackend) -> AppState {
+        AppState {
+            db,
+            config: Arc::new(crate::config::Config::default()),
+            agent_jwt_challenges: Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            metrics: xlstatus_tsdb::MetricStore::in_memory(),
+            realtime: crate::realtime::BroadcastHub::new(),
+            session_registry: crate::grpc::SessionRegistry::new(),
+            terminal_sessions: crate::api::v1::terminal::TerminalSessionRegistry::new(),
+            io_registry: crate::grpc::IoRegistry::new(),
+        }
+    }
+
+    async fn seed_user(db: &DatabaseBackend, id: Uuid, username: &str, role: &str) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, role, created_at, updated_at) VALUES (?, ?, 'x', ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id.to_string())
+        .bind(username)
+        .bind(role)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_agent(db: &DatabaseBackend, id: Uuid, owner: Uuid, name: &str, created_at: &str) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO agents (id, name, public_key, owner_user_id, created_at, updated_at) VALUES (?, ?, 'pk', ?, ?, ?)",
+        )
+        .bind(id.to_string())
+        .bind(name)
+        .bind(owner.to_string())
+        .bind(created_at)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_server_group(db: &DatabaseBackend, id: Uuid, owner: Uuid, name: &str) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO server_groups (id, owner_user_id, name, created_at, updated_at) VALUES (?, ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id.to_string())
+        .bind(owner.to_string())
+        .bind(name)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_server_group_member(db: &DatabaseBackend, group_id: Uuid, server_id: Uuid) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO server_group_members (group_id, agent_id, created_at) VALUES (?, ?, '2026-01-01T00:00:00Z')",
+        )
+        .bind(group_id.to_string())
+        .bind(server_id.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn admin_pat_server_list_respects_server_allowlist_total() {
+        let db = test_db().await;
+        let admin = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let other = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let allowed_server = Uuid::parse_str("00000000-0000-0000-0000-000000000101").unwrap();
+        let blocked_server = Uuid::parse_str("00000000-0000-0000-0000-000000000202").unwrap();
+
+        seed_user(&db, admin, "admin", "admin").await;
+        seed_user(&db, other, "other", "member").await;
+        seed_agent(
+            &db,
+            allowed_server,
+            admin,
+            "allowed",
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+        seed_agent(
+            &db,
+            blocked_server,
+            other,
+            "blocked",
+            "2026-01-02T00:00:00Z",
+        )
+        .await;
+
+        let mut auth = auth_session(AuthKind::PersonalAccessToken, UserRole::Admin);
+        auth.user_id = UserId(admin);
+        auth.server_ids = Some(vec![allowed_server.to_string()]);
+        auth.pat_id = Some("pat".into());
+
+        let Json(response) = list_servers(
+            State(test_state(db)),
+            auth,
+            Query(ListQuery {
+                limit: 50,
+                offset: 0,
+            }),
+        )
+        .await
+        .unwrap();
+        let data = response.data.unwrap();
+
+        assert_eq!(data.total, 1);
+        assert_eq!(data.servers.len(), 1);
+        assert_eq!(data.servers[0].id, allowed_server.to_string());
+    }
+
+    #[tokio::test]
+    async fn admin_pat_server_groups_respect_server_allowlist() {
+        let db = test_db().await;
+        let admin = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let allowed_server = Uuid::parse_str("00000000-0000-0000-0000-000000000101").unwrap();
+        let blocked_server = Uuid::parse_str("00000000-0000-0000-0000-000000000202").unwrap();
+        let allowed_group = Uuid::parse_str("00000000-0000-0000-0000-000000000301").unwrap();
+        let blocked_group = Uuid::parse_str("00000000-0000-0000-0000-000000000302").unwrap();
+
+        seed_user(&db, admin, "admin", "admin").await;
+        seed_agent(
+            &db,
+            allowed_server,
+            admin,
+            "allowed",
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+        seed_agent(
+            &db,
+            blocked_server,
+            admin,
+            "blocked",
+            "2026-01-02T00:00:00Z",
+        )
+        .await;
+        seed_server_group(&db, allowed_group, admin, "allowed-group").await;
+        seed_server_group(&db, blocked_group, admin, "blocked-group").await;
+        seed_server_group_member(&db, allowed_group, allowed_server).await;
+        seed_server_group_member(&db, blocked_group, blocked_server).await;
+
+        let mut auth = auth_session(AuthKind::PersonalAccessToken, UserRole::Admin);
+        auth.user_id = UserId(admin);
+        auth.server_ids = Some(vec![allowed_server.to_string()]);
+        auth.pat_id = Some("pat".into());
+
+        let (groups, total) = load_server_groups(&db, &auth, 50, 0).await.unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].id, allowed_group.to_string());
+
+        let err = load_server_group(&db, &auth, &blocked_group.to_string())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Forbidden(_)));
+
+        let update_err = update_server_group(
+            State(test_state(db.clone())),
+            auth.clone(),
+            Path(blocked_group.to_string()),
+            Json(UpdateServerGroupRequest {
+                name: Some("renamed".into()),
+                color: None,
+                display_order: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(update_err, AppError::Forbidden(_)));
+
+        let delete_err =
+            delete_server_group(State(test_state(db)), auth, Path(blocked_group.to_string()))
+                .await
+                .unwrap_err();
+        assert!(matches!(delete_err, AppError::Forbidden(_)));
+    }
+
+    #[test]
+    fn ownership_transfer_rejects_admin_pat() {
+        let auth = auth_session(AuthKind::PersonalAccessToken, UserRole::Admin);
+        let err = require_transfer_admin(&auth).unwrap_err();
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[test]
+    fn ownership_transfer_allows_admin_cookie_session() {
+        let auth = auth_session(AuthKind::Session, UserRole::Admin);
+        assert!(require_transfer_admin(&auth).is_ok());
+    }
 
     #[test]
     fn online_when_fresh() {

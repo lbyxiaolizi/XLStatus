@@ -3,7 +3,7 @@
 use crate::api::types::ApiResponse;
 use crate::api::v1::auth::{require_sensitive_totp, AppError, AppState};
 use crate::api::v1::settings::{set_tsdb_retention_days, tsdb_retention_days};
-use crate::auth::middleware::AuthSession;
+use crate::auth::middleware::{AuthKind, AuthSession};
 use axum::{
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, Query, State},
@@ -112,7 +112,7 @@ pub async fn maintenance_status(
     State(state): State<AppState>,
     auth: AuthSession,
 ) -> Result<Json<ApiResponse<MaintenanceStatus>>, AppError> {
-    require_admin(&auth)?;
+    require_admin_cookie_session(&auth)?;
     let sqlite = matches!(state.db, crate::db::DatabaseBackend::Sqlite(_));
     let tsdb_health = state.metrics.health();
     let configured_retention = tsdb_retention_days(&state.db).await?;
@@ -139,7 +139,7 @@ pub async fn download_backup(
     State(state): State<AppState>,
     auth: AuthSession,
 ) -> Result<Response, AppError> {
-    require_admin(&auth)?;
+    require_admin_cookie_session(&auth)?;
     let crate::db::DatabaseBackend::Sqlite(pool) = &state.db else {
         return Err(AppError::BadRequest(
             "backup download currently supports SQLite only".into(),
@@ -180,7 +180,7 @@ pub async fn download_archive(
     State(state): State<AppState>,
     auth: AuthSession,
 ) -> Result<Response, AppError> {
-    require_admin(&auth)?;
+    require_admin_cookie_session(&auth)?;
     let crate::db::DatabaseBackend::Sqlite(pool) = &state.db else {
         return Err(AppError::BadRequest(
             "full archive currently supports SQLite only".into(),
@@ -264,7 +264,7 @@ pub async fn restore_backup(
     Query(query): Query<RestoreQuery>,
     body: Bytes,
 ) -> Result<Json<ApiResponse<MaintenanceRestoreResponse>>, AppError> {
-    require_admin(&auth)?;
+    require_admin_cookie_session(&auth)?;
     if !query.dry_run {
         require_sensitive_totp(&state.db, auth.user_id, &headers).await?;
     }
@@ -330,7 +330,7 @@ pub async fn vacuum_sqlite(
     auth: AuthSession,
     headers: HeaderMap,
 ) -> Result<Json<ApiResponse<MaintenanceActionResponse>>, AppError> {
-    require_admin(&auth)?;
+    require_admin_cookie_session(&auth)?;
     require_sensitive_totp(&state.db, auth.user_id, &headers).await?;
     let crate::db::DatabaseBackend::Sqlite(pool) = &state.db else {
         return Err(AppError::BadRequest(
@@ -350,7 +350,7 @@ pub async fn compact_tsdb(
     auth: AuthSession,
     headers: HeaderMap,
 ) -> Result<Json<ApiResponse<TsdbCompactResponse>>, AppError> {
-    require_admin(&auth)?;
+    require_admin_cookie_session(&auth)?;
     require_sensitive_totp(&state.db, auth.user_id, &headers).await?;
     let before = state.metrics.health();
     let removed = state
@@ -375,7 +375,7 @@ pub async fn update_tsdb_retention(
     headers: HeaderMap,
     Json(req): Json<TsdbRetentionRequest>,
 ) -> Result<Json<ApiResponse<TsdbRetentionResponse>>, AppError> {
-    require_admin(&auth)?;
+    require_admin_cookie_session(&auth)?;
     require_sensitive_totp(&state.db, auth.user_id, &headers).await?;
     let days = req.retention_days.clamp(1, 3650);
     let before = state.metrics.health();
@@ -614,6 +614,16 @@ fn require_admin(auth: &AuthSession) -> Result<(), AppError> {
     }
 }
 
+fn require_admin_cookie_session(auth: &AuthSession) -> Result<(), AppError> {
+    require_admin(auth)?;
+    if matches!(auth.auth_kind, AuthKind::PersonalAccessToken) {
+        return Err(AppError::Forbidden(
+            "Maintenance endpoints require an admin cookie session".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn sql_quote_path(path: &Path) -> String {
     path.to_string_lossy().replace('\'', "''")
 }
@@ -630,6 +640,7 @@ fn db_err(err: sqlx::Error) -> AppError {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use xlstatus_shared::{UserId, UserRole};
 
     #[test]
     fn escapes_sql_path_literal() {
@@ -641,5 +652,35 @@ mod tests {
     fn quotes_sqlite_identifier() {
         assert_eq!(sqlite_quote_identifier("users"), "\"users\"");
         assert_eq!(sqlite_quote_identifier("a\"b"), "\"a\"\"b\"");
+    }
+
+    #[test]
+    fn maintenance_allows_admin_cookie_session() {
+        let auth = auth_session(AuthKind::Session, UserRole::Admin);
+
+        assert!(require_admin_cookie_session(&auth).is_ok());
+    }
+
+    #[test]
+    fn maintenance_rejects_admin_pat_session() {
+        let auth = auth_session(AuthKind::PersonalAccessToken, UserRole::Admin);
+
+        let err = require_admin_cookie_session(&auth).unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    fn auth_session(auth_kind: AuthKind, role: UserRole) -> AuthSession {
+        AuthSession {
+            session_id: "sess".into(),
+            user_id: UserId(uuid::Uuid::from_bytes([1; 16])),
+            username: "admin".into(),
+            role,
+            csrf_token: "csrf".into(),
+            auth_kind,
+            scopes: vec!["admin:*".into()],
+            server_ids: None,
+            pat_id: None,
+        }
     }
 }

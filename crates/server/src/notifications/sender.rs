@@ -1,4 +1,6 @@
-use crate::security::validate_outbound_url;
+use crate::security::{
+    secure_reqwest_client_builder, validate_outbound_url_resolved, ValidatedOutboundUrl,
+};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -84,9 +86,10 @@ impl NotificationSender {
         message: &NotificationMessage,
     ) -> Result<()> {
         let url_text = self.render_url_template(&channel.url, message);
-        let url = validate_outbound_url(&url_text, "notification webhook").await?;
+        let validated = validate_outbound_url_resolved(&url_text, "notification webhook").await?;
+        let url = validated.url.clone();
         let body = self.render_template(&channel.body_template, message)?;
-        let client = self.client_for_channel(channel)?;
+        let client = self.client_for_channel(channel, &validated)?;
         let mut request = self.request_for_method(&client, &channel.request_method, url);
 
         // Add headers
@@ -120,9 +123,10 @@ impl NotificationSender {
         message: &NotificationMessage,
     ) -> Result<()> {
         let url_text = self.render_url_template(&channel.url, message);
-        let url = validate_outbound_url(&url_text, "notification webhook").await?;
+        let validated = validate_outbound_url_resolved(&url_text, "notification webhook").await?;
+        let url = validated.url.clone();
         let body = self.render_template(&channel.body_template, message)?;
-        let client = self.client_for_channel(channel)?;
+        let client = self.client_for_channel(channel, &validated)?;
         let mut request = self.request_for_method(&client, &channel.request_method, url);
 
         for (key, value) in &channel.headers {
@@ -155,9 +159,10 @@ impl NotificationSender {
         message: &NotificationMessage,
     ) -> Result<()> {
         let url_text = self.render_url_template(&channel.url, message);
-        let url = validate_outbound_url(&url_text, "notification webhook").await?;
+        let validated = validate_outbound_url_resolved(&url_text, "notification webhook").await?;
+        let url = validated.url.clone();
         let body = self.render_template(&channel.body_template, message)?;
-        let client = self.client_for_channel(channel)?;
+        let client = self.client_for_channel(channel, &validated)?;
         let mut request = self.request_for_method(&client, &channel.request_method, url);
 
         for (key, value) in &channel.headers {
@@ -210,15 +215,19 @@ impl NotificationSender {
         rendered
     }
 
-    fn client_for_channel(&self, channel: &NotificationChannel) -> Result<reqwest::Client> {
-        if channel.verify_tls {
-            return Ok(self.client.clone());
-        }
-
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none())
-            .danger_accept_invalid_certs(true)
+    fn client_for_channel(
+        &self,
+        channel: &NotificationChannel,
+        validated: &ValidatedOutboundUrl,
+    ) -> Result<reqwest::Client> {
+        let builder =
+            secure_reqwest_client_builder(validated).timeout(std::time::Duration::from_secs(30));
+        let builder = if channel.verify_tls {
+            builder
+        } else {
+            builder.danger_accept_invalid_certs(true)
+        };
+        builder
             .build()
             .context("failed to build notification HTTP client")
     }

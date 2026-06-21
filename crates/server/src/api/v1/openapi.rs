@@ -394,6 +394,18 @@ const ROUTES: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "get",
+        path: "/api/v1/transfers/temp/tokens",
+        summary: "List temporary transfer tokens",
+        protected: true,
+    },
+    RouteSpec {
+        method: "post",
+        path: "/api/v1/transfers/temp/tokens/{id}/revoke",
+        summary: "Revoke temporary transfer token",
+        protected: true,
+    },
+    RouteSpec {
+        method: "get",
         path: "/api/v1/servers/{id}",
         summary: "Read server",
         protected: true,
@@ -768,12 +780,6 @@ const ROUTES: &[RouteSpec] = &[
         method: "get",
         path: "/api/v1/public/servers/{id}",
         summary: "Read public server detail",
-        protected: false,
-    },
-    RouteSpec {
-        method: "get",
-        path: "/api/v1/public/servers/{id}/metrics",
-        summary: "Read public server metrics",
         protected: false,
     },
     RouteSpec {

@@ -39,6 +39,10 @@ xlstatus-agent run --config /etc/xlstatus-agent/agent.json
 {
   "server": "http://dashboard.example.com:8080",
   "grpc_server": "http://dashboard.example.com:50051",
+  "grpc_tls_ca_path": null,
+  "grpc_tls_domain_name": null,
+  "grpc_tls_client_cert_path": null,
+  "grpc_tls_client_key_path": null,
   "agent_id": "...",
   "name": "web-01",
   "public_key": "...",
@@ -48,13 +52,44 @@ xlstatus-agent run --config /etc/xlstatus-agent/agent.json
 
 这个文件包含私钥，建议权限为 `0600`。
 
+## gRPC TLS/mTLS
+
+生产环境如果 gRPC 不在可信内网或 WireGuard/VPC 内，建议把 `--grpc-server` 配置为 `https://...`，并在 Server 设置 `GRPC_TLS_CERT_PATH` 与 `GRPC_TLS_KEY_PATH`。使用私有 CA 时，在 Agent 注册时传入 CA：
+
+```bash
+xlstatus-agent enroll \
+  --server https://dashboard.example.com \
+  --grpc-server https://grpc.dashboard.example.com:50051 \
+  --grpc-tls-ca-path /etc/xlstatus-agent/tls/grpc-ca.crt \
+  --token xle_... \
+  --name web-01 \
+  --config /etc/xlstatus-agent/agent.json
+```
+
+如果 Server 配置了 `GRPC_TLS_CLIENT_CA_PATH` 启用 mTLS，Agent 还必须配置客户端证书和私钥：
+
+```bash
+xlstatus-agent enroll \
+  --server https://dashboard.example.com \
+  --grpc-server https://grpc.dashboard.example.com:50051 \
+  --grpc-tls-ca-path /etc/xlstatus-agent/tls/grpc-ca.crt \
+  --grpc-tls-client-cert-path /etc/xlstatus-agent/tls/agent.crt \
+  --grpc-tls-client-key-path /etc/xlstatus-agent/tls/agent.key \
+  --token xle_... \
+  --name web-01 \
+  --config /etc/xlstatus-agent/agent.json
+```
+
 ## systemd 安装
 
 使用当前 Release 安装脚本：
 
 ```bash
 sudo SERVER_URL=http://dashboard.example.com:8080 \
-  GRPC_SERVER=http://dashboard.example.com:50051 \
+  GRPC_SERVER=https://grpc.dashboard.example.com:50051 \
+  GRPC_TLS_CA_PATH=/etc/xlstatus-agent/tls/grpc-ca.crt \
+  GRPC_TLS_CLIENT_CERT_PATH=/etc/xlstatus-agent/tls/agent.crt \
+  GRPC_TLS_CLIENT_KEY_PATH=/etc/xlstatus-agent/tls/agent.key \
   ENROLLMENT_TOKEN=xle_... \
   AGENT_NAME="$(hostname)" \
   bash -c 'curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.3/install-agent.sh | bash'
@@ -94,12 +129,13 @@ https://github.com/lbyxiaolizi/XLStatus/releases/download/<VERSION>/install-agen
 
 后台“设置 / Agent 安装”默认会从 GitHub Releases 获取最新非草稿版本，并把该版本写入带参数安装命令。
 
-生成链接时会包含 enrollment token；这个 token 建议设置短有效期，并只发给受信任主机。
+生成链接时会包含 enrollment token；后端限制有效期为 1 到 24 小时，建议使用默认 1 小时，并只发给受信任主机。
 
 ## 地址说明
 
 - `--server` 是 Dashboard HTTP API 地址，例如 `http://dashboard.example.com:8080`。
-- `--grpc-server` 是 Agent 长连接地址，例如 `http://dashboard.example.com:50051`。
+- `--grpc-server` 是 Agent 长连接地址，例如 `http://dashboard.example.com:50051` 或 `https://grpc.dashboard.example.com:50051`。
+- `--grpc-tls-ca-path`、`--grpc-tls-domain-name`、`--grpc-tls-client-cert-path`、`--grpc-tls-client-key-path` 只用于 gRPC TLS/mTLS。配置这些字段时 `--grpc-server` 必须使用 `https://`。
 
 两者不能混用。HTTP API 可通过 `/healthz` 检查，gRPC 端口需要确认网络可达。
 

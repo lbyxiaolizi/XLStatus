@@ -1,7 +1,10 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 
-use crate::security::validate_outbound_url;
+use crate::security::{
+    resolve_outbound_host, secure_reqwest_client_builder, validate_outbound_url_resolved,
+    ValidatedOutboundUrl,
+};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -49,9 +52,10 @@ impl ProbeType {
 
 pub async fn probe_http(url: &str, timeout_secs: u64) -> Result<ServiceProbe> {
     let start = Instant::now();
-    let parsed = validate_outbound_url(url, "HTTP monitor").await?;
+    let validated = validate_outbound_url_resolved(url, "HTTP monitor").await?;
+    let parsed = validated.url.clone();
     let cert = if parsed.scheme() == "https" {
-        match probe_tls_certificate(&parsed, timeout_secs).await {
+        match probe_tls_certificate(&validated, timeout_secs).await {
             Ok(cert) => Some(cert),
             Err(e) => {
                 tracing::warn!("failed to inspect TLS certificate for {}: {}", url, e);
@@ -61,9 +65,8 @@ pub async fn probe_http(url: &str, timeout_secs: u64) -> Result<ServiceProbe> {
     } else {
         None
     };
-    let client = reqwest::Client::builder()
+    let client = secure_reqwest_client_builder(&validated)
         .timeout(Duration::from_secs(timeout_secs))
-        .redirect(reqwest::redirect::Policy::none())
         .build()?;
 
     match client.get(parsed.clone()).send().await {
@@ -108,72 +111,67 @@ pub async fn probe_http(url: &str, timeout_secs: u64) -> Result<ServiceProbe> {
 
 pub async fn probe_tcp(host: &str, port: u16, timeout_secs: u64) -> Result<ServiceProbe> {
     let start = Instant::now();
-    let addr = format!("{}:{}", host, port);
+    let addrs = resolve_outbound_host(host, port, "TCP monitor").await?;
 
-    match tokio::time::timeout(
-        Duration::from_secs(timeout_secs),
-        tokio::net::TcpStream::connect(&addr),
-    )
-    .await
-    {
-        Ok(Ok(_stream)) => {
-            let latency_ms = start.elapsed().as_millis() as i32;
-            Ok(ServiceProbe {
-                id: uuid::Uuid::now_v7().to_string(),
-                service_id: String::new(),
-                success: true,
-                latency_ms: Some(latency_ms),
-                status_code: None,
-                error: None,
-                cert_fingerprint: None,
-                cert_not_after: None,
-                checked_at: Utc::now(),
-            })
-        }
-        Ok(Err(e)) => {
-            let latency_ms = start.elapsed().as_millis() as i32;
-            Ok(ServiceProbe {
-                id: uuid::Uuid::now_v7().to_string(),
-                service_id: String::new(),
-                success: false,
-                latency_ms: Some(latency_ms),
-                status_code: None,
-                error: Some(e.to_string()),
-                cert_fingerprint: None,
-                cert_not_after: None,
-                checked_at: Utc::now(),
-            })
-        }
-        Err(_timeout) => {
-            let latency_ms = start.elapsed().as_millis() as i32;
-            Ok(ServiceProbe {
-                id: uuid::Uuid::now_v7().to_string(),
-                service_id: String::new(),
-                success: false,
-                latency_ms: Some(latency_ms),
-                status_code: None,
-                error: Some("Connection timeout".to_string()),
-                cert_fingerprint: None,
-                cert_not_after: None,
-                checked_at: Utc::now(),
-            })
+    for addr in addrs {
+        match tokio::time::timeout(
+            Duration::from_secs(timeout_secs),
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await
+        {
+            Ok(Ok(_stream)) => {
+                let latency_ms = start.elapsed().as_millis() as i32;
+                return Ok(ServiceProbe {
+                    id: uuid::Uuid::now_v7().to_string(),
+                    service_id: String::new(),
+                    success: true,
+                    latency_ms: Some(latency_ms),
+                    status_code: None,
+                    error: None,
+                    cert_fingerprint: None,
+                    cert_not_after: None,
+                    checked_at: Utc::now(),
+                });
+            }
+            Ok(Err(_)) => {}
+            Err(_timeout) => {}
         }
     }
+
+    let latency_ms = start.elapsed().as_millis() as i32;
+    Ok(ServiceProbe {
+        id: uuid::Uuid::now_v7().to_string(),
+        service_id: String::new(),
+        success: false,
+        latency_ms: Some(latency_ms),
+        status_code: None,
+        error: Some("Connection failed".to_string()),
+        cert_fingerprint: None,
+        cert_not_after: None,
+        checked_at: Utc::now(),
+    })
 }
 
 /// ICMP ping probe (requires system ping command)
 #[allow(dead_code)]
 pub async fn probe_icmp(host: &str, timeout_secs: u64) -> Result<ServiceProbe> {
     let start = Instant::now();
+    let addrs = resolve_outbound_host(host, 0, "ICMP monitor").await?;
+    let target = addrs
+        .first()
+        .context("ICMP monitor host did not resolve to any address")?
+        .ip()
+        .to_string();
 
     let output = if cfg!(target_os = "windows") {
         tokio::process::Command::new("ping")
-            .args(["-n", "4", "-w", &(timeout_secs * 1000).to_string(), host])
+            .args(["-n", "4", "-w", &(timeout_secs * 1000).to_string(), &target])
             .output()
             .await?
     } else {
         tokio::process::Command::new("ping")
-            .args(["-c", "4", "-W", &timeout_secs.to_string(), host])
+            .args(["-c", "4", "-W", &timeout_secs.to_string(), &target])
             .output()
             .await?
     };
@@ -225,40 +223,68 @@ fn cert_fields(cert: Option<CertificateStatus>) -> (Option<String>, Option<DateT
     }
 }
 
-async fn probe_tls_certificate(url: &reqwest::Url, timeout_secs: u64) -> Result<CertificateStatus> {
+async fn probe_tls_certificate(
+    validated: &ValidatedOutboundUrl,
+    timeout_secs: u64,
+) -> Result<CertificateStatus> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let host = url
-        .host_str()
-        .context("HTTPS URL must include a host for TLS probing")?
-        .to_string();
-    let port = url.port_or_known_default().unwrap_or(443);
-    let addr = format!("{host}:{port}");
-    let stream = tokio::time::timeout(Duration::from_secs(timeout_secs), TcpStream::connect(&addr))
-        .await
-        .context("TLS TCP connect timed out")??;
+    let host = validated.host.clone();
+    let mut last_error = None;
 
     let config = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
         .with_no_client_auth();
     let connector = TlsConnector::from(Arc::new(config));
-    let server_name = ServerName::try_from(host.clone())
-        .with_context(|| format!("invalid TLS server name: {host}"))?;
-    let tls_stream = tokio::time::timeout(
-        Duration::from_secs(timeout_secs),
-        connector.connect(server_name, stream),
-    )
-    .await
-    .context("TLS handshake timed out")??;
 
-    let (_, session) = tls_stream.get_ref();
-    let certs = session
-        .peer_certificates()
-        .context("TLS peer did not present a certificate")?;
-    let leaf = certs
-        .first()
-        .context("TLS peer certificate chain is empty")?;
-    parse_certificate_status(leaf)
+    for addr in &validated.addrs {
+        let stream =
+            match tokio::time::timeout(Duration::from_secs(timeout_secs), TcpStream::connect(addr))
+                .await
+            {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(err)) => {
+                    last_error = Some(err.to_string());
+                    continue;
+                }
+                Err(_) => {
+                    last_error = Some("TLS TCP connect timed out".to_string());
+                    continue;
+                }
+            };
+        let server_name = ServerName::try_from(host.clone())
+            .with_context(|| format!("invalid TLS server name: {host}"))?;
+        let tls_stream = match tokio::time::timeout(
+            Duration::from_secs(timeout_secs),
+            connector.connect(server_name, stream),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(err)) => {
+                last_error = Some(err.to_string());
+                continue;
+            }
+            Err(_) => {
+                last_error = Some("TLS handshake timed out".to_string());
+                continue;
+            }
+        };
+
+        let (_, session) = tls_stream.get_ref();
+        let certs = session
+            .peer_certificates()
+            .context("TLS peer did not present a certificate")?;
+        let leaf = certs
+            .first()
+            .context("TLS peer certificate chain is empty")?;
+        return parse_certificate_status(leaf);
+    }
+
+    anyhow::bail!(
+        "TLS certificate probe failed: {}",
+        last_error.unwrap_or_else(|| "no resolved addresses".to_string())
+    )
 }
 
 fn parse_certificate_status(leaf: &CertificateDer<'_>) -> Result<CertificateStatus> {

@@ -39,14 +39,14 @@ export default function LoginPage() {
     setLoading(false);
 
     if (response.success && response.data) {
-      const data = response.data as { session_token?: string; user?: unknown; mfa_required?: boolean };
+      const data = response.data as { user?: unknown; mfa_required?: boolean };
       if (data.mfa_required) {
         setMfaRequired(true);
         setTotpCode("");
         return;
       }
-      if (data.session_token && data.user) {
-        localStorage.setItem("session_token", data.session_token);
+      if (data.user) {
+        localStorage.removeItem("session_token");
         localStorage.setItem("user", JSON.stringify(data.user));
         router.push("/dashboard");
         return;
@@ -97,7 +97,7 @@ export default function LoginPage() {
                 required
                 autoComplete="current-password"
                 className={inputClass}
-                placeholder="admin123"
+                placeholder="请输入密码"
               />
             </Field>
             {mfaRequired ? (

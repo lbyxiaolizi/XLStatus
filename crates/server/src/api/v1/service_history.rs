@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::api::types::ApiResponse;
 use crate::api::v1::auth::{AppError, AppState};
+use crate::api::v1::services::ensure_service_id_visible_to_auth;
 use crate::auth::middleware::AuthSession;
 use crate::auth::rbac::has_scope;
 
@@ -65,6 +66,7 @@ pub async fn get_service_history(
     Query(query): Query<HistoryQuery>,
 ) -> Result<Json<ApiResponse<ServiceHistoryResponse>>, AppError> {
     require_scope(&auth, "service:read")?;
+    ensure_service_id_visible_to_auth(&state.db, &auth, &service_id).await?;
     let limit = query.limit.clamp(1, 1000);
     let offset = query.offset.max(0);
     let results: Vec<ServiceResult> = match &state.db {
@@ -167,6 +169,7 @@ pub async fn get_service_uptime(
     Query(query): Query<HistoryQuery>,
 ) -> Result<Json<ApiResponse<ServiceUptimeResponse>>, AppError> {
     require_scope(&auth, "service:read")?;
+    ensure_service_id_visible_to_auth(&state.db, &auth, &service_id).await?;
     let start_time = query
         .start_time
         .unwrap_or_else(|| (Utc::now() - Duration::days(30)).to_rfc3339());

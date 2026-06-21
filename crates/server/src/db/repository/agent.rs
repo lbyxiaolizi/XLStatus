@@ -79,70 +79,92 @@ impl EnrollmentTokenRepository {
 
         match &self.db {
             DatabaseBackend::Sqlite(pool) => {
-                // Find unused, valid token
-                let row = sqlx::query_as::<_, (String, String, String, String, Option<String>, Option<String>, String)>(
-                    "SELECT id, token_hash, created_by_user_id, expires_at, used_at, used_by_agent_id, created_at FROM enrollment_tokens WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?",
+                let result = sqlx::query(
+                    "UPDATE enrollment_tokens SET used_at = ?, used_by_agent_id = ? WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?",
                 )
+                .bind(now.to_rfc3339())
+                .bind(agent_id.0.to_string())
                 .bind(token_hash)
                 .bind(now.to_rfc3339())
+                .execute(pool)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Ok(None);
+                }
+
+                let row = sqlx::query_as::<_, (String, String, String, String, Option<String>, Option<String>, String)>(
+                    "SELECT id, token_hash, created_by_user_id, expires_at, used_at, used_by_agent_id, created_at FROM enrollment_tokens WHERE token_hash = ? AND used_by_agent_id = ?",
+                )
+                .bind(token_hash)
+                .bind(agent_id.0.to_string())
                 .fetch_optional(pool)
                 .await?;
 
-                if let Some((id, token_hash, created_by_user_id, expires_at, _, _, created_at)) =
-                    row
-                {
-                    // Mark as used
-                    sqlx::query("UPDATE enrollment_tokens SET used_at = ?, used_by_agent_id = ? WHERE id = ?")
-                        .bind(now.to_rfc3339())
-                        .bind(agent_id.0.to_string())
-                        .bind(&id)
-                        .execute(pool)
-                        .await?;
+                let Some((
+                    id,
+                    token_hash,
+                    created_by_user_id,
+                    expires_at,
+                    used_at,
+                    used_by_agent_id,
+                    created_at,
+                )) = row
+                else {
+                    return Ok(None);
+                };
 
-                    Ok(Some(EnrollmentToken {
-                        id,
-                        token_hash,
-                        created_by_user_id: UserId(uuid::Uuid::parse_str(&created_by_user_id)?),
-                        expires_at: DateTime::parse_from_rfc3339(&expires_at)?.with_timezone(&Utc),
-                        used_at: Some(now),
-                        used_by_agent_id: Some(agent_id),
-                        created_at: DateTime::parse_from_rfc3339(&created_at)?.with_timezone(&Utc),
-                    }))
-                } else {
-                    Ok(None)
-                }
+                Ok(Some(EnrollmentToken {
+                    id,
+                    token_hash,
+                    created_by_user_id: UserId(uuid::Uuid::parse_str(&created_by_user_id)?),
+                    expires_at: DateTime::parse_from_rfc3339(&expires_at)?.with_timezone(&Utc),
+                    used_at: used_at
+                        .map(|value| {
+                            DateTime::parse_from_rfc3339(&value).map(|dt| dt.with_timezone(&Utc))
+                        })
+                        .transpose()?,
+                    used_by_agent_id: used_by_agent_id
+                        .map(|value| uuid::Uuid::parse_str(&value).map(AgentId))
+                        .transpose()?,
+                    created_at: DateTime::parse_from_rfc3339(&created_at)?.with_timezone(&Utc),
+                }))
             }
             DatabaseBackend::Postgres(pool) => {
                 let row = sqlx::query_as::<_, (uuid::Uuid, String, uuid::Uuid, DateTime<Utc>, Option<DateTime<Utc>>, Option<uuid::Uuid>, DateTime<Utc>)>(
-                    "SELECT id, token_hash, created_by_user_id, expires_at, used_at, used_by_agent_id, created_at FROM enrollment_tokens WHERE token_hash = $1 AND used_at IS NULL AND expires_at > $2",
+                    r#"
+                    UPDATE enrollment_tokens
+                    SET used_at = $1, used_by_agent_id = $2
+                    WHERE token_hash = $3 AND used_at IS NULL AND expires_at > $1
+                    RETURNING id, token_hash, created_by_user_id, expires_at, used_at, used_by_agent_id, created_at
+                    "#,
                 )
-                .bind(token_hash)
                 .bind(now)
+                .bind(agent_id.0)
+                .bind(token_hash)
                 .fetch_optional(pool)
                 .await?;
 
-                if let Some((id, token_hash, created_by_user_id, expires_at, _, _, created_at)) =
-                    row
-                {
-                    sqlx::query("UPDATE enrollment_tokens SET used_at = $1, used_by_agent_id = $2 WHERE id = $3")
-                        .bind(now)
-                        .bind(agent_id.0)
-                        .bind(id)
-                        .execute(pool)
-                        .await?;
-
-                    Ok(Some(EnrollmentToken {
-                        id: id.to_string(),
+                Ok(row.map(
+                    |(
+                        id,
                         token_hash,
-                        created_by_user_id: UserId(created_by_user_id),
+                        created_by_user_id,
                         expires_at,
-                        used_at: Some(now),
-                        used_by_agent_id: Some(agent_id),
+                        used_at,
+                        used_by_agent_id,
                         created_at,
-                    }))
-                } else {
-                    Ok(None)
-                }
+                    )| {
+                        EnrollmentToken {
+                            id: id.to_string(),
+                            token_hash,
+                            created_by_user_id: UserId(created_by_user_id),
+                            expires_at,
+                            used_at,
+                            used_by_agent_id: used_by_agent_id.map(AgentId),
+                            created_at,
+                        }
+                    },
+                ))
             }
         }
     }
@@ -158,7 +180,10 @@ impl AgentRepository {
     }
 
     pub async fn create(&self, input: CreateAgentInput) -> Result<Agent> {
-        let id = AgentId::new();
+        self.create_with_id(AgentId::new(), input).await
+    }
+
+    pub async fn create_with_id(&self, id: AgentId, input: CreateAgentInput) -> Result<Agent> {
         let now = Utc::now();
 
         match &self.db {
@@ -647,50 +672,203 @@ impl AgentRepository {
                 rows
             }
         };
-        let out = rows
-            .into_iter()
-            .map(
-                |(
-                    id,
-                    name,
-                    public_key,
-                    owner_user_id,
-                    last_seen_at,
-                    revoked_at,
-                    created_at,
-                    updated_at,
-                    remark,
-                    expires_at,
-                    renewal_price,
-                    dashboard_metadata_json,
-                    last_state_json,
-                    _last_state_at,
-                    last_info_json,
-                    _last_info_at,
-                )| {
-                    let agent = Agent {
-                        id: AgentId(uuid::Uuid::parse_str(&id).unwrap()),
-                        name,
-                        public_key,
-                        owner_user_id: UserId(uuid::Uuid::parse_str(&owner_user_id).unwrap()),
-                        last_seen_at: last_seen_at.as_deref().and_then(parse_rfc3339_opt),
-                        revoked_at: revoked_at.as_deref().and_then(parse_rfc3339_opt),
-                        created_at: parse_rfc3339_opt(&created_at).unwrap_or_else(Utc::now),
-                        updated_at: parse_rfc3339_opt(&updated_at).unwrap_or_else(Utc::now),
-                    };
-                    AgentWithState {
-                        agent,
-                        remark,
-                        expires_at,
-                        renewal_price,
-                        dashboard_metadata_json,
-                        last_state_json,
-                        last_info_json,
-                    }
-                },
-            )
-            .collect();
-        Ok((out, total))
+        Ok((agent_with_state_rows(rows), total))
+    }
+
+    pub async fn list_with_state_by_owner(
+        &self,
+        owner_user_id: UserId,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<AgentWithState>, i64)> {
+        let rows = match &self.db {
+            DatabaseBackend::Sqlite(pool) => {
+                sqlx::query_as::<_, (String, String, String, String, Option<String>, Option<String>, String, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)>(
+                    r#"
+                    SELECT id, name, public_key, owner_user_id, last_seen_at, revoked_at, created_at, updated_at,
+                           remark, expires_at, renewal_price, dashboard_metadata_json,
+                           last_state_json, last_state_at, last_info_json, last_info_at
+                    FROM agents
+                    WHERE owner_user_id = ?
+                    ORDER BY created_at DESC
+                    LIMIT ? OFFSET ?
+                    "#,
+                )
+                .bind(owner_user_id.0.to_string())
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(pool)
+                .await?
+            }
+            DatabaseBackend::Postgres(pool) => {
+                sqlx::query_as::<
+                    _,
+                    (
+                        String,
+                        String,
+                        String,
+                        String,
+                        Option<String>,
+                        Option<String>,
+                        String,
+                        String,
+                        Option<String>,
+                        Option<String>,
+                        Option<String>,
+                        Option<String>,
+                        Option<String>,
+                        Option<String>,
+                        Option<String>,
+                        Option<String>,
+                    ),
+                >(
+                    r#"
+                    SELECT id::text, name, public_key, owner_user_id::text,
+                           to_char(last_seen_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                           to_char(revoked_at,  'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                           to_char(created_at,  'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                           to_char(updated_at,  'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                           remark, expires_at, renewal_price, dashboard_metadata_json,
+                           last_state_json, last_state_at::text, last_info_json, last_info_at::text
+                    FROM agents
+                    WHERE owner_user_id = $1
+                    ORDER BY created_at DESC
+                    LIMIT $2 OFFSET $3
+                    "#,
+                )
+                .bind(owner_user_id.0)
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(pool)
+                .await?
+            }
+        };
+        let total = self.count_by_owner(owner_user_id).await?;
+        Ok((agent_with_state_rows(rows), total))
+    }
+
+    pub async fn list_with_state_by_server_ids(
+        &self,
+        owner_user_id: Option<UserId>,
+        server_ids: &[String],
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<AgentWithState>, i64)> {
+        if server_ids.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+
+        match &self.db {
+            DatabaseBackend::Sqlite(pool) => {
+                let placeholders = std::iter::repeat_n("?", server_ids.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let owner_filter = owner_user_id
+                    .map(|_| " AND owner_user_id = ?")
+                    .unwrap_or_default();
+                let count_sql = format!(
+                    "SELECT COUNT(*) FROM agents WHERE id IN ({placeholders}){owner_filter}"
+                );
+                let mut count_query = sqlx::query_as::<_, (i64,)>(&count_sql);
+                for id in server_ids {
+                    count_query = count_query.bind(id);
+                }
+                if let Some(owner) = owner_user_id {
+                    count_query = count_query.bind(owner.0.to_string());
+                }
+                let total = count_query.fetch_one(pool).await?.0;
+
+                let list_sql = format!(
+                    r#"
+                    SELECT id, name, public_key, owner_user_id, last_seen_at, revoked_at, created_at, updated_at,
+                           remark, expires_at, renewal_price, dashboard_metadata_json,
+                           last_state_json, last_state_at, last_info_json, last_info_at
+                    FROM agents
+                    WHERE id IN ({placeholders}){owner_filter}
+                    ORDER BY created_at DESC
+                    LIMIT ? OFFSET ?
+                    "#
+                );
+                let mut list_query = sqlx::query_as::<_, AgentWithStateRow>(&list_sql);
+                for id in server_ids {
+                    list_query = list_query.bind(id);
+                }
+                if let Some(owner) = owner_user_id {
+                    list_query = list_query.bind(owner.0.to_string());
+                }
+                let rows = list_query.bind(limit).bind(offset).fetch_all(pool).await?;
+                Ok((agent_with_state_rows(rows), total))
+            }
+            DatabaseBackend::Postgres(pool) => {
+                let parsed_ids: Vec<uuid::Uuid> = server_ids
+                    .iter()
+                    .map(|id| uuid::Uuid::parse_str(id))
+                    .collect::<std::result::Result<_, _>>()?;
+                let total = if let Some(owner) = owner_user_id {
+                    let row: (i64,) = sqlx::query_as(
+                        "SELECT COUNT(*) FROM agents WHERE id = ANY($1::uuid[]) AND owner_user_id = $2",
+                    )
+                    .bind(&parsed_ids)
+                    .bind(owner.0)
+                    .fetch_one(pool)
+                    .await?;
+                    row.0
+                } else {
+                    let row: (i64,) =
+                        sqlx::query_as("SELECT COUNT(*) FROM agents WHERE id = ANY($1::uuid[])")
+                            .bind(&parsed_ids)
+                            .fetch_one(pool)
+                            .await?;
+                    row.0
+                };
+
+                let rows = if let Some(owner) = owner_user_id {
+                    sqlx::query_as::<_, AgentWithStateRow>(
+                        r#"
+                        SELECT id::text, name, public_key, owner_user_id::text,
+                               to_char(last_seen_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                               to_char(revoked_at,  'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                               to_char(created_at,  'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                               to_char(updated_at,  'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                               remark, expires_at, renewal_price, dashboard_metadata_json,
+                               last_state_json, last_state_at::text, last_info_json, last_info_at::text
+                        FROM agents
+                        WHERE id = ANY($1::uuid[]) AND owner_user_id = $2
+                        ORDER BY created_at DESC
+                        LIMIT $3 OFFSET $4
+                        "#,
+                    )
+                    .bind(&parsed_ids)
+                    .bind(owner.0)
+                    .bind(limit)
+                    .bind(offset)
+                    .fetch_all(pool)
+                    .await?
+                } else {
+                    sqlx::query_as::<_, AgentWithStateRow>(
+                        r#"
+                        SELECT id::text, name, public_key, owner_user_id::text,
+                               to_char(last_seen_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                               to_char(revoked_at,  'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                               to_char(created_at,  'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                               to_char(updated_at,  'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                               remark, expires_at, renewal_price, dashboard_metadata_json,
+                               last_state_json, last_state_at::text, last_info_json, last_info_at::text
+                        FROM agents
+                        WHERE id = ANY($1::uuid[])
+                        ORDER BY created_at DESC
+                        LIMIT $2 OFFSET $3
+                        "#,
+                    )
+                    .bind(&parsed_ids)
+                    .bind(limit)
+                    .bind(offset)
+                    .fetch_all(pool)
+                    .await?
+                };
+                Ok((agent_with_state_rows(rows), total))
+            }
+        }
     }
 
     pub async fn count_total(&self) -> Result<i64> {
@@ -705,6 +883,27 @@ impl AgentRepository {
                 let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM agents")
                     .fetch_one(pool)
                     .await?;
+                Ok(row.0)
+            }
+        }
+    }
+
+    pub async fn count_by_owner(&self, owner_user_id: UserId) -> Result<i64> {
+        match &self.db {
+            DatabaseBackend::Sqlite(pool) => {
+                let row: (i64,) =
+                    sqlx::query_as("SELECT COUNT(*) FROM agents WHERE owner_user_id = ?")
+                        .bind(owner_user_id.0.to_string())
+                        .fetch_one(pool)
+                        .await?;
+                Ok(row.0)
+            }
+            DatabaseBackend::Postgres(pool) => {
+                let row: (i64,) =
+                    sqlx::query_as("SELECT COUNT(*) FROM agents WHERE owner_user_id = $1")
+                        .bind(owner_user_id.0)
+                        .fetch_one(pool)
+                        .await?;
                 Ok(row.0)
             }
         }
@@ -817,9 +1016,170 @@ impl AgentRepository {
     }
 }
 
+type AgentWithStateRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn agent_with_state_rows(rows: Vec<AgentWithStateRow>) -> Vec<AgentWithState> {
+    rows.into_iter()
+        .map(
+            |(
+                id,
+                name,
+                public_key,
+                owner_user_id,
+                last_seen_at,
+                revoked_at,
+                created_at,
+                updated_at,
+                remark,
+                expires_at,
+                renewal_price,
+                dashboard_metadata_json,
+                last_state_json,
+                _last_state_at,
+                last_info_json,
+                _last_info_at,
+            )| {
+                let agent = Agent {
+                    id: AgentId(uuid::Uuid::parse_str(&id).unwrap()),
+                    name,
+                    public_key,
+                    owner_user_id: UserId(uuid::Uuid::parse_str(&owner_user_id).unwrap()),
+                    last_seen_at: last_seen_at.as_deref().and_then(parse_rfc3339_opt),
+                    revoked_at: revoked_at.as_deref().and_then(parse_rfc3339_opt),
+                    created_at: parse_rfc3339_opt(&created_at).unwrap_or_else(Utc::now),
+                    updated_at: parse_rfc3339_opt(&updated_at).unwrap_or_else(Utc::now),
+                };
+                AgentWithState {
+                    agent,
+                    remark,
+                    expires_at,
+                    renewal_price,
+                    dashboard_metadata_json,
+                    last_state_json,
+                    last_info_json,
+                }
+            },
+        )
+        .collect()
+}
+
 /// M3: best-effort rfc3339 parse that returns None on bad input.
 fn parse_rfc3339_opt(s: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .ok()
         .map(|dt| dt.with_timezone(&Utc))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{CreateUserInput, UserRepository};
+    use xlstatus_shared::UserRole;
+
+    #[tokio::test]
+    async fn enrollment_token_can_only_be_consumed_once() {
+        let db = test_db().await;
+        let user = UserRepository::new(db.clone())
+            .create(CreateUserInput {
+                username: "owner".into(),
+                password: "password123".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        let repo = EnrollmentTokenRepository::new(db);
+        let token_hash = "hashed-token";
+        repo.create(
+            CreateEnrollmentTokenInput {
+                created_by_user_id: user.id,
+                expires_at: Utc::now() + chrono::Duration::hours(1),
+            },
+            token_hash.into(),
+        )
+        .await
+        .unwrap();
+
+        let first_agent = AgentId(uuid::Uuid::now_v7());
+        let second_agent = AgentId(uuid::Uuid::now_v7());
+        let first = repo.find_and_use(token_hash, first_agent).await.unwrap();
+        let second = repo.find_and_use(token_hash, second_agent).await.unwrap();
+
+        assert!(first.is_some());
+        assert_eq!(first.unwrap().used_by_agent_id, Some(first_agent));
+        assert!(second.is_none());
+    }
+
+    #[tokio::test]
+    async fn agent_can_be_created_with_preallocated_id_for_enrollment_audit() {
+        let db = test_db().await;
+        let user = UserRepository::new(db.clone())
+            .create(CreateUserInput {
+                username: "owner-fixed".into(),
+                password: "password123".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        let token_repo = EnrollmentTokenRepository::new(db.clone());
+        let token_hash = "hashed-fixed-token";
+        token_repo
+            .create(
+                CreateEnrollmentTokenInput {
+                    created_by_user_id: user.id,
+                    expires_at: Utc::now() + chrono::Duration::hours(1),
+                },
+                token_hash.into(),
+            )
+            .await
+            .unwrap();
+
+        let agent_id = AgentId(uuid::Uuid::now_v7());
+        let token = token_repo
+            .find_and_use(token_hash, agent_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let agent = AgentRepository::new(db)
+            .create_with_id(
+                agent_id,
+                CreateAgentInput {
+                    name: "agent".into(),
+                    public_key: "public-key".into(),
+                    owner_user_id: token.created_by_user_id,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(token.used_by_agent_id, Some(agent.id));
+        assert_eq!(agent.id, agent_id);
+    }
+
+    async fn test_db() -> DatabaseBackend {
+        let path = std::env::temp_dir().join(format!(
+            "xlstatus-agent-repo-test-{}.db",
+            uuid::Uuid::now_v7()
+        ));
+        let url = format!("sqlite://{}?mode=rwc", path.to_string_lossy());
+        let db = DatabaseBackend::connect(&url, true).await.unwrap();
+        db.run_migrations().await.unwrap();
+        db
+    }
 }

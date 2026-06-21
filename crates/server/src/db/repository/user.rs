@@ -2,6 +2,7 @@
 #![allow(unused)]
 
 use crate::db::{models::*, DatabaseBackend};
+use crate::secrets::{decrypt_optional_secret, encrypt_secret};
 use anyhow::Result;
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
@@ -209,9 +210,10 @@ impl UserRepository {
                 .bind(user_id.0.to_string())
                 .fetch_optional(pool)
                 .await?;
-                Ok(row
+                let (secret, enabled) = row
                     .map(|(secret, enabled)| (secret, enabled != 0))
-                    .unwrap_or((None, false)))
+                    .unwrap_or((None, false));
+                Ok((decrypt_optional_secret(secret)?, enabled))
             }
             DatabaseBackend::Postgres(pool) => {
                 let row: Option<(Option<String>, bool)> = sqlx::query_as(
@@ -220,7 +222,8 @@ impl UserRepository {
                 .bind(user_id.0)
                 .fetch_optional(pool)
                 .await?;
-                Ok(row.unwrap_or((None, false)))
+                let (secret, enabled) = row.unwrap_or((None, false));
+                Ok((decrypt_optional_secret(secret)?, enabled))
             }
         }
     }
@@ -232,10 +235,11 @@ impl UserRepository {
         enabled: bool,
     ) -> Result<()> {
         let now = Utc::now();
+        let secret = encrypt_secret(secret)?;
         match &self.db {
             DatabaseBackend::Sqlite(pool) => {
                 sqlx::query("UPDATE users SET totp_secret = ?, totp_enabled = ?, updated_at = ? WHERE id = ?")
-                    .bind(secret)
+                    .bind(&secret)
                     .bind(if enabled { 1_i64 } else { 0_i64 })
                     .bind(now.to_rfc3339())
                     .bind(user_id.0.to_string())
@@ -244,7 +248,7 @@ impl UserRepository {
             }
             DatabaseBackend::Postgres(pool) => {
                 sqlx::query("UPDATE users SET totp_secret = $1, totp_enabled = $2, updated_at = $3 WHERE id = $4")
-                    .bind(secret)
+                    .bind(&secret)
                     .bind(enabled)
                     .bind(now)
                     .bind(user_id.0)
@@ -433,5 +437,62 @@ fn postgres_user_from_row(
         token_version,
         created_at,
         updated_at,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::DatabaseBackend;
+    use crate::secrets::is_encrypted_secret;
+    use sqlx::Row;
+
+    #[tokio::test]
+    async fn totp_secret_is_encrypted_at_rest() {
+        let db = test_db().await;
+        let repo = UserRepository::new(db.clone());
+        let user = repo
+            .create(CreateUserInput {
+                username: "owner".into(),
+                password: "secret".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        repo.set_totp_secret(user.id, "BASE32SECRET", false)
+            .await
+            .unwrap();
+
+        let raw = raw_totp_secret(&db, user.id).await.unwrap();
+        assert!(is_encrypted_secret(&raw));
+        assert_ne!(raw, "BASE32SECRET");
+
+        let (secret, enabled) = repo.totp_config(user.id).await.unwrap();
+        assert_eq!(secret.as_deref(), Some("BASE32SECRET"));
+        assert!(!enabled);
+    }
+
+    async fn test_db() -> DatabaseBackend {
+        let path = std::env::temp_dir().join(format!(
+            "xlstatus-user-secret-test-{}.db",
+            uuid::Uuid::now_v7()
+        ));
+        let url = format!("sqlite://{}?mode=rwc", path.to_string_lossy());
+        let db = DatabaseBackend::connect(&url, true).await.unwrap();
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    async fn raw_totp_secret(db: &DatabaseBackend, user_id: UserId) -> Result<String> {
+        match db {
+            DatabaseBackend::Sqlite(pool) => {
+                let row = sqlx::query("SELECT totp_secret FROM users WHERE id = ?")
+                    .bind(user_id.0.to_string())
+                    .fetch_one(pool)
+                    .await?;
+                Ok(row.try_get("totp_secret")?)
+            }
+            DatabaseBackend::Postgres(_) => unreachable!(),
+        }
     }
 }

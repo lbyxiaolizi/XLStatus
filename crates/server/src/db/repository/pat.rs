@@ -2,7 +2,7 @@
 #![allow(unused)]
 
 use crate::db::{CreatePATInput, DatabaseBackend, PersonalAccessToken};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use xlstatus_shared::UserId;
 
@@ -57,6 +57,7 @@ impl PATRepository {
                     .as_ref()
                     .map(|ids| serde_json::to_value(ids))
                     .transpose()?;
+                let id_uuid = parse_pat_uuid(&id, "id")?;
 
                 sqlx::query(
                     r#"
@@ -65,7 +66,7 @@ impl PATRepository {
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                     "#,
                 )
-                .bind(&id)
+                .bind(id_uuid)
                 .bind(input.user_id.0)
                 .bind(&input.name)
                 .bind(&token_hash)
@@ -157,7 +158,7 @@ impl PATRepository {
                     .collect())
             }
             DatabaseBackend::Postgres(pool) => {
-                let rows = sqlx::query_as::<_, (String, uuid::Uuid, String, String, serde_json::Value, Option<serde_json::Value>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>, DateTime<Utc>, Option<DateTime<Utc>>)>(
+                let rows = sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid, String, String, serde_json::Value, Option<serde_json::Value>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>, DateTime<Utc>, Option<DateTime<Utc>>)>(
                     r#"
                     SELECT id, user_id, name, token_hash, scopes, server_ids, expires_at, last_used_at, last_used_ip, created_at, revoked_at
                     FROM personal_access_tokens
@@ -186,7 +187,7 @@ impl PATRepository {
                             revoked_at,
                         )| {
                             PersonalAccessToken {
-                                id,
+                                id: id.to_string(),
                                 user_id: UserId(user_id_uuid),
                                 name,
                                 token_hash,
@@ -266,7 +267,7 @@ impl PATRepository {
                 ))
             }
             DatabaseBackend::Postgres(pool) => {
-                let row = sqlx::query_as::<_, (String, uuid::Uuid, String, String, serde_json::Value, Option<serde_json::Value>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>, DateTime<Utc>, Option<DateTime<Utc>>)>(
+                let row = sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid, String, String, serde_json::Value, Option<serde_json::Value>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>, DateTime<Utc>, Option<DateTime<Utc>>)>(
                     r#"
                     SELECT id, user_id, name, token_hash, scopes, server_ids, expires_at, last_used_at, last_used_ip, created_at, revoked_at
                     FROM personal_access_tokens
@@ -291,7 +292,107 @@ impl PATRepository {
                         created_at,
                         revoked_at,
                     )| PersonalAccessToken {
+                        id: id.to_string(),
+                        user_id: UserId(user_id_uuid),
+                        name,
+                        token_hash,
+                        scopes: serde_json::from_value(scopes_json).unwrap(),
+                        server_ids: server_ids_json.and_then(|v| serde_json::from_value(v).ok()),
+                        expires_at,
+                        last_used_at,
+                        last_used_ip,
+                        created_at,
+                        revoked_at,
+                    },
+                ))
+            }
+        }
+    }
+
+    pub async fn find_by_id(&self, id: &str) -> Result<Option<PersonalAccessToken>> {
+        match &self.db {
+            DatabaseBackend::Sqlite(pool) => {
+                let row = sqlx::query_as::<_, (String, String, String, String, String, Option<String>, Option<String>, Option<String>, Option<String>, String, Option<String>)>(
+                    r#"
+                    SELECT id, user_id, name, token_hash, scopes, server_ids, expires_at, last_used_at, last_used_ip, created_at, revoked_at
+                    FROM personal_access_tokens
+                    WHERE id = ?
+                    "#,
+                )
+                .bind(id)
+                .fetch_optional(pool)
+                .await?;
+
+                Ok(row.map(
+                    |(
                         id,
+                        user_id_str,
+                        name,
+                        token_hash,
+                        scopes_json,
+                        server_ids_json,
+                        expires_at,
+                        last_used_at,
+                        last_used_ip,
+                        created_at,
+                        revoked_at,
+                    )| PersonalAccessToken {
+                        id,
+                        user_id: UserId(uuid::Uuid::parse_str(&user_id_str).unwrap()),
+                        name,
+                        token_hash,
+                        scopes: serde_json::from_str(&scopes_json).unwrap(),
+                        server_ids: server_ids_json.and_then(|s| serde_json::from_str(&s).ok()),
+                        expires_at: expires_at.and_then(|s| {
+                            DateTime::parse_from_rfc3339(&s)
+                                .ok()
+                                .map(|dt| dt.with_timezone(&Utc))
+                        }),
+                        last_used_at: last_used_at.and_then(|s| {
+                            DateTime::parse_from_rfc3339(&s)
+                                .ok()
+                                .map(|dt| dt.with_timezone(&Utc))
+                        }),
+                        last_used_ip,
+                        created_at: DateTime::parse_from_rfc3339(&created_at)
+                            .unwrap()
+                            .with_timezone(&Utc),
+                        revoked_at: revoked_at.and_then(|s| {
+                            DateTime::parse_from_rfc3339(&s)
+                                .ok()
+                                .map(|dt| dt.with_timezone(&Utc))
+                        }),
+                    },
+                ))
+            }
+            DatabaseBackend::Postgres(pool) => {
+                let id = parse_pat_uuid(id, "id")?;
+                let row = sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid, String, String, serde_json::Value, Option<serde_json::Value>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>, DateTime<Utc>, Option<DateTime<Utc>>)>(
+                    r#"
+                    SELECT id, user_id, name, token_hash, scopes, server_ids, expires_at, last_used_at, last_used_ip, created_at, revoked_at
+                    FROM personal_access_tokens
+                    WHERE id = $1
+                    "#,
+                )
+                .bind(id)
+                .fetch_optional(pool)
+                .await?;
+
+                Ok(row.map(
+                    |(
+                        id,
+                        user_id_uuid,
+                        name,
+                        token_hash,
+                        scopes_json,
+                        server_ids_json,
+                        expires_at,
+                        last_used_at,
+                        last_used_ip,
+                        created_at,
+                        revoked_at,
+                    )| PersonalAccessToken {
+                        id: id.to_string(),
                         user_id: UserId(user_id_uuid),
                         name,
                         token_hash,
@@ -323,6 +424,7 @@ impl PATRepository {
                 .await?;
             }
             DatabaseBackend::Postgres(pool) => {
+                let id = parse_pat_uuid(id, "id")?;
                 sqlx::query(
                     "UPDATE personal_access_tokens SET last_used_at = $1, last_used_ip = $2 WHERE id = $3",
                 )
@@ -357,7 +459,7 @@ impl PATRepository {
                     "UPDATE personal_access_tokens SET revoked_at = $1 WHERE id = $2 AND user_id = $3 AND revoked_at IS NULL",
                 )
                 .bind(now)
-                .bind(id)
+                .bind(parse_pat_uuid(id, "id")?)
                 .bind(user_id.0)
                 .execute(pool)
                 .await?;
@@ -367,4 +469,8 @@ impl PATRepository {
 
         Ok(affected > 0)
     }
+}
+
+fn parse_pat_uuid(value: &str, field: &str) -> Result<uuid::Uuid> {
+    uuid::Uuid::parse_str(value).with_context(|| format!("invalid PAT {field} UUID"))
 }

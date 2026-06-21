@@ -9,6 +9,11 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use xlstatus_shared::AgentId;
 
+const CHALLENGE_TTL_SECONDS: i64 = 60;
+const MAX_PENDING_CHALLENGES: usize = 4096;
+const MAX_PENDING_CHALLENGES_PER_AGENT: usize = 16;
+const NONCE_HEX_LEN: usize = 64;
+
 #[derive(Debug, Deserialize)]
 pub struct GetJwtChallengeRequest {
     pub agent_id: String,
@@ -49,19 +54,26 @@ pub async fn get_agent_jwt_challenge(
         return Err(AppError::Unauthorized("Agent has been revoked".to_string()));
     }
 
+    let now = Utc::now();
+    let mut challenges = state.agent_jwt_challenges.write().await;
+    prune_expired_challenges(&mut challenges, now);
+    if challenges.len() >= MAX_PENDING_CHALLENGES
+        || pending_challenges_for_agent(&challenges, agent_id) >= MAX_PENDING_CHALLENGES_PER_AGENT
+    {
+        return Err(AppError::Forbidden(
+            "too many pending JWT challenges".to_string(),
+        ));
+    }
+
     let mut nonce = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut nonce);
     let nonce = hex::encode(nonce);
-    let expires_at = Utc::now() + Duration::seconds(60);
-    state
-        .agent_jwt_challenges
-        .write()
-        .await
-        .insert(challenge_key(agent_id, &nonce), expires_at);
+    let expires_at = now + Duration::seconds(CHALLENGE_TTL_SECONDS);
+    challenges.insert(challenge_key(agent_id, &nonce), expires_at);
 
     Ok(Json(ApiResponse::success(GetJwtChallengeResponse {
         nonce,
-        expires_in: 60,
+        expires_in: CHALLENGE_TTL_SECONDS,
     })))
 }
 
@@ -70,6 +82,12 @@ pub async fn get_agent_jwt(
     Json(req): Json<GetJwtRequest>,
 ) -> Result<Json<ApiResponse<GetJwtResponse>>, AppError> {
     let agent_id = parse_agent_id(&req.agent_id)?;
+
+    if !valid_nonce_shape(&req.nonce) {
+        return Err(AppError::Unauthorized(
+            "JWT challenge not found".to_string(),
+        ));
+    }
 
     let challenge_key = challenge_key(agent_id, &req.nonce);
     let expires_at = state
@@ -116,6 +134,28 @@ fn challenge_key(agent_id: AgentId, nonce: &str) -> String {
     format!("{}:{}", agent_id.0, nonce)
 }
 
+fn prune_expired_challenges(
+    challenges: &mut std::collections::HashMap<String, chrono::DateTime<Utc>>,
+    now: chrono::DateTime<Utc>,
+) {
+    challenges.retain(|_, expires_at| *expires_at > now);
+}
+
+fn pending_challenges_for_agent(
+    challenges: &std::collections::HashMap<String, chrono::DateTime<Utc>>,
+    agent_id: AgentId,
+) -> usize {
+    let prefix = format!("{}:", agent_id.0);
+    challenges
+        .keys()
+        .filter(|key| key.starts_with(&prefix))
+        .count()
+}
+
+fn valid_nonce_shape(nonce: &str) -> bool {
+    nonce.len() == NONCE_HEX_LEN && nonce.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 fn verify_agent_signature(public_key: &str, nonce: &str, signature: &str) -> Result<(), AppError> {
     let public_key_bytes = hex::decode(public_key)
         .map_err(|_| AppError::BadRequest("Agent public key is not Ed25519 hex".to_string()))?;
@@ -135,4 +175,44 @@ fn verify_agent_signature(public_key: &str, nonce: &str, signature: &str) -> Res
     verifying_key
         .verify(nonce.as_bytes(), &signature)
         .map_err(|_| AppError::Unauthorized("Agent signature verification failed".to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn challenge_pruning_and_agent_count_ignore_expired_items() {
+        let agent_id = AgentId(uuid::Uuid::now_v7());
+        let other_agent_id = AgentId(uuid::Uuid::now_v7());
+        let now = Utc::now();
+        let mut challenges = HashMap::new();
+        challenges.insert(
+            challenge_key(agent_id, &"a".repeat(NONCE_HEX_LEN)),
+            now + Duration::seconds(30),
+        );
+        challenges.insert(
+            challenge_key(agent_id, &"b".repeat(NONCE_HEX_LEN)),
+            now - Duration::seconds(1),
+        );
+        challenges.insert(
+            challenge_key(other_agent_id, &"c".repeat(NONCE_HEX_LEN)),
+            now + Duration::seconds(30),
+        );
+
+        prune_expired_challenges(&mut challenges, now);
+
+        assert_eq!(challenges.len(), 2);
+        assert_eq!(pending_challenges_for_agent(&challenges, agent_id), 1);
+        assert_eq!(pending_challenges_for_agent(&challenges, other_agent_id), 1);
+    }
+
+    #[test]
+    fn nonce_shape_requires_32_byte_hex() {
+        assert!(valid_nonce_shape(&"a".repeat(NONCE_HEX_LEN)));
+        assert!(valid_nonce_shape(&"A".repeat(NONCE_HEX_LEN)));
+        assert!(!valid_nonce_shape(&"a".repeat(NONCE_HEX_LEN - 1)));
+        assert!(!valid_nonce_shape(&"g".repeat(NONCE_HEX_LEN)));
+    }
 }

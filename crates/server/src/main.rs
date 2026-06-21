@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::transport::Server as TonicServer;
+use tonic::transport::{Certificate, Identity, Server as TonicServer, ServerTlsConfig};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use xlstatus_proto_gen::xlstatus::v1::agent_service_server::AgentServiceServer;
 
@@ -26,6 +26,7 @@ mod mcp;
 mod nat;
 mod notifications;
 mod realtime;
+mod secrets;
 mod security;
 mod services;
 mod tasks;
@@ -84,7 +85,10 @@ use api::v1::services::{
 use api::v1::tasks::{
     create_task, delete_task, get_task, get_task_runs, list_tasks, run_task, update_task,
 };
-use api::v1::transfers::{temp_download, temp_upload, upload_body_limit};
+use api::v1::transfers::{
+    list_temporary_transfers, revoke_temporary_transfer, temp_download, temp_upload,
+    upload_body_limit,
+};
 use auth::middleware::session_middleware;
 use xlstatus_shared::UserRole;
 
@@ -152,6 +156,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Load configuration
     let config = config::Config::load()?;
+    secrets::init_secret_crypto(config.secret_encryption_key_material())?;
     tracing::info!("Configuration loaded");
 
     // Connect to database
@@ -162,6 +167,16 @@ async fn main() -> anyhow::Result<()> {
     // Run migrations
     db.run_migrations().await?;
     tracing::info!("Database migrations applied");
+    match secrets::migrate_plaintext_secrets(&db).await {
+        Ok(changed) if changed > 0 => {
+            tracing::info!("Encrypted {} existing plaintext secret values", changed);
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::warn!("Secret migration failed: {}", err);
+            return Err(err);
+        }
+    }
 
     seed_admin_user(&db).await?;
 
@@ -441,6 +456,14 @@ async fn main() -> anyhow::Result<()> {
                     post(api::v1::servers::cancel_server_owner_transfer),
                 )
                 .route(
+                    "/api/v1/transfers/temp/tokens",
+                    get(list_temporary_transfers),
+                )
+                .route(
+                    "/api/v1/transfers/temp/tokens/:id/revoke",
+                    post(revoke_temporary_transfer),
+                )
+                .route(
                     "/api/v1/server-groups",
                     get(api::v1::servers::list_server_groups),
                 )
@@ -524,10 +547,6 @@ async fn main() -> anyhow::Result<()> {
                     "/api/v1/public/servers/:id",
                     get(api::v1::public::public_server_detail),
                 )
-                .route(
-                    "/api/v1/public/servers/:id/metrics",
-                    get(api::v1::public::public_server_metrics),
-                )
                 .route("/api/v1/agents/enroll", post(enroll))
                 .route("/api/v1/transfers/temp/download", get(temp_download))
                 .route(
@@ -549,9 +568,12 @@ async fn main() -> anyhow::Result<()> {
                 .with_context(|| format!("failed to bind HTTP server to {addr}"))?;
 
             tracing::info!("HTTP server listening on {}", addr);
-            axum::serve(listener, app)
-                .await
-                .map_err(|e| anyhow::anyhow!("HTTP server error: {}", e))
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("HTTP server error: {}", e))
         }
 
         run_http_server(http_bind, state).await
@@ -563,7 +585,7 @@ async fn main() -> anyhow::Result<()> {
     api::v1::agent::set_revoke_registry(Arc::new(session_registry.clone()));
 
     // Start gRPC server
-    let grpc_bind = config.server.grpc_bind.clone();
+    let grpc_config = config.clone();
     let grpc_db = db.clone();
     let grpc_session_registry = session_registry.clone();
     let grpc_metrics = metrics.clone();
@@ -571,19 +593,20 @@ async fn main() -> anyhow::Result<()> {
     let grpc_io_registry = io_registry.clone();
     let grpc_handle = tokio::spawn(async move {
         async fn run_grpc_server(
-            bind: String,
+            config: config::Config,
             db: DatabaseBackend,
             session_registry: grpc::SessionRegistry,
             metrics: xlstatus_tsdb::MetricStore,
             realtime: crate::realtime::BroadcastHub,
             io_registry: grpc::IoRegistry,
         ) -> anyhow::Result<()> {
+            let bind = config.server.grpc_bind.clone();
             let addr: SocketAddr = bind.parse()?;
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
                 .with_context(|| format!("failed to bind gRPC server to {addr}"))?;
 
-            let config = config::Config::load()?;
+            let server_tls_config = build_grpc_server_tls_config(&config).await?;
             let agent_service = grpc::AgentServiceImpl::new(
                 db,
                 session_registry,
@@ -592,28 +615,43 @@ async fn main() -> anyhow::Result<()> {
                 realtime,
                 io_registry,
             );
-            let reflection_service = tonic_reflection::server::Builder::configure()
-                .register_encoded_file_descriptor_set(
-                    xlstatus_proto_gen::xlstatus::v1::FILE_DESCRIPTOR_SET,
+            let reflection_service = if config.server.grpc_reflection_enabled {
+                Some(
+                    tonic_reflection::server::Builder::configure()
+                        .register_encoded_file_descriptor_set(
+                            xlstatus_proto_gen::xlstatus::v1::FILE_DESCRIPTOR_SET,
+                        )
+                        .build_v1()
+                        .map_err(|e| {
+                            anyhow::anyhow!("Failed to build reflection service: {}", e)
+                        })?,
                 )
-                .build_v1()
-                .map_err(|e| anyhow::anyhow!("Failed to build reflection service: {}", e))?;
+            } else {
+                None
+            };
 
             let agent_service = AgentServiceServer::new(agent_service)
                 .max_decoding_message_size(GRPC_MESSAGE_LIMIT)
                 .max_encoding_message_size(GRPC_MESSAGE_LIMIT);
 
             tracing::info!("gRPC server listening on {}", addr);
-            TonicServer::builder()
+            let mut server = TonicServer::builder();
+            if let Some(tls_config) = server_tls_config {
+                server = server
+                    .tls_config(tls_config)
+                    .context("failed to configure gRPC TLS")?;
+                tracing::info!("gRPC TLS enabled");
+            }
+            server
                 .add_service(agent_service)
-                .add_service(reflection_service)
+                .add_optional_service(reflection_service)
                 .serve_with_incoming(TcpListenerStream::new(listener))
                 .await
                 .map_err(|e| anyhow::anyhow!("gRPC server error: {}", e))
         }
 
         run_grpc_server(
-            grpc_bind,
+            grpc_config,
             grpc_db,
             grpc_session_registry,
             grpc_metrics,
@@ -650,32 +688,81 @@ async fn healthz() -> &'static str {
     "OK"
 }
 
+async fn build_grpc_server_tls_config(
+    config: &config::Config,
+) -> anyhow::Result<Option<ServerTlsConfig>> {
+    let cert_path = non_empty_config_path(&config.server.grpc_tls_cert_path);
+    let key_path = non_empty_config_path(&config.server.grpc_tls_key_path);
+    let client_ca_path = non_empty_config_path(&config.server.grpc_tls_client_ca_path);
+
+    let (cert_path, key_path) = match (cert_path, key_path) {
+        (None, None) => {
+            if client_ca_path.is_some() {
+                anyhow::bail!(
+                    "GRPC_TLS_CLIENT_CA_PATH requires GRPC_TLS_CERT_PATH and GRPC_TLS_KEY_PATH"
+                );
+            }
+            return Ok(None);
+        }
+        (Some(cert_path), Some(key_path)) => (cert_path, key_path),
+        _ => {
+            anyhow::bail!("GRPC_TLS_CERT_PATH and GRPC_TLS_KEY_PATH must be configured together");
+        }
+    };
+
+    let cert = tokio::fs::read(cert_path)
+        .await
+        .with_context(|| format!("failed to read gRPC TLS certificate from {cert_path}"))?;
+    let key = tokio::fs::read(key_path)
+        .await
+        .with_context(|| format!("failed to read gRPC TLS private key from {key_path}"))?;
+    let mut tls_config = ServerTlsConfig::new().identity(Identity::from_pem(cert, key));
+
+    if let Some(client_ca_path) = client_ca_path {
+        let client_ca = tokio::fs::read(client_ca_path)
+            .await
+            .with_context(|| format!("failed to read gRPC mTLS client CA from {client_ca_path}"))?;
+        tls_config = tls_config.client_ca_root(Certificate::from_pem(client_ca));
+        tracing::info!("gRPC mTLS client certificate verification enabled");
+    }
+
+    Ok(Some(tls_config))
+}
+
+fn non_empty_config_path(value: &Option<String>) -> Option<&str> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct AgentInstallQuery {
     server_url: Option<String>,
     grpc_server: Option<String>,
+    grpc_tls_ca_path: Option<String>,
+    grpc_tls_domain_name: Option<String>,
+    grpc_tls_client_cert_path: Option<String>,
+    grpc_tls_client_key_path: Option<String>,
     enrollment_token: Option<String>,
     agent_name: Option<String>,
     version: Option<String>,
-    script_url: Option<String>,
 }
 
 async fn install_agent_script(Query(query): Query<AgentInstallQuery>) -> impl IntoResponse {
-    let version = query
+    let requested_version = query
         .version
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(DEFAULT_AGENT_INSTALL_VERSION);
-    let custom_script_url = query
-        .script_url
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .map(ToString::to_string);
-    let script_url = custom_script_url.clone().unwrap_or_else(|| {
-        format!(
-            "https://github.com/lbyxiaolizi/XLStatus/releases/download/{version}/install-agent.sh"
-        )
-    });
+    let version = if valid_release_version(requested_version) {
+        requested_version
+    } else {
+        DEFAULT_AGENT_INSTALL_VERSION
+    };
+    let script_url = format!(
+        "https://github.com/lbyxiaolizi/XLStatus/releases/download/{version}/install-agent.sh"
+    );
     let server_url = query
         .server_url
         .as_deref()
@@ -686,6 +773,22 @@ async fn install_agent_script(Query(query): Query<AgentInstallQuery>) -> impl In
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("http://localhost:50051");
+    let grpc_tls_ca_path = query
+        .grpc_tls_ca_path
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    let grpc_tls_domain_name = query
+        .grpc_tls_domain_name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    let grpc_tls_client_cert_path = query
+        .grpc_tls_client_cert_path
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    let grpc_tls_client_key_path = query
+        .grpc_tls_client_key_path
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
     let enrollment_token = query
         .enrollment_token
         .as_deref()
@@ -701,7 +804,7 @@ async fn install_agent_script(Query(query): Query<AgentInstallQuery>) -> impl In
     } else {
         format!("export AGENT_NAME={}", shell_quote(agent_name))
     };
-    let script_url_block = if version == "latest" && custom_script_url.is_none() {
+    let script_url_block = if version == "latest" {
         r#"LATEST_RELEASE_API="https://api.github.com/repos/lbyxiaolizi/XLStatus/releases?per_page=20"
 VERSION="$(curl -fsSL "$LATEST_RELEASE_API" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
 if [ -z "$VERSION" ]; then
@@ -720,6 +823,10 @@ set -e
 export VERSION={version}
 export SERVER_URL={server_url}
 export GRPC_SERVER={grpc_server}
+{grpc_tls_ca_path_line}
+{grpc_tls_domain_name_line}
+{grpc_tls_client_cert_path_line}
+{grpc_tls_client_key_path_line}
 export ENROLLMENT_TOKEN={enrollment_token}
 {agent_name_line}
 
@@ -735,6 +842,13 @@ curl -fsSL "$SCRIPT_URL" | bash
         version = shell_quote(version),
         server_url = shell_quote(server_url),
         grpc_server = shell_quote(grpc_server),
+        grpc_tls_ca_path_line = optional_export_line("GRPC_TLS_CA_PATH", grpc_tls_ca_path),
+        grpc_tls_domain_name_line =
+            optional_export_line("GRPC_TLS_DOMAIN_NAME", grpc_tls_domain_name),
+        grpc_tls_client_cert_path_line =
+            optional_export_line("GRPC_TLS_CLIENT_CERT_PATH", grpc_tls_client_cert_path),
+        grpc_tls_client_key_path_line =
+            optional_export_line("GRPC_TLS_CLIENT_KEY_PATH", grpc_tls_client_key_path),
         enrollment_token = shell_quote(enrollment_token),
         agent_name_line = agent_name_line,
         script_url_block = script_url_block,
@@ -753,6 +867,21 @@ curl -fsSL "$SCRIPT_URL" | bash
         ],
         body,
     )
+}
+
+fn optional_export_line(name: &str, value: Option<&str>) -> String {
+    value
+        .map(|value| format!("export {name}={}", shell_quote(value)))
+        .unwrap_or_default()
+}
+
+fn valid_release_version(value: &str) -> bool {
+    value == "latest"
+        || (!value.is_empty()
+            && value.len() <= 80
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')))
 }
 
 fn shell_quote(value: &str) -> String {

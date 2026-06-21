@@ -3,12 +3,12 @@
 use crate::api::types::ApiResponse;
 use crate::api::v1::auth::{AppError, AppState};
 use crate::api::v1::settings;
-use crate::auth::middleware::AuthSession;
+use crate::auth::middleware::{AuthKind, AuthSession};
 use crate::db::{AgentRepository, DatabaseBackend};
 use crate::notifications::sender::{
     NotificationChannel, NotificationMessage, NotificationSender, NotificationSeverity,
 };
-use crate::security::validate_outbound_url;
+use crate::security::{secure_reqwest_client_builder, validate_outbound_url_resolved};
 use axum::{
     extract::{DefaultBodyLimit, Multipart, Query, State},
     Json,
@@ -160,7 +160,7 @@ pub async fn geoip_status(
     State(_state): State<AppState>,
     auth: AuthSession,
 ) -> Result<Json<ApiResponse<GeoIpMmdbStatus>>, AppError> {
-    require_admin(&auth)?;
+    require_admin_cookie_session(&auth)?;
     Ok(Json(ApiResponse::success(read_mmdb_status())))
 }
 
@@ -169,7 +169,7 @@ pub async fn update_geoip_database(
     auth: AuthSession,
     payload: Option<Json<GeoIpUpdateRequest>>,
 ) -> Result<Json<ApiResponse<GeoIpMaintenanceResponse>>, AppError> {
-    require_admin(&auth)?;
+    require_admin_cookie_session(&auth)?;
     let req = payload.map(|Json(req)| req).unwrap_or_default();
     let source_url = req
         .source_url
@@ -222,7 +222,7 @@ pub async fn upload_geoip_database(
     auth: AuthSession,
     mut multipart: Multipart,
 ) -> Result<Json<ApiResponse<GeoIpMaintenanceResponse>>, AppError> {
-    require_admin(&auth)?;
+    require_admin_cookie_session(&auth)?;
     while let Some(field) = multipart
         .next_field()
         .await
@@ -594,15 +594,14 @@ fn install_mmdb_bytes(bytes: &[u8]) -> Result<GeoIpMmdbStatus, AppError> {
 }
 
 async fn download_mmdb(url: &str) -> Result<Vec<u8>, AppError> {
-    let url = validate_outbound_url(url, "GeoIP MMDB download")
+    let validated = validate_outbound_url_resolved(url, "GeoIP MMDB download")
         .await
         .map_err(|e| AppError::BadRequest(e.to_string()))?;
-    let response = reqwest::Client::builder()
+    let response = secure_reqwest_client_builder(&validated)
         .timeout(std::time::Duration::from_secs(60))
-        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| AppError::BadRequest(format!("GeoIP download client init failed: {e}")))?
-        .get(url)
+        .get(validated.url.clone())
         .send()
         .await
         .map_err(|e| AppError::BadRequest(format!("GeoIP MMDB download failed: {e}")))?;
@@ -994,6 +993,16 @@ fn require_admin(auth: &AuthSession) -> Result<(), AppError> {
     }
 }
 
+fn require_admin_cookie_session(auth: &AuthSession) -> Result<(), AppError> {
+    require_admin(auth)?;
+    if matches!(auth.auth_kind, AuthKind::PersonalAccessToken) {
+        return Err(AppError::Forbidden(
+            "GeoIP maintenance requires an admin cookie session".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn normalize_geoip_provider(value: &str) -> Result<String, AppError> {
     match value.trim().to_ascii_lowercase().as_str() {
         "empty" => Ok("empty".into()),
@@ -1010,6 +1019,7 @@ fn normalize_geoip_provider(value: &str) -> Result<String, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xlstatus_shared::{UserId, UserRole};
 
     #[test]
     fn cleans_valid_ip_only() {
@@ -1023,5 +1033,36 @@ mod tests {
         let value = serde_json::json!({ "lat": "12.5", "lon": 35.0 });
         assert_eq!(json_f64(&value, &["lat"]), Some(12.5));
         assert_eq!(json_f64(&value, &["lon"]), Some(35.0));
+    }
+
+    #[test]
+    fn geoip_maintenance_allows_admin_cookie_session() {
+        let auth = auth_session(AuthKind::Session);
+
+        assert!(require_admin_cookie_session(&auth).is_ok());
+    }
+
+    #[test]
+    fn geoip_maintenance_rejects_admin_pat_session() {
+        let auth = auth_session(AuthKind::PersonalAccessToken);
+
+        assert!(matches!(
+            require_admin_cookie_session(&auth),
+            Err(AppError::Forbidden(_))
+        ));
+    }
+
+    fn auth_session(auth_kind: AuthKind) -> AuthSession {
+        AuthSession {
+            session_id: "sess".into(),
+            user_id: UserId(uuid::Uuid::from_bytes([1; 16])),
+            username: "admin".into(),
+            role: UserRole::Admin,
+            csrf_token: "csrf".into(),
+            auth_kind,
+            scopes: vec!["admin:*".into()],
+            server_ids: None,
+            pat_id: None,
+        }
     }
 }

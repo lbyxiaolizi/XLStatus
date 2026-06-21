@@ -2,11 +2,14 @@
 
 use crate::api::types::ApiResponse;
 use crate::api::v1::auth::{AppError, AppState};
-use crate::auth::middleware::AuthSession;
-use crate::db::DatabaseBackend;
+use crate::api::v1::notifications::ensure_notification_group_owned_by;
+use crate::auth::middleware::{AuthKind, AuthSession};
+use crate::db::{AgentRepository, DatabaseBackend};
+use crate::secrets::{decrypt_secret_if_needed, encrypt_secret, is_encrypted_secret};
 use axum::{extract::State, Json};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use xlstatus_shared::AgentId;
 
 const PUBLIC_SITE_ENABLED: &str = "public_site_enabled";
 const PUBLIC_SITE_NAME: &str = "public_site_name";
@@ -16,6 +19,7 @@ const PUBLIC_THEME_COLOR: &str = "public_theme_color";
 const PUBLIC_BACKGROUND_URL: &str = "public_background_url";
 const PUBLIC_CUSTOM_HEAD: &str = "public_custom_head";
 const PUBLIC_CUSTOM_BODY: &str = "public_custom_body";
+const PUBLIC_SERVER_DETAILS_ENABLED: &str = "public_server_details_enabled";
 const GEOIP_PROVIDER: &str = "geoip_provider";
 const GEOIP_IPINFO_TOKEN: &str = "geoip_ipinfo_token";
 const GEOIP_IP_CHANGE_ENABLED: &str = "geoip_ip_change_enabled";
@@ -47,6 +51,7 @@ pub struct SystemSettingsResponse {
     pub public_background_url: Option<String>,
     pub public_custom_head: Option<String>,
     pub public_custom_body: Option<String>,
+    pub public_server_details_enabled: bool,
     pub geoip_provider: String,
     pub geoip_ipinfo_token_configured: bool,
     pub geoip_ip_change_enabled: bool,
@@ -66,6 +71,7 @@ pub struct UpdateSystemSettingsRequest {
     pub public_background_url: Option<Option<String>>,
     pub public_custom_head: Option<Option<String>>,
     pub public_custom_body: Option<Option<String>>,
+    pub public_server_details_enabled: Option<bool>,
     pub geoip_provider: Option<String>,
     pub geoip_ipinfo_token: Option<String>,
     pub geoip_ip_change_enabled: Option<bool>,
@@ -79,7 +85,7 @@ pub async fn get_settings(
     State(state): State<AppState>,
     auth: AuthSession,
 ) -> Result<Json<ApiResponse<SystemSettingsResponse>>, AppError> {
-    require_admin(&auth)?;
+    require_admin_cookie_session(&auth)?;
     Ok(Json(ApiResponse::success(
         system_settings_response(&state.db).await?,
     )))
@@ -90,7 +96,7 @@ pub async fn update_settings(
     auth: AuthSession,
     Json(req): Json<UpdateSystemSettingsRequest>,
 ) -> Result<Json<ApiResponse<SystemSettingsResponse>>, AppError> {
-    require_admin(&auth)?;
+    require_admin_cookie_session(&auth)?;
     if let Some(enabled) = req.public_site_enabled {
         set_bool_setting(&state.db, PUBLIC_SITE_ENABLED, enabled).await?;
     }
@@ -138,7 +144,7 @@ pub async fn update_settings(
         set_string_setting(
             &state.db,
             PUBLIC_CUSTOM_HEAD,
-            &normalize_optional_text_setting(custom_head, 10_000, "public_custom_head")?,
+            &normalize_disabled_custom_html(custom_head, "public_custom_head")?,
         )
         .await?;
     }
@@ -146,9 +152,12 @@ pub async fn update_settings(
         set_string_setting(
             &state.db,
             PUBLIC_CUSTOM_BODY,
-            &normalize_optional_text_setting(custom_body, 20_000, "public_custom_body")?,
+            &normalize_disabled_custom_html(custom_body, "public_custom_body")?,
         )
         .await?;
+    }
+    if let Some(enabled) = req.public_server_details_enabled {
+        set_bool_setting(&state.db, PUBLIC_SERVER_DETAILS_ENABLED, enabled).await?;
     }
     if let Some(provider) = req.geoip_provider {
         set_string_setting(
@@ -159,26 +168,25 @@ pub async fn update_settings(
         .await?;
     }
     if let Some(token) = req.geoip_ipinfo_token {
-        set_string_setting(&state.db, GEOIP_IPINFO_TOKEN, token.trim()).await?;
+        set_secret_string_setting(&state.db, GEOIP_IPINFO_TOKEN, token.trim()).await?;
     }
     if let Some(enabled) = req.geoip_ip_change_enabled {
         set_bool_setting(&state.db, GEOIP_IP_CHANGE_ENABLED, enabled).await?;
     }
     if let Some(group_id) = req.geoip_ip_change_notification_group_id {
+        let group_id = normalize_optional_id(group_id);
+        ensure_notification_group_owned_by(&state.db, auth.user_id.0, group_id.as_deref()).await?;
         set_string_setting(
             &state.db,
             GEOIP_IP_CHANGE_NOTIFICATION_GROUP_ID,
-            group_id.as_deref().unwrap_or("").trim(),
+            group_id.as_deref().unwrap_or(""),
         )
         .await?;
     }
     if let Some(server_ids) = req.geoip_ip_change_server_ids {
-        set_string_list_setting(
-            &state.db,
-            GEOIP_IP_CHANGE_SERVER_IDS,
-            normalize_string_list(server_ids),
-        )
-        .await?;
+        let server_ids = normalize_string_list(server_ids);
+        ensure_geoip_ip_change_servers_exist(&state.db, &server_ids).await?;
+        set_string_list_setting(&state.db, GEOIP_IP_CHANGE_SERVER_IDS, server_ids).await?;
     }
     if let Some(severity) = req.geoip_ip_change_severity {
         set_string_setting(
@@ -207,8 +215,9 @@ async fn system_settings_response(
         public_favicon_url: branding.favicon_url,
         public_theme_color: branding.theme_color,
         public_background_url: branding.background_url,
-        public_custom_head: branding.custom_head,
-        public_custom_body: branding.custom_body,
+        public_custom_head: get_string_setting(db, PUBLIC_CUSTOM_HEAD).await?,
+        public_custom_body: get_string_setting(db, PUBLIC_CUSTOM_BODY).await?,
+        public_server_details_enabled: public_server_details_enabled(db).await?,
         geoip_provider: geoip_provider(db).await?,
         geoip_ipinfo_token_configured: geoip_ipinfo_token(db).await?.is_some(),
         geoip_ip_change_enabled: geoip_ip_change_enabled(db).await?,
@@ -220,9 +229,15 @@ async fn system_settings_response(
 }
 
 pub async fn public_site_enabled(db: &DatabaseBackend) -> Result<bool, AppError> {
-    Ok(get_bool_setting(db, PUBLIC_SITE_ENABLED)
+    Ok(default_public_site_enabled(
+        get_bool_setting(db, PUBLIC_SITE_ENABLED).await?,
+    ))
+}
+
+pub async fn public_server_details_enabled(db: &DatabaseBackend) -> Result<bool, AppError> {
+    Ok(get_bool_setting(db, PUBLIC_SERVER_DETAILS_ENABLED)
         .await?
-        .unwrap_or(true))
+        .unwrap_or(false))
 }
 
 pub async fn public_site_branding(db: &DatabaseBackend) -> Result<PublicSiteBranding, AppError> {
@@ -234,8 +249,8 @@ pub async fn public_site_branding(db: &DatabaseBackend) -> Result<PublicSiteBran
         favicon_url: get_string_setting(db, PUBLIC_FAVICON_URL).await?,
         theme_color: get_string_setting(db, PUBLIC_THEME_COLOR).await?,
         background_url: get_string_setting(db, PUBLIC_BACKGROUND_URL).await?,
-        custom_head: get_string_setting(db, PUBLIC_CUSTOM_HEAD).await?,
-        custom_body: get_string_setting(db, PUBLIC_CUSTOM_BODY).await?,
+        custom_head: None,
+        custom_body: None,
     })
 }
 
@@ -249,7 +264,7 @@ pub async fn geoip_provider(db: &DatabaseBackend) -> Result<String, AppError> {
 }
 
 pub async fn geoip_ipinfo_token(db: &DatabaseBackend) -> Result<Option<String>, AppError> {
-    Ok(get_string_setting(db, GEOIP_IPINFO_TOKEN).await?)
+    Ok(get_secret_string_setting(db, GEOIP_IPINFO_TOKEN).await?)
 }
 
 pub async fn geoip_ip_change_enabled(db: &DatabaseBackend) -> Result<bool, AppError> {
@@ -298,7 +313,7 @@ pub async fn set_tsdb_retention_days(db: &DatabaseBackend, days: i64) -> Result<
 }
 
 pub async fn cloudflared_token(db: &DatabaseBackend) -> Result<Option<String>, AppError> {
-    get_string_setting(db, CLOUDFLARED_TOKEN).await
+    get_secret_string_setting(db, CLOUDFLARED_TOKEN).await
 }
 
 pub async fn cloudflared_token_configured(db: &DatabaseBackend) -> Result<bool, AppError> {
@@ -309,7 +324,7 @@ pub async fn set_cloudflared_token(
     db: &DatabaseBackend,
     token: Option<String>,
 ) -> Result<(), AppError> {
-    set_string_setting(db, CLOUDFLARED_TOKEN, token.unwrap_or_default().trim()).await
+    set_secret_string_setting(db, CLOUDFLARED_TOKEN, token.unwrap_or_default().trim()).await
 }
 
 async fn get_bool_setting(db: &DatabaseBackend, key: &str) -> Result<Option<bool>, AppError> {
@@ -442,6 +457,31 @@ async fn set_string_setting(db: &DatabaseBackend, key: &str, value: &str) -> Res
     set_raw_setting(db, key, &value_json).await
 }
 
+async fn get_secret_string_setting(
+    db: &DatabaseBackend,
+    key: &str,
+) -> Result<Option<String>, AppError> {
+    get_string_setting(db, key)
+        .await?
+        .map(|value| decrypt_secret_if_needed(&value))
+        .transpose()
+        .map_err(AppError::from)
+}
+
+async fn set_secret_string_setting(
+    db: &DatabaseBackend,
+    key: &str,
+    value: &str,
+) -> Result<(), AppError> {
+    let value = value.trim();
+    let stored = if value.is_empty() || is_encrypted_secret(value) {
+        value.to_string()
+    } else {
+        encrypt_secret(value)?
+    };
+    set_string_setting(db, key, &stored).await
+}
+
 async fn set_raw_setting(
     db: &DatabaseBackend,
     key: &str,
@@ -530,6 +570,20 @@ fn normalize_optional_text_setting(
     Ok(value.to_string())
 }
 
+fn default_public_site_enabled(value: Option<bool>) -> bool {
+    value.unwrap_or(false)
+}
+
+fn normalize_disabled_custom_html(value: Option<String>, field: &str) -> Result<String, AppError> {
+    if value.unwrap_or_default().trim().is_empty() {
+        Ok(String::new())
+    } else {
+        Err(AppError::BadRequest(format!(
+            "{field} is disabled because arbitrary public HTML is not supported"
+        )))
+    }
+}
+
 fn normalize_optional_theme_color(value: Option<String>) -> Result<String, AppError> {
     let value = value.unwrap_or_default();
     let value = value.trim();
@@ -557,6 +611,29 @@ fn normalize_string_list(values: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+fn normalize_optional_id(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+async fn ensure_geoip_ip_change_servers_exist(
+    db: &DatabaseBackend,
+    server_ids: &[String],
+) -> Result<(), AppError> {
+    let repo = AgentRepository::new(db.clone());
+    for server_id in server_ids {
+        let parsed = uuid::Uuid::parse_str(server_id)
+            .map_err(|_| AppError::BadRequest(format!("invalid server id: {server_id}")))?;
+        if repo.find_by_id(AgentId(parsed)).await?.is_none() {
+            return Err(AppError::BadRequest(format!(
+                "geoip_ip_change_server_ids contains unknown server: {server_id}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn require_admin(auth: &AuthSession) -> Result<(), AppError> {
     if auth.role.is_admin() {
         Ok(())
@@ -565,11 +642,78 @@ fn require_admin(auth: &AuthSession) -> Result<(), AppError> {
     }
 }
 
+fn require_admin_cookie_session(auth: &AuthSession) -> Result<(), AppError> {
+    require_admin(auth)?;
+    if matches!(auth.auth_kind, AuthKind::PersonalAccessToken) {
+        return Err(AppError::Forbidden(
+            "System settings require an admin cookie session".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{
+        default_public_site_enabled, normalize_disabled_custom_html, require_admin_cookie_session,
+    };
+    use crate::auth::middleware::{AuthKind, AuthSession};
+    use xlstatus_shared::{UserId, UserRole};
+
     #[test]
     fn parses_bool_json_setting() {
         assert_eq!(serde_json::from_str::<bool>("true").unwrap(), true);
         assert_eq!(serde_json::from_str::<bool>("false").unwrap(), false);
+    }
+
+    #[test]
+    fn rejects_non_empty_public_custom_html() {
+        assert!(
+            normalize_disabled_custom_html(Some("<script>alert(1)</script>".into()), "field")
+                .is_err()
+        );
+        assert_eq!(
+            normalize_disabled_custom_html(Some("   ".into()), "field").unwrap(),
+            ""
+        );
+        assert_eq!(normalize_disabled_custom_html(None, "field").unwrap(), "");
+    }
+
+    #[test]
+    fn public_site_is_private_by_default() {
+        assert!(!default_public_site_enabled(None));
+        assert!(default_public_site_enabled(Some(true)));
+        assert!(!default_public_site_enabled(Some(false)));
+    }
+
+    #[test]
+    fn system_settings_reject_admin_pat_session() {
+        let auth = auth_session(AuthKind::PersonalAccessToken);
+
+        assert!(matches!(
+            require_admin_cookie_session(&auth),
+            Err(super::AppError::Forbidden(_))
+        ));
+    }
+
+    #[test]
+    fn system_settings_allow_admin_cookie_session() {
+        let auth = auth_session(AuthKind::Session);
+
+        assert!(require_admin_cookie_session(&auth).is_ok());
+    }
+
+    fn auth_session(auth_kind: AuthKind) -> AuthSession {
+        AuthSession {
+            session_id: "sess".into(),
+            user_id: UserId(uuid::Uuid::from_bytes([1; 16])),
+            username: "admin".into(),
+            role: UserRole::Admin,
+            csrf_token: "csrf".into(),
+            auth_kind,
+            scopes: vec!["admin:*".into()],
+            server_ids: None,
+            pat_id: None,
+        }
     }
 }

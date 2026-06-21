@@ -255,9 +255,8 @@ async fn execute_tool(
 
     Ok(executor
         .execute(
-            &auth_user.user.id.0.to_string(),
+            &auth_user.auth_session(),
             McpToolRequest { tool, arguments },
-            auth_user.server_ids.as_deref(),
         )
         .await)
 }

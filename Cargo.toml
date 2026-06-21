@@ -19,14 +19,14 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors", "compression-br", "compression-gzip", "set-header"] }
 
 # gRPC
-tonic = { version = "0.12", features = ["transport", "tls"] }
+tonic = { version = "0.12", features = ["transport", "tls", "tls-native-roots"] }
 tonic-build = "0.12"
 tonic-reflection = "0.12"
 prost = "0.13"
 prost-types = "0.13"
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "postgres", "uuid", "chrono", "json"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "postgres", "uuid", "chrono", "json", "macros", "migrate"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

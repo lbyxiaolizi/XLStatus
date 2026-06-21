@@ -1,4 +1,4 @@
-use crate::security::validate_outbound_url;
+use crate::security::{secure_reqwest_client_builder, validate_outbound_url_resolved};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
@@ -249,18 +249,11 @@ impl DdnsProviderTrait for TencentCloudProvider {
 /// Webhook DDNS provider
 pub struct WebhookProvider {
     config: WebhookConfig,
-    client: reqwest::Client,
 }
 
 impl WebhookProvider {
     pub fn new(config: WebhookConfig) -> Self {
-        Self {
-            config,
-            client: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .expect("failed to build DDNS webhook HTTP client"),
-        }
+        Self { config }
     }
 }
 
@@ -272,12 +265,16 @@ impl DdnsProviderTrait for WebhookProvider {
             .url
             .replace("{{ip}}", ip)
             .replace("{{hostname}}", hostname);
-        let url = validate_outbound_url(&url, "DDNS webhook").await?;
+        let validated = validate_outbound_url_resolved(&url, "DDNS webhook").await?;
+        let client = secure_reqwest_client_builder(&validated)
+            .build()
+            .context("failed to build DDNS webhook HTTP client")?;
+        let url = validated.url.clone();
 
         let mut request = match self.config.method.to_uppercase().as_str() {
-            "POST" => self.client.post(url.clone()),
-            "PUT" => self.client.put(url.clone()),
-            _ => self.client.get(url.clone()),
+            "POST" => client.post(url.clone()),
+            "PUT" => client.put(url.clone()),
+            _ => client.get(url.clone()),
         };
 
         // Add custom headers

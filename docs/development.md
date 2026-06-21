@@ -46,9 +46,9 @@ Server：
 DATABASE_URL="sqlite://$(pwd)/data/xlstatus.db?mode=rwc" \
 DATABASE_CREATE_IF_MISSING=true \
 CORS_ALLOWED_ORIGINS="http://localhost:3000,http://127.0.0.1:3000" \
-SESSION_SECRET="dev-secret" \
+SESSION_SECRET="$(openssl rand -hex 32)" \
 XLSTATUS_SEED_ADMIN_USERNAME="admin" \
-XLSTATUS_SEED_ADMIN_PASSWORD="admin123" \
+XLSTATUS_SEED_ADMIN_PASSWORD="replace-with-a-strong-initial-password" \
 cargo run --bin xlstatus-server
 ```
 

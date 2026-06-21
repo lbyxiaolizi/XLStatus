@@ -2,18 +2,21 @@
 
 use crate::api::types::{ApiResponse, UserInfo};
 use crate::api::v1::auth::{
-    active_waf_ban, record_waf_event, register_oauth_failure, AppError, AppState,
+    active_waf_ban, cookie_secure_attr, record_waf_event, register_oauth_failure, AppError,
+    AppState,
 };
 use crate::auth::middleware::{derive_csrf_token, AuthUser, CSRF_COOKIE_NAME, SESSION_COOKIE_NAME};
-use crate::auth::{generate_session_token, hash_token};
+use crate::auth::{generate_session_token, hash_token, SessionRepository};
 use crate::config::OidcProviderConfig;
 use crate::db::{CreateSessionInput, DatabaseBackend, UserRepository};
+use crate::security::{secure_reqwest_client_builder, validate_outbound_url_resolved};
 use axum::{
-    extract::{Path, Query, State},
+    extract::{connect_info::ConnectInfo, Path, Query, State},
     http::{header, HeaderMap, HeaderValue},
     response::{AppendHeaders, IntoResponse, Redirect, Response},
     Json,
 };
+use axum_extra::extract::CookieJar;
 use chrono::{Duration, Utc};
 use hmac::{Hmac, Mac};
 use rand::Rng;
@@ -21,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sha2::Sha256;
 use sqlx::Row;
+use std::net::SocketAddr;
 use xlstatus_shared::UserId;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -126,11 +130,12 @@ pub async fn list_oauth_providers(
 
 pub async fn start_oauth_login(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(provider_id): Path<String>,
     Query(query): Query<OAuthStartQuery>,
 ) -> Result<Response, AppError> {
-    let client_ip = client_ip_from_headers(&headers);
+    let client_ip = crate::security::client_ip_from_headers_and_peer(&headers, Some(peer_addr));
     if active_waf_ban(&state.db, &client_ip).await?.is_some() {
         record_waf_event(
             &state.db,
@@ -210,10 +215,12 @@ pub async fn unbind_oauth_provider(
 
 pub async fn oauth_callback(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    cookie_jar: CookieJar,
     Query(query): Query<OAuthCallbackQuery>,
 ) -> Result<Response, AppError> {
-    let client_ip = client_ip_from_headers(&headers);
+    let client_ip = crate::security::client_ip_from_headers_and_peer(&headers, Some(peer_addr));
     if active_waf_ban(&state.db, &client_ip).await?.is_some() {
         record_waf_event(
             &state.db,
@@ -245,6 +252,31 @@ pub async fn oauth_callback(
     }
 
     let provider = oauth_provider(&state, &oauth_state.provider)?;
+    let bind_user_id = if oauth_state.flow == OAuthFlow::Bind {
+        let user_id = oauth_state
+            .user_id
+            .as_deref()
+            .ok_or(AppError::BadRequest("OAuth bind state missing user".into()))
+            .and_then(parse_user_id)?;
+        let cookie_user_id = cookie_session_user_id(&state, &cookie_jar).await?;
+        if let Err(err) = bind_cookie_session_matches(user_id, cookie_user_id) {
+            register_oauth_failure(
+                &state.db,
+                &client_ip,
+                Some(&oauth_state.provider),
+                match &err {
+                    AppError::Forbidden(_) => "bind session user mismatch",
+                    AppError::Unauthorized(_) => "bind session missing",
+                    _ => "bind session invalid",
+                },
+            )
+            .await?;
+            return Err(err);
+        }
+        Some(user_id)
+    } else {
+        None
+    };
     let code = query
         .code
         .ok_or(AppError::BadRequest("OAuth callback missing code".into()));
@@ -290,11 +322,8 @@ pub async fn oauth_callback(
 
     match oauth_state.flow {
         OAuthFlow::Bind => {
-            let user_id = oauth_state
-                .user_id
-                .as_deref()
-                .ok_or(AppError::BadRequest("OAuth bind state missing user".into()))
-                .and_then(parse_user_id)?;
+            let user_id =
+                bind_user_id.ok_or(AppError::BadRequest("OAuth bind state missing user".into()))?;
             bind_oauth_account(&state.db, user_id, provider, &userinfo).await?;
             Ok(Redirect::temporary(&frontend_redirect(
                 &state,
@@ -329,7 +358,7 @@ pub async fn oauth_callback(
                     "OAuth account user not found".into(),
                 ))?;
             let (session_cookie, csrf_cookie) =
-                create_oauth_session(&state, &headers, user.id).await?;
+                create_oauth_session(&state, &headers, peer_addr, user.id).await?;
             record_waf_event(
                 &state.db,
                 &client_ip,
@@ -429,7 +458,14 @@ async fn exchange_code(
     provider: &OidcProviderConfig,
     code: &str,
 ) -> Result<TokenResponse, AppError> {
-    let client = reqwest::Client::new();
+    let validated = validate_outbound_url_resolved(&provider.token_url, "OAuth token endpoint")
+        .await
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let token_url = validated.url.clone();
+    let client = secure_reqwest_client_builder(&validated)
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| AppError::BadRequest(format!("OAuth token client init failed: {e}")))?;
     let token_auth_method = parse_token_auth_method(&provider.token_auth_method)?;
     if matches!(
         token_auth_method,
@@ -457,7 +493,7 @@ async fn exchange_code(
         }
     }
 
-    let request = client.post(&provider.token_url).form(&form);
+    let request = client.post(token_url).form(&form);
     let request = match token_auth_method {
         TokenAuthMethod::ClientSecretBasic => {
             request.basic_auth(&provider.client_id, Some(&provider.client_secret))
@@ -484,14 +520,20 @@ async fn fetch_userinfo(
     provider: &OidcProviderConfig,
     access_token: &str,
 ) -> Result<OidcUserInfo, AppError> {
-    let client = reqwest::Client::new();
     let userinfo_auth_method = parse_userinfo_auth_method(&provider.userinfo_auth_method)?;
-    let mut url = reqwest::Url::parse(&provider.userinfo_url)
-        .map_err(|e| AppError::BadRequest(format!("invalid OIDC userinfo URL: {e}")))?;
+    let validated =
+        validate_outbound_url_resolved(&provider.userinfo_url, "OIDC userinfo endpoint")
+            .await
+            .map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let mut url = validated.url.clone();
     if matches!(userinfo_auth_method, UserinfoAuthMethod::Query) {
         url.query_pairs_mut()
             .append_pair("access_token", access_token);
     }
+    let client = secure_reqwest_client_builder(&validated)
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| AppError::BadRequest(format!("OIDC userinfo client init failed: {e}")))?;
     let request = client.get(url);
     let request = match userinfo_auth_method {
         UserinfoAuthMethod::Bearer => request.bearer_auth(access_token),
@@ -824,6 +866,7 @@ async fn delete_oauth_account(
 async fn create_oauth_session(
     state: &AppState,
     headers: &HeaderMap,
+    peer_addr: SocketAddr,
     user_id: UserId,
 ) -> Result<(HeaderValue, HeaderValue), AppError> {
     let session_token = generate_session_token();
@@ -834,7 +877,7 @@ async fn create_oauth_session(
         .create(
             CreateSessionInput {
                 user_id,
-                ip: Some(client_ip_from_headers(headers)),
+                ip: Some(client_ip_from_headers(headers, peer_addr)),
                 user_agent: header_value(headers, header::USER_AGENT.as_str()),
                 expires_at,
             },
@@ -843,21 +886,54 @@ async fn create_oauth_session(
         .await?;
 
     let csrf_token = derive_csrf_token(&token_hash);
+    let secure_attr = cookie_secure_attr(state.config.security.cookie_secure);
     let session_cookie = HeaderValue::from_str(&format!(
-        "{}={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}",
+        "{}={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}{}",
         SESSION_COOKIE_NAME,
         session_token,
-        state.config.security.session_ttl_hours * 3600
+        state.config.security.session_ttl_hours * 3600,
+        secure_attr
     ))
     .map_err(|e| AppError::BadRequest(format!("Invalid session cookie: {e}")))?;
     let csrf_cookie = HeaderValue::from_str(&format!(
-        "{}={}; SameSite=Lax; Path=/; Max-Age={}",
+        "{}={}; SameSite=Lax; Path=/; Max-Age={}{}",
         CSRF_COOKIE_NAME,
         csrf_token,
-        state.config.security.session_ttl_hours * 3600
+        state.config.security.session_ttl_hours * 3600,
+        secure_attr
     ))
     .map_err(|e| AppError::BadRequest(format!("Invalid session cookie: {e}")))?;
     Ok((session_cookie, csrf_cookie))
+}
+
+async fn cookie_session_user_id(
+    state: &AppState,
+    cookie_jar: &CookieJar,
+) -> Result<Option<UserId>, AppError> {
+    let Some(cookie) = cookie_jar.get(SESSION_COOKIE_NAME) else {
+        return Ok(None);
+    };
+    let token_hash = hash_token(cookie.value());
+    let session_repo = SessionRepository::new(state.db.clone());
+    let Some(session) = session_repo.find_by_token_hash(&token_hash).await? else {
+        return Ok(None);
+    };
+    Ok(Some(session.user_id))
+}
+
+fn bind_cookie_session_matches(
+    state_user_id: UserId,
+    cookie_user_id: Option<UserId>,
+) -> Result<(), AppError> {
+    match cookie_user_id {
+        Some(cookie_user_id) if cookie_user_id == state_user_id => Ok(()),
+        Some(_) => Err(AppError::Forbidden(
+            "OAuth bind session does not match state user".into(),
+        )),
+        None => Err(AppError::Unauthorized(
+            "OAuth bind requires an active cookie session".into(),
+        )),
+    }
 }
 
 fn frontend_redirect(
@@ -941,18 +1017,8 @@ fn parse_user_id(id: &str) -> Result<UserId, AppError> {
         .map_err(|e| AppError::BadRequest(format!("invalid user id: {e}")))
 }
 
-fn client_ip_from_headers(headers: &HeaderMap) -> String {
-    header_value(headers, "x-forwarded-for")
-        .and_then(|value| {
-            value
-                .split(',')
-                .next()
-                .map(str::trim)
-                .map(ToString::to_string)
-        })
-        .filter(|value| !value.is_empty())
-        .or_else(|| header_value(headers, "x-real-ip"))
-        .unwrap_or_else(|| "unknown".to_string())
+fn client_ip_from_headers(headers: &HeaderMap, peer_addr: SocketAddr) -> String {
+    crate::security::client_ip_from_headers_and_peer(headers, Some(peer_addr))
 }
 
 fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -1032,6 +1098,19 @@ mod tests {
     }
 
     #[test]
+    fn bind_callback_requires_matching_cookie_session() {
+        let user_id = UserId(uuid::Uuid::from_bytes([1; 16]));
+        assert!(bind_cookie_session_matches(user_id, Some(user_id)).is_ok());
+
+        let missing = bind_cookie_session_matches(user_id, None).unwrap_err();
+        assert!(matches!(missing, AppError::Unauthorized(_)));
+
+        let other_id = UserId(uuid::Uuid::from_bytes([2; 16]));
+        let mismatch = bind_cookie_session_matches(user_id, Some(other_id)).unwrap_err();
+        assert!(matches!(mismatch, AppError::Forbidden(_)));
+    }
+
+    #[test]
     fn authorize_url_includes_extra_params_without_overriding_core() {
         let mut provider = test_provider();
         provider
@@ -1081,5 +1160,24 @@ mod tests {
             parse_userinfo_auth_method("access token query").unwrap(),
             UserinfoAuthMethod::Query
         );
+    }
+
+    #[tokio::test]
+    async fn oauth_outbound_requests_reject_private_targets() {
+        let mut provider = test_provider();
+        provider.token_url = "http://127.0.0.1:8080/token".into();
+        let token_err = exchange_code(&provider, "code").await.unwrap_err();
+        assert!(matches!(
+            token_err,
+            AppError::BadRequest(message) if message.contains("disallowed private address")
+        ));
+
+        provider.token_url = "https://login.example.com/token".into();
+        provider.userinfo_url = "http://127.0.0.1:8080/userinfo".into();
+        let userinfo_err = fetch_userinfo(&provider, "access-token").await.unwrap_err();
+        assert!(matches!(
+            userinfo_err,
+            AppError::BadRequest(message) if message.contains("disallowed private address")
+        ));
     }
 }

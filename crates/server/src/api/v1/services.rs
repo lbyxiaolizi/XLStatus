@@ -1,8 +1,11 @@
 use crate::api::types::*;
 use crate::api::v1::auth::{AppError, AppState};
+use crate::api::v1::notifications::ensure_notification_group_owned_by;
+use crate::api::v1::servers::agent_visible;
 use crate::auth::middleware::AuthSession;
 use crate::auth::rbac::has_scope;
-use crate::security::validate_outbound_url;
+use crate::db::AgentRepository;
+use crate::security::{validate_outbound_host, validate_outbound_url};
 use crate::services::{probe_http, probe_icmp, probe_tcp, ProbeType};
 use axum::{
     extract::{Path, Query, State},
@@ -101,18 +104,7 @@ pub struct ProbeTestResponse {
     pub cert_not_after: Option<String>,
 }
 
-pub async fn list_services(
-    State(state): State<AppState>,
-    auth: AuthSession,
-    Query(q): Query<ListServicesQuery>,
-) -> Result<Json<ApiResponse<ServiceListResponse>>, AppError> {
-    require_scope(&auth, "service:read")?;
-    let limit = q.limit.clamp(1, 500);
-    let offset = q.offset.max(0);
-    match &state.db {
-        crate::db::DatabaseBackend::Sqlite(pool) => {
-            let rows = sqlx::query(
-                r#"
+const SERVICE_LIST_SQLITE: &str = r#"
                 SELECT s.id, s.name, s.type, s.target, s.interval_seconds, s.timeout_seconds,
                        s.enabled, s.server_id, s.notification_group_id, s.created_at, s.updated_at,
                        COALESCE(s.cover_mode, 'local') AS cover_mode,
@@ -128,32 +120,9 @@ pub async fn list_services(
                     ORDER BY sr.created_at DESC
                     LIMIT 1
                 )
-                ORDER BY s.created_at DESC
-                LIMIT ? OFFSET ?
-                "#,
-            )
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(pool)
-            .await
-            .map_err(db_err)?;
-            let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM services")
-                .fetch_one(pool)
-                .await
-                .map_err(db_err)?;
-            let mut services = rows
-                .into_iter()
-                .map(service_from_sqlite_row)
-                .collect::<Vec<_>>();
-            attach_service_server_ids(&state.db, &mut services).await?;
-            Ok(Json(ApiResponse::success(ServiceListResponse {
-                services,
-                total: total.0,
-            })))
-        }
-        crate::db::DatabaseBackend::Postgres(pool) => {
-            let rows = sqlx::query(
-                r#"
+"#;
+
+const SERVICE_LIST_POSTGRES: &str = r#"
                 SELECT s.id::text AS id, s.name, s.type, s.target, s.interval_seconds, s.timeout_seconds,
                        s.enabled, s.server_id::text AS server_id, s.notification_group_id::text AS notification_group_id,
                        s.created_at::text AS created_at, s.updated_at::text AS updated_at,
@@ -170,28 +139,130 @@ pub async fn list_services(
                     ORDER BY sr.created_at DESC
                     LIMIT 1
                 )
-                ORDER BY s.created_at DESC
-                LIMIT $1 OFFSET $2
-                "#,
-            )
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(pool)
-            .await
-            .map_err(db_err)?;
-            let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM services")
-                .fetch_one(pool)
+"#;
+
+const VISIBLE_SERVICE_FILTER_SQL: &str = r#"
+                (
+                    EXISTS (
+                        SELECT 1 FROM service_servers ss
+                        JOIN visible_server_ids vsi ON vsi.id = ss.server_id
+                        WHERE ss.service_id = s.id
+                    )
+                    OR (
+                        NOT EXISTS (
+                            SELECT 1 FROM service_servers ss
+                            WHERE ss.service_id = s.id
+                        )
+                        AND s.server_id IS NOT NULL
+                        AND TRIM(s.server_id) <> ''
+                        AND EXISTS (
+                            SELECT 1 FROM visible_server_ids vsi
+                            WHERE vsi.id = s.server_id
+                        )
+                    )
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM service_servers ss
+                    WHERE ss.service_id = s.id
+                    AND NOT EXISTS (
+                        SELECT 1 FROM visible_server_ids vsi
+                        WHERE vsi.id = ss.server_id
+                    )
+                )
+"#;
+
+pub async fn list_services(
+    State(state): State<AppState>,
+    auth: AuthSession,
+    Query(q): Query<ListServicesQuery>,
+) -> Result<Json<ApiResponse<ServiceListResponse>>, AppError> {
+    require_scope(&auth, "service:read")?;
+    let limit = q.limit.clamp(1, 500);
+    let offset = q.offset.max(0);
+    Ok(Json(ApiResponse::success(
+        list_services_for_auth(&state.db, &auth, limit, offset).await?,
+    )))
+}
+
+async fn list_services_for_auth(
+    db: &crate::db::Db,
+    auth: &AuthSession,
+    limit: i64,
+    offset: i64,
+) -> Result<ServiceListResponse, AppError> {
+    match db {
+        crate::db::DatabaseBackend::Sqlite(pool) => {
+            let visible_server_ids = visible_server_ids_for_auth(db, auth).await?;
+            if !auth_has_global_service_visibility(auth) && visible_server_ids.is_empty() {
+                return Ok(ServiceListResponse {
+                    services: Vec::new(),
+                    total: 0,
+                });
+            }
+            let total = if auth_has_global_service_visibility(auth) {
+                let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM services")
+                    .fetch_one(pool)
+                    .await
+                    .map_err(db_err)?;
+                row.0
+            } else {
+                fetch_visible_service_count_sqlite(pool, &visible_server_ids).await?
+            };
+            let rows = if auth_has_global_service_visibility(auth) {
+                sqlx::query(&format!(
+                    "{SERVICE_LIST_SQLITE} ORDER BY s.created_at DESC LIMIT ? OFFSET ?"
+                ))
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(pool)
                 .await
-                .map_err(db_err)?;
+                .map_err(db_err)?
+            } else {
+                fetch_visible_service_rows_sqlite(pool, &visible_server_ids, limit, offset).await?
+            };
+            let mut services = rows
+                .into_iter()
+                .map(service_from_sqlite_row)
+                .collect::<Vec<_>>();
+            attach_service_server_ids(db, &mut services).await?;
+            Ok(ServiceListResponse { services, total })
+        }
+        crate::db::DatabaseBackend::Postgres(pool) => {
+            let visible_server_ids = visible_server_ids_for_auth(db, auth).await?;
+            if !auth_has_global_service_visibility(auth) && visible_server_ids.is_empty() {
+                return Ok(ServiceListResponse {
+                    services: Vec::new(),
+                    total: 0,
+                });
+            }
+            let total = if auth_has_global_service_visibility(auth) {
+                let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM services")
+                    .fetch_one(pool)
+                    .await
+                    .map_err(db_err)?;
+                row.0
+            } else {
+                fetch_visible_service_count_postgres(pool, &visible_server_ids).await?
+            };
+            let rows = if auth_has_global_service_visibility(auth) {
+                sqlx::query(&format!(
+                    "{SERVICE_LIST_POSTGRES} ORDER BY s.created_at DESC LIMIT $1 OFFSET $2"
+                ))
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(pool)
+                .await
+                .map_err(db_err)?
+            } else {
+                fetch_visible_service_rows_postgres(pool, &visible_server_ids, limit, offset)
+                    .await?
+            };
             let mut services = rows
                 .into_iter()
                 .map(service_from_postgres_row)
                 .collect::<Vec<_>>();
-            attach_service_server_ids(&state.db, &mut services).await?;
-            Ok(Json(ApiResponse::success(ServiceListResponse {
-                services,
-                total: total.0,
-            })))
+            attach_service_server_ids(db, &mut services).await?;
+            Ok(ServiceListResponse { services, total })
         }
     }
 }
@@ -203,6 +274,7 @@ pub async fn get_service(
 ) -> Result<Json<ApiResponse<ServiceResponse>>, AppError> {
     require_scope(&auth, "service:read")?;
     let service = load_service(&state.db, &id).await?;
+    ensure_service_visible_to_auth(&state.db, &auth, &service).await?;
     Ok(Json(ApiResponse::success(service)))
 }
 
@@ -215,7 +287,14 @@ pub async fn create_service(
     let input = validate_service_request(req).await?;
     ensure_servers_exist(&state.db, &input.server_ids).await?;
     ensure_servers_exist(&state.db, &input.exclude_server_ids).await?;
+    ensure_service_input_servers_visible(&state.db, &auth, &input).await?;
     let owner = auth.user_id.0.to_string();
+    ensure_notification_group_owned_by(
+        &state.db,
+        auth.user_id.0,
+        input.notification_group_id.as_deref(),
+    )
+    .await?;
     ensure_tasks_owned_by(&state.db, &owner, &input.failure_task_ids).await?;
     ensure_tasks_owned_by(&state.db, &owner, &input.recovery_task_ids).await?;
     let id = Uuid::now_v7().to_string();
@@ -296,9 +375,18 @@ pub async fn update_service(
 ) -> Result<Json<ApiResponse<ServiceResponse>>, AppError> {
     require_scope(&auth, "service:write")?;
     let input = validate_service_request(req).await?;
+    let existing = load_service(&state.db, &id).await?;
+    ensure_service_visible_to_auth(&state.db, &auth, &existing).await?;
     ensure_servers_exist(&state.db, &input.server_ids).await?;
     ensure_servers_exist(&state.db, &input.exclude_server_ids).await?;
+    ensure_service_input_servers_visible(&state.db, &auth, &input).await?;
     let owner = auth.user_id.0.to_string();
+    ensure_notification_group_owned_by(
+        &state.db,
+        auth.user_id.0,
+        input.notification_group_id.as_deref(),
+    )
+    .await?;
     ensure_tasks_owned_by(&state.db, &owner, &input.failure_task_ids).await?;
     ensure_tasks_owned_by(&state.db, &owner, &input.recovery_task_ids).await?;
     let now = Utc::now();
@@ -379,6 +467,8 @@ pub async fn delete_service(
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     require_scope(&auth, "service:delete")?;
+    let service = load_service(&state.db, &id).await?;
+    ensure_service_visible_to_auth(&state.db, &auth, &service).await?;
     let affected = match &state.db {
         crate::db::DatabaseBackend::Sqlite(pool) => {
             sqlx::query("DELETE FROM services WHERE id = ?")
@@ -420,9 +510,17 @@ pub async fn test_probe(
         Some(ProbeType::Http) => probe_http(&req.target, timeout).await,
         Some(ProbeType::Tcp) => {
             let (host, port) = parse_tcp_target(&req.target)?;
+            validate_outbound_host(host, port, "TCP probe")
+                .await
+                .map_err(|e| AppError::BadRequest(e.to_string()))?;
             probe_tcp(host, port, timeout).await
         }
-        Some(ProbeType::Icmp) => probe_icmp(&req.target, timeout).await,
+        Some(ProbeType::Icmp) => {
+            validate_outbound_host(&req.target, 0, "ICMP probe")
+                .await
+                .map_err(|e| AppError::BadRequest(e.to_string()))?;
+            probe_icmp(&req.target, timeout).await
+        }
         None => {
             return Err(AppError::BadRequest("Invalid service type".to_string()));
         }
@@ -489,9 +587,16 @@ async fn validate_service_request(
                 .map_err(|e| AppError::BadRequest(e.to_string()))?;
         }
         ProbeType::Tcp => {
-            parse_tcp_target(&target)?;
+            let (host, port) = parse_tcp_target(&target)?;
+            validate_outbound_host(host, port, "TCP monitor")
+                .await
+                .map_err(|e| AppError::BadRequest(e.to_string()))?;
         }
-        ProbeType::Icmp => {}
+        ProbeType::Icmp => {
+            validate_outbound_host(&target, 0, "ICMP monitor")
+                .await
+                .map_err(|e| AppError::BadRequest(e.to_string()))?;
+        }
     }
     let mut server_ids = Vec::new();
     if let Some(server_id) = req.server_id {
@@ -585,7 +690,10 @@ fn normalize_cover_mode(
     }
 }
 
-async fn load_service(db: &crate::db::Db, id: &str) -> Result<ServiceResponse, AppError> {
+pub(crate) async fn load_service(
+    db: &crate::db::Db,
+    id: &str,
+) -> Result<ServiceResponse, AppError> {
     match db {
         crate::db::DatabaseBackend::Sqlite(pool) => {
             let row = sqlx::query(
@@ -749,6 +857,192 @@ fn service_from_postgres_row(row: sqlx::postgres::PgRow) -> ServiceResponse {
     }
 }
 
+async fn visible_server_ids_for_auth(
+    db: &crate::db::Db,
+    auth: &AuthSession,
+) -> Result<Vec<String>, AppError> {
+    if auth.role.is_admin() && auth.server_ids.is_none() {
+        return Ok(Vec::new());
+    }
+
+    let allowlist = auth
+        .server_ids
+        .as_ref()
+        .map(|ids| normalize_id_list(ids.clone()));
+
+    match db {
+        crate::db::DatabaseBackend::Sqlite(pool) => {
+            let mut query = if auth.role.is_admin() {
+                "SELECT id FROM agents WHERE 1 = 1".to_string()
+            } else {
+                "SELECT id FROM agents WHERE owner_user_id = ?".to_string()
+            };
+            if let Some(ids) = &allowlist {
+                if ids.is_empty() {
+                    return Ok(Vec::new());
+                }
+                query.push_str(" AND id IN (");
+                query.push_str(&placeholders("?", ids.len()));
+                query.push(')');
+            }
+            query.push_str(" ORDER BY id ASC");
+            let mut sql = sqlx::query(&query);
+            if !auth.role.is_admin() {
+                sql = sql.bind(auth.user_id.0.to_string());
+            }
+            if let Some(ids) = &allowlist {
+                for id in ids {
+                    sql = sql.bind(id);
+                }
+            }
+            let rows = sql.fetch_all(pool).await.map_err(db_err)?;
+            Ok(rows
+                .into_iter()
+                .filter_map(|row| row.try_get::<String, _>("id").ok())
+                .collect())
+        }
+        crate::db::DatabaseBackend::Postgres(pool) => {
+            let mut query = if auth.role.is_admin() {
+                "SELECT id::text AS id FROM agents WHERE 1 = 1".to_string()
+            } else {
+                "SELECT id::text AS id FROM agents WHERE owner_user_id = $1".to_string()
+            };
+            if let Some(ids) = &allowlist {
+                if ids.is_empty() {
+                    return Ok(Vec::new());
+                }
+                query.push_str(" AND id IN (");
+                query.push_str(&numbered_placeholders(
+                    if auth.role.is_admin() { 1 } else { 2 },
+                    ids.len(),
+                ));
+                query.push(')');
+            }
+            query.push_str(" ORDER BY id ASC");
+            let mut sql = sqlx::query(&query);
+            if !auth.role.is_admin() {
+                sql = sql.bind(auth.user_id.0);
+            }
+            if let Some(ids) = &allowlist {
+                for id in ids {
+                    let parsed = Uuid::parse_str(id)
+                        .map_err(|e| AppError::BadRequest(format!("invalid server_id: {e}")))?;
+                    sql = sql.bind(parsed);
+                }
+            }
+            let rows = sql.fetch_all(pool).await.map_err(db_err)?;
+            Ok(rows
+                .into_iter()
+                .filter_map(|row| row.try_get::<String, _>("id").ok())
+                .collect())
+        }
+    }
+}
+
+async fn fetch_visible_service_count_sqlite(
+    pool: &sqlx::SqlitePool,
+    visible_server_ids: &[String],
+) -> Result<i64, AppError> {
+    let visible_cte = sqlite_visible_server_ids_cte(visible_server_ids.len());
+    let sql =
+        format!("{visible_cte} SELECT COUNT(*) FROM services s WHERE {VISIBLE_SERVICE_FILTER_SQL}");
+    let mut query = sqlx::query_as::<_, (i64,)>(&sql);
+    for id in visible_server_ids {
+        query = query.bind(id);
+    }
+    let row = query.fetch_one(pool).await.map_err(db_err)?;
+    Ok(row.0)
+}
+
+async fn fetch_visible_service_rows_sqlite(
+    pool: &sqlx::SqlitePool,
+    visible_server_ids: &[String],
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<sqlx::sqlite::SqliteRow>, AppError> {
+    let visible_cte = sqlite_visible_server_ids_cte(visible_server_ids.len());
+    let sql = format!(
+        "{visible_cte} {SERVICE_LIST_SQLITE} WHERE {VISIBLE_SERVICE_FILTER_SQL} ORDER BY s.created_at DESC LIMIT ? OFFSET ?"
+    );
+    let mut query = sqlx::query(&sql);
+    for id in visible_server_ids {
+        query = query.bind(id);
+    }
+    query
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await
+        .map_err(db_err)
+}
+
+async fn fetch_visible_service_count_postgres(
+    pool: &sqlx::PgPool,
+    visible_server_ids: &[String],
+) -> Result<i64, AppError> {
+    let parsed = parse_uuid_ids(visible_server_ids)?;
+    let sql = format!(
+        "WITH visible_server_ids(id) AS (SELECT UNNEST($1::uuid[])) SELECT COUNT(*) FROM services s WHERE {VISIBLE_SERVICE_FILTER_SQL}"
+    );
+    let row: (i64,) = sqlx::query_as(&sql)
+        .bind(parsed)
+        .fetch_one(pool)
+        .await
+        .map_err(db_err)?;
+    Ok(row.0)
+}
+
+async fn fetch_visible_service_rows_postgres(
+    pool: &sqlx::PgPool,
+    visible_server_ids: &[String],
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<sqlx::postgres::PgRow>, AppError> {
+    let parsed = parse_uuid_ids(visible_server_ids)?;
+    let sql = format!(
+        "WITH visible_server_ids(id) AS (SELECT UNNEST($1::uuid[])) {SERVICE_LIST_POSTGRES} WHERE {VISIBLE_SERVICE_FILTER_SQL} ORDER BY s.created_at DESC LIMIT $2 OFFSET $3"
+    );
+    sqlx::query(&sql)
+        .bind(parsed)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await
+        .map_err(db_err)
+}
+
+fn sqlite_visible_server_ids_cte(len: usize) -> String {
+    format!(
+        "WITH visible_server_ids(id) AS (VALUES {})",
+        (0..len).map(|_| "(?)").collect::<Vec<_>>().join(", ")
+    )
+}
+
+fn placeholders(token: &str, len: usize) -> String {
+    std::iter::repeat_n(token, len)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn numbered_placeholders(start: usize, len: usize) -> String {
+    (start..start + len)
+        .map(|index| format!("${index}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn parse_uuid_ids(ids: &[String]) -> Result<Vec<Uuid>, AppError> {
+    ids.iter()
+        .map(|id| {
+            Uuid::parse_str(id).map_err(|e| AppError::BadRequest(format!("invalid server_id: {e}")))
+        })
+        .collect()
+}
+
+fn auth_has_global_service_visibility(auth: &AuthSession) -> bool {
+    auth.role.is_admin() && auth.server_ids.is_none()
+}
+
 async fn attach_service_server_ids(
     db: &crate::db::Db,
     services: &mut [ServiceResponse],
@@ -824,6 +1118,95 @@ async fn ensure_servers_exist(db: &crate::db::Db, server_ids: &[String]) -> Resu
         }
     }
     Ok(())
+}
+
+pub(crate) async fn ensure_service_id_visible_to_auth(
+    db: &crate::db::Db,
+    auth: &AuthSession,
+    service_id: &str,
+) -> Result<(), AppError> {
+    let service = load_service(db, service_id).await?;
+    ensure_service_visible_to_auth(db, auth, &service).await
+}
+
+async fn ensure_service_visible_to_auth(
+    db: &crate::db::Db,
+    auth: &AuthSession,
+    service: &ServiceResponse,
+) -> Result<(), AppError> {
+    if service_visible_to_auth(db, auth, service).await? {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden("service not in scope".into()))
+    }
+}
+
+async fn service_visible_to_auth(
+    db: &crate::db::Db,
+    auth: &AuthSession,
+    service: &ServiceResponse,
+) -> Result<bool, AppError> {
+    if auth_has_global_service_visibility(auth) {
+        return Ok(true);
+    }
+    let server_ids = service_effective_server_ids(service);
+    if server_ids.is_empty() {
+        return Ok(false);
+    }
+    for server_id in server_ids {
+        if !server_visible_to_auth(db, auth, &server_id).await? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+async fn ensure_service_input_servers_visible(
+    db: &crate::db::Db,
+    auth: &AuthSession,
+    input: &ValidServiceInput,
+) -> Result<(), AppError> {
+    if auth_has_global_service_visibility(auth) {
+        return Ok(());
+    }
+    let mut server_ids = input.server_ids.clone();
+    server_ids.extend(input.exclude_server_ids.clone());
+    if server_ids.is_empty() {
+        return Err(AppError::Forbidden(
+            "non-admin services must be scoped to owned servers".into(),
+        ));
+    }
+    for server_id in server_ids {
+        if !server_visible_to_auth(db, auth, &server_id).await? {
+            return Err(AppError::Forbidden("server not in scope".into()));
+        }
+    }
+    Ok(())
+}
+
+async fn server_visible_to_auth(
+    db: &crate::db::Db,
+    auth: &AuthSession,
+    server_id: &str,
+) -> Result<bool, AppError> {
+    let agent_id = Uuid::parse_str(server_id)
+        .map(xlstatus_shared::AgentId)
+        .map_err(|e| AppError::BadRequest(format!("invalid server_id: {e}")))?;
+    let agent = AgentRepository::new(db.clone())
+        .find_by_id(agent_id)
+        .await?
+        .ok_or(AppError::NotFound("server not found".into()))?;
+    Ok(agent_visible(auth, &agent))
+}
+
+fn service_effective_server_ids(service: &ServiceResponse) -> Vec<String> {
+    let mut server_ids = service.server_ids.clone();
+    if let Some(server_id) = &service.server_id {
+        if !server_ids.iter().any(|existing| existing == server_id) {
+            server_ids.push(server_id.clone());
+        }
+    }
+    server_ids
 }
 
 async fn ensure_tasks_owned_by(
@@ -1000,4 +1383,290 @@ fn require_scope(auth: &AuthSession, scope: &str) -> Result<(), AppError> {
 
 fn db_err(err: sqlx::Error) -> AppError {
     AppError::Database(anyhow::anyhow!(err))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::middleware::AuthKind;
+    use crate::db::DatabaseBackend;
+    use xlstatus_shared::{UserId, UserRole};
+
+    #[tokio::test]
+    async fn list_services_filters_visibility_before_pagination() {
+        let db = test_db().await;
+        let owner = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let other = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let own_server = Uuid::parse_str("00000000-0000-0000-0000-000000000101").unwrap();
+        let other_server = Uuid::parse_str("00000000-0000-0000-0000-000000000202").unwrap();
+
+        seed_user(&db, owner, "owner", "member").await;
+        seed_user(&db, other, "other", "member").await;
+        seed_agent(&db, own_server, owner, "own").await;
+        seed_agent(&db, other_server, other, "other").await;
+
+        seed_service(
+            &db,
+            "00000000-0000-0000-0000-000000000301",
+            "other-newer",
+            other_server,
+            "2026-01-03T00:00:00Z",
+        )
+        .await;
+        seed_service(
+            &db,
+            "00000000-0000-0000-0000-000000000302",
+            "own-older",
+            own_server,
+            "2026-01-02T00:00:00Z",
+        )
+        .await;
+        seed_service_with_servers(
+            &db,
+            "00000000-0000-0000-0000-000000000303",
+            "mixed",
+            &[own_server, other_server],
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+
+        let response = list_services_for_auth(&db, &member_session(owner), 1, 0)
+            .await
+            .unwrap();
+
+        assert_eq!(response.total, 1);
+        assert_eq!(response.services.len(), 1);
+        assert_eq!(response.services[0].name, "own-older");
+        assert_eq!(
+            response.services[0].server_ids,
+            vec![own_server.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_pat_service_list_respects_server_allowlist() {
+        let db = test_db().await;
+        let owner = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let other = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let own_server = Uuid::parse_str("00000000-0000-0000-0000-000000000101").unwrap();
+        let other_server = Uuid::parse_str("00000000-0000-0000-0000-000000000202").unwrap();
+
+        seed_user(&db, owner, "owner", "admin").await;
+        seed_user(&db, other, "other", "member").await;
+        seed_agent(&db, own_server, owner, "own").await;
+        seed_agent(&db, other_server, other, "other").await;
+        seed_service(
+            &db,
+            "00000000-0000-0000-0000-000000000301",
+            "own",
+            own_server,
+            "2026-01-02T00:00:00Z",
+        )
+        .await;
+        seed_service(
+            &db,
+            "00000000-0000-0000-0000-000000000302",
+            "other",
+            other_server,
+            "2026-01-03T00:00:00Z",
+        )
+        .await;
+
+        let response = list_services_for_auth(
+            &db,
+            &admin_pat_session(owner, vec![other_server.to_string()]),
+            10,
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.total, 1);
+        assert_eq!(response.services.len(), 1);
+        assert_eq!(response.services[0].name, "other");
+    }
+
+    #[tokio::test]
+    async fn service_history_visibility_rejects_other_owner_service() {
+        let db = test_db().await;
+        let owner = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let other = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let other_server = Uuid::parse_str("00000000-0000-0000-0000-000000000202").unwrap();
+        let other_service = "00000000-0000-0000-0000-000000000302";
+
+        seed_user(&db, owner, "owner", "member").await;
+        seed_user(&db, other, "other", "member").await;
+        seed_agent(&db, other_server, other, "other").await;
+        seed_service(
+            &db,
+            other_service,
+            "other",
+            other_server,
+            "2026-01-03T00:00:00Z",
+        )
+        .await;
+
+        let err = ensure_service_id_visible_to_auth(&db, &member_session(owner), other_service)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn admin_pat_service_write_respects_server_allowlist() {
+        let db = test_db().await;
+        let admin = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let other = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let allowed_server = Uuid::parse_str("00000000-0000-0000-0000-000000000101").unwrap();
+        let blocked_server = Uuid::parse_str("00000000-0000-0000-0000-000000000202").unwrap();
+
+        seed_user(&db, admin, "admin", "admin").await;
+        seed_user(&db, other, "other", "member").await;
+        seed_agent(&db, allowed_server, admin, "allowed").await;
+        seed_agent(&db, blocked_server, other, "blocked").await;
+
+        let mut input = valid_service_input();
+        input.server_ids = vec![blocked_server.to_string()];
+        input.server_id = Some(blocked_server.to_string());
+
+        let err = ensure_service_input_servers_visible(
+            &db,
+            &admin_pat_session(admin, vec![allowed_server.to_string()]),
+            &input,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    async fn test_db() -> DatabaseBackend {
+        let db = DatabaseBackend::connect("sqlite::memory:", true)
+            .await
+            .unwrap();
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    fn member_session(user_id: Uuid) -> AuthSession {
+        AuthSession {
+            session_id: "sess".into(),
+            user_id: UserId(user_id),
+            username: "member".into(),
+            role: UserRole::Member,
+            csrf_token: "csrf".into(),
+            auth_kind: AuthKind::Session,
+            scopes: vec!["service:read".into()],
+            server_ids: None,
+            pat_id: None,
+        }
+    }
+
+    fn admin_pat_session(user_id: Uuid, server_ids: Vec<String>) -> AuthSession {
+        AuthSession {
+            session_id: "sess".into(),
+            user_id: UserId(user_id),
+            username: "admin".into(),
+            role: UserRole::Admin,
+            csrf_token: "csrf".into(),
+            auth_kind: AuthKind::PersonalAccessToken,
+            scopes: vec!["service:read".into()],
+            server_ids: Some(server_ids),
+            pat_id: Some("pat".into()),
+        }
+    }
+
+    fn valid_service_input() -> ValidServiceInput {
+        ValidServiceInput {
+            name: "svc".into(),
+            service_type: ProbeType::Http,
+            target: "https://example.com".into(),
+            interval_seconds: 60,
+            timeout_seconds: 10,
+            enabled: true,
+            server_id: None,
+            server_ids: Vec::new(),
+            cover_mode: "specific".into(),
+            exclude_server_ids: Vec::new(),
+            notification_group_id: None,
+            failure_task_ids: Vec::new(),
+            recovery_task_ids: Vec::new(),
+        }
+    }
+
+    async fn seed_user(db: &DatabaseBackend, id: Uuid, username: &str, role: &str) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, role, created_at, updated_at) VALUES (?, ?, 'x', ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id.to_string())
+        .bind(username)
+        .bind(role)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_agent(db: &DatabaseBackend, id: Uuid, owner: Uuid, name: &str) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO agents (id, name, public_key, owner_user_id, created_at, updated_at) VALUES (?, ?, 'pk', ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id.to_string())
+        .bind(name)
+        .bind(owner.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_service(
+        db: &DatabaseBackend,
+        id: &str,
+        name: &str,
+        server_id: Uuid,
+        created_at: &str,
+    ) {
+        seed_service_with_servers(db, id, name, &[server_id], created_at).await;
+    }
+
+    async fn seed_service_with_servers(
+        db: &DatabaseBackend,
+        id: &str,
+        name: &str,
+        server_ids: &[Uuid],
+        created_at: &str,
+    ) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        let primary = server_ids.first().expect("service must have a server");
+        sqlx::query(
+            "INSERT INTO services (id, name, type, target, interval_seconds, timeout_seconds, enabled, server_id, cover_mode, created_at, updated_at) VALUES (?, ?, 'http', 'https://example.com', 60, 10, 1, ?, 'specific', ?, ?)",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(primary.to_string())
+        .bind(created_at)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .unwrap();
+        for server_id in server_ids {
+            sqlx::query(
+                "INSERT INTO service_servers (service_id, server_id, created_at) VALUES (?, ?, ?)",
+            )
+            .bind(id)
+            .bind(server_id.to_string())
+            .bind(created_at)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
 }

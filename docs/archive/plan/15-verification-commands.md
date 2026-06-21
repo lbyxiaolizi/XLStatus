@@ -18,14 +18,14 @@ curl -f http://localhost:3000
 ## M1 Web Auth + DB
 
 ```bash
-XLSTATUS_SEED_ADMIN_PASSWORD=admin123 \
+XLSTATUS_SEED_ADMIN_PASSWORD=replace-with-a-strong-initial-password \
 DATABASE_URL=sqlite:///tmp/xlstatus.db \
 cargo run -p xlstatus-server &
 
 curl -i -c /tmp/xlstatus.cookies \
   -X POST http://localhost:8080/api/v1/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"admin123"}'
+  -d '{"username":"admin","password":"replace-with-a-strong-initial-password"}'
 
 curl -b /tmp/xlstatus.cookies http://localhost:8080/api/v1/profile
 curl -i -b /tmp/xlstatus.cookies -c /tmp/xlstatus.cookies \
@@ -138,4 +138,3 @@ cargo run -p xlstatus-xtask -- query-bench \
   --period 1d,7d,30d \
   --p95-target-ms 500
 ```
-

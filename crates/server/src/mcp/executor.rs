@@ -1,12 +1,25 @@
 use crate::db::Db;
 use anyhow::{Context, Result};
+use chrono::Utc;
 use hmac::{Hmac, Mac};
 use serde_json::json;
 use sha2::Sha256;
+use xlstatus_proto_gen::xlstatus::v1::{
+    server_task::Spec, FileDeleteTask, FileListTask, FileReadTask, FileWriteTask, ServerTask,
+    TaskOutcome, TaskType,
+};
 use xlstatus_shared::{AgentId, UserId};
 
 use super::tools::{McpToolRequest, McpToolResponse};
+use crate::auth::generate_temporary_transfer_token;
+use crate::auth::middleware::{AuthKind, AuthSession};
 use crate::db::repository::agent::AgentRepository;
+use crate::db::{CreateTemporaryTransferTokenInput, TemporaryTransferTokenRepository};
+
+const MCP_FILE_OP_TIMEOUT_SECS: u64 = 30;
+const MCP_FILE_READ_MAX_BYTES: u64 = 1024 * 1024;
+pub(crate) const TEMP_URL_DEFAULT_EXPIRES_SECS: i64 = 300;
+pub(crate) const TEMP_URL_MAX_EXPIRES_SECS: i64 = 600;
 
 /// MCP tool executor
 pub struct McpExecutor {
@@ -32,50 +45,18 @@ impl McpExecutor {
     }
 
     /// Execute an MCP tool
-    pub async fn execute(
-        &self,
-        user_id: &str,
-        request: McpToolRequest,
-        allowed_server_ids: Option<&[String]>,
-    ) -> McpToolResponse {
+    pub async fn execute(&self, auth: &AuthSession, request: McpToolRequest) -> McpToolResponse {
         let result = match request.tool.as_str() {
-            "meta.whoami" => self.exec_whoami(user_id).await,
-            "server.list" => {
-                self.exec_server_list(user_id, &request.arguments, allowed_server_ids)
-                    .await
-            }
-            "server.get" => {
-                self.exec_server_get(user_id, &request.arguments, allowed_server_ids)
-                    .await
-            }
-            "server.exec" => {
-                self.exec_server_exec(&request.arguments, allowed_server_ids)
-                    .await
-            }
-            "fs.list" => {
-                self.exec_fs_list(&request.arguments, allowed_server_ids)
-                    .await
-            }
-            "fs.read" => {
-                self.exec_fs_read(&request.arguments, allowed_server_ids)
-                    .await
-            }
-            "fs.write" => {
-                self.exec_fs_write(&request.arguments, allowed_server_ids)
-                    .await
-            }
-            "fs.delete" => {
-                self.exec_fs_delete(&request.arguments, allowed_server_ids)
-                    .await
-            }
-            "fs.download_url" => {
-                self.exec_fs_download_url(&request.arguments, allowed_server_ids)
-                    .await
-            }
-            "fs.upload_url" => {
-                self.exec_fs_upload_url(&request.arguments, allowed_server_ids)
-                    .await
-            }
+            "meta.whoami" => self.exec_whoami(&auth.user_id.0.to_string()).await,
+            "server.list" => self.exec_server_list(auth, &request.arguments).await,
+            "server.get" => self.exec_server_get(auth, &request.arguments).await,
+            "server.exec" => self.exec_server_exec(auth, &request.arguments).await,
+            "fs.list" => self.exec_fs_list(auth, &request.arguments).await,
+            "fs.read" => self.exec_fs_read(auth, &request.arguments).await,
+            "fs.write" => self.exec_fs_write(auth, &request.arguments).await,
+            "fs.delete" => self.exec_fs_delete(auth, &request.arguments).await,
+            "fs.download_url" => self.exec_fs_download_url(auth, &request.arguments).await,
+            "fs.upload_url" => self.exec_fs_upload_url(auth, &request.arguments).await,
             _ => Err(anyhow::anyhow!("Unknown tool: {}", request.tool)),
         };
 
@@ -106,21 +87,17 @@ impl McpExecutor {
     /// Execute server.list
     async fn exec_server_list(
         &self,
-        user_id: &str,
+        auth: &AuthSession,
         args: &serde_json::Value,
-        allowed_server_ids: Option<&[String]>,
     ) -> Result<serde_json::Value> {
-        let user_id = parse_user_id(user_id)?;
         let limit = args["limit"].as_i64().unwrap_or(50).clamp(1, 200);
         let offset = args["offset"].as_i64().unwrap_or(0).max(0);
         let repo = AgentRepository::new(self.db.clone());
-        let agents = repo.list_by_owner(user_id, limit, offset).await?;
+        let agents = repo.list_by_owner(auth.user_id, limit, offset).await?;
         let servers: Vec<_> = agents
             .into_iter()
             .filter(|agent| {
-                allowed_server_ids
-                    .map(|ids| ids.iter().any(|id| id == &agent.id.0.to_string()))
-                    .unwrap_or(true)
+                agent_visible_to_auth(auth, agent)
             })
             .map(|agent| {
                 json!({
@@ -147,23 +124,11 @@ impl McpExecutor {
     /// Execute server.get
     async fn exec_server_get(
         &self,
-        user_id: &str,
+        auth: &AuthSession,
         args: &serde_json::Value,
-        allowed_server_ids: Option<&[String]>,
     ) -> Result<serde_json::Value> {
-        let user_id = parse_user_id(user_id)?;
         let server_id = args["server_id"].as_str().context("Missing server_id")?;
-        ensure_server_allowed(server_id, allowed_server_ids)?;
-        let agent_id = AgentId(uuid::Uuid::parse_str(server_id).context("Invalid server_id")?);
-        let repo = AgentRepository::new(self.db.clone());
-        let agent = repo
-            .find_by_id(agent_id)
-            .await?
-            .context("Server not found")?;
-
-        if agent.owner_user_id != user_id {
-            anyhow::bail!("Server not found");
-        }
+        let agent = self.ensure_agent_visible(auth, server_id).await?;
 
         Ok(json!({
             "server_id": agent.id.0.to_string(),
@@ -181,18 +146,16 @@ impl McpExecutor {
     /// Execute server.exec
     async fn exec_server_exec(
         &self,
+        auth: &AuthSession,
         args: &serde_json::Value,
-        allowed_server_ids: Option<&[String]>,
     ) -> Result<serde_json::Value> {
         let server_id = args["server_id"].as_str().context("Missing server_id")?;
-        ensure_server_allowed(server_id, allowed_server_ids)?;
+        let agent_id = self.ensure_agent_visible(auth, server_id).await?.id;
         let command = args["command"].as_str().context("Missing command")?;
         let timeout = args["timeout"].as_i64().unwrap_or(30);
 
         // M6: dispatch the command to the live agent over gRPC and
         // wait up to `timeout` seconds for the `TaskResult`.
-        let agent_uuid = uuid::Uuid::parse_str(server_id).context("server_id must be a UUID")?;
-        let agent_id = AgentId(agent_uuid);
         if !self.session_registry.is_online(&agent_id).await {
             anyhow::bail!("agent {} is offline", server_id);
         }
@@ -240,138 +203,177 @@ impl McpExecutor {
     /// Execute fs.list
     async fn exec_fs_list(
         &self,
+        auth: &AuthSession,
         args: &serde_json::Value,
-        allowed_server_ids: Option<&[String]>,
     ) -> Result<serde_json::Value> {
         let server_id = args["server_id"].as_str().context("Missing server_id")?;
-        ensure_server_allowed(server_id, allowed_server_ids)?;
-        let path = args["path"].as_str().context("Missing path")?;
-
-        // M6: delegate to the agent via `ls -la` shell task.
-        let cmd = format!("ls -la {}", shell_escape(path));
-        let r = self.dispatch_shell(server_id, &cmd, 15).await?;
+        self.ensure_agent_visible(auth, server_id).await?;
+        let path = validate_abs_path(args["path"].as_str().context("Missing path")?)?;
+        let result = self
+            .dispatch_file_task(
+                server_id,
+                ServerTask {
+                    task_id: String::new(),
+                    task_type: TaskType::FileList as i32,
+                    spec: Some(Spec::FileList(FileListTask { path: path.clone() })),
+                },
+                MCP_FILE_OP_TIMEOUT_SECS,
+            )
+            .await?;
+        ensure_task_success(&result)?;
+        let entries = serde_json::from_str::<serde_json::Value>(&result.stdout)
+            .context("agent returned invalid file list JSON")?;
         Ok(json!({
             "server_id": server_id,
             "path": path,
-            "raw": r.get("stdout").cloned().unwrap_or_default(),
-            "status": r.get("status").cloned().unwrap_or_else(|| "unknown".into()),
+            "entries": entries,
         }))
     }
 
     /// Execute fs.read
     async fn exec_fs_read(
         &self,
+        auth: &AuthSession,
         args: &serde_json::Value,
-        allowed_server_ids: Option<&[String]>,
     ) -> Result<serde_json::Value> {
         let server_id = args["server_id"].as_str().context("Missing server_id")?;
-        ensure_server_allowed(server_id, allowed_server_ids)?;
-        let path = args["path"].as_str().context("Missing path")?;
-        let max_size = args["max_size"].as_i64().unwrap_or(1048576);
-
-        // M6: read the file via the shell task using `head -c`.
-        let cmd = format!(
-            "head -c {} {} 2>/dev/null || echo __XLSTATUS_READ_ERROR__",
-            max_size,
-            shell_escape(path)
-        );
-        let r = self.dispatch_shell(server_id, &cmd, 30).await?;
-        let content = r
-            .get("stdout")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let truncated = content.len() as i64 >= max_size;
-        let error = if content.contains("__XLSTATUS_READ_ERROR__") {
-            Some("file not found or unreadable".to_string())
-        } else {
-            None
-        };
+        self.ensure_agent_visible(auth, server_id).await?;
+        let path = validate_abs_path(args["path"].as_str().context("Missing path")?)?;
+        let max_size = args["max_size"]
+            .as_u64()
+            .unwrap_or(MCP_FILE_READ_MAX_BYTES)
+            .clamp(1, MCP_FILE_READ_MAX_BYTES);
+        let result = self
+            .dispatch_file_task(
+                server_id,
+                ServerTask {
+                    task_id: String::new(),
+                    task_type: TaskType::FileRead as i32,
+                    spec: Some(Spec::FileRead(FileReadTask {
+                        path: path.clone(),
+                        offset: 0,
+                        length: max_size,
+                    })),
+                },
+                MCP_FILE_OP_TIMEOUT_SECS,
+            )
+            .await?;
+        ensure_task_success(&result)?;
+        let data = decode_base64(result.stdout.trim())
+            .map_err(|e| anyhow::anyhow!("agent returned invalid base64: {e}"))?;
+        let content = String::from_utf8(data.clone()).context("file is not valid UTF-8")?;
         Ok(json!({
             "server_id": server_id,
             "path": path,
             "max_size": max_size,
             "content": content,
-            "truncated": truncated,
-            "error": error,
+            "bytes": data.len(),
+            "truncated": data.len() as u64 >= max_size,
         }))
     }
 
     /// Execute fs.write
     async fn exec_fs_write(
         &self,
+        auth: &AuthSession,
         args: &serde_json::Value,
-        allowed_server_ids: Option<&[String]>,
     ) -> Result<serde_json::Value> {
         let server_id = args["server_id"].as_str().context("Missing server_id")?;
-        ensure_server_allowed(server_id, allowed_server_ids)?;
-        let path = args["path"].as_str().context("Missing path")?;
+        self.ensure_agent_visible(auth, server_id).await?;
+        let path = validate_abs_path(args["path"].as_str().context("Missing path")?)?;
         let content = args["content"].as_str().context("Missing content")?;
         let mode = args["mode"].as_str().unwrap_or("overwrite");
-
-        // M6: write via shell using a python helper that respects mode.
-        let b64 = base64_encode(content.as_bytes());
-        let cmd = format!(
-            "mkdir -p $(dirname {}) && echo {} | base64 -d > {}",
-            shell_escape(path),
-            b64,
-            shell_escape(path)
-        );
-        let r = self.dispatch_shell(server_id, &cmd, 30).await?;
+        if mode != "overwrite" {
+            anyhow::bail!("unsupported write mode: {mode}");
+        }
+        let result = self
+            .dispatch_file_task(
+                server_id,
+                ServerTask {
+                    task_id: String::new(),
+                    task_type: TaskType::FileWrite as i32,
+                    spec: Some(Spec::FileWrite(FileWriteTask {
+                        path: path.clone(),
+                        data: content.as_bytes().to_vec(),
+                        mode: 0,
+                        create_dirs: true,
+                    })),
+                },
+                MCP_FILE_OP_TIMEOUT_SECS,
+            )
+            .await?;
+        ensure_task_success(&result)?;
         Ok(json!({
             "server_id": server_id,
             "path": path,
             "mode": mode,
-            "bytes_written": content.len(),
-            "status": r.get("status").cloned().unwrap_or_else(|| "unknown".into()),
+            "bytes_written": result.stdout.trim().parse::<u64>().unwrap_or(content.len() as u64),
         }))
     }
 
     /// Execute fs.delete
     async fn exec_fs_delete(
         &self,
+        auth: &AuthSession,
         args: &serde_json::Value,
-        allowed_server_ids: Option<&[String]>,
     ) -> Result<serde_json::Value> {
         let server_id = args["server_id"].as_str().context("Missing server_id")?;
-        ensure_server_allowed(server_id, allowed_server_ids)?;
-        let path = args["path"].as_str().context("Missing path")?;
-
-        // M6: delete via shell `rm -f`.
-        let cmd = format!("rm -f {}", shell_escape(path));
-        let r = self.dispatch_shell(server_id, &cmd, 15).await?;
+        self.ensure_agent_visible(auth, server_id).await?;
+        let path = validate_abs_path(args["path"].as_str().context("Missing path")?)?;
+        if path == "/" {
+            anyhow::bail!("refusing to delete filesystem root");
+        }
+        let result = self
+            .dispatch_file_task(
+                server_id,
+                ServerTask {
+                    task_id: String::new(),
+                    task_type: TaskType::FileDelete as i32,
+                    spec: Some(Spec::FileDelete(FileDeleteTask {
+                        path: path.clone(),
+                        recursive: false,
+                    })),
+                },
+                MCP_FILE_OP_TIMEOUT_SECS,
+            )
+            .await?;
+        ensure_task_success(&result)?;
         Ok(json!({
             "server_id": server_id,
             "path": path,
-            "status": r.get("status").cloned().unwrap_or_else(|| "unknown".into()),
+            "deleted": true,
         }))
     }
 
     /// Execute fs.download_url
     async fn exec_fs_download_url(
         &self,
+        auth: &AuthSession,
         args: &serde_json::Value,
-        allowed_server_ids: Option<&[String]>,
     ) -> Result<serde_json::Value> {
         let server_id = args["server_id"].as_str().context("Missing server_id")?;
-        ensure_server_allowed(server_id, allowed_server_ids)?;
-        let path = args["path"].as_str().context("Missing path")?;
-        let expires_in = args["expires_in"].as_i64().unwrap_or(3600);
+        self.ensure_agent_visible(auth, server_id).await?;
+        let path = validate_abs_path(args["path"].as_str().context("Missing path")?)?;
+        let expires_in = temporary_url_expires_in(
+            args["expires_in"]
+                .as_i64()
+                .unwrap_or(TEMP_URL_DEFAULT_EXPIRES_SECS),
+        );
 
         let expires_at = temporary_url_expires_at(expires_in);
-        let token = temporary_url_token(
-            &self.temp_url_secret,
-            server_id,
-            path,
-            "download",
-            expires_at,
-        )?;
+        let token = self
+            .create_temporary_transfer_token(
+                auth,
+                server_id,
+                &path,
+                "download",
+                "transfer:read",
+                expires_at,
+            )
+            .await?;
         let url = format!(
-            "/api/v1/transfers/temp/download?server_id={}&path={}&expires_at={}&token={}",
-            percent_encode(server_id),
-            percent_encode(path),
-            expires_at,
-            token
+            "/api/v1/transfers/temp/download?token={}",
+            percent_encode(&token)
         );
 
         Ok(json!({
@@ -387,23 +389,32 @@ impl McpExecutor {
     /// Execute fs.upload_url
     async fn exec_fs_upload_url(
         &self,
+        auth: &AuthSession,
         args: &serde_json::Value,
-        allowed_server_ids: Option<&[String]>,
     ) -> Result<serde_json::Value> {
         let server_id = args["server_id"].as_str().context("Missing server_id")?;
-        ensure_server_allowed(server_id, allowed_server_ids)?;
-        let path = args["path"].as_str().context("Missing path")?;
-        let expires_in = args["expires_in"].as_i64().unwrap_or(3600);
+        self.ensure_agent_visible(auth, server_id).await?;
+        let path = validate_abs_path(args["path"].as_str().context("Missing path")?)?;
+        let expires_in = temporary_url_expires_in(
+            args["expires_in"]
+                .as_i64()
+                .unwrap_or(TEMP_URL_DEFAULT_EXPIRES_SECS),
+        );
 
         let expires_at = temporary_url_expires_at(expires_in);
-        let token =
-            temporary_url_token(&self.temp_url_secret, server_id, path, "upload", expires_at)?;
+        let token = self
+            .create_temporary_transfer_token(
+                auth,
+                server_id,
+                &path,
+                "upload",
+                "transfer:write",
+                expires_at,
+            )
+            .await?;
         let url = format!(
-            "/api/v1/transfers/temp/upload?server_id={}&path={}&expires_at={}&token={}",
-            percent_encode(server_id),
-            percent_encode(path),
-            expires_at,
-            token
+            "/api/v1/transfers/temp/upload?token={}",
+            percent_encode(&token)
         );
 
         Ok(json!({
@@ -414,6 +425,59 @@ impl McpExecutor {
             "expires_at": expires_at,
             "method": "PUT",
         }))
+    }
+
+    async fn create_temporary_transfer_token(
+        &self,
+        auth: &AuthSession,
+        server_id: &str,
+        path: &str,
+        op: &str,
+        scope: &str,
+        expires_at: i64,
+    ) -> Result<String> {
+        let (token, token_hash) = generate_temporary_transfer_token();
+        let expires_at = chrono::DateTime::from_timestamp(expires_at, 0)
+            .context("invalid temporary URL expiration")?;
+        let auth_kind = match auth.auth_kind {
+            AuthKind::Session => "session",
+            AuthKind::PersonalAccessToken => "pat",
+        }
+        .to_string();
+        TemporaryTransferTokenRepository::new(self.db.clone())
+            .create(CreateTemporaryTransferTokenInput {
+                token_hash,
+                server_id: AgentId(uuid::Uuid::parse_str(server_id).context("invalid server_id")?),
+                path: path.to_string(),
+                op: op.to_string(),
+                issued_by_user_id: auth.user_id,
+                auth_kind,
+                session_id: matches!(auth.auth_kind, AuthKind::Session)
+                    .then_some(auth.session_id.clone()),
+                api_token_id: auth.pat_id.clone(),
+                scope: scope.to_string(),
+                expires_at,
+                created_ip: None,
+            })
+            .await?;
+        Ok(token)
+    }
+
+    async fn ensure_agent_visible(
+        &self,
+        auth: &AuthSession,
+        server_id: &str,
+    ) -> Result<crate::db::Agent> {
+        let agent_id = AgentId(uuid::Uuid::parse_str(server_id).context("Invalid server_id")?);
+        let agent = AgentRepository::new(self.db.clone())
+            .find_by_id(agent_id)
+            .await?
+            .context("Server not found")?;
+        if agent_visible_to_auth(auth, &agent) {
+            Ok(agent)
+        } else {
+            anyhow::bail!("Server not allowed")
+        }
     }
 }
 
@@ -470,12 +534,64 @@ impl McpExecutor {
             "error": if result.error.is_empty() { serde_json::Value::Null } else { json!(result.error) },
         }))
     }
+
+    async fn dispatch_file_task(
+        &self,
+        server_id: &str,
+        mut task: ServerTask,
+        timeout_seconds: u64,
+    ) -> Result<xlstatus_proto_gen::xlstatus::v1::TaskResult> {
+        let agent_uuid = uuid::Uuid::parse_str(server_id).context("server_id must be a UUID")?;
+        let agent_id = AgentId(agent_uuid);
+        if !self.session_registry.is_online(&agent_id).await {
+            anyhow::bail!("agent {} is offline", server_id);
+        }
+        let response_registry = crate::current_task_response_registry();
+        let run_id = uuid::Uuid::now_v7().to_string();
+        task.task_id = run_id.clone();
+        let rx = response_registry.register(run_id.clone()).await;
+        if let Err(e) = self
+            .session_registry
+            .send_server_task(&agent_id, task)
+            .await
+        {
+            response_registry.cancel(&run_id).await;
+            return Err(anyhow::anyhow!(e));
+        }
+        match tokio::time::timeout(std::time::Duration::from_secs(timeout_seconds), rx).await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(_)) => anyhow::bail!("agent disconnected before reply"),
+            Err(_) => {
+                response_registry.cancel(&run_id).await;
+                anyhow::bail!("task timeout")
+            }
+        }
+    }
+}
+
+fn ensure_task_success(result: &xlstatus_proto_gen::xlstatus::v1::TaskResult) -> Result<()> {
+    let outcome = TaskOutcome::try_from(result.status).unwrap_or(TaskOutcome::Unspecified);
+    if outcome == TaskOutcome::Success && result.exit_code == 0 {
+        return Ok(());
+    }
+    let detail = if !result.error.trim().is_empty() {
+        result.error.trim().to_string()
+    } else if !result.stderr.trim().is_empty() {
+        result.stderr.trim().to_string()
+    } else {
+        format!("agent operation failed with exit code {}", result.exit_code)
+    };
+    anyhow::bail!(detail)
+}
+
+pub(crate) fn temporary_url_expires_in(expires_in: i64) -> i64 {
+    expires_in.clamp(1, TEMP_URL_MAX_EXPIRES_SECS)
 }
 
 pub(crate) fn temporary_url_expires_at(expires_in: i64) -> i64 {
     chrono::Utc::now()
         .timestamp()
-        .saturating_add(expires_in.max(1))
+        .saturating_add(temporary_url_expires_in(expires_in))
 }
 
 pub(crate) fn temporary_url_token(
@@ -487,6 +603,8 @@ pub(crate) fn temporary_url_token(
 ) -> Result<String> {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
         .context("failed to initialize temp-url HMAC")?;
+    mac.update(b"xlstatus-temp-url-v2");
+    mac.update(b"\0");
     mac.update(server_id.as_bytes());
     mac.update(b"\0");
     mac.update(path.as_bytes());
@@ -505,7 +623,8 @@ pub(crate) fn validate_temporary_url_token(
     expires_at: i64,
     token: &str,
 ) -> bool {
-    if expires_at <= chrono::Utc::now().timestamp() {
+    let now = chrono::Utc::now().timestamp();
+    if expires_at <= now || expires_at.saturating_sub(now) > TEMP_URL_MAX_EXPIRES_SECS {
         return false;
     }
     temporary_url_token(secret, server_id, path, op, expires_at)
@@ -557,6 +676,17 @@ pub(crate) fn percent_decode(input: &str) -> Result<String> {
     Ok(String::from_utf8(out)?)
 }
 
+fn validate_abs_path(path: &str) -> Result<String> {
+    let trimmed = path.trim();
+    if !trimmed.starts_with('/') {
+        anyhow::bail!("path must be absolute");
+    }
+    if trimmed.contains('\0') {
+        anyhow::bail!("path contains NUL byte");
+    }
+    Ok(trimmed.to_string())
+}
+
 pub(crate) fn shell_escape(s: &str) -> String {
     // Wrap in single quotes and escape any embedded single quote.
     let mut out = String::with_capacity(s.len() + 2);
@@ -572,6 +702,45 @@ pub(crate) fn shell_escape(s: &str) -> String {
     out
 }
 
+fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
+    let bytes = input.as_bytes();
+    if bytes.len() % 4 != 0 {
+        return Err("length is not a multiple of 4".to_string());
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for chunk in bytes.chunks_exact(4) {
+        let mut vals = [0u8; 4];
+        let mut padding = 0;
+        for (idx, b) in chunk.iter().copied().enumerate() {
+            vals[idx] = match b {
+                b'A'..=b'Z' => b - b'A',
+                b'a'..=b'z' => b - b'a' + 26,
+                b'0'..=b'9' => b - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                b'=' => {
+                    padding += 1;
+                    0
+                }
+                _ => return Err(format!("invalid base64 byte: {b}")),
+            };
+        }
+        let n = ((vals[0] as u32) << 18)
+            | ((vals[1] as u32) << 12)
+            | ((vals[2] as u32) << 6)
+            | vals[3] as u32;
+        out.push(((n >> 16) & 0xff) as u8);
+        if padding < 2 {
+            out.push(((n >> 8) & 0xff) as u8);
+        }
+        if padding < 1 {
+            out.push((n & 0xff) as u8);
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
 fn base64_encode(data: &[u8]) -> String {
     const ALPH: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
@@ -601,29 +770,183 @@ fn base64_encode(data: &[u8]) -> String {
     out
 }
 
-fn parse_user_id(user_id: &str) -> Result<UserId> {
-    Ok(UserId(
-        uuid::Uuid::parse_str(user_id).context("Invalid user_id")?,
-    ))
-}
-
-fn ensure_server_allowed(server_id: &str, allowed_server_ids: Option<&[String]>) -> Result<()> {
-    if allowed_server_ids
-        .map(|ids| ids.iter().any(|id| id == server_id))
-        .unwrap_or(true)
-    {
-        Ok(())
-    } else {
-        anyhow::bail!("Server not allowed by PAT")
-    }
+fn agent_visible_to_auth(auth: &AuthSession, agent: &crate::db::Agent) -> bool {
+    let allowed_by_pat = auth
+        .server_ids
+        .as_ref()
+        .map(|ids| ids.iter().any(|id| id == &agent.id.0.to_string()))
+        .unwrap_or(true);
+    allowed_by_pat && (auth.role.is_admin() || agent.owner_user_id == auth.user_id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::{CreateAgentInput, DatabaseBackend};
+    use serde_json::json;
+    use xlstatus_shared::UserRole;
 
     #[tokio::test]
     async fn test_whoami() {
         // Placeholder test
+    }
+
+    #[tokio::test]
+    async fn mcp_agent_visibility_rejects_other_owner_even_if_pat_allowlisted() {
+        let db = test_db().await;
+        let owner = UserId(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap());
+        let other = UserId(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap());
+        seed_user(&db, owner, "owner", "member").await;
+        seed_user(&db, other, "other", "member").await;
+        let other_agent = AgentRepository::new(db.clone())
+            .create(CreateAgentInput {
+                name: "other".into(),
+                public_key: "pk".into(),
+                owner_user_id: other,
+            })
+            .await
+            .unwrap();
+        let executor = test_executor(db);
+        let auth = pat_auth(owner, UserRole::Member, vec![other_agent.id.0.to_string()]);
+
+        let denied = executor
+            .execute(
+                &auth,
+                McpToolRequest {
+                    tool: "server.get".into(),
+                    arguments: json!({ "server_id": other_agent.id.0.to_string() }),
+                },
+            )
+            .await;
+
+        assert!(!denied.success);
+        assert!(denied
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Server not allowed"));
+    }
+
+    #[tokio::test]
+    async fn mcp_agent_visibility_allows_admin_pat_when_allowlisted() {
+        let db = test_db().await;
+        let admin = UserId(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap());
+        let other = UserId(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap());
+        seed_user(&db, admin, "admin", "admin").await;
+        seed_user(&db, other, "other", "member").await;
+        let other_agent = AgentRepository::new(db.clone())
+            .create(CreateAgentInput {
+                name: "other".into(),
+                public_key: "pk".into(),
+                owner_user_id: other,
+            })
+            .await
+            .unwrap();
+        let executor = test_executor(db);
+        let auth = pat_auth(admin, UserRole::Admin, vec![other_agent.id.0.to_string()]);
+
+        let allowed = executor
+            .execute(
+                &auth,
+                McpToolRequest {
+                    tool: "server.get".into(),
+                    arguments: json!({ "server_id": other_agent.id.0.to_string() }),
+                },
+            )
+            .await;
+
+        assert!(allowed.success);
+    }
+
+    #[test]
+    fn temporary_url_expires_in_is_capped() {
+        assert_eq!(temporary_url_expires_in(-10), 1);
+        assert_eq!(temporary_url_expires_in(300), 300);
+        assert_eq!(
+            temporary_url_expires_in(60 * 60 * 24),
+            TEMP_URL_MAX_EXPIRES_SECS
+        );
+    }
+
+    #[test]
+    fn temporary_url_token_rejects_expired_or_overlong_lifetime() {
+        let secret = "test-secret";
+        let server_id = "018f7dc7-9db7-7c00-9b63-582c6b2a1184";
+        let path = "/var/lib/xlstatus/files/report.txt";
+        let now = chrono::Utc::now().timestamp();
+        let valid_expires_at = now + TEMP_URL_MAX_EXPIRES_SECS;
+        let valid =
+            temporary_url_token(secret, server_id, path, "download", valid_expires_at).unwrap();
+        assert!(validate_temporary_url_token(
+            secret,
+            server_id,
+            path,
+            "download",
+            valid_expires_at,
+            &valid
+        ));
+
+        let overlong_expires_at = now + TEMP_URL_MAX_EXPIRES_SECS + 1;
+        let overlong =
+            temporary_url_token(secret, server_id, path, "download", overlong_expires_at).unwrap();
+        assert!(!validate_temporary_url_token(
+            secret,
+            server_id,
+            path,
+            "download",
+            overlong_expires_at,
+            &overlong
+        ));
+
+        let expired_at = now - 1;
+        let expired = temporary_url_token(secret, server_id, path, "download", expired_at).unwrap();
+        assert!(!validate_temporary_url_token(
+            secret, server_id, path, "download", expired_at, &expired
+        ));
+    }
+
+    async fn test_db() -> DatabaseBackend {
+        let db = DatabaseBackend::connect("sqlite::memory:", true)
+            .await
+            .unwrap();
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    fn test_executor(db: DatabaseBackend) -> McpExecutor {
+        McpExecutor::new(db, crate::grpc::SessionRegistry::new(), "secret".into())
+    }
+
+    async fn seed_user(db: &DatabaseBackend, id: UserId, username: &str, role: &str) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, role, created_at, updated_at) VALUES (?, ?, 'x', ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id.0.to_string())
+        .bind(username)
+        .bind(role)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn pat_auth(user_id: UserId, role: UserRole, server_ids: Vec<String>) -> AuthSession {
+        AuthSession {
+            session_id: "pat-session".into(),
+            user_id,
+            username: "pat".into(),
+            role,
+            csrf_token: "csrf".into(),
+            auth_kind: AuthKind::PersonalAccessToken,
+            scopes: vec![
+                "server:read".into(),
+                "server:exec".into(),
+                "transfer:read".into(),
+            ],
+            server_ids: Some(server_ids),
+            pat_id: Some("pat".into()),
+        }
     }
 }

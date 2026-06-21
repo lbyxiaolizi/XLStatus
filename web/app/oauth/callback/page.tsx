@@ -28,7 +28,7 @@ export default function OAuthCallbackPage() {
       const response = await apiClient.getProfile();
       if (cancelled) return;
       if (response.success && response.data) {
-        localStorage.setItem("session_token", "cookie-session");
+        localStorage.removeItem("session_token");
         localStorage.setItem("user", JSON.stringify(response.data));
         router.replace(returnTo);
         return;

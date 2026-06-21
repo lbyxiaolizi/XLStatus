@@ -119,7 +119,7 @@ curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alph
 cargo build --release --bin xlstatus-server
 sudo BINARY_PATH=target/release/xlstatus-server \
   ADMIN_USERNAME=admin \
-  ADMIN_PASSWORD='admin123' \
+  ADMIN_PASSWORD='replace-with-a-strong-initial-password' \
   CORS_ALLOWED_ORIGINS='http://localhost:3000,http://127.0.0.1:3000' \
   bash deploy/install.sh
 ```
@@ -135,12 +135,12 @@ sudo bash deploy/install.sh
 ```bash
 sudo INTERACTIVE=false \
   VERSION=v0.1.0-alpha.3 \
-  HTTP_BIND=0.0.0.0:8080 \
-  GRPC_BIND=0.0.0.0:50051 \
+  HTTP_BIND=127.0.0.1:8080 \
+  GRPC_BIND=127.0.0.1:50051 \
   DATABASE_URL=sqlite:///var/lib/xlstatus/xlstatus.db?mode=rwc \
   DATABASE_CREATE_IF_MISSING=true \
   CORS_ALLOWED_ORIGINS=https://status.example.com \
-  ADMIN_PASSWORD='admin123' \
+  ADMIN_PASSWORD='replace-with-a-strong-initial-password' \
   bash deploy/install.sh
 ```
 
@@ -171,14 +171,14 @@ INSTALL_DIR=/opt/xlstatus
 DATA_DIR=/var/lib/xlstatus
 BINARY_PATH=target/release/xlstatus-server
 CONFIG_FILE=/etc/xlstatus/server.toml
-HTTP_BIND=0.0.0.0:8080
-GRPC_BIND=0.0.0.0:50051
+HTTP_BIND=127.0.0.1:8080
+GRPC_BIND=127.0.0.1:50051
 DATABASE_URL=sqlite:///var/lib/xlstatus/xlstatus.db?mode=rwc
 DATABASE_CREATE_IF_MISSING=true
 CORS_ALLOWED_ORIGINS=https://status.example.com
 SESSION_SECRET="$(openssl rand -hex 32)"
 ADMIN_USERNAME=admin
-ADMIN_PASSWORD=admin123
+ADMIN_PASSWORD=replace-with-a-strong-initial-password
 ```
 
 安装脚本会生成完整 `server.toml`。如果要走 `CONFIG_FILE` 模式，不要在 systemd unit 里额外设置 `DATABASE_URL`。
@@ -205,12 +205,12 @@ psql 'postgresql://xlstatus:change-this-password@localhost:5432/xlstatus' -c 'se
 
 ```bash
 DATABASE_URL='postgresql://xlstatus:change-this-password@localhost:5432/xlstatus' \
-HTTP_BIND="0.0.0.0:8080" \
-GRPC_BIND="0.0.0.0:50051" \
+HTTP_BIND="127.0.0.1:8080" \
+GRPC_BIND="127.0.0.1:50051" \
 CORS_ALLOWED_ORIGINS="http://localhost:3000,http://127.0.0.1:3000" \
 SESSION_SECRET="$(openssl rand -hex 32)" \
 XLSTATUS_SEED_ADMIN_USERNAME="admin" \
-XLSTATUS_SEED_ADMIN_PASSWORD="admin123" \
+XLSTATUS_SEED_ADMIN_PASSWORD="replace-with-a-strong-initial-password" \
 ./target/release/xlstatus-server
 ```
 
@@ -221,7 +221,7 @@ sudo BINARY_PATH=target/release/xlstatus-server \
   DATABASE_URL='postgresql://xlstatus:change-this-password@localhost:5432/xlstatus' \
   DATABASE_CREATE_IF_MISSING=false \
   CORS_ALLOWED_ORIGINS='https://status.example.com' \
-  ADMIN_PASSWORD='admin123' \
+  ADMIN_PASSWORD='replace-with-a-strong-initial-password' \
   bash deploy/install.sh
 ```
 
@@ -321,12 +321,12 @@ mkdir -p ./data
 timeout 8s env \
   DATABASE_URL="sqlite://$(pwd)/data/xlstatus.db?mode=rwc" \
   DATABASE_CREATE_IF_MISSING=true \
-  HTTP_BIND="0.0.0.0:8080" \
-  GRPC_BIND="0.0.0.0:50051" \
+  HTTP_BIND="127.0.0.1:8080" \
+  GRPC_BIND="127.0.0.1:50051" \
   CORS_ALLOWED_ORIGINS="http://localhost:3000,http://127.0.0.1:3000" \
-  SESSION_SECRET="replace-me" \
+  SESSION_SECRET="$(openssl rand -hex 32)" \
   XLSTATUS_SEED_ADMIN_USERNAME="admin" \
-  XLSTATUS_SEED_ADMIN_PASSWORD="admin123" \
+  XLSTATUS_SEED_ADMIN_PASSWORD="replace-with-a-strong-initial-password" \
   ./target/release/xlstatus-server
 echo $?
 ```

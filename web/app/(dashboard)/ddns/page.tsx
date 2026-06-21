@@ -20,20 +20,7 @@ import {
   textareaClass,
   thClass,
 } from "@/app/components/M7Primitives";
-import { apiClient, type JsonObject } from "@/lib/api";
-
-interface DdnsConfig {
-  id: string;
-  agent_id?: string | null;
-  name?: string;
-  provider?: string;
-  domain?: string;
-  webhook_url?: string | null;
-  current_ip?: string | null;
-  last_applied_ip?: string | null;
-  enabled?: boolean;
-  updated_at?: string;
-}
+import { apiClient, type DdnsConfig, type JsonObject } from "@/lib/api";
 
 interface DdnsHistory {
   id?: string;
@@ -64,7 +51,7 @@ export default function DdnsPage() {
   const load = useCallback(async () => {
     const response = await apiClient.listDdnsConfigs();
     if (response.success && response.data) {
-      setConfigs((response.data.configs as DdnsConfig[]) ?? []);
+      setConfigs(response.data.configs ?? []);
     } else {
       setError(responseError(response));
     }

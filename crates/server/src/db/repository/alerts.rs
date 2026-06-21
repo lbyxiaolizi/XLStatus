@@ -205,6 +205,17 @@ impl AlertRepository {
         Ok(out)
     }
 
+    pub async fn list_by_owner(&self, owner_user_id: &str) -> Result<Vec<AlertRuleRow>> {
+        let mut rows = self.list().await?;
+        rows.retain(|row| row.owner_user_id == owner_user_id);
+        Ok(rows)
+    }
+
+    pub async fn find_by_id(&self, id: &str) -> Result<Option<AlertRuleRow>> {
+        let rows = self.list().await?;
+        Ok(rows.into_iter().find(|row| row.id == id))
+    }
+
     pub async fn delete(&self, id: &str) -> Result<bool> {
         let q = "DELETE FROM alert_rules WHERE id = $1";
         let affected = match &self.db {
@@ -215,6 +226,30 @@ impl AlertRepository {
                 let pid = Uuid::parse_str(id)?;
                 sqlx::query(q)
                     .bind(pid)
+                    .execute(pool)
+                    .await?
+                    .rows_affected()
+            }
+        };
+        Ok(affected > 0)
+    }
+
+    pub async fn delete_for_owner(&self, id: &str, owner_user_id: &str) -> Result<bool> {
+        let affected = match &self.db {
+            DatabaseBackend::Sqlite(pool) => {
+                sqlx::query("DELETE FROM alert_rules WHERE id = ? AND owner_user_id = ?")
+                    .bind(id)
+                    .bind(owner_user_id)
+                    .execute(pool)
+                    .await?
+                    .rows_affected()
+            }
+            DatabaseBackend::Postgres(pool) => {
+                let pid = Uuid::parse_str(id)?;
+                let owner = Uuid::parse_str(owner_user_id)?;
+                sqlx::query("DELETE FROM alert_rules WHERE id = $1 AND owner_user_id = $2")
+                    .bind(pid)
+                    .bind(owner)
                     .execute(pool)
                     .await?
                     .rows_affected()
@@ -270,6 +305,89 @@ impl AlertEventRepository {
                 let rows: Vec<(String, String, Option<String>, Option<String>, String, String, String)> = sqlx::query_as(
                     "SELECT id::text, rule_id::text, agent_id::text, service_id::text, kind, payload_json, fired_at::text FROM alert_events ORDER BY fired_at DESC LIMIT $1",
                 )
+                .bind(limit)
+                .fetch_all(pool)
+                .await?;
+                for (id, rule_id, agent_id, service_id, kind, payload_json, fired_at) in rows {
+                    out.push(AlertEventRow {
+                        id,
+                        rule_id,
+                        agent_id,
+                        service_id,
+                        kind,
+                        payload_json,
+                        fired_at: parse_dt(&fired_at)?,
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn list_recent_for_owner(
+        &self,
+        owner_user_id: &str,
+        limit: i64,
+    ) -> Result<Vec<AlertEventRow>> {
+        let mut out = Vec::new();
+        match &self.db {
+            DatabaseBackend::Sqlite(pool) => {
+                let rows: Vec<(
+                    String,
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    String,
+                    String,
+                    String,
+                )> = sqlx::query_as(
+                    r#"
+                    SELECT e.id, e.rule_id, e.agent_id, e.service_id, e.kind, e.payload_json, e.fired_at
+                    FROM alert_events e
+                    JOIN alert_rules r ON r.id = e.rule_id
+                    WHERE r.owner_user_id = ?
+                    ORDER BY e.fired_at DESC
+                    LIMIT ?
+                    "#,
+                )
+                .bind(owner_user_id)
+                .bind(limit)
+                .fetch_all(pool)
+                .await?;
+                for (id, rule_id, agent_id, service_id, kind, payload_json, fired_at) in rows {
+                    out.push(AlertEventRow {
+                        id,
+                        rule_id,
+                        agent_id,
+                        service_id,
+                        kind,
+                        payload_json,
+                        fired_at: parse_dt(&fired_at)?,
+                    });
+                }
+            }
+            DatabaseBackend::Postgres(pool) => {
+                let owner = Uuid::parse_str(owner_user_id)?;
+                let rows: Vec<(
+                    String,
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    String,
+                    String,
+                    String,
+                )> = sqlx::query_as(
+                    r#"
+                    SELECT e.id::text, e.rule_id::text, e.agent_id::text, e.service_id::text,
+                           e.kind, e.payload_json, e.fired_at::text
+                    FROM alert_events e
+                    JOIN alert_rules r ON r.id = e.rule_id
+                    WHERE r.owner_user_id = $1
+                    ORDER BY e.fired_at DESC
+                    LIMIT $2
+                    "#,
+                )
+                .bind(owner)
                 .bind(limit)
                 .fetch_all(pool)
                 .await?;

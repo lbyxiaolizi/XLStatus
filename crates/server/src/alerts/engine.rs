@@ -624,16 +624,18 @@ impl AlertEngine {
             "rule_id": rule.id,
             "rule_name": rule.name,
             "kind": kind,
+            "agent_id": source_agent_id,
             "fired_at": now.to_rfc3339(),
         });
         let payload_text = serde_json::to_string(&payload)?;
         match &self.db {
             crate::db::DatabaseBackend::Sqlite(pool) => {
                 sqlx::query(
-                    "INSERT INTO alert_events (id, rule_id, kind, payload_json, fired_at) VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO alert_events (id, rule_id, agent_id, kind, payload_json, fired_at) VALUES (?, ?, ?, ?, ?, ?)",
                 )
                 .bind(&id)
                 .bind(&rule.id)
+                .bind(source_agent_id)
                 .bind(kind)
                 .bind(&payload_text)
                 .bind(now.to_rfc3339())
@@ -643,11 +645,16 @@ impl AlertEngine {
             crate::db::DatabaseBackend::Postgres(pool) => {
                 let pid = uuid::Uuid::parse_str(&id)?;
                 let prid = uuid::Uuid::parse_str(&rule.id)?;
+                let agent_id = source_agent_id
+                    .map(uuid::Uuid::parse_str)
+                    .transpose()
+                    .context("invalid alert source agent id")?;
                 sqlx::query(
-                    "INSERT INTO alert_events (id, rule_id, kind, payload_json, fired_at) VALUES ($1, $2, $3, $4, $5)",
+                    "INSERT INTO alert_events (id, rule_id, agent_id, kind, payload_json, fired_at) VALUES ($1, $2, $3, $4, $5, $6)",
                 )
                 .bind(pid)
                 .bind(prid)
+                .bind(agent_id)
                 .bind(kind)
                 .bind(&payload_text)
                 .bind(now)

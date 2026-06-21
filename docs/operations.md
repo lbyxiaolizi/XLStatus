@@ -77,8 +77,10 @@ sudo systemctl start xlstatus
 PostgreSQL：
 
 ```bash
-pg_dump 'postgresql://xlstatus:xlstatus_password@localhost:5432/xlstatus' > xlstatus.sql
+pg_dump 'postgresql://xlstatus:replace-with-a-strong-db-password@localhost:5432/xlstatus' > xlstatus.sql
 ```
+
+同时备份 `/etc/xlstatus/server.toml` 或部署环境中的 `SECRET_ENCRYPTION_KEY`。数据库中的 DDNS/API token、cloudflared token、GeoIP ipinfo token 和 TOTP secret 使用该密钥加密；只有数据库备份而没有匹配的 `SECRET_ENCRYPTION_KEY` 时，这些历史密文无法恢复。
 
 ## 恢复
 
@@ -95,8 +97,10 @@ curl -fsS http://localhost:8080/healthz
 PostgreSQL：
 
 ```bash
-psql 'postgresql://xlstatus:xlstatus_password@localhost:5432/xlstatus' < xlstatus.sql
+psql 'postgresql://xlstatus:replace-with-a-strong-db-password@localhost:5432/xlstatus' < xlstatus.sql
 ```
+
+恢复前确认服务使用的 `SECRET_ENCRYPTION_KEY` 与备份创建时一致。若必须轮换密钥，应先用旧密钥完成恢复和启动迁移验证，再按受控流程重新加密并更新密钥。
 
 恢复建议使用创建备份时相同的应用版本，升级迁移前先在测试环境验证。
 
@@ -125,12 +129,12 @@ mkdir -p ./data
 timeout 8s env \
   DATABASE_URL="sqlite://$(pwd)/data/xlstatus.db?mode=rwc" \
   DATABASE_CREATE_IF_MISSING=true \
-  HTTP_BIND="0.0.0.0:8080" \
-  GRPC_BIND="0.0.0.0:50051" \
+  HTTP_BIND="127.0.0.1:8080" \
+  GRPC_BIND="127.0.0.1:50051" \
   CORS_ALLOWED_ORIGINS="http://localhost:3000,http://127.0.0.1:3000" \
-  SESSION_SECRET="replace-me" \
+  SESSION_SECRET="$(openssl rand -hex 32)" \
   XLSTATUS_SEED_ADMIN_USERNAME="admin" \
-  XLSTATUS_SEED_ADMIN_PASSWORD="admin123" \
+  XLSTATUS_SEED_ADMIN_PASSWORD="replace-with-a-strong-initial-password" \
   ./target/release/xlstatus-server
 echo $?
 ```

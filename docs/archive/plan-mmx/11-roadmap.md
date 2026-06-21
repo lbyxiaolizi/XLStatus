@@ -118,12 +118,12 @@ pkill -f "next dev"
 
 ```bash
 # 启动 server
-XLSTATUS_SEED_ADMIN_PASSWORD=admin123 cargo run -p xlstatus-server &
+XLSTATUS_SEED_ADMIN_PASSWORD=replace-with-a-strong-initial-password cargo run -p xlstatus-server &
 
 # 1. 登录
 curl -i -c /tmp/cookies.txt -X POST http://localhost:8080/api/v1/auth/login \
     -H "Content-Type: application/json" \
-    -d '{"username":"admin","password":"admin123"}'
+    -d '{"username":"admin","password":"replace-with-a-strong-initial-password"}'
 # 期望：200 + Set-Cookie access_token + refresh_token
 
 # 2. 查 me

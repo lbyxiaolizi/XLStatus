@@ -27,6 +27,7 @@ import {
   type MaintenanceStatusResponse,
   type OAuthAccount,
   type OAuthProvider,
+  type PatInfo,
   type SystemSettingsResponse,
   type ThemeDefinition,
   type TotpSetupResponse,
@@ -76,7 +77,9 @@ interface NotificationGroup {
 export default function SettingsPage() {
   const [name, setName] = useState("");
   const [scopes, setScopes] = useState("server:read service:read task:* nat:* ddns:*");
-  const [tokens, setTokens] = useState<unknown[]>([]);
+  const [patExpiresAt, setPatExpiresAt] = useState(() => defaultPatExpiresAt());
+  const [patServerIds, setPatServerIds] = useState("");
+  const [tokens, setTokens] = useState<PatInfo[]>([]);
   const [createdToken, setCreatedToken] = useState("");
   const [users, setUsers] = useState<UserAccount[]>([]);
   const [usersLoading, setUsersLoading] = useState(false);
@@ -136,7 +139,7 @@ export default function SettingsPage() {
   const [agentUseLatestVersion, setAgentUseLatestVersion] = useState(true);
   const [agentLatestVersionStatus, setAgentLatestVersionStatus] = useState("等待获取 GitHub 最新版");
   const [agentLatestVersionLoading, setAgentLatestVersionLoading] = useState(false);
-  const [enrollmentHours, setEnrollmentHours] = useState("24");
+  const [enrollmentHours, setEnrollmentHours] = useState("1");
   const [enrollmentToken, setEnrollmentToken] = useState("");
   const [enrollmentExpiresAt, setEnrollmentExpiresAt] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -803,6 +806,18 @@ export default function SettingsPage() {
     }
   }
 
+  async function updatePublicServerDetailsEnabled(enabled: boolean) {
+    setSettingsLoading(true);
+    const response = await apiClient.updateSettings({ public_server_details_enabled: enabled });
+    setSettingsLoading(false);
+    if (response.success && response.data) {
+      setSystemSettings(response.data);
+      setNotice(enabled ? "公开状态页已显示服务器详细信息。" : "公开状态页已隐藏服务器详细信息。");
+    } else {
+      setError(responseError(response));
+    }
+  }
+
   async function savePublicBranding() {
     const siteName = publicBranding.siteName.trim();
     if (!siteName) {
@@ -816,12 +831,13 @@ export default function SettingsPage() {
       public_favicon_url: nullableText(publicBranding.faviconUrl),
       public_theme_color: nullableText(publicBranding.themeColor),
       public_background_url: nullableText(publicBranding.backgroundUrl),
-      public_custom_head: nullableText(publicBranding.customHead),
-      public_custom_body: nullableText(publicBranding.customBody),
+      public_custom_head: null,
+      public_custom_body: null,
     });
     setSettingsLoading(false);
     if (response.success && response.data) {
       setSystemSettings(response.data);
+      setPublicBranding((current) => ({ ...current, customHead: "", customBody: "" }));
       setNotice("公开状态页品牌设置已保存。");
     } else {
       setError(responseError(response));
@@ -830,16 +846,29 @@ export default function SettingsPage() {
 
   async function createToken(event: FormEvent) {
     event.preventDefault();
+    const serverIds = splitSettingList(patServerIds);
+    const expiresAt = new Date(patExpiresAt);
+    if (Number.isNaN(expiresAt.getTime())) {
+      setError("请填写有效的 PAT 过期时间。");
+      return;
+    }
+    if (serverIds.length === 0 && !window.confirm("未填写 server allowlist 会创建全局 PAT。确认继续？")) {
+      return;
+    }
     const totpCode = await sensitiveTotpCode();
     if (totpCode === null) return;
     const response = await apiClient.createPat({
       name,
       scopes: scopes.split(/\s+/).filter(Boolean),
+      expires_at: expiresAt.toISOString(),
+      ...(serverIds.length > 0 ? { server_ids: serverIds } : {}),
     }, totpCode);
     if (response.success && response.data) {
       setCreatedToken(response.data.token);
-      setNotice("个人访问令牌已创建。");
+      setNotice(`个人访问令牌已创建，过期时间：${formatDate(response.data.expires_at)}。`);
       setName("");
+      setPatExpiresAt(defaultPatExpiresAt());
+      setPatServerIds("");
       await loadTokens();
     } else {
       setError(responseError(response));
@@ -849,7 +878,7 @@ export default function SettingsPage() {
   async function createEnrollmentToken() {
     const expiresInHours = Number.parseInt(enrollmentHours, 10);
     const response = await apiClient.createEnrollmentToken(
-      Number.isFinite(expiresInHours) && expiresInHours > 0 ? expiresInHours : 24,
+      Number.isFinite(expiresInHours) && expiresInHours > 0 ? expiresInHours : 1,
     );
     if (response.success && response.data) {
       setEnrollmentToken(response.data.token);
@@ -948,7 +977,7 @@ export default function SettingsPage() {
                   <input className={inputClass} value={agentName} onChange={(e) => setAgentName(e.target.value)} />
                 </Field>
                 <Field label="令牌有效期（小时）">
-                  <input className={inputClass} type="number" min="1" value={enrollmentHours} onChange={(e) => setEnrollmentHours(e.target.value)} />
+                  <input className={inputClass} type="number" min="1" max="24" value={enrollmentHours} onChange={(e) => setEnrollmentHours(e.target.value)} />
                 </Field>
               </div>
               <div className="mt-4 flex flex-wrap items-center gap-2">
@@ -1299,8 +1328,8 @@ export default function SettingsPage() {
           </div>
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="flex flex-wrap items-center gap-2">
-              <StatusBadge tone={systemSettings?.public_site_enabled === false ? "red" : "green"}>
-                {systemSettings?.public_site_enabled === false ? "私有" : "公开"}
+              <StatusBadge tone={systemSettings?.public_site_enabled ? "green" : "red"}>
+                {systemSettings?.public_site_enabled ? "公开" : "私有"}
               </StatusBadge>
               <span className="text-sm font-bold text-[var(--text-muted)]">
                 关闭后匿名状态页、公开服务器详情和公开指标接口会返回拒绝访问。
@@ -1309,11 +1338,30 @@ export default function SettingsPage() {
             <label className="inline-flex cursor-pointer items-center gap-2 border-2 border-black bg-[var(--accent-bg)] px-3 py-2 text-sm font-black shadow-[var(--shadow-brutal-sm)]">
               <input
                 type="checkbox"
-                checked={systemSettings?.public_site_enabled !== false}
+                checked={systemSettings?.public_site_enabled === true}
                 onChange={(event) => void updatePublicSiteEnabled(event.target.checked)}
                 disabled={settingsLoading || !systemSettings}
               />
               匿名访问
+            </label>
+          </div>
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-3 border-t-2 border-black pt-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <StatusBadge tone={systemSettings?.public_server_details_enabled ? "green" : "gray"}>
+                {systemSettings?.public_server_details_enabled ? "显示详情" : "隐藏详情"}
+              </StatusBadge>
+              <span className="text-sm font-bold text-[var(--text-muted)]">
+                开启后匿名状态页会显示公开服务器的 CPU、内存、磁盘、网络和监控图表。
+              </span>
+            </div>
+            <label className="inline-flex cursor-pointer items-center gap-2 border-2 border-black bg-[var(--accent-bg)] px-3 py-2 text-sm font-black shadow-[var(--shadow-brutal-sm)]">
+              <input
+                type="checkbox"
+                checked={systemSettings?.public_server_details_enabled === true}
+                onChange={(event) => void updatePublicServerDetailsEnabled(event.target.checked)}
+                disabled={settingsLoading || !systemSettings}
+              />
+              服务器详细信息
             </label>
           </div>
           <div className="mt-4 grid gap-3 border-t-2 border-black pt-4 lg:grid-cols-2">
@@ -1358,18 +1406,18 @@ export default function SettingsPage() {
                 保存品牌
               </button>
             </div>
-            <Field label="自定义 head">
+            <Field label="自定义 head（已停用）">
               <textarea
                 className={`${textareaClass} min-h-28`}
                 value={publicBranding.customHead}
-                onChange={(event) => setPublicBranding((current) => ({ ...current, customHead: event.target.value }))}
+                readOnly
               />
             </Field>
-            <Field label="自定义 body">
+            <Field label="自定义 body（已停用）">
               <textarea
                 className={`${textareaClass} min-h-28`}
                 value={publicBranding.customBody}
-                onChange={(event) => setPublicBranding((current) => ({ ...current, customBody: event.target.value }))}
+                readOnly
               />
             </Field>
           </div>
@@ -1851,6 +1899,8 @@ export default function SettingsPage() {
             <form onSubmit={createToken} className="space-y-4">
               <Field label="名称"><input className={inputClass} value={name} onChange={(e) => setName(e.target.value)} required /></Field>
               <Field label="Scope"><textarea className={`${textareaClass} min-h-24`} value={scopes} onChange={(e) => setScopes(e.target.value)} /></Field>
+              <Field label="过期时间"><input className={inputClass} type="datetime-local" value={patExpiresAt} onChange={(e) => setPatExpiresAt(e.target.value)} required /></Field>
+              <Field label="Server Allowlist"><textarea className={`${textareaClass} min-h-20`} value={patServerIds} onChange={(e) => setPatServerIds(e.target.value)} placeholder="server id, server id" /></Field>
               <button className={buttonClass("primary")}>创建令牌</button>
             </form>
             {createdToken ? (
@@ -1866,11 +1916,32 @@ export default function SettingsPage() {
               {tokens.length === 0 ? (
                 <p className="text-sm font-bold text-[var(--text-muted)]">暂无令牌。</p>
               ) : (
-                tokens.map((token, index) => (
-                  <div key={index} className="border-2 border-black bg-[var(--accent-bg)] p-3 text-sm font-bold">
-                    <pre className="overflow-auto whitespace-pre-wrap">{JSON.stringify(token, null, 2)}</pre>
-                  </div>
-                ))
+                tokens.map((token) => {
+                  const serverIds = token.server_ids ?? [];
+                  return (
+                    <div key={token.id} className="border-2 border-black bg-[var(--accent-bg)] p-3 text-sm font-bold">
+                      <div className="flex flex-wrap items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="break-words text-base font-black">{token.name || "未命名令牌"}</div>
+                          <div className="mt-1 break-all font-mono text-[11px] text-[var(--text-muted)]">{token.id}</div>
+                        </div>
+                        <div className="flex flex-wrap gap-2">
+                          {serverIds.length === 0 ? (
+                            <StatusBadge tone="red">全局 PAT</StatusBadge>
+                          ) : (
+                            <StatusBadge tone="green">{serverIds.length} 台服务器</StatusBadge>
+                          )}
+                        </div>
+                      </div>
+                      <div className="mt-3 grid gap-2 text-xs text-[var(--text-muted)]">
+                        <div>Scope：{token.scopes?.join(" ") || "N/A"}</div>
+                        <div>过期：{formatDate(token.expires_at)}</div>
+                        <div>最近使用：{formatDate(token.last_used_at)}</div>
+                        {serverIds.length > 0 ? <div className="break-all">Server allowlist：{serverIds.join(", ")}</div> : null}
+                      </div>
+                    </div>
+                  );
+                })
               )}
             </div>
           </BrutalCard>
@@ -1924,6 +1995,12 @@ function splitSettingList(value: string): string[] {
     });
 }
 
+function defaultPatExpiresAt(): string {
+  const date = new Date(Date.now() + 90 * 24 * 60 * 60 * 1000);
+  const timezoneOffsetMs = date.getTimezoneOffset() * 60 * 1000;
+  return new Date(date.getTime() - timezoneOffsetMs).toISOString().slice(0, 16);
+}
+
 function nullableText(value: string): string | null {
   const trimmed = value.trim();
   return trimmed ? trimmed : null;
@@ -1966,7 +2043,6 @@ function defaultThemeImportText(): string {
           "--btn-text": "#ffffff",
           "--dot-color": "#d1d5db",
         },
-        custom_css: "",
       },
     },
     null,

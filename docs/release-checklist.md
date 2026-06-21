@@ -45,12 +45,12 @@ Linux x86_64 smoke：
 timeout 8s env \
   DATABASE_URL="sqlite://$(pwd)/data/xlstatus.db?mode=rwc" \
   DATABASE_CREATE_IF_MISSING=true \
-  HTTP_BIND="0.0.0.0:8080" \
-  GRPC_BIND="0.0.0.0:50051" \
+  HTTP_BIND="127.0.0.1:8080" \
+  GRPC_BIND="127.0.0.1:50051" \
   CORS_ALLOWED_ORIGINS="http://localhost:3000,http://127.0.0.1:3000" \
-  SESSION_SECRET="replace-me" \
+  SESSION_SECRET="$(openssl rand -hex 32)" \
   XLSTATUS_SEED_ADMIN_USERNAME="admin" \
-  XLSTATUS_SEED_ADMIN_PASSWORD="admin123" \
+  XLSTATUS_SEED_ADMIN_PASSWORD="replace-with-a-strong-initial-password" \
   ./target/release/xlstatus-server
 ```
 

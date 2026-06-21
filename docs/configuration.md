@@ -17,24 +17,36 @@ Server 有两种配置模式：
 ```env
 DATABASE_URL=sqlite:///var/lib/xlstatus/xlstatus.db?mode=rwc
 DATABASE_CREATE_IF_MISSING=true
-HTTP_BIND=0.0.0.0:8080
-GRPC_BIND=0.0.0.0:50051
+HTTP_BIND=127.0.0.1:8080
+GRPC_BIND=127.0.0.1:50051
+GRPC_TLS_CERT_PATH=/etc/xlstatus/tls/grpc-server.crt
+GRPC_TLS_KEY_PATH=/etc/xlstatus/tls/grpc-server.key
+GRPC_TLS_CLIENT_CA_PATH=/etc/xlstatus/tls/agent-ca.crt
+GRPC_REFLECTION_ENABLED=false
 CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
 SESSION_SECRET=replace-with-a-long-random-secret
+SECRET_ENCRYPTION_KEY=replace-with-a-different-long-random-secret
 SESSION_TTL_HOURS=24
+SECURITY_COOKIE_SECURE=true
 XLSTATUS_SEED_ADMIN_USERNAME=admin
-XLSTATUS_SEED_ADMIN_PASSWORD=admin123
+XLSTATUS_SEED_ADMIN_PASSWORD=replace-with-a-strong-initial-password
 ```
 
 | 变量 | 说明 |
 |---|---|
 | `DATABASE_URL` | SQLite 或 PostgreSQL URL。设置后启用环境变量模式。 |
 | `DATABASE_CREATE_IF_MISSING` | 仅 SQLite 使用。`1`、`true`、`yes`、`y`、`on` 视为开启。 |
-| `HTTP_BIND` | HTTP API 监听地址，默认 `0.0.0.0:8080`。 |
-| `GRPC_BIND` | Agent gRPC 监听地址，默认 `0.0.0.0:50051`。 |
+| `HTTP_BIND` | HTTP API 监听地址，默认 `127.0.0.1:8080`。 |
+| `GRPC_BIND` | Agent gRPC 监听地址，默认 `127.0.0.1:50051`。 |
+| `GRPC_TLS_CERT_PATH` | 可选的 gRPC 服务端 PEM 证书路径。必须与 `GRPC_TLS_KEY_PATH` 同时设置，设置后 gRPC 使用 TLS。 |
+| `GRPC_TLS_KEY_PATH` | 可选的 gRPC 服务端 PEM 私钥路径。必须与 `GRPC_TLS_CERT_PATH` 同时设置。 |
+| `GRPC_TLS_CLIENT_CA_PATH` | 可选的 gRPC 客户端证书 CA 路径。设置后启用 mTLS，Agent 必须提交该 CA 签发的客户端证书。 |
+| `GRPC_REFLECTION_ENABLED` | 是否启用 gRPC reflection。默认关闭；只建议在可信网络调试时开启。 |
 | `CORS_ALLOWED_ORIGINS` | 允许访问 API 的浏览器来源，多个来源用英文逗号分隔。 |
 | `SESSION_SECRET` | 会话和 Agent JWT 签名密钥。生产必须使用长随机值。 |
+| `SECRET_ENCRYPTION_KEY` | 可选的数据库 secret 加密主密钥，用于 DDNS/API token、cloudflared token、GeoIP ipinfo token、TOTP secret 的应用层加密。不设置时使用 `SESSION_SECRET`；生产建议单独设置长随机值并备份。 |
 | `SESSION_TTL_HOURS` | Cookie 会话有效期，默认 `24` 小时。 |
+| `SECURITY_COOKIE_SECURE` | 是否为 session/CSRF Cookie 添加 `Secure`。环境变量和 TOML 部署默认开启，本地无配置开发默认关闭。 |
 | `XLSTATUS_SEED_ADMIN_USERNAME` | 可选的首个管理员用户名。 |
 | `XLSTATUS_SEED_ADMIN_PASSWORD` | 可选的首个管理员密码。只在用户不存在时创建。 |
 
@@ -54,8 +66,12 @@ url = "sqlite:///var/lib/xlstatus/xlstatus.db?mode=rwc"
 create_if_missing = true
 
 [server]
-http_bind = "0.0.0.0:8080"
-grpc_bind = "0.0.0.0:50051"
+http_bind = "127.0.0.1:8080"
+grpc_bind = "127.0.0.1:50051"
+# grpc_tls_cert_path = "/etc/xlstatus/tls/grpc-server.crt"
+# grpc_tls_key_path = "/etc/xlstatus/tls/grpc-server.key"
+# grpc_tls_client_ca_path = "/etc/xlstatus/tls/agent-ca.crt"
+grpc_reflection_enabled = false
 cors_allowed_origins = [
   "http://localhost:3000",
   "http://127.0.0.1:3000",
@@ -63,6 +79,7 @@ cors_allowed_origins = [
 
 [security]
 session_secret = "replace-with-a-long-random-secret"
+secret_encryption_key = "replace-with-a-different-long-random-secret"
 session_ttl_hours = 24
 ```
 
@@ -195,7 +212,7 @@ Web UI 国际化配置位于 `web/lib/i18n.ts`。
 
 ```env
 XLSTATUS_SEED_ADMIN_USERNAME=admin
-XLSTATUS_SEED_ADMIN_PASSWORD=admin123
+XLSTATUS_SEED_ADMIN_PASSWORD=replace-with-a-strong-initial-password
 ```
 
-如果该用户名已存在，不会覆盖密码。生产环境应在首次登录后更换密码，并移除明文 seed 变量。
+如果该用户名已存在，不会覆盖密码。生产环境必须使用强随机初始密码，并在首次登录后移除明文 seed 变量。

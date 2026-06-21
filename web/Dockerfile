@@ -5,7 +5,7 @@ FROM node:20-alpine AS base
 FROM base AS deps
 WORKDIR /app
 
-COPY package.json pnpm-lock.yaml* ./
+COPY package.json pnpm-lock.yaml* pnpm-workspace.yaml* ./
 RUN corepack enable pnpm && corepack prepare pnpm@10.23.0 --activate && pnpm install --frozen-lockfile
 
 # Build stage

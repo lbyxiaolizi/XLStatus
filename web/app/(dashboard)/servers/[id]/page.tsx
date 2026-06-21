@@ -187,7 +187,7 @@ const blankMetadataForm: ServerMetadataForm = {
   plan: "",
   tags: "",
   accent_color: "#db2777",
-  dashboard_visible: true,
+  dashboard_visible: false,
   hide_for_guest: false,
   display_order: "",
 };
@@ -254,7 +254,7 @@ export default function ServerDetailPage({ params }: PageProps) {
         plan: detail.plan || metadataFromRecord(detail.last_info ?? {}, ["plan", "package", "sku", "product", "instance_type"]) || "",
         tags: Array.isArray(detail.tags) ? detail.tags.join(", ") : "",
         accent_color: detail.accent_color || "#db2777",
-        dashboard_visible: detail.dashboard_visible ?? true,
+        dashboard_visible: detail.dashboard_visible ?? false,
         hide_for_guest: detail.hide_for_guest ?? false,
         display_order: detail.display_order === null || detail.display_order === undefined ? "" : String(detail.display_order),
       });
@@ -1370,7 +1370,7 @@ function trafficQuotaLabel(value?: string | number | null, type?: string | null)
 
 function publicVisibilityLabel(server: ServerDetail): string {
   if (server.hide_for_guest) return "游客隐藏";
-  if (server.dashboard_visible === false) return "状态页隐藏";
+  if (server.dashboard_visible !== true) return "状态页隐藏";
   return "公开显示";
 }
 
@@ -1482,7 +1482,7 @@ function ServerMetadataEditor({
           </Field>
           <label className="flex min-h-12 items-center gap-2 border-2 border-black bg-[var(--accent-bg)] px-3 py-2 text-sm font-black shadow-[var(--shadow-brutal-sm)]">
             <input type="checkbox" checked={form.dashboard_visible} onChange={(event) => onChange({ ...form, dashboard_visible: event.target.checked })} />
-            面板显示
+            公开状态页显示
           </label>
         </div>
         <button type="submit" disabled={saving} className={buttonClass("primary")}>

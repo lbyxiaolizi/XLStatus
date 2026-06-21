@@ -37,3 +37,13 @@ pub fn generate_pat() -> (String, String) {
     let hash = hash_token(&token);
     (token, hash)
 }
+
+/// Generate a one-time temporary transfer token with xlt_ prefix.
+pub fn generate_temporary_transfer_token() -> (String, String) {
+    let mut rng = rand::thread_rng();
+    let bytes: [u8; 32] = rng.gen();
+    let token_body = hex::encode(bytes);
+    let token = format!("xlt_{}", token_body);
+    let hash = hash_token(&token);
+    (token, hash)
+}

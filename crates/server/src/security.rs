@@ -1,8 +1,25 @@
 use anyhow::{Context, Result};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use axum::http::HeaderMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::net::lookup_host;
 
 pub async fn validate_outbound_url(url: &str, purpose: &str) -> Result<reqwest::Url> {
+    validate_outbound_url_resolved(url, purpose)
+        .await
+        .map(|validated| validated.url)
+}
+
+#[derive(Debug, Clone)]
+pub struct ValidatedOutboundUrl {
+    pub url: reqwest::Url,
+    pub host: String,
+    pub addrs: Vec<SocketAddr>,
+}
+
+pub async fn validate_outbound_url_resolved(
+    url: &str,
+    purpose: &str,
+) -> Result<ValidatedOutboundUrl> {
     let parsed = reqwest::Url::parse(url).with_context(|| format!("{purpose} URL is invalid"))?;
     match parsed.scheme() {
         "http" | "https" => {}
@@ -14,37 +31,63 @@ pub async fn validate_outbound_url(url: &str, purpose: &str) -> Result<reqwest::
 
     let host = parsed
         .host_str()
-        .with_context(|| format!("{purpose} URL must include a host"))?;
+        .with_context(|| format!("{purpose} URL must include a host"))?
+        .to_string();
     let port = parsed
         .port_or_known_default()
         .with_context(|| format!("{purpose} URL must include a port or known scheme"))?;
 
-    validate_outbound_host(host, port, purpose).await?;
-    Ok(parsed)
+    let addrs = resolve_outbound_host(&host, port, purpose).await?;
+    Ok(ValidatedOutboundUrl {
+        url: parsed,
+        host,
+        addrs,
+    })
 }
 
 pub async fn validate_outbound_host(host: &str, port: u16, purpose: &str) -> Result<()> {
+    resolve_outbound_host(host, port, purpose).await.map(|_| ())
+}
+
+pub async fn resolve_outbound_host(
+    host: &str,
+    port: u16,
+    purpose: &str,
+) -> Result<Vec<SocketAddr>> {
     if allow_private_outbound() {
-        return Ok(());
+        let resolved: Vec<_> = lookup_host((host, port))
+            .await
+            .with_context(|| format!("failed to resolve {purpose} host '{host}'"))
+            .map(|addrs| addrs.collect())?;
+        if resolved.is_empty() {
+            anyhow::bail!("{purpose} host '{host}' did not resolve to any address");
+        }
+        return Ok(resolved);
     }
 
     if let Ok(ip) = host.parse::<IpAddr>() {
         ensure_public_ip(ip, purpose)?;
-        return Ok(());
+        return Ok(vec![SocketAddr::new(ip, port)]);
     }
 
     let mut addrs = lookup_host((host, port))
         .await
         .with_context(|| format!("failed to resolve {purpose} host '{host}'"))?;
-    let mut resolved = false;
+    let mut resolved = Vec::new();
     for addr in &mut addrs {
-        resolved = true;
         ensure_public_ip(addr.ip(), purpose)?;
+        resolved.push(addr);
     }
-    if !resolved {
+    if resolved.is_empty() {
         anyhow::bail!("{purpose} host '{host}' did not resolve to any address");
     }
-    Ok(())
+    Ok(resolved)
+}
+
+pub fn secure_reqwest_client_builder(validated: &ValidatedOutboundUrl) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(&validated.host, &validated.addrs)
 }
 
 fn ensure_public_ip(ip: IpAddr, purpose: &str) -> Result<()> {
@@ -65,6 +108,127 @@ pub fn allow_private_outbound() -> bool {
             .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
             .unwrap_or(false)
     })
+}
+
+pub fn client_ip_from_headers(headers: &HeaderMap) -> String {
+    client_ip_from_headers_and_peer(headers, None)
+}
+
+pub fn client_ip_from_headers_and_peer(
+    headers: &HeaderMap,
+    peer_addr: Option<SocketAddr>,
+) -> String {
+    let peer_ip = peer_addr.map(|addr| addr.ip());
+    if !trust_proxy_headers() {
+        return sanitize_ip_label(peer_ip.map(|ip| ip.to_string()))
+            .unwrap_or_else(|| "unknown".to_string());
+    }
+    forwarded_client_ip_with_peer(
+        |name| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        },
+        peer_ip.map(|ip| ip.to_string()),
+        peer_ip,
+    )
+}
+
+pub fn forwarded_client_ip_with_peer<F>(
+    mut get_header: F,
+    fallback: Option<String>,
+    peer_ip: Option<IpAddr>,
+) -> String
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    if !trust_proxy_headers() {
+        return sanitize_ip_label(fallback).unwrap_or_else(|| "unknown".to_string());
+    }
+    let peer_is_trusted = peer_ip.map(trusted_proxy_ip).unwrap_or(false);
+    if peer_is_trusted {
+        let forwarded = get_header("x-forwarded-for")
+            .and_then(|value| value.split(',').next().map(str::trim).map(str::to_string))
+            .or_else(|| get_header("x-real-ip"))
+            .or_else(|| get_header("cf-connecting-ip"));
+        if let Some(ip) = sanitize_ip_label(forwarded) {
+            return ip;
+        }
+    }
+    sanitize_ip_label(fallback).unwrap_or_else(|| "unknown".to_string())
+}
+
+fn trust_proxy_headers() -> bool {
+    std::env::var("XLSTATUS_TRUST_PROXY_HEADERS")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn sanitize_ip_label(value: Option<String>) -> Option<String> {
+    let value = value?;
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    parse_header_ip(value).map(|ip| ip.to_string())
+}
+
+fn parse_header_ip(value: &str) -> Option<IpAddr> {
+    value
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<IpAddr>()
+        .ok()
+}
+
+fn trusted_proxy_ip(ip: IpAddr) -> bool {
+    let Ok(raw) = std::env::var("XLSTATUS_TRUSTED_PROXIES") else {
+        return false;
+    };
+    raw.split([',', ' ', '\n', '\t'])
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .any(|item| trusted_proxy_entry_matches(item, ip))
+}
+
+fn trusted_proxy_entry_matches(entry: &str, ip: IpAddr) -> bool {
+    if let Ok(exact) = entry.parse::<IpAddr>() {
+        return exact == ip;
+    }
+    let Some((network, prefix)) = entry.split_once('/') else {
+        return false;
+    };
+    let Ok(network) = network.parse::<IpAddr>() else {
+        return false;
+    };
+    let Ok(prefix) = prefix.parse::<u8>() else {
+        return false;
+    };
+    ip_in_cidr(ip, network, prefix)
+}
+
+fn ip_in_cidr(ip: IpAddr, network: IpAddr, prefix: u8) -> bool {
+    match (ip, network) {
+        (IpAddr::V4(ip), IpAddr::V4(network)) if prefix <= 32 => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            (u32::from(ip) & mask) == (u32::from(network) & mask)
+        }
+        (IpAddr::V6(ip), IpAddr::V6(network)) if prefix <= 128 => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            (u128::from(ip) & mask) == (u128::from(network) & mask)
+        }
+        _ => false,
+    }
 }
 
 fn is_blocked_ip(ip: IpAddr) -> bool {
@@ -123,5 +287,57 @@ mod tests {
     fn allows_public_ip_ranges() {
         assert!(!is_blocked_ip("1.1.1.1".parse().unwrap()));
         assert!(!is_blocked_ip("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn rejects_private_ip_literal_in_outbound_url() {
+        let err = validate_outbound_url_resolved("http://127.0.0.1:8080/status", "test")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("disallowed private address"));
+    }
+
+    #[tokio::test]
+    async fn resolved_url_pins_ip_literal_address() {
+        let validated = validate_outbound_url_resolved("https://1.1.1.1/dns-query", "test")
+            .await
+            .unwrap();
+        assert_eq!(validated.host, "1.1.1.1");
+        assert_eq!(validated.addrs.len(), 1);
+        assert_eq!(
+            validated.addrs[0].ip(),
+            "1.1.1.1".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(validated.addrs[0].port(), 443);
+    }
+
+    #[test]
+    fn matches_trusted_proxy_cidrs() {
+        assert!(trusted_proxy_entry_matches(
+            "10.0.0.0/8",
+            "10.1.2.3".parse().unwrap()
+        ));
+        assert!(!trusted_proxy_entry_matches(
+            "10.0.0.0/8",
+            "11.1.2.3".parse().unwrap()
+        ));
+        assert!(trusted_proxy_entry_matches(
+            "2001:db8::/32",
+            "2001:db8::1".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn forwarded_ip_requires_trusted_peer_decision() {
+        let headers =
+            |name: &str| (name == "x-forwarded-for").then(|| "203.0.113.10, 10.0.0.1".to_string());
+        assert_eq!(
+            forwarded_client_ip_with_peer(
+                headers,
+                Some("198.51.100.9".to_string()),
+                Some("198.51.100.9".parse().unwrap())
+            ),
+            "198.51.100.9"
+        );
     }
 }

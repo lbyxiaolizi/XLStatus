@@ -32,7 +32,7 @@ Open:
 - API: `http://localhost:8080`
 - Public status: `http://localhost:3000/status`
 
-Default local credentials are `admin` / `admin123`. Change them before exposing the service.
+Set `XLSTATUS_SEED_ADMIN_PASSWORD` to a strong initial password before first start.
 
 For PostgreSQL:
 
@@ -52,7 +52,7 @@ Agent:
 
 ```bash
 sudo SERVER_URL=http://dashboard.example.com:8080 \
-  GRPC_SERVER=http://dashboard.example.com:50051 \
+  GRPC_SERVER=https://grpc.dashboard.example.com:50051 \
   ENROLLMENT_TOKEN=xle_... \
   AGENT_NAME="$(hostname)" \
   bash -c 'curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.3/install-agent.sh | bash'

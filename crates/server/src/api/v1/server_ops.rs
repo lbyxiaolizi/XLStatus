@@ -12,15 +12,20 @@ use xlstatus_shared::AgentId;
 
 use crate::api::types::ApiResponse;
 use crate::api::v1::auth::{AppError, AppState};
-use crate::api::v1::servers::server_visible;
-use crate::auth::middleware::AuthSession;
+use crate::api::v1::servers::{ensure_agent_visible, server_visible};
+use crate::auth::generate_temporary_transfer_token;
+use crate::auth::middleware::{AuthKind, AuthSession};
 use crate::auth::rbac::has_scope;
-use crate::db::AgentRepository;
-use crate::mcp::executor::{percent_encode, temporary_url_expires_at, temporary_url_token};
+use crate::db::{
+    AgentRepository, CreateTemporaryTransferTokenInput, TemporaryTransferTokenRepository,
+};
+use crate::mcp::executor::{
+    percent_encode, temporary_url_expires_at, temporary_url_expires_in,
+    TEMP_URL_DEFAULT_EXPIRES_SECS,
+};
 
 const FILE_OP_TIMEOUT_SECS: u64 = 30;
 const FILE_READ_MAX_BYTES: u64 = 2 * 1024 * 1024;
-const TEMP_URL_DEFAULT_EXPIRES_SECS: i64 = 3600;
 
 #[derive(Debug, Deserialize)]
 pub struct FileListQuery {
@@ -334,7 +339,8 @@ pub async fn get_config(
             "disable_force_update",
             "disable_command_execute",
             "disable_nat",
-            "disable_send_query"
+            "disable_send_query",
+            "file_allowed_roots"
         ]
     }))))
 }
@@ -431,28 +437,41 @@ async fn build_temp_url(
     require_transfer_scope(&auth, scope)?;
     ensure_server_visible(&state, &auth, &server_id).await?;
     let path = validate_abs_path(&query.path)?;
-    let expires_at = temporary_url_expires_at(query.expires_in);
-    let token = temporary_url_token(
-        &state.config.security.session_secret,
-        &server_id,
-        &path,
-        op,
-        expires_at,
-    )
-    .map_err(|e| AppError::BadRequest(format!("failed to sign temporary URL: {e}")))?;
+    let expires_in = temporary_url_expires_in(query.expires_in);
+    let expires_at = temporary_url_expires_at(expires_in);
+    let (token, token_hash) = generate_temporary_transfer_token();
+    let expires_at_dt = chrono::DateTime::from_timestamp(expires_at, 0)
+        .ok_or_else(|| AppError::BadRequest("invalid temporary URL expiration".into()))?;
+    let auth_kind = match auth.auth_kind {
+        AuthKind::Session => "session",
+        AuthKind::PersonalAccessToken => "pat",
+    }
+    .to_string();
+    TemporaryTransferTokenRepository::new(state.db.clone())
+        .create(CreateTemporaryTransferTokenInput {
+            token_hash,
+            server_id: AgentId(
+                uuid::Uuid::parse_str(&server_id)
+                    .map_err(|_| AppError::BadRequest(format!("invalid server id: {server_id}")))?,
+            ),
+            path: path.clone(),
+            op: op.to_string(),
+            issued_by_user_id: auth.user_id,
+            auth_kind,
+            session_id: matches!(auth.auth_kind, AuthKind::Session)
+                .then_some(auth.session_id.clone()),
+            api_token_id: auth.pat_id.clone(),
+            scope: scope.to_string(),
+            expires_at: expires_at_dt,
+            created_ip: None,
+        })
+        .await?;
     let route = if op == "download" {
         "/api/v1/transfers/temp/download"
     } else {
         "/api/v1/transfers/temp/upload"
     };
-    let url = format!(
-        "{}?server_id={}&path={}&expires_at={}&token={}",
-        route,
-        percent_encode(&server_id),
-        percent_encode(&path),
-        expires_at,
-        token
-    );
+    let url = format!("{}?token={}", route, percent_encode(&token),);
     Ok(Json(ApiResponse::success(TempUrlResponse {
         server_id,
         path,
@@ -473,13 +492,11 @@ async fn ensure_server_visible(
     if !server_visible(auth, &agent_id) {
         return Err(AppError::Forbidden("agent not in scope".into()));
     }
-    let exists = AgentRepository::new(state.db.clone())
+    let agent = AgentRepository::new(state.db.clone())
         .find_by_id(agent_id)
         .await?
-        .is_some();
-    if !exists {
-        return Err(AppError::NotFound("agent not found".into()));
-    }
+        .ok_or(AppError::NotFound("agent not found".into()))?;
+    ensure_agent_visible(auth, &agent)?;
     Ok(agent_id)
 }
 

@@ -36,6 +36,7 @@ sha2 = "0.10"
 sha1 = "0.10"
 hex = "0.4"
 hmac = "0.12"
+ring = "0.17"
 toml = "0.8"
 jsonwebtoken = { workspace = true }
 reqwest = { workspace = true }

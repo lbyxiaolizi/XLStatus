@@ -19,9 +19,13 @@ use xlstatus_shared::{
 
 use crate::api::types::ApiResponse;
 use crate::api::v1::auth::{AppError, AppState};
-use crate::api::v1::servers::server_visible;
+use crate::api::v1::servers::{ensure_agent_visible, server_visible};
 use crate::auth::middleware::AuthSession;
 use crate::auth::rbac::has_scope;
+use crate::db::AgentRepository;
+
+const TERMINAL_SESSION_TTL_SECONDS: i64 = 300;
+const MAX_PENDING_TERMINAL_SESSIONS: usize = 256;
 
 #[derive(Clone, Default)]
 pub struct TerminalSessionRegistry {
@@ -65,6 +69,11 @@ pub async fn create_terminal_session(
     if !server_visible(&auth, &agent_id) {
         return Err(AppError::Forbidden("agent not in scope".into()));
     }
+    let agent = AgentRepository::new(state.db.clone())
+        .find_by_id(agent_id)
+        .await?
+        .ok_or(AppError::NotFound("agent not found".into()))?;
+    ensure_agent_visible(&auth, &agent)?;
     if !state.session_registry.is_online(&agent_id).await
         || !state.io_registry.is_agent_online(&agent_id).await
     {
@@ -73,7 +82,7 @@ pub async fn create_terminal_session(
     let session = state
         .terminal_sessions
         .create(agent_id, sanitize_cols(req.cols), sanitize_rows(req.rows))
-        .await;
+        .await?;
     Ok(Json(ApiResponse::success(CreateTerminalSessionResponse {
         session_id: session.id.clone(),
         agent_id: session.agent_id.0.to_string(),
@@ -98,6 +107,11 @@ pub async fn ws_terminal(
     if !server_visible(&auth, &session.agent_id) {
         return Err(AppError::Forbidden("agent not in scope".into()));
     }
+    let agent = AgentRepository::new(state.db.clone())
+        .find_by_id(session.agent_id)
+        .await?
+        .ok_or(AppError::NotFound("agent not found".into()))?;
+    ensure_agent_visible(&auth, &agent)?;
 
     let io_registry = state.io_registry.clone();
     let terminal_sessions = state.terminal_sessions.clone();
@@ -359,7 +373,12 @@ impl TerminalSessionRegistry {
         Self::default()
     }
 
-    pub async fn create(&self, agent_id: AgentId, cols: u16, rows: u16) -> TerminalSession {
+    pub async fn create(
+        &self,
+        agent_id: AgentId,
+        cols: u16,
+        rows: u16,
+    ) -> Result<TerminalSession, AppError> {
         let session = TerminalSession {
             id: uuid::Uuid::now_v7().to_string(),
             agent_id,
@@ -367,18 +386,84 @@ impl TerminalSessionRegistry {
             rows,
             created_at: chrono::Utc::now(),
         };
-        self.inner
-            .write()
-            .await
-            .insert(session.id.clone(), session.clone());
-        session
+        let mut sessions = self.inner.write().await;
+        prune_expired_terminal_sessions(&mut sessions, chrono::Utc::now());
+        if sessions.len() >= MAX_PENDING_TERMINAL_SESSIONS {
+            return Err(AppError::Forbidden(
+                "too many pending terminal sessions".into(),
+            ));
+        }
+        sessions.insert(session.id.clone(), session.clone());
+        Ok(session)
     }
 
     pub async fn get(&self, session_id: &str) -> Option<TerminalSession> {
-        self.inner.read().await.get(session_id).cloned()
+        let mut sessions = self.inner.write().await;
+        prune_expired_terminal_sessions(&mut sessions, chrono::Utc::now());
+        sessions.get(session_id).cloned()
     }
 
     pub async fn remove(&self, session_id: &str) {
         self.inner.write().await.remove(session_id);
+    }
+}
+
+fn prune_expired_terminal_sessions(
+    sessions: &mut HashMap<String, TerminalSession>,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    sessions.retain(|_, session| {
+        now.signed_duration_since(session.created_at).num_seconds() <= TERMINAL_SESSION_TTL_SECONDS
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn terminal_registry_prunes_expired_sessions() {
+        let registry = TerminalSessionRegistry::new();
+        let expired = TerminalSession {
+            id: "expired".into(),
+            agent_id: AgentId(uuid::Uuid::now_v7()),
+            cols: 80,
+            rows: 24,
+            created_at: chrono::Utc::now()
+                - chrono::Duration::seconds(TERMINAL_SESSION_TTL_SECONDS + 1),
+        };
+        registry
+            .inner
+            .write()
+            .await
+            .insert(expired.id.clone(), expired);
+
+        assert!(registry.get("expired").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_registry_limits_pending_sessions() {
+        let registry = TerminalSessionRegistry::new();
+        for index in 0..MAX_PENDING_TERMINAL_SESSIONS {
+            let session = TerminalSession {
+                id: format!("session-{index}"),
+                agent_id: AgentId(uuid::Uuid::now_v7()),
+                cols: 80,
+                rows: 24,
+                created_at: chrono::Utc::now(),
+            };
+            registry
+                .inner
+                .write()
+                .await
+                .insert(session.id.clone(), session);
+        }
+
+        let err = registry
+            .create(AgentId(uuid::Uuid::now_v7()), 80, 24)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
     }
 }

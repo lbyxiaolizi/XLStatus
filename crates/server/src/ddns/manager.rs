@@ -3,7 +3,7 @@
 
 use crate::api::v1::settings;
 use crate::db::Db;
-use crate::security::validate_outbound_url;
+use crate::security::{secure_reqwest_client_builder, validate_outbound_url_resolved};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -400,13 +400,12 @@ async fn resolver_contains_ip(resolver_url: &str, domain: &str, ip: &str) -> Res
     url.query_pairs_mut()
         .append_pair("name", domain)
         .append_pair("type", record_type);
-    let url = validate_outbound_url(url.as_str(), "DDNS resolver").await?;
-    let raw = reqwest::Client::builder()
+    let validated = validate_outbound_url_resolved(url.as_str(), "DDNS resolver").await?;
+    let raw = secure_reqwest_client_builder(&validated)
         .timeout(std::time::Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("failed to build DDNS resolver client")?
-        .get(url)
+        .get(validated.url.clone())
         .send()
         .await
         .context("DDNS resolver request failed")?

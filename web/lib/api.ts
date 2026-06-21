@@ -110,9 +110,6 @@ export interface ThemeDefinition {
   variables: Record<string, string>;
   light_variables?: Record<string, string>;
   dark_variables?: Record<string, string>;
-  custom_css?: string | null;
-  light_custom_css?: string | null;
-  dark_custom_css?: string | null;
   builtin: boolean;
   created_at?: string | null;
   updated_at?: string | null;
@@ -133,9 +130,6 @@ export interface ImportThemeRequest {
     variables?: Record<string, string>;
     light_variables?: Record<string, string>;
     dark_variables?: Record<string, string>;
-    custom_css?: string | null;
-    light_custom_css?: string | null;
-    dark_custom_css?: string | null;
   };
 }
 
@@ -297,6 +291,7 @@ export interface SystemSettingsResponse {
   public_background_url?: string | null;
   public_custom_head?: string | null;
   public_custom_body?: string | null;
+  public_server_details_enabled: boolean;
   geoip_provider: string;
   geoip_ipinfo_token?: string;
   geoip_ipinfo_token_configured: boolean;
@@ -317,8 +312,27 @@ export interface TaskRunListResponse {
   total?: number;
 }
 
+export interface NatMapping {
+  id: string;
+  agent_id: string;
+  description?: string | null;
+  protocol?: string;
+  local_host?: string;
+  local_port?: number;
+  public_port?: number;
+  enabled?: boolean;
+  allowed_sources?: string | null;
+  max_active_tunnels?: number | null;
+  idle_timeout_seconds?: number | null;
+  max_bytes_per_tunnel?: number | null;
+  max_bandwidth_bytes_per_second?: number | null;
+  rate_limit_window_seconds?: number | null;
+  max_connections_per_window?: number | null;
+  max_bytes_per_window?: number | null;
+}
+
 export interface NatMappingListResponse {
-  mappings: unknown[];
+  mappings: NatMapping[];
   total?: number;
 }
 
@@ -347,8 +361,29 @@ export interface NotificationProviderListResponse {
 }
 
 export interface DdnsConfigListResponse {
-  configs: unknown[];
+  configs: DdnsConfig[];
   total?: number;
+}
+
+export interface DdnsConfig {
+  id: string;
+  owner_user_id: string;
+  agent_id?: string | null;
+  name: string;
+  provider: string;
+  domain: string;
+  record_id?: string | null;
+  zone_id?: string | null;
+  api_token_configured: boolean;
+  api_key_configured: boolean;
+  api_secret_configured: boolean;
+  webhook_url_configured: boolean;
+  current_ip?: string | null;
+  last_applied_ip?: string | null;
+  last_applied_at?: string | null;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface DdnsHistoryListResponse {
@@ -406,7 +441,18 @@ export interface CreatePatResponse {
   name: string;
   token: string;
   scopes: string[];
+  expires_at: string;
   created_at: string;
+}
+
+export interface PatInfo {
+  id: string;
+  name?: string;
+  scopes?: string[];
+  server_ids?: string[] | null;
+  expires_at?: string;
+  last_used_at?: string | null;
+  created_at?: string;
 }
 
 export interface CreateEnrollmentTokenResponse {
@@ -641,9 +687,10 @@ class ApiClient {
     return this.request<TotpStatusResponse>("/api/v1/auth/totp/status");
   }
 
-  async setupTotp(): Promise<ApiResponse<TotpSetupResponse>> {
+  async setupTotp(code?: string): Promise<ApiResponse<TotpSetupResponse>> {
     return this.request<TotpSetupResponse>("/api/v1/auth/totp/setup", {
       method: "POST",
+      ...(code ? { body: JSON.stringify({ code }) } : {}),
     });
   }
 
@@ -662,8 +709,8 @@ class ApiClient {
   }
 
   // Personal access tokens
-  async listPats(): Promise<ApiResponse<unknown[]>> {
-    return this.request<unknown[]>("/api/v1/tokens");
+  async listPats(): Promise<ApiResponse<PatInfo[]>> {
+    return this.request<PatInfo[]>("/api/v1/tokens");
   }
 
   async createPat(
@@ -690,7 +737,7 @@ class ApiClient {
   }
 
   async createEnrollmentToken(
-    expiresInHours = 24,
+    expiresInHours = 1,
   ): Promise<ApiResponse<CreateEnrollmentTokenResponse>> {
     return this.request<CreateEnrollmentTokenResponse>("/api/v1/enrollment-tokens", {
       method: "POST",
@@ -950,16 +997,6 @@ class ApiClient {
   async getPublicServer(id: string): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
       `/api/v1/public/servers/${encodeURIComponent(id)}`,
-      { anonymous: true },
-    );
-  }
-
-  async getPublicServerMetrics(
-    id: string,
-    range = "1d",
-  ): Promise<ApiResponse<JsonObject>> {
-    return this.request<JsonObject>(
-      `/api/v1/public/servers/${encodeURIComponent(id)}/metrics?range=${encodeURIComponent(range)}`,
       { anonymous: true },
     );
   }

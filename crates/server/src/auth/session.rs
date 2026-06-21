@@ -99,7 +99,7 @@ impl SessionRepository {
                 ))
             }
             DatabaseBackend::Postgres(pool) => {
-                let row = sqlx::query_as::<_, (String, uuid::Uuid, String, Option<String>, Option<String>, DateTime<Utc>, DateTime<Utc>)>(
+                let row = sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid, String, Option<String>, Option<String>, DateTime<Utc>, DateTime<Utc>)>(
                     "SELECT id, user_id, token_hash, ip, user_agent, expires_at, created_at FROM sessions WHERE token_hash = $1 AND expires_at > $2",
                 )
                 .bind(token_hash)
@@ -109,7 +109,62 @@ impl SessionRepository {
 
                 Ok(row.map(
                     |(id, user_id, token_hash, ip, user_agent, expires_at, created_at)| Session {
+                        id: id.to_string(),
+                        user_id: UserId(user_id),
+                        token_hash,
+                        ip,
+                        user_agent,
+                        expires_at,
+                        created_at,
+                    },
+                ))
+            }
+        }
+    }
+
+    pub async fn find_by_id(&self, session_id: &str) -> Result<Option<Session>> {
+        let now = Utc::now();
+
+        match &self.db {
+            DatabaseBackend::Sqlite(pool) => {
+                let row = sqlx::query_as::<_, (String, String, String, Option<String>, Option<String>, String, String)>(
+                    "SELECT id, user_id, token_hash, ip, user_agent, expires_at, created_at FROM sessions WHERE id = ? AND expires_at > ?",
+                )
+                .bind(session_id)
+                .bind(now.to_rfc3339())
+                .fetch_optional(pool)
+                .await?;
+
+                Ok(row.map(
+                    |(id, user_id, token_hash, ip, user_agent, expires_at, created_at)| Session {
                         id,
+                        user_id: UserId(uuid::Uuid::parse_str(&user_id).unwrap()),
+                        token_hash,
+                        ip,
+                        user_agent,
+                        expires_at: DateTime::parse_from_rfc3339(&expires_at)
+                            .unwrap()
+                            .with_timezone(&Utc),
+                        created_at: DateTime::parse_from_rfc3339(&created_at)
+                            .unwrap()
+                            .with_timezone(&Utc),
+                    },
+                ))
+            }
+            DatabaseBackend::Postgres(pool) => {
+                let session_uuid = uuid::Uuid::parse_str(session_id)
+                    .map_err(|e| anyhow::anyhow!("invalid session id: {}", e))?;
+                let row = sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid, String, Option<String>, Option<String>, DateTime<Utc>, DateTime<Utc>)>(
+                    "SELECT id, user_id, token_hash, ip, user_agent, expires_at, created_at FROM sessions WHERE id = $1 AND expires_at > $2",
+                )
+                .bind(session_uuid)
+                .bind(now)
+                .fetch_optional(pool)
+                .await?;
+
+                Ok(row.map(
+                    |(id, user_id, token_hash, ip, user_agent, expires_at, created_at)| Session {
+                        id: id.to_string(),
                         user_id: UserId(user_id),
                         token_hash,
                         ip,

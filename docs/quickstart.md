@@ -26,7 +26,7 @@ docker compose -f docker-compose.pg.yml ps
 - API: `http://localhost:8080`
 - 公开状态页: `http://localhost:3000/status`
 
-默认本地账号：`admin` / `admin123`。
+本地管理员账号使用你在 `XLSTATUS_SEED_ADMIN_PASSWORD` 中设置的初始密码。
 
 Compose 已设置：
 
@@ -78,12 +78,12 @@ SQLite：
 mkdir -p ./data
 DATABASE_URL="sqlite://$(pwd)/data/xlstatus.db?mode=rwc" \
 DATABASE_CREATE_IF_MISSING=true \
-HTTP_BIND="0.0.0.0:8080" \
-GRPC_BIND="0.0.0.0:50051" \
+HTTP_BIND="127.0.0.1:8080" \
+GRPC_BIND="127.0.0.1:50051" \
 CORS_ALLOWED_ORIGINS="http://localhost:3000,http://127.0.0.1:3000" \
-SESSION_SECRET="replace-me" \
+SESSION_SECRET="$(openssl rand -hex 32)" \
 XLSTATUS_SEED_ADMIN_USERNAME="admin" \
-XLSTATUS_SEED_ADMIN_PASSWORD="admin123" \
+XLSTATUS_SEED_ADMIN_PASSWORD="replace-with-a-strong-initial-password" \
 ./target/release/xlstatus-server
 ```
 
@@ -99,12 +99,12 @@ curl -fsS http://localhost:8080/healthz
 timeout 8s env \
   DATABASE_URL="sqlite://$(pwd)/data/xlstatus.db?mode=rwc" \
   DATABASE_CREATE_IF_MISSING=true \
-  HTTP_BIND="0.0.0.0:8080" \
-  GRPC_BIND="0.0.0.0:50051" \
+  HTTP_BIND="127.0.0.1:8080" \
+  GRPC_BIND="127.0.0.1:50051" \
   CORS_ALLOWED_ORIGINS="http://localhost:3000,http://127.0.0.1:3000" \
-  SESSION_SECRET="replace-me" \
+  SESSION_SECRET="$(openssl rand -hex 32)" \
   XLSTATUS_SEED_ADMIN_USERNAME="admin" \
-  XLSTATUS_SEED_ADMIN_PASSWORD="admin123" \
+  XLSTATUS_SEED_ADMIN_PASSWORD="replace-with-a-strong-initial-password" \
   ./target/release/xlstatus-server
 echo $?
 ```
@@ -116,7 +116,9 @@ echo $?
 ```bash
 cp config.example.toml ./config.toml
 SESSION_SECRET_VALUE="$(openssl rand -hex 32)"
+SECRET_ENCRYPTION_KEY_VALUE="$(openssl rand -hex 32)"
 sed -i.bak "s/replace-with-a-long-random-secret/${SESSION_SECRET_VALUE}/" ./config.toml
+sed -i.bak "s/replace-with-a-different-long-random-secret/${SECRET_ENCRYPTION_KEY_VALUE}/" ./config.toml
 CONFIG_FILE=./config.toml ./target/release/xlstatus-server
 ```
 
@@ -162,12 +164,12 @@ SQL
 
 ```bash
 DATABASE_URL='postgresql://xlstatus:change-this-password@localhost:5432/xlstatus' \
-HTTP_BIND="0.0.0.0:8080" \
-GRPC_BIND="0.0.0.0:50051" \
+HTTP_BIND="127.0.0.1:8080" \
+GRPC_BIND="127.0.0.1:50051" \
 CORS_ALLOWED_ORIGINS="http://localhost:3000,http://127.0.0.1:3000" \
 SESSION_SECRET="$(openssl rand -hex 32)" \
 XLSTATUS_SEED_ADMIN_USERNAME="admin" \
-XLSTATUS_SEED_ADMIN_PASSWORD="admin123" \
+XLSTATUS_SEED_ADMIN_PASSWORD="replace-with-a-strong-initial-password" \
 ./target/release/xlstatus-server
 ```
 
