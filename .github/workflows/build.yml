@@ -139,11 +139,22 @@ jobs:
             verify_glibc: false
     steps:
       - uses: actions/checkout@v4
-      - name: Install protoc
-        uses: arduino/setup-protoc@v3
-      - name: Install system dependencies
+      - name: Install Linux system dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y binutils
+        run: sudo apt-get update && sudo apt-get install -y binutils protobuf-compiler
+      - name: Install macOS system dependencies
+        if: runner.os == 'macOS'
+        run: |
+          if ! command -v protoc >/dev/null 2>&1; then
+            brew install protobuf
+          fi
+      - name: Install Windows system dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command protoc.exe -ErrorAction SilentlyContinue)) {
+            choco install protoc --no-progress -y
+          }
       - name: Configure MSVC
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
@@ -160,6 +171,7 @@ jobs:
         if: matrix.use_zigbuild
         uses: mlugg/setup-zig@v2
       - name: Build release binaries
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -168,6 +180,10 @@ jobs:
           else
             cargo build --release --target "${{ matrix.target }}" --bin xlstatus-server --bin xlstatus-agent
           fi
+      - name: Build release binaries
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: cargo build --release --target "${{ matrix.target }}" --bin xlstatus-server --bin xlstatus-agent
       - name: Verify glibc compatibility
         if: matrix.verify_glibc
         run: |
@@ -183,6 +199,7 @@ jobs:
             fi
           done
       - name: Package artifacts
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -194,6 +211,13 @@ jobs:
             cp deploy/install-agent.sh dist/install-agent.sh
           fi
           chmod +x dist/* || true
+      - name: Package artifacts
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/xlstatus-server${{ matrix.binary_ext }}" "dist/xlstatus-server-${{ matrix.os_name }}-${{ matrix.arch }}${{ matrix.binary_ext }}"
+          Copy-Item "target/${{ matrix.target }}/release/xlstatus-agent${{ matrix.binary_ext }}" "dist/xlstatus-agent-${{ matrix.os_name }}-${{ matrix.arch }}${{ matrix.binary_ext }}"
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -217,4 +241,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
+          overwrite_files: true
           files: dist/*
