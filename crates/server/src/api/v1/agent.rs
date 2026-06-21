@@ -270,6 +270,8 @@ mod tests {
 
     #[test]
     fn enrollment_token_ttl_is_bounded() {
+        let _ = agent_auth_body_limit();
+        assert_eq!(AGENT_AUTH_API_MAX_BODY_BYTES, 4 * 1024);
         assert_eq!(normalize_enrollment_token_ttl(None).unwrap(), 1);
         assert_eq!(normalize_enrollment_token_ttl(Some(24)).unwrap(), 24);
         assert!(matches!(

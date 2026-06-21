@@ -23,6 +23,9 @@ use zip::write::SimpleFileOptions;
 
 const RESTORE_MAX_BYTES: usize = 512 * 1024 * 1024;
 const RESTORE_SCHEMA_ALIAS: &str = "restore_src";
+const MAINTENANCE_ACTION_MAX_BODY_BYTES: usize = 4 * 1024;
+const TSDB_RETENTION_MIN_DAYS: i64 = 1;
+const TSDB_RETENTION_MAX_DAYS: i64 = 3650;
 
 #[derive(Debug, Serialize)]
 pub struct MaintenanceStatus {
@@ -317,6 +320,10 @@ pub fn restore_body_limit() -> DefaultBodyLimit {
     DefaultBodyLimit::max(RESTORE_MAX_BYTES)
 }
 
+pub fn maintenance_action_body_limit() -> DefaultBodyLimit {
+    DefaultBodyLimit::max(MAINTENANCE_ACTION_MAX_BODY_BYTES)
+}
+
 async fn sqlite_backup_bytes(pool: &Pool<Sqlite>) -> Result<Vec<u8>, AppError> {
     let tmp_path =
         std::env::temp_dir().join(format!("xlstatus-backup-{}.sqlite3", uuid::Uuid::now_v7()));
@@ -381,7 +388,7 @@ pub async fn update_tsdb_retention(
 ) -> Result<Json<ApiResponse<TsdbRetentionResponse>>, AppError> {
     require_admin_cookie_session(&auth)?;
     require_sensitive_totp(&state.db, auth.user_id, &headers).await?;
-    let days = req.retention_days.clamp(1, 3650);
+    let days = normalize_tsdb_retention_days(req.retention_days)?;
     let before = state.metrics.health();
     state
         .metrics
@@ -398,6 +405,15 @@ pub async fn update_tsdb_retention(
         samples_after: after.samples,
         message: format!("TSDB retention updated to {days} day(s)"),
     })))
+}
+
+fn normalize_tsdb_retention_days(value: i64) -> Result<i64, AppError> {
+    if !(TSDB_RETENTION_MIN_DAYS..=TSDB_RETENTION_MAX_DAYS).contains(&value) {
+        return Err(AppError::BadRequest(format!(
+            "retention_days must be between {TSDB_RETENTION_MIN_DAYS} and {TSDB_RETENTION_MAX_DAYS}"
+        )));
+    }
+    Ok(value)
 }
 
 struct RestoreValidation {
@@ -672,6 +688,32 @@ mod tests {
         let err = require_admin_cookie_session(&auth).unwrap_err();
 
         assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[test]
+    fn maintenance_action_body_limit_is_small() {
+        let _ = maintenance_action_body_limit();
+        assert_eq!(MAINTENANCE_ACTION_MAX_BODY_BYTES, 4 * 1024);
+    }
+
+    #[test]
+    fn tsdb_retention_days_are_bounded() {
+        assert_eq!(
+            normalize_tsdb_retention_days(TSDB_RETENTION_MIN_DAYS).unwrap(),
+            TSDB_RETENTION_MIN_DAYS
+        );
+        assert_eq!(
+            normalize_tsdb_retention_days(TSDB_RETENTION_MAX_DAYS).unwrap(),
+            TSDB_RETENTION_MAX_DAYS
+        );
+        assert!(matches!(
+            normalize_tsdb_retention_days(TSDB_RETENTION_MIN_DAYS - 1),
+            Err(AppError::BadRequest(_))
+        ));
+        assert!(matches!(
+            normalize_tsdb_retention_days(TSDB_RETENTION_MAX_DAYS + 1),
+            Err(AppError::BadRequest(_))
+        ));
     }
 
     fn auth_session(auth_kind: AuthKind, role: UserRole) -> AuthSession {

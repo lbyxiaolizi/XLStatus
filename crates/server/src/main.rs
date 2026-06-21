@@ -54,8 +54,8 @@ use api::v1::geoip::{
     test_geoip, update_geoip_database, upload_geoip_database,
 };
 use api::v1::maintenance::{
-    compact_tsdb, download_archive, download_backup, maintenance_status, restore_backup,
-    restore_body_limit, update_tsdb_retention, vacuum_sqlite,
+    compact_tsdb, download_archive, download_backup, maintenance_action_body_limit,
+    maintenance_status, restore_backup, restore_body_limit, update_tsdb_retention, vacuum_sqlite,
 };
 use api::v1::mcp::{
     execute_mcp_tool, get_mcp_info, handle_mcp_jsonrpc, list_mcp_tools, mcp_body_limit,
@@ -346,7 +346,7 @@ async fn main() -> anyhow::Result<()> {
                 .route("/api/v1/maintenance/tsdb-compact", post(compact_tsdb))
                 .route(
                     "/api/v1/maintenance/tsdb-retention",
-                    post(update_tsdb_retention),
+                    post(update_tsdb_retention).layer(maintenance_action_body_limit()),
                 )
                 .route(
                     "/api/v1/cloudflared/status",
@@ -406,7 +406,10 @@ async fn main() -> anyhow::Result<()> {
                 .route("/api/v1/tokens", post(create_pat).layer(pat_body_limit()))
                 .route("/api/v1/tokens", get(list_pats))
                 .route("/api/v1/tokens/:id", axum::routing::delete(revoke_pat))
-                .route("/api/v1/enrollment-tokens", post(create_enrollment_token))
+                .route(
+                    "/api/v1/enrollment-tokens",
+                    post(create_enrollment_token).layer(agent_auth_body_limit()),
+                )
                 .route(
                     "/api/v1/agents/:id/revoke",
                     post(api::v1::agent::revoke_agent),

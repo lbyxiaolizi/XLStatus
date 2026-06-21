@@ -94,6 +94,8 @@ PAT 创建请求体上限为 16KiB。PAT 名称最长 128 字节，scopes 最多
 
 服务器展示元数据更新、批量管理、服务器分组创建/更新/加成员请求体上限为 64KiB。服务器名称最长 128 字节，备注、公开说明、供应商、地域、套餐、价格、计费周期等展示 label 最长 512 字节；dashboard metadata 序列化后最多 16KiB。标签输入最多 64 项、单项最长 128 字节，保存后最多保留 8 个展示标签。批量服务器 ID 和分组成员单次最多 200 个 UUID，并会规范化为 canonical 文本。`display_order` 必须在数据库 `INTEGER` 范围内。
 
+Enrollment token 创建请求体上限为 4KiB，`expires_in_hours` 必须在 1 到 24 小时之间，默认 1 小时；创建入口只允许管理员 Cookie session。
+
 ### 服务监控
 
 | 方法 | 路径 | 说明 |
@@ -157,6 +159,8 @@ PAT 创建请求体上限为 16KiB。PAT 名称最长 128 字节，scopes 最多
 终端 session 创建请求体上限为 4KiB。终端 WebSocket 单条浏览器文本消息最多 16KiB，单次输入转发给 Agent 前最多保留 8KiB；Agent 终端输出单帧最多 64KiB，关闭原因最多 1024 字节，错误消息最多 4096 字节。
 
 强制更新需要 `server:exec` 权限、明确版本、HTTPS 下载 URL 和 SHA-256 校验和。默认只允许 `https://github.com/lbyxiaolizi/XLStatus/releases/download/<VERSION>/xlstatus-agent-*` 这类官方 Agent release 资产；自托管更新源必须显式设置 `XLSTATUS_ALLOW_CUSTOM_FORCE_UPDATE_URL=1`，但仍要求 HTTPS 和 SHA-256。
+
+维护导出、SQLite VACUUM、TSDB compact 和 TSDB retention 均只允许管理员 Cookie session，敏感写操作仍要求 TOTP。TSDB retention 请求体上限为 4KiB，`retention_days` 必须在 1 到 3650 天之间；超出范围会拒绝而不是静默修正。
 
 ### DDNS、NAT、MCP
 
