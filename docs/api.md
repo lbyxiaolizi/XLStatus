@@ -60,6 +60,8 @@
 | `GET` | `/api/v1/services/:id/history` | 历史结果 |
 | `GET` | `/api/v1/services/:id/uptime` | 可用率 |
 
+服务创建、更新和测试探测请求体上限为 128KiB。服务名称最长 128 字节，target 最长 2048 字节，`interval_seconds` 必须在 10 到 86400 秒之间，`timeout_seconds` 必须在 1 到 30 秒之间。单个服务最多关联或排除 64 台服务器，失败/恢复触发任务各最多 32 个；后台一次服务探测最多下发到 64 台 Agent。
+
 ### 告警
 
 | 方法 | 路径 | 说明 |

@@ -82,7 +82,8 @@ use api::v1::terminal::{create_terminal_session, ws_terminal};
 use api::v1::themes::{delete_theme, import_theme, list_themes, select_theme, update_theme};
 // M3: server list / detail / metrics routes are registered inline below
 use api::v1::services::{
-    create_service, delete_service, get_service, list_services, test_probe, update_service,
+    create_service, delete_service, get_service, list_services, service_body_limit, test_probe,
+    update_service,
 };
 use api::v1::tasks::{
     create_task, delete_task, get_task, get_task_runs, list_tasks, run_task, task_body_limit,
@@ -379,10 +380,19 @@ async fn main() -> anyhow::Result<()> {
                 .route("/api/v1/mcp/info", get(get_mcp_info))
                 .route("/mcp", post(handle_mcp_jsonrpc).layer(mcp_body_limit()))
                 .route("/api/v1/services", get(list_services))
-                .route("/api/v1/services", post(create_service))
-                .route("/api/v1/services/test-probe", post(test_probe))
+                .route(
+                    "/api/v1/services",
+                    post(create_service).layer(service_body_limit()),
+                )
+                .route(
+                    "/api/v1/services/test-probe",
+                    post(test_probe).layer(service_body_limit()),
+                )
                 .route("/api/v1/services/:id", get(get_service))
-                .route("/api/v1/services/:id", post(update_service))
+                .route(
+                    "/api/v1/services/:id",
+                    post(update_service).layer(service_body_limit()),
+                )
                 .route("/api/v1/services/:id", delete(delete_service))
                 .route("/api/v1/services/:id/history", get(get_service_history))
                 .route("/api/v1/services/:id/uptime", get(get_service_uptime))

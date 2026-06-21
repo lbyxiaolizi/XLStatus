@@ -3,6 +3,10 @@
 //! `api/v1/service_history.rs` reads back from the same table for the
 //! dashboard's history view.
 
+use crate::api::v1::services::{
+    SERVICE_MAX_INTERVAL_SECONDS, SERVICE_MAX_TARGETS_PER_PROBE, SERVICE_MAX_TIMEOUT_SECONDS,
+    SERVICE_MIN_INTERVAL_SECONDS, SERVICE_MIN_TIMEOUT_SECONDS,
+};
 use crate::db::Db;
 use crate::grpc::{SessionRegistry, TaskResponseRegistry};
 use crate::services::probe::{probe_http, probe_icmp, probe_tcp, ProbeType, ServiceProbe};
@@ -82,7 +86,8 @@ impl ServiceMonitor {
                 sch.get(&s.id).map(|t| now >= *t).unwrap_or(true)
             };
             if should {
-                let next = now + chrono::Duration::seconds(s.interval_seconds as i64);
+                let interval_seconds = bounded_interval_seconds(s.interval_seconds);
+                let next = now + chrono::Duration::seconds(interval_seconds as i64);
                 self.scheduled.write().await.insert(s.id.clone(), next);
                 if let Err(e) = self.probe(&s).await {
                     warn!("probe {} failed: {}", s.id, e);
@@ -95,7 +100,9 @@ impl ServiceMonitor {
     async fn probe(&self, s: &ServiceConfig) -> Result<()> {
         match s.cover_mode.as_str() {
             "all" | "exclude" => {
-                for server_id in self.covered_agent_ids(s).await? {
+                let server_ids = self.covered_agent_ids(s).await?;
+                ensure_probe_target_count(server_ids.len())?;
+                for server_id in server_ids {
                     if !self
                         .session_registry
                         .is_online(&AgentId(uuid::Uuid::parse_str(&server_id)?))
@@ -112,6 +119,7 @@ impl ServiceMonitor {
                 Ok(())
             }
             "specific" if !s.server_ids.is_empty() => {
+                ensure_probe_target_count(s.server_ids.len())?;
                 for server_id in &s.server_ids {
                     let result = match self.probe_via_agent(s, server_id).await {
                         Ok(result) => result,
@@ -164,13 +172,14 @@ impl ServiceMonitor {
 
     async fn probe_locally(&self, s: &ServiceConfig) -> Result<ServiceProbe> {
         let probe_type = ProbeType::from_str(&s.kind).context("invalid kind")?;
+        let timeout_seconds = bounded_timeout_seconds(s.timeout_seconds);
         Ok(match probe_type {
-            ProbeType::Http => probe_http(&s.target, s.timeout_seconds).await?,
+            ProbeType::Http => probe_http(&s.target, timeout_seconds).await?,
             ProbeType::Tcp => {
                 let (host, port) = parse_tcp_target(&s.target)?;
-                probe_tcp(host, port, s.timeout_seconds).await?
+                probe_tcp(host, port, timeout_seconds).await?
             }
-            ProbeType::Icmp => probe_icmp(&s.target, s.timeout_seconds).await?,
+            ProbeType::Icmp => probe_icmp(&s.target, timeout_seconds).await?,
         })
     }
 
@@ -192,7 +201,9 @@ impl ServiceMonitor {
             anyhow::bail!(e);
         }
 
-        let wait_seconds = s.timeout_seconds.saturating_add(5).max(5);
+        let wait_seconds = bounded_timeout_seconds(s.timeout_seconds)
+            .saturating_add(5)
+            .max(5);
         let result = match tokio::time::timeout(Duration::from_secs(wait_seconds), rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => anyhow::bail!("agent disconnected before reply"),
@@ -641,7 +652,7 @@ struct AgentProbeOutput {
 
 fn build_agent_probe_task(task_id: &str, s: &ServiceConfig) -> Result<ServerTask> {
     let probe_type = ProbeType::from_str(&s.kind).context("invalid kind")?;
-    let timeout_seconds = s.timeout_seconds.min(u32::MAX as u64) as u32;
+    let timeout_seconds = bounded_timeout_seconds(s.timeout_seconds) as u32;
     let task_type = match &probe_type {
         ProbeType::Http => TaskType::HttpGet,
         ProbeType::Tcp => TaskType::TcpPing,
@@ -674,6 +685,29 @@ fn build_agent_probe_task(task_id: &str, s: &ServiceConfig) -> Result<ServerTask
         task_type: task_type as i32,
         spec: Some(spec),
     })
+}
+
+fn bounded_interval_seconds(seconds: u64) -> u64 {
+    seconds.clamp(
+        SERVICE_MIN_INTERVAL_SECONDS as u64,
+        SERVICE_MAX_INTERVAL_SECONDS as u64,
+    )
+}
+
+fn bounded_timeout_seconds(seconds: u64) -> u64 {
+    seconds.clamp(
+        SERVICE_MIN_TIMEOUT_SECONDS as u64,
+        SERVICE_MAX_TIMEOUT_SECONDS as u64,
+    )
+}
+
+fn ensure_probe_target_count(count: usize) -> Result<()> {
+    if count > SERVICE_MAX_TARGETS_PER_PROBE {
+        anyhow::bail!(
+            "service probe resolves to {count} target servers; maximum is {SERVICE_MAX_TARGETS_PER_PROBE}"
+        );
+    }
+    Ok(())
 }
 
 fn service_probe_from_task_result(
@@ -859,6 +893,44 @@ mod tests {
             None
         );
         assert_eq!(unique_nonempty_value(vec![" ".into()]), None);
+    }
+
+    #[test]
+    fn service_monitor_bounds_timeout_interval_and_target_count() {
+        assert_eq!(
+            bounded_interval_seconds(1),
+            SERVICE_MIN_INTERVAL_SECONDS as u64
+        );
+        assert_eq!(
+            bounded_interval_seconds(u64::MAX),
+            SERVICE_MAX_INTERVAL_SECONDS as u64
+        );
+        assert_eq!(
+            bounded_timeout_seconds(0),
+            SERVICE_MIN_TIMEOUT_SECONDS as u64
+        );
+        assert_eq!(
+            bounded_timeout_seconds(u64::MAX),
+            SERVICE_MAX_TIMEOUT_SECONDS as u64
+        );
+        assert!(ensure_probe_target_count(SERVICE_MAX_TARGETS_PER_PROBE).is_ok());
+        assert!(ensure_probe_target_count(SERVICE_MAX_TARGETS_PER_PROBE + 1).is_err());
+    }
+
+    #[test]
+    fn agent_probe_task_uses_bounded_timeout() {
+        let mut service = test_service_config();
+        service.cover_mode = "specific".into();
+        service.kind = "tcp".into();
+        service.target = "example.com:443".into();
+        service.timeout_seconds = u64::MAX;
+
+        let task = build_agent_probe_task("task", &service).unwrap();
+        let Some(Spec::TcpPing(tcp)) = task.spec else {
+            panic!("expected tcp ping task");
+        };
+
+        assert_eq!(tcp.timeout_seconds, SERVICE_MAX_TIMEOUT_SECONDS as u32);
     }
 
     #[tokio::test]

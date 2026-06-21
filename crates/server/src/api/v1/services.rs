@@ -8,7 +8,7 @@ use crate::db::AgentRepository;
 use crate::security::{validate_outbound_host, validate_outbound_url};
 use crate::services::{probe_http, probe_icmp, probe_tcp, ProbeType};
 use axum::{
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     Json,
 };
 use chrono::Utc;
@@ -140,6 +140,17 @@ const SERVICE_LIST_POSTGRES: &str = r#"
                     LIMIT 1
                 )
 "#;
+
+pub(crate) const SERVICE_API_MAX_BODY_BYTES: usize = 128 * 1024;
+pub(crate) const SERVICE_MAX_NAME_BYTES: usize = 128;
+pub(crate) const SERVICE_MAX_TARGET_BYTES: usize = 2048;
+pub(crate) const SERVICE_MIN_INTERVAL_SECONDS: i32 = 10;
+pub(crate) const SERVICE_MAX_INTERVAL_SECONDS: i32 = 86_400;
+pub(crate) const SERVICE_MIN_TIMEOUT_SECONDS: i32 = 1;
+pub(crate) const SERVICE_MAX_TIMEOUT_SECONDS: i32 = 30;
+pub(crate) const SERVICE_MAX_SERVER_IDS: usize = 64;
+pub(crate) const SERVICE_MAX_TASK_IDS: usize = 32;
+pub(crate) const SERVICE_MAX_TARGETS_PER_PROBE: usize = 64;
 
 const VISIBLE_SERVICE_FILTER_SQL: &str = r#"
                 (
@@ -508,7 +519,7 @@ pub async fn test_probe(
 ) -> Result<Json<ApiResponse<ProbeTestResponse>>, AppError> {
     require_probe_test_scope(&auth)?;
 
-    let timeout = req.timeout_seconds.unwrap_or(10).max(1) as u64;
+    let timeout = normalize_probe_timeout(req.timeout_seconds)? as u64;
 
     let result = match ProbeType::from_str(&req.service_type) {
         Some(ProbeType::Http) => probe_http(&req.target, timeout).await,
@@ -542,6 +553,10 @@ pub async fn test_probe(
     })))
 }
 
+pub fn service_body_limit() -> DefaultBodyLimit {
+    DefaultBodyLimit::max(SERVICE_API_MAX_BODY_BYTES)
+}
+
 #[derive(Debug)]
 struct ValidServiceInput {
     name: String,
@@ -566,24 +581,75 @@ async fn validate_service_request(
     if name.is_empty() {
         return Err(AppError::BadRequest("name is required".into()));
     }
+    ensure_byte_len(&name, SERVICE_MAX_NAME_BYTES, "name")?;
     let service_type = ProbeType::from_str(&req.service_type)
         .ok_or_else(|| AppError::BadRequest("Invalid service type".into()))?;
     let target = req.target.trim().to_string();
     if target.is_empty() {
         return Err(AppError::BadRequest("target is required".into()));
     }
-    let interval_seconds = req.interval_seconds.unwrap_or(60);
-    if interval_seconds < 10 {
-        return Err(AppError::BadRequest(
-            "interval_seconds must be at least 10".into(),
-        ));
+    ensure_byte_len(&target, SERVICE_MAX_TARGET_BYTES, "target")?;
+    let interval_seconds = normalize_service_interval(req.interval_seconds)?;
+    let timeout_seconds = normalize_probe_timeout(req.timeout_seconds)?;
+    let mut server_ids = Vec::new();
+    if let Some(server_id) = req.server_id {
+        let trimmed = server_id.trim();
+        if !trimmed.is_empty() {
+            server_ids.push(trimmed.to_string());
+        }
     }
-    let timeout_seconds = req.timeout_seconds.unwrap_or(10);
-    if timeout_seconds < 1 {
-        return Err(AppError::BadRequest(
-            "timeout_seconds must be at least 1".into(),
-        ));
+    for server_id in req.server_ids {
+        let trimmed = server_id.trim();
+        if !trimmed.is_empty() && !server_ids.iter().any(|existing| existing == trimmed) {
+            ensure_byte_len(trimmed, 128, "server_id")?;
+            server_ids.push(trimmed.to_string());
+        }
     }
+    ensure_list_len(&server_ids, SERVICE_MAX_SERVER_IDS, "server_ids")?;
+    for server_id in &server_ids {
+        Uuid::parse_str(server_id)
+            .map_err(|e| AppError::BadRequest(format!("invalid server_id: {e}")))?;
+    }
+    let mut exclude_server_ids = Vec::new();
+    for server_id in req.exclude_server_ids {
+        let trimmed = server_id.trim();
+        if !trimmed.is_empty()
+            && !exclude_server_ids
+                .iter()
+                .any(|existing| existing == trimmed)
+        {
+            ensure_byte_len(trimmed, 128, "exclude_server_id")?;
+            Uuid::parse_str(trimmed)
+                .map_err(|e| AppError::BadRequest(format!("invalid exclude_server_id: {e}")))?;
+            exclude_server_ids.push(trimmed.to_string());
+        }
+    }
+    ensure_list_len(
+        &exclude_server_ids,
+        SERVICE_MAX_SERVER_IDS,
+        "exclude_server_ids",
+    )?;
+    let cover_mode = normalize_cover_mode(req.cover_mode, !server_ids.is_empty())?;
+    let server_id = server_ids.first().cloned();
+    let notification_group_id = req
+        .notification_group_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if let Some(group_id) = notification_group_id.as_deref() {
+        ensure_byte_len(group_id, 128, "notification_group_id")?;
+        Uuid::parse_str(group_id)
+            .map_err(|e| AppError::BadRequest(format!("invalid notification_group_id: {e}")))?;
+    }
+    let failure_task_ids = normalize_id_list(req.failure_task_ids);
+    let recovery_task_ids = normalize_id_list(req.recovery_task_ids);
+    ensure_list_len(&failure_task_ids, SERVICE_MAX_TASK_IDS, "failure_task_ids")?;
+    ensure_list_len(
+        &recovery_task_ids,
+        SERVICE_MAX_TASK_IDS,
+        "recovery_task_ids",
+    )?;
+    validate_task_id_list(&failure_task_ids)?;
+    validate_task_id_list(&recovery_task_ids)?;
     match service_type {
         ProbeType::Http => {
             validate_outbound_url(&target, "HTTP monitor")
@@ -602,38 +668,6 @@ async fn validate_service_request(
                 .map_err(|e| AppError::BadRequest(e.to_string()))?;
         }
     }
-    let mut server_ids = Vec::new();
-    if let Some(server_id) = req.server_id {
-        let trimmed = server_id.trim();
-        if !trimmed.is_empty() {
-            server_ids.push(trimmed.to_string());
-        }
-    }
-    for server_id in req.server_ids {
-        let trimmed = server_id.trim();
-        if !trimmed.is_empty() && !server_ids.iter().any(|existing| existing == trimmed) {
-            server_ids.push(trimmed.to_string());
-        }
-    }
-    for server_id in &server_ids {
-        Uuid::parse_str(server_id)
-            .map_err(|e| AppError::BadRequest(format!("invalid server_id: {e}")))?;
-    }
-    let mut exclude_server_ids = Vec::new();
-    for server_id in req.exclude_server_ids {
-        let trimmed = server_id.trim();
-        if !trimmed.is_empty()
-            && !exclude_server_ids
-                .iter()
-                .any(|existing| existing == trimmed)
-        {
-            Uuid::parse_str(trimmed)
-                .map_err(|e| AppError::BadRequest(format!("invalid exclude_server_id: {e}")))?;
-            exclude_server_ids.push(trimmed.to_string());
-        }
-    }
-    let cover_mode = normalize_cover_mode(req.cover_mode, !server_ids.is_empty())?;
-    let server_id = server_ids.first().cloned();
     Ok(ValidServiceInput {
         name,
         service_type,
@@ -645,12 +679,55 @@ async fn validate_service_request(
         server_ids,
         cover_mode,
         exclude_server_ids,
-        notification_group_id: req
-            .notification_group_id
-            .filter(|value| !value.trim().is_empty()),
-        failure_task_ids: normalize_id_list(req.failure_task_ids),
-        recovery_task_ids: normalize_id_list(req.recovery_task_ids),
+        notification_group_id,
+        failure_task_ids,
+        recovery_task_ids,
     })
+}
+
+fn normalize_service_interval(value: Option<i32>) -> Result<i32, AppError> {
+    let seconds = value.unwrap_or(60);
+    if !(SERVICE_MIN_INTERVAL_SECONDS..=SERVICE_MAX_INTERVAL_SECONDS).contains(&seconds) {
+        return Err(AppError::BadRequest(format!(
+            "interval_seconds must be between {SERVICE_MIN_INTERVAL_SECONDS} and {SERVICE_MAX_INTERVAL_SECONDS}"
+        )));
+    }
+    Ok(seconds)
+}
+
+fn normalize_probe_timeout(value: Option<i32>) -> Result<i32, AppError> {
+    let seconds = value.unwrap_or(10);
+    if !(SERVICE_MIN_TIMEOUT_SECONDS..=SERVICE_MAX_TIMEOUT_SECONDS).contains(&seconds) {
+        return Err(AppError::BadRequest(format!(
+            "timeout_seconds must be between {SERVICE_MIN_TIMEOUT_SECONDS} and {SERVICE_MAX_TIMEOUT_SECONDS}"
+        )));
+    }
+    Ok(seconds)
+}
+
+fn ensure_byte_len(value: &str, max_bytes: usize, field: &str) -> Result<(), AppError> {
+    if value.len() > max_bytes {
+        return Err(AppError::BadRequest(format!(
+            "{field} must be at most {max_bytes} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_list_len<T>(values: &[T], max_len: usize, field: &str) -> Result<(), AppError> {
+    if values.len() > max_len {
+        return Err(AppError::BadRequest(format!(
+            "{field} must contain at most {max_len} entries"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_task_id_list(task_ids: &[String]) -> Result<(), AppError> {
+    for task_id in task_ids {
+        ensure_byte_len(task_id, 128, "task_id")?;
+    }
+    Ok(())
 }
 
 impl ProbeType {
@@ -1613,6 +1690,75 @@ mod tests {
         let err = require_probe_test_scope(&read_only).unwrap_err();
         assert!(matches!(err, AppError::Forbidden(_)));
         assert!(require_probe_test_scope(&writer).is_ok());
+    }
+
+    #[test]
+    fn service_interval_and_timeout_are_bounded() {
+        assert_eq!(normalize_service_interval(None).unwrap(), 60);
+        assert_eq!(
+            normalize_service_interval(Some(SERVICE_MIN_INTERVAL_SECONDS)).unwrap(),
+            SERVICE_MIN_INTERVAL_SECONDS
+        );
+        assert_eq!(normalize_probe_timeout(None).unwrap(), 10);
+        assert_eq!(
+            normalize_probe_timeout(Some(SERVICE_MAX_TIMEOUT_SECONDS)).unwrap(),
+            SERVICE_MAX_TIMEOUT_SECONDS
+        );
+        assert!(matches!(
+            normalize_service_interval(Some(SERVICE_MIN_INTERVAL_SECONDS - 1)),
+            Err(AppError::BadRequest(_))
+        ));
+        assert!(matches!(
+            normalize_service_interval(Some(SERVICE_MAX_INTERVAL_SECONDS + 1)),
+            Err(AppError::BadRequest(_))
+        ));
+        assert!(matches!(
+            normalize_probe_timeout(Some(SERVICE_MAX_TIMEOUT_SECONDS + 1)),
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn service_request_rejects_oversized_server_and_task_lists() {
+        let mut req = CreateServiceRequest {
+            name: "svc".into(),
+            service_type: "http".into(),
+            target: "https://example.com".into(),
+            interval_seconds: Some(60),
+            timeout_seconds: Some(10),
+            enabled: Some(true),
+            server_id: None,
+            server_ids: (0..=SERVICE_MAX_SERVER_IDS)
+                .map(|idx| format!("00000000-0000-0000-0000-{idx:012}"))
+                .collect(),
+            cover_mode: Some("specific".into()),
+            exclude_server_ids: Vec::new(),
+            notification_group_id: None,
+            failure_task_ids: Vec::new(),
+            recovery_task_ids: Vec::new(),
+        };
+        let err = validate_service_request(req).await.unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+
+        req = CreateServiceRequest {
+            name: "svc".into(),
+            service_type: "http".into(),
+            target: "https://example.com".into(),
+            interval_seconds: Some(60),
+            timeout_seconds: Some(10),
+            enabled: Some(true),
+            server_id: None,
+            server_ids: Vec::new(),
+            cover_mode: Some("local".into()),
+            exclude_server_ids: Vec::new(),
+            notification_group_id: None,
+            failure_task_ids: (0..=SERVICE_MAX_TASK_IDS)
+                .map(|idx| format!("task-{idx}"))
+                .collect(),
+            recovery_task_ids: Vec::new(),
+        };
+        let err = validate_service_request(req).await.unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
     }
 
     async fn test_db() -> DatabaseBackend {
