@@ -24,6 +24,12 @@ use std::path::{Path, PathBuf};
 use xlstatus_shared::AgentId;
 
 const GEOIP_MMDB_MAX_BYTES: usize = 128 * 1024 * 1024;
+const GEOIP_TEST_MAX_BODY_BYTES: usize = 4 * 1024;
+const GEOIP_JSON_MAX_BYTES: usize = 16 * 1024;
+const GEOIP_RAW_MAX_STRING_BYTES: usize = 1024;
+const GEOIP_RAW_MAX_ARRAY_ITEMS: usize = 16;
+const GEOIP_RAW_MAX_OBJECT_FIELDS: usize = 32;
+const GEOIP_RAW_MAX_DEPTH: usize = 4;
 
 #[derive(Debug, Deserialize)]
 pub struct GeoIpTestRequest {
@@ -256,6 +262,10 @@ pub fn geoip_upload_body_limit() -> DefaultBodyLimit {
     DefaultBodyLimit::max(GEOIP_MMDB_MAX_BYTES)
 }
 
+pub fn geoip_test_body_limit() -> DefaultBodyLimit {
+    DefaultBodyLimit::max(GEOIP_TEST_MAX_BODY_BYTES)
+}
+
 pub async fn handle_agent_ip_report(
     db: &DatabaseBackend,
     agent_id: AgentId,
@@ -411,10 +421,8 @@ async fn fetch_json(url: &str, bearer_token: Option<&str>) -> Result<serde_json:
             response.status()
         )));
     }
-    response
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|e| AppError::BadRequest(format!("GeoIP response is invalid: {e}")))
+    let raw = read_limited_json_response(response, GEOIP_JSON_MAX_BYTES, "GeoIP response").await?;
+    normalize_geoip_raw(raw)
 }
 
 fn ipinfo_lookup_url(ip: &str) -> Result<reqwest::Url, AppError> {
@@ -640,17 +648,7 @@ async fn download_mmdb(url: &str) -> Result<Vec<u8>, AppError> {
             GEOIP_MMDB_MAX_BYTES
         )));
     }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| AppError::BadRequest(format!("failed to read MMDB download: {e}")))?;
-    if bytes.len() > GEOIP_MMDB_MAX_BYTES {
-        return Err(AppError::BadRequest(format!(
-            "MMDB download exceeds {} bytes",
-            GEOIP_MMDB_MAX_BYTES
-        )));
-    }
-    Ok(bytes.to_vec())
+    read_limited_response_bytes(response, GEOIP_MMDB_MAX_BYTES, "MMDB download").await
 }
 
 fn mmdb_path() -> PathBuf {
@@ -994,6 +992,100 @@ fn app_error_to_anyhow(err: AppError) -> anyhow::Error {
     anyhow::anyhow!("{err:?}")
 }
 
+async fn read_limited_json_response(
+    response: reqwest::Response,
+    max_bytes: usize,
+    label: &str,
+) -> Result<serde_json::Value, AppError> {
+    let bytes = read_limited_response_bytes(response, max_bytes, label).await?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| AppError::BadRequest(format!("{label} is invalid: {e}")))
+}
+
+async fn read_limited_response_bytes(
+    response: reqwest::Response,
+    max_bytes: usize,
+    label: &str,
+) -> Result<Vec<u8>, AppError> {
+    if response
+        .content_length()
+        .map(|length| length > max_bytes as u64)
+        .unwrap_or(false)
+    {
+        return Err(AppError::BadRequest(format!(
+            "{label} exceeds {max_bytes} bytes"
+        )));
+    }
+
+    let mut response = response;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("failed to read {label}: {e}")))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(AppError::BadRequest(format!(
+                "{label} exceeds {max_bytes} bytes"
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+fn normalize_geoip_raw(raw: serde_json::Value) -> Result<serde_json::Value, AppError> {
+    normalize_geoip_raw_value(raw, 0)
+}
+
+fn normalize_geoip_raw_value(
+    value: serde_json::Value,
+    depth: usize,
+) -> Result<serde_json::Value, AppError> {
+    if depth > GEOIP_RAW_MAX_DEPTH {
+        return Ok(serde_json::Value::Null);
+    }
+    match value {
+        serde_json::Value::String(value) => Ok(serde_json::Value::String(normalize_geoip_text(
+            &value,
+            "GeoIP response string",
+        )?)),
+        serde_json::Value::Array(items) => {
+            let items = items
+                .into_iter()
+                .take(GEOIP_RAW_MAX_ARRAY_ITEMS)
+                .map(|item| normalize_geoip_raw_value(item, depth + 1))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(serde_json::Value::Array(items))
+        }
+        serde_json::Value::Object(map) => {
+            let entries = map
+                .into_iter()
+                .take(GEOIP_RAW_MAX_OBJECT_FIELDS)
+                .map(|(key, value)| {
+                    Ok((
+                        normalize_geoip_text(&key, "GeoIP response key")?,
+                        normalize_geoip_raw_value(value, depth + 1)?,
+                    ))
+                })
+                .collect::<Result<serde_json::Map<String, serde_json::Value>, AppError>>()?;
+            Ok(serde_json::Value::Object(entries))
+        }
+        value => Ok(value),
+    }
+}
+
+fn normalize_geoip_text(value: &str, label: &str) -> Result<String, AppError> {
+    let value = value.trim();
+    if value.len() > GEOIP_RAW_MAX_STRING_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "{label} exceeds {} bytes",
+            GEOIP_RAW_MAX_STRING_BYTES
+        )));
+    }
+    Ok(value.to_string())
+}
+
 fn clean_ip(value: Option<&str>) -> Option<String> {
     value
         .map(str::trim)
@@ -1064,6 +1156,38 @@ mod tests {
         let value = serde_json::json!({ "lat": "12.5", "lon": 35.0 });
         assert_eq!(json_f64(&value, &["lat"]), Some(12.5));
         assert_eq!(json_f64(&value, &["lon"]), Some(35.0));
+    }
+
+    #[test]
+    fn geoip_raw_response_is_bounded() {
+        let raw = serde_json::json!({
+            "items": (0..32).collect::<Vec<_>>(),
+            "nested": { "a": { "b": { "c": { "d": { "e": "too-deep" } } } } },
+        });
+        let normalized = normalize_geoip_raw(raw).expect("bounded raw");
+
+        assert_eq!(
+            normalized
+                .get("items")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(GEOIP_RAW_MAX_ARRAY_ITEMS)
+        );
+        assert_eq!(
+            normalized.pointer("/nested/a/b/c/d"),
+            Some(&serde_json::Value::Null)
+        );
+
+        let too_long = serde_json::json!({ "value": "a".repeat(GEOIP_RAW_MAX_STRING_BYTES + 1) });
+        assert!(matches!(
+            normalize_geoip_raw(too_long),
+            Err(AppError::BadRequest(message)) if message.contains("GeoIP response string")
+        ));
+    }
+
+    #[test]
+    fn geoip_test_body_limit_is_small() {
+        assert_eq!(GEOIP_TEST_MAX_BODY_BYTES, 4 * 1024);
     }
 
     #[test]

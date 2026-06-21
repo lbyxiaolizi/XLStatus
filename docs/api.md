@@ -136,6 +136,8 @@ NAT 创建/更新支持安全策略字段：`allowed_sources`、`max_active_tunn
 
 MCP POST 入口请求体上限为 1MiB。`/mcp` JSON-RPC batch 最多 16 项，空 batch 或超过上限会返回 `Invalid Request`。`server.exec` 命令最长 8192 字节，timeout 被限制在 1 到 60 秒，默认 30 秒。
 
+GeoIP 测试接口请求体上限为 4KiB。GeoIP JSON provider 响应最多读取 16KiB，返回的 `raw` JSON 会限制字符串长度、数组项数、对象字段数和嵌套深度；MMDB 下载和上传文件上限均为 128MiB，下载路径会在读取过程中按上限中止。
+
 ## gRPC
 
 Agent gRPC 服务定义在 `proto/xlstatus/v1/agent.proto`，生成代码在 `crates/proto-gen/`。默认消息大小限制为 `256 MiB`。

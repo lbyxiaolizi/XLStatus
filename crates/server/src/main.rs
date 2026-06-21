@@ -47,7 +47,8 @@ use api::v1::ddns::{
     reload_ddns_providers,
 };
 use api::v1::geoip::{
-    geoip_status, geoip_upload_body_limit, test_geoip, update_geoip_database, upload_geoip_database,
+    geoip_status, geoip_test_body_limit, geoip_upload_body_limit, test_geoip,
+    update_geoip_database, upload_geoip_database,
 };
 use api::v1::maintenance::{
     compact_tsdb, download_archive, download_backup, maintenance_status, restore_backup,
@@ -343,7 +344,10 @@ async fn main() -> anyhow::Result<()> {
                     post(api::v1::cloudflared::stop_cloudflared),
                 )
                 .route("/api/v1/geoip/status", get(geoip_status))
-                .route("/api/v1/geoip/test", post(test_geoip))
+                .route(
+                    "/api/v1/geoip/test",
+                    post(test_geoip).layer(geoip_test_body_limit()),
+                )
                 .route("/api/v1/geoip/update", post(update_geoip_database))
                 .route(
                     "/api/v1/geoip/upload",
