@@ -138,8 +138,10 @@ pub async fn maintenance_status(
 pub async fn download_backup(
     State(state): State<AppState>,
     auth: AuthSession,
+    headers: HeaderMap,
 ) -> Result<Response, AppError> {
     require_admin_cookie_session(&auth)?;
+    require_sensitive_totp(&state.db, auth.user_id, &headers).await?;
     let crate::db::DatabaseBackend::Sqlite(pool) = &state.db else {
         return Err(AppError::BadRequest(
             "backup download currently supports SQLite only".into(),
@@ -179,8 +181,10 @@ pub async fn download_backup(
 pub async fn download_archive(
     State(state): State<AppState>,
     auth: AuthSession,
+    headers: HeaderMap,
 ) -> Result<Response, AppError> {
     require_admin_cookie_session(&auth)?;
+    require_sensitive_totp(&state.db, auth.user_id, &headers).await?;
     let crate::db::DatabaseBackend::Sqlite(pool) = &state.db else {
         return Err(AppError::BadRequest(
             "full archive currently supports SQLite only".into(),

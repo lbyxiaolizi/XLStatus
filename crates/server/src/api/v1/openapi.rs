@@ -231,13 +231,13 @@ const ROUTES: &[RouteSpec] = &[
         protected: true,
     },
     RouteSpec {
-        method: "get",
+        method: "post",
         path: "/api/v1/maintenance/backup",
         summary: "Download SQLite backup",
         protected: true,
     },
     RouteSpec {
-        method: "get",
+        method: "post",
         path: "/api/v1/maintenance/archive",
         summary: "Download full maintenance archive",
         protected: true,
@@ -1058,6 +1058,18 @@ mod tests {
 
         assert!(geoip_test["post"].get("security").is_some());
         assert!(geoip_test["get"].is_null());
+    }
+
+    #[test]
+    fn openapi_documents_maintenance_exports_as_post_only() {
+        let doc = openapi_document();
+        let backup = &doc["paths"]["/api/v1/maintenance/backup"];
+        let archive = &doc["paths"]["/api/v1/maintenance/archive"];
+
+        assert!(backup["post"].get("security").is_some());
+        assert!(archive["post"].get("security").is_some());
+        assert!(backup["get"].is_null());
+        assert!(archive["get"].is_null());
     }
 
     #[test]

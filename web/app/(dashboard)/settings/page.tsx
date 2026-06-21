@@ -602,6 +602,24 @@ export default function SettingsPage() {
     }
   }
 
+  async function downloadMaintenanceExport(kind: "backup" | "archive") {
+    const supported = kind === "backup" ? maintenanceStatus?.backup_supported : maintenanceStatus?.archive_supported;
+    if (!supported) return;
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
+    setMaintenanceLoading(true);
+    const response = kind === "backup"
+      ? await apiClient.downloadMaintenanceBackup(totpCode)
+      : await apiClient.downloadMaintenanceArchive(totpCode);
+    setMaintenanceLoading(false);
+    if (response.success && response.data) {
+      saveBlob(response.data.blob, response.data.filename);
+      setNotice(kind === "backup" ? "备份下载已开始。" : "归档下载已开始。");
+    } else {
+      setError(responseError(response));
+    }
+  }
+
   async function saveCloudflaredToken() {
     const totpCode = await sensitiveTotpCode();
     if (totpCode === null) return;
@@ -1645,26 +1663,22 @@ export default function SettingsPage() {
               >
                 保存 retention
               </button>
-              <a
+              <button
+                type="button"
                 className={buttonClass(maintenanceStatus?.backup_supported ? "primary" : "secondary")}
-                href={maintenanceStatus?.backup_supported ? apiClient.getMaintenanceBackupUrl() : undefined}
-                aria-disabled={!maintenanceStatus?.backup_supported}
-                onClick={(event) => {
-                  if (!maintenanceStatus?.backup_supported) event.preventDefault();
-                }}
+                disabled={!maintenanceStatus?.backup_supported || maintenanceLoading}
+                onClick={() => void downloadMaintenanceExport("backup")}
               >
                 下载备份
-              </a>
-              <a
+              </button>
+              <button
+                type="button"
                 className={buttonClass(maintenanceStatus?.archive_supported ? "primary" : "secondary")}
-                href={maintenanceStatus?.archive_supported ? apiClient.getMaintenanceArchiveUrl() : undefined}
-                aria-disabled={!maintenanceStatus?.archive_supported}
-                onClick={(event) => {
-                  if (!maintenanceStatus?.archive_supported) event.preventDefault();
-                }}
+                disabled={!maintenanceStatus?.archive_supported || maintenanceLoading}
+                onClick={() => void downloadMaintenanceExport("archive")}
               >
                 下载归档
-              </a>
+              </button>
               <button
                 type="button"
                 className={buttonClass("secondary")}
@@ -2056,4 +2070,15 @@ function buildAgentInstallCommand({
   installScriptUrl: string;
 }): string {
   return `curl -fsSL ${shellQuote(installScriptUrl)} | sudo bash`;
+}
+
+function saveBlob(blob: Blob, filename: string) {
+  const url = window.URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename || "download";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.URL.revokeObjectURL(url);
 }

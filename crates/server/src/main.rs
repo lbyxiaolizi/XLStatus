@@ -310,8 +310,8 @@ async fn main() -> anyhow::Result<()> {
                     axum::routing::delete(delete_waf_ban),
                 )
                 .route("/api/v1/maintenance/status", get(maintenance_status))
-                .route("/api/v1/maintenance/backup", get(download_backup))
-                .route("/api/v1/maintenance/archive", get(download_archive))
+                .route("/api/v1/maintenance/backup", post(download_backup))
+                .route("/api/v1/maintenance/archive", post(download_archive))
                 .route(
                     "/api/v1/maintenance/restore",
                     post(restore_backup).layer(restore_body_limit()),

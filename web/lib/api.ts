@@ -177,6 +177,11 @@ export interface MaintenanceRestoreResponse {
   message: string;
 }
 
+export interface DownloadFileResponse {
+  blob: Blob;
+  filename: string;
+}
+
 export interface TsdbCompactResponse {
   action: string;
   success: boolean;
@@ -552,6 +557,57 @@ class ApiClient {
     }
 
     return last ?? { success: false, error: getTranslations().common.noRequestAttempted };
+  }
+
+  private async downloadFile(
+    path: string,
+    options: ApiRequestOptions = {},
+  ): Promise<ApiResponse<DownloadFileResponse>> {
+    const url = `${this.baseUrl}${path}`;
+    const { anonymous, headers, ...fetchOptions } = options;
+    const csrfToken = getCookie("xlstatus_csrf");
+
+    try {
+      const response = await fetch(url, {
+        ...fetchOptions,
+        headers: {
+          ...(csrfToken && !anonymous ? { "x-csrf-token": csrfToken } : {}),
+          ...headers,
+        },
+        credentials: anonymous ? "omit" : "include",
+      });
+
+      if (!response.ok) {
+        const text = await response.text();
+        const payload = parseJson(text);
+        const envelope = normalizeEnvelope<DownloadFileResponse>(payload, response.status);
+        return {
+          success: false,
+          data: envelope.data,
+          error:
+            envelope.error ||
+            response.statusText ||
+            `Request failed with ${response.status}`,
+          status: response.status,
+          request_id: envelope.request_id,
+        };
+      }
+
+      const blob = await response.blob();
+      return {
+        success: true,
+        status: response.status,
+        data: {
+          blob,
+          filename: filenameFromContentDisposition(response.headers.get("Content-Disposition")),
+        },
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : getTranslations().common.networkError,
+      };
+    }
   }
 
   private sensitiveHeaders(totpCode?: string): HeadersInit {
@@ -1356,12 +1412,22 @@ class ApiClient {
     return this.request<MaintenanceStatusResponse>("/api/v1/maintenance/status");
   }
 
-  getMaintenanceBackupUrl(): string {
-    return `${this.baseUrl}/api/v1/maintenance/backup`;
+  async downloadMaintenanceBackup(
+    totpCode?: string,
+  ): Promise<ApiResponse<DownloadFileResponse>> {
+    return this.downloadFile("/api/v1/maintenance/backup", {
+      method: "POST",
+      headers: this.sensitiveHeaders(totpCode),
+    });
   }
 
-  getMaintenanceArchiveUrl(): string {
-    return `${this.baseUrl}/api/v1/maintenance/archive`;
+  async downloadMaintenanceArchive(
+    totpCode?: string,
+  ): Promise<ApiResponse<DownloadFileResponse>> {
+    return this.downloadFile("/api/v1/maintenance/archive", {
+      method: "POST",
+      headers: this.sensitiveHeaders(totpCode),
+    });
   }
 
   async vacuumSqlite(totpCode?: string): Promise<ApiResponse<JsonObject>> {
@@ -1607,4 +1673,18 @@ function getCookie(name: string): string | null {
       .find((row) => row.startsWith(`${name}=`))
       ?.split("=")[1] ?? null
   );
+}
+
+function filenameFromContentDisposition(value: string | null): string {
+  if (!value) return "download";
+  const utf8 = value.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8?.[1]) {
+    try {
+      return decodeURIComponent(utf8[1].replace(/^"|"$/g, ""));
+    } catch {
+      return utf8[1].replace(/^"|"$/g, "");
+    }
+  }
+  const plain = value.match(/filename="?([^";]+)"?/i);
+  return plain?.[1]?.trim() || "download";
 }
