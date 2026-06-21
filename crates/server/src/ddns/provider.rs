@@ -2,8 +2,16 @@ use crate::security::{secure_reqwest_client_builder, validate_outbound_url_resol
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
+use reqwest::{RequestBuilder, Url};
 use sha2::{Digest, Sha256};
+use std::time::Duration;
 use xlstatus_shared::ddns::*;
+
+const DDNS_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const CLOUDFLARE_API_BASE: &str = "https://api.cloudflare.com/client/v4";
+const HE_DDNS_UPDATE_URL: &str = "https://dyn.dns.he.net/nic/update";
+const TENCENT_DNSPOD_API_HOST: &str = "dnspod.tencentcloudapi.com";
+const TENCENT_DNSPOD_API_URL: &str = "https://dnspod.tencentcloudapi.com/";
 
 /// DDNS provider trait
 #[async_trait]
@@ -18,15 +26,11 @@ pub trait DdnsProviderTrait: Send + Sync {
 /// Cloudflare DDNS provider
 pub struct CloudflareProvider {
     config: CloudflareConfig,
-    client: reqwest::Client,
 }
 
 impl CloudflareProvider {
     pub fn new(config: CloudflareConfig) -> Self {
-        Self {
-            config,
-            client: reqwest::Client::new(),
-        }
+        Self { config }
     }
 }
 
@@ -34,14 +38,11 @@ impl CloudflareProvider {
 impl DdnsProviderTrait for CloudflareProvider {
     async fn update_ip(&self, hostname: &str, ip: &str) -> Result<()> {
         // Get DNS record ID
-        let list_url = format!(
-            "https://api.cloudflare.com/client/v4/zones/{}/dns_records?name={}",
-            self.config.zone_id, hostname
-        );
+        let list_url = cloudflare_list_url(&self.config.zone_id, hostname)?;
+        let (client, list_url) = ddns_http_client_for_url(&list_url, "Cloudflare DDNS").await?;
 
-        let list_response = self
-            .client
-            .get(&list_url)
+        let list_response = client
+            .get(list_url)
             .header("Authorization", format!("Bearer {}", self.config.api_token))
             .header("Content-Type", "application/json")
             .send()
@@ -62,10 +63,8 @@ impl DdnsProviderTrait for CloudflareProvider {
         let record_id = records[0]["id"].as_str().context("No record ID")?;
 
         // Update DNS record
-        let update_url = format!(
-            "https://api.cloudflare.com/client/v4/zones/{}/dns_records/{}",
-            self.config.zone_id, record_id
-        );
+        let update_url = cloudflare_update_url(&self.config.zone_id, record_id)?;
+        let (client, update_url) = ddns_http_client_for_url(&update_url, "Cloudflare DDNS").await?;
 
         let update_body = serde_json::json!({
             "type": self.config.record_type,
@@ -75,9 +74,8 @@ impl DdnsProviderTrait for CloudflareProvider {
             "proxied": self.config.proxied,
         });
 
-        let update_response = self
-            .client
-            .put(&update_url)
+        let update_response = client
+            .put(update_url)
             .header("Authorization", format!("Bearer {}", self.config.api_token))
             .header("Content-Type", "application/json")
             .json(&update_body)
@@ -101,29 +99,22 @@ impl DdnsProviderTrait for CloudflareProvider {
 /// Hurricane Electric DDNS provider
 pub struct HeProvider {
     config: HeConfig,
-    client: reqwest::Client,
 }
 
 impl HeProvider {
     pub fn new(config: HeConfig) -> Self {
-        Self {
-            config,
-            client: reqwest::Client::new(),
-        }
+        Self { config }
     }
 }
 
 #[async_trait]
 impl DdnsProviderTrait for HeProvider {
     async fn update_ip(&self, _hostname: &str, ip: &str) -> Result<()> {
-        let url = format!(
-            "https://dyn.dns.he.net/nic/update?hostname={}&password={}&myip={}",
-            self.config.hostname, self.config.password, ip
-        );
+        let url = he_update_url(&self.config.hostname, ip)?;
+        let (client, url) = ddns_http_client_for_url(&url, "HE DDNS").await?;
 
         let response = self
-            .client
-            .get(&url)
+            .he_update_request(&client, url)
             .send()
             .await
             .context("Failed to update HE DDNS")?;
@@ -146,6 +137,15 @@ impl DdnsProviderTrait for HeProvider {
     }
 }
 
+impl HeProvider {
+    fn he_update_request(&self, client: &reqwest::Client, url: Url) -> RequestBuilder {
+        client.get(url).basic_auth(
+            self.config.hostname.trim(),
+            Some(self.config.password.trim()),
+        )
+    }
+}
+
 /// Tencent Cloud DNSPod DDNS provider.
 ///
 /// Uses Tencent Cloud API v3 `dnspod` `ModifyDynamicDNS`. The DB/API layer
@@ -153,15 +153,11 @@ impl DdnsProviderTrait for HeProvider {
 /// UX helper, but update itself is fully implemented here.
 pub struct TencentCloudProvider {
     config: TencentCloudConfig,
-    client: reqwest::Client,
 }
 
 impl TencentCloudProvider {
     pub fn new(config: TencentCloudConfig) -> Self {
-        Self {
-            config,
-            client: reqwest::Client::new(),
-        }
+        Self { config }
     }
 
     fn subdomain_for(&self, hostname: &str) -> String {
@@ -188,7 +184,7 @@ impl DdnsProviderTrait for TencentCloudProvider {
             anyhow::bail!("Tencent Cloud secret_id and secret_key are required");
         }
 
-        let endpoint = "dnspod.tencentcloudapi.com";
+        let endpoint = TENCENT_DNSPOD_API_HOST;
         let timestamp = chrono::Utc::now().timestamp();
         let body = serde_json::json!({
             "Domain": self.config.domain,
@@ -211,15 +207,8 @@ impl DdnsProviderTrait for TencentCloudProvider {
         )?;
 
         let response = self
-            .client
-            .post(format!("https://{}", endpoint))
-            .header("Authorization", authorization)
-            .header("Content-Type", "application/json")
-            .header("Host", endpoint)
-            .header("X-TC-Action", "ModifyDynamicDNS")
-            .header("X-TC-Version", "2021-03-23")
-            .header("X-TC-Timestamp", timestamp.to_string())
-            .body(body)
+            .tencent_request(&body, timestamp, &authorization)
+            .await?
             .send()
             .await
             .context("Failed to update Tencent Cloud DNS record")?;
@@ -246,6 +235,65 @@ impl DdnsProviderTrait for TencentCloudProvider {
     }
 }
 
+impl TencentCloudProvider {
+    async fn tencent_request(
+        &self,
+        body: &str,
+        timestamp: i64,
+        authorization: &str,
+    ) -> Result<RequestBuilder> {
+        let url = Url::parse(TENCENT_DNSPOD_API_URL).context("invalid Tencent Cloud DDNS URL")?;
+        let (client, url) = ddns_http_client_for_url(&url, "Tencent Cloud DDNS").await?;
+        Ok(client
+            .post(url)
+            .header("Authorization", authorization)
+            .header("Content-Type", "application/json")
+            .header("Host", TENCENT_DNSPOD_API_HOST)
+            .header("X-TC-Action", "ModifyDynamicDNS")
+            .header("X-TC-Version", "2021-03-23")
+            .header("X-TC-Timestamp", timestamp.to_string())
+            .body(body.to_string()))
+    }
+}
+
+async fn ddns_http_client_for_url(url: &Url, purpose: &str) -> Result<(reqwest::Client, Url)> {
+    let validated = validate_outbound_url_resolved(url.as_str(), purpose).await?;
+    let client = secure_reqwest_client_builder(&validated)
+        .timeout(DDNS_HTTP_TIMEOUT)
+        .build()
+        .with_context(|| format!("failed to build {purpose} HTTP client"))?;
+    Ok((client, validated.url))
+}
+
+fn cloudflare_list_url(zone_id: &str, hostname: &str) -> Result<Url> {
+    let mut url = cloudflare_api_url(["zones", zone_id.trim(), "dns_records"])?;
+    url.query_pairs_mut().append_pair("name", hostname.trim());
+    Ok(url)
+}
+
+fn cloudflare_update_url(zone_id: &str, record_id: &str) -> Result<Url> {
+    cloudflare_api_url(["zones", zone_id.trim(), "dns_records", record_id.trim()])
+}
+
+fn cloudflare_api_url<'a>(segments: impl IntoIterator<Item = &'a str>) -> Result<Url> {
+    let mut url = Url::parse(CLOUDFLARE_API_BASE).context("invalid Cloudflare DDNS URL")?;
+    {
+        let mut path = url
+            .path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Cloudflare DDNS URL cannot be a base"))?;
+        path.extend(segments);
+    }
+    Ok(url)
+}
+
+fn he_update_url(hostname: &str, ip: &str) -> Result<Url> {
+    let mut url = Url::parse(HE_DDNS_UPDATE_URL).context("invalid HE DDNS URL")?;
+    url.query_pairs_mut()
+        .append_pair("hostname", hostname.trim())
+        .append_pair("myip", ip.trim());
+    Ok(url)
+}
+
 /// Webhook DDNS provider
 pub struct WebhookProvider {
     config: WebhookConfig,
@@ -267,6 +315,7 @@ impl DdnsProviderTrait for WebhookProvider {
             .replace("{{hostname}}", hostname);
         let validated = validate_outbound_url_resolved(&url, "DDNS webhook").await?;
         let client = secure_reqwest_client_builder(&validated)
+            .timeout(DDNS_HTTP_TIMEOUT)
             .build()
             .context("failed to build DDNS webhook HTTP client")?;
         let url = validated.url.clone();
@@ -440,5 +489,59 @@ mod tests {
         assert!(auth.starts_with("TC3-HMAC-SHA256 Credential=akid/"));
         assert!(auth.contains("SignedHeaders=content-type;host;x-tc-action"));
         assert!(auth.contains("Signature="));
+    }
+
+    #[test]
+    fn he_update_url_does_not_put_password_in_query() {
+        let url = he_update_url(" host.example.com ", " 203.0.113.10 ").unwrap();
+
+        assert_eq!(
+            url.as_str(),
+            "https://dyn.dns.he.net/nic/update?hostname=host.example.com&myip=203.0.113.10"
+        );
+        assert!(url.query_pairs().all(|(key, _)| key != "password"));
+    }
+
+    #[test]
+    fn he_update_request_uses_basic_authorization_header() {
+        let provider = HeProvider::new(HeConfig {
+            hostname: " host.example.com ".into(),
+            password: " dynamic-key ".into(),
+        });
+        let client = reqwest::Client::builder().build().unwrap();
+        let request = provider
+            .he_update_request(
+                &client,
+                he_update_url("host.example.com", "203.0.113.10").unwrap(),
+            )
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            request.url().query(),
+            Some("hostname=host.example.com&myip=203.0.113.10")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Basic aG9zdC5leGFtcGxlLmNvbTpkeW5hbWljLWtleQ==")
+        );
+    }
+
+    #[test]
+    fn cloudflare_urls_encode_path_segments_and_query_values() {
+        let list = cloudflare_list_url("zone/id", "www.example.com?x=1").unwrap();
+        let update = cloudflare_update_url("zone/id", "record/id").unwrap();
+
+        assert_eq!(
+            list.as_str(),
+            "https://api.cloudflare.com/client/v4/zones/zone%2Fid/dns_records?name=www.example.com%3Fx%3D1"
+        );
+        assert_eq!(
+            update.as_str(),
+            "https://api.cloudflare.com/client/v4/zones/zone%2Fid/dns_records/record%2Fid"
+        );
     }
 }
