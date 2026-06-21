@@ -1,7 +1,7 @@
 use axum::{
     body::{to_bytes, Body, Bytes},
     extract::{connect_info::ConnectInfo, DefaultBodyLimit, Path, Query, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
     response::{IntoResponse, Response},
     Json,
 };
@@ -26,6 +26,7 @@ use crate::db::{
 };
 
 const TEMP_TRANSFER_MAX_BYTES: usize = 100 * 1024 * 1024;
+const TEMP_TRANSFER_MAX_QUERY_BYTES: usize = 512;
 const DOWNLOAD_TIMEOUT_SECS: u64 = 60;
 const UPLOAD_TIMEOUT_SECS: u64 = 120;
 const TEMP_TRANSFER_RATE_LIMIT: u32 = 10;
@@ -142,8 +143,12 @@ pub async fn temp_download(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Query(query): Query<TempTransferQuery>,
+    uri: Uri,
 ) -> Response {
+    let query = match parse_temp_transfer_query(&uri) {
+        Ok(query) => query,
+        Err((status, message)) => return json_error(status, message),
+    };
     let client_ip = crate::security::client_ip_from_headers_and_peer(&headers, Some(peer_addr));
     match run_temp_download(state, query, client_ip).await {
         Ok(response) => response,
@@ -211,9 +216,13 @@ pub async fn temp_upload(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Query(query): Query<TempTransferQuery>,
+    uri: Uri,
     body: Body,
 ) -> Response {
+    let query = match parse_temp_transfer_query(&uri) {
+        Ok(query) => query,
+        Err((status, message)) => return json_error(status, message),
+    };
     let client_ip = crate::security::client_ip_from_headers_and_peer(&headers, Some(peer_addr));
     match run_temp_upload(state, query, client_ip, body).await {
         Ok(response) => response,
@@ -488,6 +497,26 @@ async fn run_temp_upload(
 
 async fn read_limited_upload_body(body: Body) -> Result<Bytes, (StatusCode, String)> {
     read_limited_body(body, TEMP_TRANSFER_MAX_BYTES).await
+}
+
+fn parse_temp_transfer_query(uri: &Uri) -> Result<TempTransferQuery, (StatusCode, String)> {
+    let raw_query = uri.query().unwrap_or_default();
+    if raw_query.len() > TEMP_TRANSFER_MAX_QUERY_BYTES {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "temporary transfer query must be at most {TEMP_TRANSFER_MAX_QUERY_BYTES} bytes"
+            ),
+        ));
+    }
+    Query::<TempTransferQuery>::try_from_uri(uri)
+        .map(|Query(query)| query)
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "temporary transfer query is invalid".to_string(),
+            )
+        })
 }
 
 async fn read_limited_body(body: Body, max_bytes: usize) -> Result<Bytes, (StatusCode, String)> {
@@ -959,6 +988,28 @@ mod tests {
         assert_eq!(serialized["used_ip"], "203.0.113.10");
         assert_eq!(serialized["used_status"], "success");
         assert_eq!(serialized["agent_task_id"], "task-1");
+    }
+
+    #[test]
+    fn temporary_transfer_query_resource_budget_is_bounded_before_deserialize() {
+        assert_eq!(TEMP_TRANSFER_MAX_QUERY_BYTES, 512);
+
+        let uri: Uri = format!(
+            "/api/v1/transfers/temp/download?token={}",
+            "a".repeat(TEMP_TRANSFER_MAX_QUERY_BYTES)
+        )
+        .parse()
+        .unwrap();
+        let err = parse_temp_transfer_query(&uri).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("temporary transfer query"));
+
+        let token = format!("xlt_{}", "a".repeat(64));
+        let uri: Uri = format!("/api/v1/transfers/temp/download?token={token}")
+            .parse()
+            .unwrap();
+        let query = parse_temp_transfer_query(&uri).unwrap();
+        assert_eq!(query.token, token);
     }
 
     #[tokio::test]

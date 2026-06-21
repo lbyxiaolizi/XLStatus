@@ -12,7 +12,7 @@ use crate::db::{CreateSessionInput, DatabaseBackend, UserRepository};
 use crate::security::{secure_reqwest_client_builder, validate_outbound_url_resolved};
 use axum::{
     extract::{connect_info::ConnectInfo, Path, Query, State},
-    http::{header, HeaderMap, HeaderValue},
+    http::{header, HeaderMap, HeaderValue, Uri},
     response::{AppendHeaders, IntoResponse, Redirect, Response},
     Json,
 };
@@ -32,6 +32,7 @@ type HmacSha256 = Hmac<Sha256>;
 const OAUTH_STATE_COOKIE_NAME: &str = "xlstatus_oauth_state";
 const OAUTH_STATE_COOKIE_PATH: &str = "/api/v1/oauth2";
 const OAUTH_STATE_TTL_SECONDS: i64 = 10 * 60;
+const OAUTH_MAX_QUERY_BYTES: usize = 16 * 1024;
 const OAUTH_MAX_STATE_BYTES: usize = 4096;
 const OAUTH_MAX_RETURN_TO_BYTES: usize = 1024;
 const OAUTH_MAX_CODE_BYTES: usize = 4096;
@@ -145,8 +146,9 @@ pub async fn start_oauth_login(
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(provider_id): Path<String>,
-    Query(query): Query<OAuthStartQuery>,
+    uri: Uri,
 ) -> Result<Response, AppError> {
+    let query = parse_oauth_start_query(&uri)?;
     let client_ip = crate::security::client_ip_from_headers_and_peer(&headers, Some(peer_addr));
     if active_waf_ban(&state.db, &client_ip).await?.is_some() {
         record_waf_event(
@@ -177,8 +179,9 @@ pub async fn start_oauth_bind(
     State(state): State<AppState>,
     auth_user: AuthUser,
     Path(provider_id): Path<String>,
-    Query(query): Query<OAuthStartQuery>,
+    uri: Uri,
 ) -> Result<Response, AppError> {
+    let query = parse_oauth_start_query(&uri)?;
     require_cookie_session(&auth_user)?;
     let provider = oauth_provider(&state, &provider_id)?;
     let oauth_state = OAuthState {
@@ -220,8 +223,9 @@ pub async fn oauth_callback(
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     cookie_jar: CookieJar,
-    Query(query): Query<OAuthCallbackQuery>,
+    uri: Uri,
 ) -> Result<Response, AppError> {
+    let query = parse_oauth_callback_query(&uri)?;
     let client_ip = crate::security::client_ip_from_headers_and_peer(&headers, Some(peer_addr));
     if active_waf_ban(&state.db, &client_ip).await?.is_some() {
         record_waf_event(
@@ -1133,6 +1137,30 @@ fn frontend_redirect(
     Ok(url.to_string())
 }
 
+fn parse_oauth_start_query(uri: &Uri) -> Result<OAuthStartQuery, AppError> {
+    ensure_oauth_query_size(uri)?;
+    Query::<OAuthStartQuery>::try_from_uri(uri)
+        .map(|Query(query)| query)
+        .map_err(|_| AppError::BadRequest("OAuth query is invalid".into()))
+}
+
+fn parse_oauth_callback_query(uri: &Uri) -> Result<OAuthCallbackQuery, AppError> {
+    ensure_oauth_query_size(uri)?;
+    Query::<OAuthCallbackQuery>::try_from_uri(uri)
+        .map(|Query(query)| query)
+        .map_err(|_| AppError::BadRequest("OAuth query is invalid".into()))
+}
+
+fn ensure_oauth_query_size(uri: &Uri) -> Result<(), AppError> {
+    let raw_query = uri.query().unwrap_or_default();
+    if raw_query.len() > OAUTH_MAX_QUERY_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "OAuth query must be at most {OAUTH_MAX_QUERY_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
 fn encode_state(secret: &str, state: &OAuthState) -> Result<String, AppError> {
     let payload = serde_json::to_vec(state)
         .map_err(|e| AppError::BadRequest(format!("OAuth state encode failed: {e}")))?;
@@ -1338,9 +1366,29 @@ mod tests {
 
     #[test]
     fn validates_oauth_text_size_boundaries() {
+        assert_eq!(OAUTH_MAX_QUERY_BYTES, 16 * 1024);
         assert!(ensure_oauth_text_size("abc", 1, 3, "field").is_ok());
         assert!(ensure_oauth_text_size("", 1, 3, "field").is_err());
         assert!(ensure_oauth_text_size("abcd", 1, 3, "field").is_err());
+    }
+
+    #[test]
+    fn oauth_query_resource_budget_is_bounded_before_deserialize() {
+        let uri: Uri = format!(
+            "/api/v1/oauth2/callback?state={}",
+            "a".repeat(OAUTH_MAX_QUERY_BYTES)
+        )
+        .parse()
+        .unwrap();
+        let err = parse_oauth_callback_query(&uri).unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::BadRequest(message) if message.contains("OAuth query")
+        ));
+
+        let uri: Uri = "/api/v1/oauth2/oidc?return_to=%2Fsettings".parse().unwrap();
+        let query = parse_oauth_start_query(&uri).unwrap();
+        assert_eq!(query.return_to.as_deref(), Some("/settings"));
     }
 
     #[test]
