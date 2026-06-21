@@ -1,5 +1,5 @@
 use crate::api::types::*;
-use crate::api::v1::auth::{AppError, AppState};
+use crate::api::v1::auth::{AgentJwtChallengeStore, AppError, AppState};
 use crate::auth::sign_agent_jwt;
 use crate::db::AgentRepository;
 use axum::{extract::State, Json};
@@ -13,6 +13,7 @@ const CHALLENGE_TTL_SECONDS: i64 = 60;
 const MAX_PENDING_CHALLENGES: usize = 4096;
 const MAX_PENDING_CHALLENGES_PER_AGENT: usize = 16;
 const NONCE_HEX_LEN: usize = 64;
+const SIGNATURE_HEX_LEN: usize = 128;
 
 #[derive(Debug, Deserialize)]
 pub struct GetJwtChallengeRequest {
@@ -88,17 +89,24 @@ pub async fn get_agent_jwt(
             "JWT challenge not found".to_string(),
         ));
     }
+    if !valid_signature_shape(&req.signature) {
+        return Err(AppError::Unauthorized(
+            "Agent signature verification failed".to_string(),
+        ));
+    }
 
     let challenge_key = challenge_key(agent_id, &req.nonce);
-    let expires_at = state
-        .agent_jwt_challenges
-        .write()
-        .await
-        .remove(&challenge_key)
+    let expires_at = agent_jwt_challenge_expires_at(&state.agent_jwt_challenges, &challenge_key)
+        .await?
         .ok_or(AppError::Unauthorized(
             "JWT challenge not found".to_string(),
         ))?;
     if expires_at < Utc::now() {
+        state
+            .agent_jwt_challenges
+            .write()
+            .await
+            .remove(&challenge_key);
         return Err(AppError::Unauthorized("JWT challenge expired".to_string()));
     }
 
@@ -114,6 +122,7 @@ pub async fn get_agent_jwt(
     }
 
     verify_agent_signature(&agent.public_key, &req.nonce, &req.signature)?;
+    consume_agent_jwt_challenge(&state.agent_jwt_challenges, &challenge_key, expires_at).await?;
 
     // Sign JWT
     let jwt = sign_agent_jwt(agent_id, &state.config.security.session_secret)?;
@@ -156,6 +165,34 @@ fn valid_nonce_shape(nonce: &str) -> bool {
     nonce.len() == NONCE_HEX_LEN && nonce.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+fn valid_signature_shape(signature: &str) -> bool {
+    signature.len() == SIGNATURE_HEX_LEN && signature.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+async fn consume_agent_jwt_challenge(
+    store: &AgentJwtChallengeStore,
+    challenge_key: &str,
+    expected_expires_at: chrono::DateTime<Utc>,
+) -> Result<(), AppError> {
+    let mut challenges = store.write().await;
+    match challenges.get(challenge_key) {
+        Some(expires_at) if *expires_at == expected_expires_at => {
+            challenges.remove(challenge_key);
+            Ok(())
+        }
+        _ => Err(AppError::Unauthorized(
+            "JWT challenge not found".to_string(),
+        )),
+    }
+}
+
+async fn agent_jwt_challenge_expires_at(
+    store: &AgentJwtChallengeStore,
+    challenge_key: &str,
+) -> Result<Option<chrono::DateTime<Utc>>, AppError> {
+    Ok(store.read().await.get(challenge_key).copied())
+}
+
 fn verify_agent_signature(public_key: &str, nonce: &str, signature: &str) -> Result<(), AppError> {
     let public_key_bytes = hex::decode(public_key)
         .map_err(|_| AppError::BadRequest("Agent public key is not Ed25519 hex".to_string()))?;
@@ -181,6 +218,8 @@ fn verify_agent_signature(public_key: &str, nonce: &str, signature: &str) -> Res
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
 
     #[test]
     fn challenge_pruning_and_agent_count_ignore_expired_items() {
@@ -214,5 +253,49 @@ mod tests {
         assert!(valid_nonce_shape(&"A".repeat(NONCE_HEX_LEN)));
         assert!(!valid_nonce_shape(&"a".repeat(NONCE_HEX_LEN - 1)));
         assert!(!valid_nonce_shape(&"g".repeat(NONCE_HEX_LEN)));
+    }
+
+    #[test]
+    fn signature_shape_requires_64_byte_hex() {
+        assert!(valid_signature_shape(&"a".repeat(SIGNATURE_HEX_LEN)));
+        assert!(valid_signature_shape(&"A".repeat(SIGNATURE_HEX_LEN)));
+        assert!(!valid_signature_shape(&"a".repeat(SIGNATURE_HEX_LEN - 1)));
+        assert!(!valid_signature_shape(&"g".repeat(SIGNATURE_HEX_LEN)));
+    }
+
+    #[test]
+    fn invalid_signature_does_not_remove_challenge() {
+        let public_key = "b".repeat(64);
+        let nonce = "a".repeat(NONCE_HEX_LEN);
+        let signature = "c".repeat(SIGNATURE_HEX_LEN);
+
+        let err = verify_agent_signature(&public_key, &nonce, &signature).unwrap_err();
+
+        assert!(matches!(err, AppError::Unauthorized(_)));
+    }
+
+    #[tokio::test]
+    async fn jwt_challenge_is_consumed_only_after_explicit_consume() {
+        let store: AgentJwtChallengeStore = Arc::new(RwLock::new(HashMap::new()));
+        let key = "agent:nonce".to_string();
+        let expires_at = Utc::now() + Duration::seconds(30);
+        store.write().await.insert(key.clone(), expires_at);
+
+        assert_eq!(
+            agent_jwt_challenge_expires_at(&store, &key).await.unwrap(),
+            Some(expires_at)
+        );
+        assert!(store.read().await.contains_key(&key));
+
+        let err = consume_agent_jwt_challenge(&store, &key, expires_at + Duration::seconds(1))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Unauthorized(_)));
+        assert!(store.read().await.contains_key(&key));
+
+        consume_agent_jwt_challenge(&store, &key, expires_at)
+            .await
+            .unwrap();
+        assert!(!store.read().await.contains_key(&key));
     }
 }

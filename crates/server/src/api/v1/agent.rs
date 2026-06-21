@@ -7,7 +7,7 @@ use crate::db::{
 };
 use crate::grpc::SessionRegistry;
 use axum::{
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     Json,
 };
 use chrono::{Duration, Utc};
@@ -18,6 +18,7 @@ use xlstatus_shared::AgentId;
 
 const DEFAULT_ENROLLMENT_TOKEN_TTL_HOURS: i64 = 1;
 const MAX_ENROLLMENT_TOKEN_TTL_HOURS: i64 = 24;
+pub(crate) const AGENT_AUTH_API_MAX_BODY_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateEnrollmentTokenRequest {
@@ -74,6 +75,10 @@ pub async fn create_enrollment_token(
         token,
         expires_at: enrollment_token.expires_at.to_rfc3339(),
     })))
+}
+
+pub fn agent_auth_body_limit() -> DefaultBodyLimit {
+    DefaultBodyLimit::max(AGENT_AUTH_API_MAX_BODY_BYTES)
 }
 
 pub async fn enroll(

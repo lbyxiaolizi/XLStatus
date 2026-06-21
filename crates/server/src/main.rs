@@ -34,7 +34,7 @@ mod tasks;
 use crate::alerts::engine::AlertEngine;
 use crate::db::{CreateUserInput, DatabaseBackend, UserRepository};
 use crate::services::monitor::ServiceMonitor;
-use api::v1::agent::{create_enrollment_token, enroll};
+use api::v1::agent::{agent_auth_body_limit, create_enrollment_token, enroll};
 use api::v1::agent_jwt::{get_agent_jwt, get_agent_jwt_challenge};
 use api::v1::alerts::{create_alert_rule, delete_alert_rule, list_alert_events, list_alert_rules};
 use api::v1::auth::{
@@ -573,7 +573,10 @@ async fn main() -> anyhow::Result<()> {
                     "/api/v1/public/servers/:id",
                     get(api::v1::public::public_server_detail),
                 )
-                .route("/api/v1/agents/enroll", post(enroll))
+                .route(
+                    "/api/v1/agents/enroll",
+                    post(enroll).layer(agent_auth_body_limit()),
+                )
                 .route("/api/v1/transfers/temp/download", get(temp_download))
                 .route(
                     "/api/v1/transfers/temp/upload",
@@ -581,9 +584,12 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .route(
                     "/api/v1/agents/jwt/challenge",
-                    post(get_agent_jwt_challenge),
+                    post(get_agent_jwt_challenge).layer(agent_auth_body_limit()),
                 )
-                .route("/api/v1/agents/jwt", post(get_agent_jwt))
+                .route(
+                    "/api/v1/agents/jwt",
+                    post(get_agent_jwt).layer(agent_auth_body_limit()),
+                )
                 .merge(protected)
                 .with_state(state)
                 .layer(cors);

@@ -24,6 +24,8 @@
 | `GET` | `/api/v1/transfers/temp/download` | 临时下载 |
 | `PUT` | `/api/v1/transfers/temp/upload` | 临时上传 |
 
+Agent 注册、JWT challenge 和 JWT 签发请求体上限为 4KiB。JWT nonce 为 32 字节 hex，signature 为 64 字节 hex；JWT challenge 只有在 Agent 签名验证通过后才会被消费。
+
 ## 需要登录的接口
 
 ### 用户和认证
