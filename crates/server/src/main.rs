@@ -36,7 +36,9 @@ use crate::db::{CreateUserInput, DatabaseBackend, UserRepository};
 use crate::services::monitor::ServiceMonitor;
 use api::v1::agent::{agent_auth_body_limit, create_enrollment_token, enroll};
 use api::v1::agent_jwt::{get_agent_jwt, get_agent_jwt_challenge};
-use api::v1::alerts::{create_alert_rule, delete_alert_rule, list_alert_events, list_alert_rules};
+use api::v1::alerts::{
+    alert_body_limit, create_alert_rule, delete_alert_rule, list_alert_events, list_alert_rules,
+};
 use api::v1::auth::{
     create_user, create_waf_bans, delete_session, delete_user, delete_waf_ban, disable_totp,
     enable_totp, get_totp_status, list_sessions, list_users, list_waf_bans, login, logout,
@@ -400,7 +402,10 @@ async fn main() -> anyhow::Result<()> {
                 .route("/api/v1/services/:id", delete(delete_service))
                 .route("/api/v1/services/:id/history", get(get_service_history))
                 .route("/api/v1/services/:id/uptime", get(get_service_uptime))
-                .route("/api/v1/alert-rules", post(create_alert_rule))
+                .route(
+                    "/api/v1/alert-rules",
+                    post(create_alert_rule).layer(alert_body_limit()),
+                )
                 .route("/api/v1/alert-rules", get(list_alert_rules))
                 .route(
                     "/api/v1/alert-rules/:id",

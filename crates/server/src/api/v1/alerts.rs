@@ -11,12 +11,18 @@ use crate::auth::rbac::has_scope;
 use crate::db::repository::alerts::{AlertEventRepository, AlertRepository};
 use crate::db::AgentRepository;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     Json,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+
+const ALERT_API_MAX_BODY_BYTES: usize = 64 * 1024;
+const ALERT_MAX_NAME_BYTES: usize = 128;
+const ALERT_MAX_CONDITIONS: usize = 32;
+const ALERT_MAX_CONDITION_BYTES: usize = 4 * 1024;
+const ALERT_MAX_TASK_IDS: usize = 32;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateAlertRuleRequest {
@@ -46,6 +52,10 @@ pub struct AlertRuleView {
     pub updated_at: String,
 }
 
+pub fn alert_body_limit() -> DefaultBodyLimit {
+    DefaultBodyLimit::max(ALERT_API_MAX_BODY_BYTES)
+}
+
 pub async fn create_alert_rule(
     State(state): State<AppState>,
     auth: AuthSession,
@@ -54,9 +64,7 @@ pub async fn create_alert_rule(
     if !has_scope(&auth, "alert:write") {
         return Err(AppError::Forbidden("missing scope: alert:write".into()));
     }
-    if req.name.trim().is_empty() {
-        return Err(AppError::BadRequest("name is required".into()));
-    }
+    let name = normalize_alert_name(&req.name)?;
     let conditions = parse_conditions(&req.conditions)?;
     let trigger = match req.trigger.as_deref() {
         Some("always") => TriggerMode::Always,
@@ -70,15 +78,15 @@ pub async fn create_alert_rule(
         req.notification_group_id.as_deref(),
     )
     .await?;
-    let failure_task_ids = normalize_id_list(req.failure_task_ids);
-    let recovery_task_ids = normalize_id_list(req.recovery_task_ids);
+    let failure_task_ids = normalize_id_list(req.failure_task_ids, "failure_task_ids")?;
+    let recovery_task_ids = normalize_id_list(req.recovery_task_ids, "recovery_task_ids")?;
     ensure_tasks_owned_by(&state.db, &owner, &failure_task_ids).await?;
     ensure_tasks_owned_by(&state.db, &owner, &recovery_task_ids).await?;
     let repo = AlertRepository::new(state.db.clone());
     let row = repo
         .create(
             &owner,
-            &req.name,
+            &name,
             trigger,
             &conditions,
             req.notification_group_id.as_deref(),
@@ -356,15 +364,38 @@ async fn alert_rule_visible_to_auth(
     )
 }
 
-fn normalize_id_list(values: Vec<String>) -> Vec<String> {
+fn normalize_alert_name(value: &str) -> Result<String, AppError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(AppError::BadRequest("name is required".into()));
+    }
+    if value.len() > ALERT_MAX_NAME_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "name exceeds {ALERT_MAX_NAME_BYTES} bytes"
+        )));
+    }
+    Ok(value.to_string())
+}
+
+fn normalize_id_list(values: Vec<String>, field: &str) -> Result<Vec<String>, AppError> {
     let mut out = Vec::new();
     for value in values {
         let trimmed = value.trim();
+        if !trimmed.is_empty() && uuid::Uuid::parse_str(trimmed).is_err() {
+            return Err(AppError::BadRequest(format!(
+                "{field} contains invalid UUID"
+            )));
+        }
         if !trimmed.is_empty() && !out.iter().any(|existing| existing == trimmed) {
+            if out.len() >= ALERT_MAX_TASK_IDS {
+                return Err(AppError::BadRequest(format!(
+                    "{field} exceeds {ALERT_MAX_TASK_IDS} items"
+                )));
+            }
             out.push(trimmed.to_string());
         }
     }
-    out
+    Ok(out)
 }
 
 fn db_err(err: sqlx::Error) -> AppError {
@@ -377,8 +408,21 @@ fn parse_conditions(items: &[JsonValue]) -> Result<Vec<AlertCondition>, AppError
             "at least one alert condition is required".into(),
         ));
     }
+    if items.len() > ALERT_MAX_CONDITIONS {
+        return Err(AppError::BadRequest(format!(
+            "conditions exceeds {ALERT_MAX_CONDITIONS} items"
+        )));
+    }
     let mut out = Vec::new();
     for v in items {
+        let condition_len = serde_json::to_vec(v)
+            .map_err(|e| AppError::BadRequest(format!("invalid condition: {e}")))?
+            .len();
+        if condition_len > ALERT_MAX_CONDITION_BYTES {
+            return Err(AppError::BadRequest(format!(
+                "condition exceeds {ALERT_MAX_CONDITION_BYTES} bytes"
+            )));
+        }
         let c: AlertCondition = serde_json::from_value(v.clone())
             .map_err(|e| AppError::BadRequest(format!("invalid condition: {e}")))?;
         validate_condition(&c)?;
@@ -529,6 +573,52 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].rule_id, owner_rule);
+    }
+
+    #[test]
+    fn alert_rule_resource_limits_are_explicit() {
+        assert_eq!(ALERT_API_MAX_BODY_BYTES, 64 * 1024);
+        assert_eq!(ALERT_MAX_NAME_BYTES, 128);
+        assert_eq!(ALERT_MAX_CONDITIONS, 32);
+        assert_eq!(ALERT_MAX_TASK_IDS, 32);
+    }
+
+    #[test]
+    fn alert_rule_rejects_oversized_name_and_task_lists() {
+        assert!(normalize_alert_name("cpu alert").is_ok());
+        assert!(normalize_alert_name(&"a".repeat(ALERT_MAX_NAME_BYTES + 1)).is_err());
+
+        let valid_ids = (0..ALERT_MAX_TASK_IDS)
+            .map(|idx| format!("00000000-0000-0000-0000-{idx:012}"))
+            .collect::<Vec<_>>();
+        assert!(normalize_id_list(valid_ids, "failure_task_ids").is_ok());
+
+        let too_many_ids = (0..=ALERT_MAX_TASK_IDS)
+            .map(|idx| format!("00000000-0000-0000-0000-{idx:012}"))
+            .collect::<Vec<_>>();
+        assert!(normalize_id_list(too_many_ids, "failure_task_ids").is_err());
+        assert!(normalize_id_list(vec!["not-a-uuid".into()], "failure_task_ids").is_err());
+    }
+
+    #[test]
+    fn alert_rule_rejects_oversized_conditions() {
+        let condition = serde_json::json!({
+            "type": "server_offline",
+            "agent_id": "00000000-0000-0000-0000-000000000101",
+            "offline_seconds": 60
+        });
+        assert!(parse_conditions(&[condition.clone()]).is_ok());
+
+        let too_many = vec![condition.clone(); ALERT_MAX_CONDITIONS + 1];
+        assert!(parse_conditions(&too_many).is_err());
+
+        let oversized = serde_json::json!({
+            "type": "server_offline",
+            "agent_id": "00000000-0000-0000-0000-000000000101",
+            "offline_seconds": 60,
+            "padding": "a".repeat(ALERT_MAX_CONDITION_BYTES)
+        });
+        assert!(parse_conditions(&[oversized]).is_err());
     }
 
     async fn test_db() -> DatabaseBackend {
