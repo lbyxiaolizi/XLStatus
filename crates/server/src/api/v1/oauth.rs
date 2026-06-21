@@ -29,6 +29,10 @@ use xlstatus_shared::UserId;
 
 type HmacSha256 = Hmac<Sha256>;
 
+const OAUTH_STATE_COOKIE_NAME: &str = "xlstatus_oauth_state";
+const OAUTH_STATE_COOKIE_PATH: &str = "/api/v1/oauth2";
+const OAUTH_STATE_TTL_SECONDS: i64 = 10 * 60;
+
 #[derive(Debug, Serialize)]
 pub struct OAuthProviderView {
     pub id: String,
@@ -158,12 +162,7 @@ pub async fn start_oauth_login(
         nonce: random_nonce(),
         exp: (Utc::now() + Duration::minutes(10)).timestamp(),
     };
-    Ok(Redirect::temporary(&authorize_url(
-        provider,
-        &encode_state(&state.config.security.session_secret, &oauth_state)?,
-        &oauth_state.nonce,
-    )?)
-    .into_response())
+    oauth_start_response(&state, provider, &oauth_state)
 }
 
 pub async fn start_oauth_bind(
@@ -182,12 +181,7 @@ pub async fn start_oauth_bind(
         nonce: random_nonce(),
         exp: (Utc::now() + Duration::minutes(10)).timestamp(),
     };
-    Ok(Redirect::temporary(&authorize_url(
-        provider,
-        &encode_state(&state.config.security.session_secret, &oauth_state)?,
-        &oauth_state.nonce,
-    )?)
-    .into_response())
+    oauth_start_response(&state, provider, &oauth_state)
 }
 
 pub async fn list_oauth_bindings(
@@ -241,14 +235,25 @@ pub async fn oauth_callback(
             return Err(err);
         }
     };
+    if let Err(err) = oauth_state_cookie_matches(&cookie_jar, &query.state) {
+        register_oauth_failure(
+            &state.db,
+            &client_ip,
+            Some(&oauth_state.provider),
+            match &err {
+                AppError::Unauthorized(_) => "oauth state cookie missing",
+                AppError::Forbidden(_) => "oauth state cookie mismatch",
+                _ => "oauth state cookie invalid",
+            },
+        )
+        .await?;
+        return Err(err);
+    }
     if let Some(error) = query.error {
         let message = query.error_description.unwrap_or(error);
         register_oauth_failure(&state.db, &client_ip, Some(&oauth_state.provider), &message)
             .await?;
-        return Ok(
-            Redirect::temporary(&frontend_redirect(&state, &oauth_state, false, &message)?)
-                .into_response(),
-        );
+        return oauth_redirect_with_state_cookie_clear(&state, &oauth_state, false, &message);
     }
 
     let provider = oauth_provider(&state, &oauth_state.provider)?;
@@ -325,13 +330,7 @@ pub async fn oauth_callback(
             let user_id =
                 bind_user_id.ok_or(AppError::BadRequest("OAuth bind state missing user".into()))?;
             bind_oauth_account(&state.db, user_id, provider, &userinfo).await?;
-            Ok(Redirect::temporary(&frontend_redirect(
-                &state,
-                &oauth_state,
-                true,
-                "oauth_bound",
-            )?)
-            .into_response())
+            oauth_redirect_with_state_cookie_clear(&state, &oauth_state, true, "oauth_bound")
         }
         OAuthFlow::Login => {
             let Some(user_id) = find_bound_user(&state.db, provider, &userinfo.sub).await? else {
@@ -342,13 +341,12 @@ pub async fn oauth_callback(
                     "account not bound",
                 )
                 .await?;
-                return Ok(Redirect::temporary(&frontend_redirect(
+                return oauth_redirect_with_state_cookie_clear(
                     &state,
                     &oauth_state,
                     false,
                     "oauth_account_not_bound",
-                )?)
-                .into_response());
+                );
             };
             let user_repo = UserRepository::new(state.db.clone());
             let user = user_repo
@@ -371,6 +369,10 @@ pub async fn oauth_callback(
                 AppendHeaders([
                     (header::SET_COOKIE, session_cookie),
                     (header::SET_COOKIE, csrf_cookie),
+                    (
+                        header::SET_COOKIE,
+                        oauth_state_cookie_clear_header(state.config.security.cookie_secure)?,
+                    ),
                 ]),
                 Redirect::temporary(&frontend_redirect(
                     &state,
@@ -399,6 +401,87 @@ fn require_cookie_session(auth_user: &AuthUser) -> Result<(), AppError> {
         return Err(AppError::Forbidden("Cookie session required".into()));
     }
     Ok(())
+}
+
+fn oauth_start_response(
+    state: &AppState,
+    provider: &OidcProviderConfig,
+    oauth_state: &OAuthState,
+) -> Result<Response, AppError> {
+    let encoded_state = encode_state(&state.config.security.session_secret, oauth_state)?;
+    Ok((
+        AppendHeaders([(
+            header::SET_COOKIE,
+            oauth_state_cookie_header(state.config.security.cookie_secure, &encoded_state)?,
+        )]),
+        Redirect::temporary(&authorize_url(
+            provider,
+            &encoded_state,
+            &oauth_state.nonce,
+        )?),
+    )
+        .into_response())
+}
+
+fn oauth_redirect_with_state_cookie_clear(
+    state: &AppState,
+    oauth_state: &OAuthState,
+    success: bool,
+    message: &str,
+) -> Result<Response, AppError> {
+    Ok((
+        AppendHeaders([(
+            header::SET_COOKIE,
+            oauth_state_cookie_clear_header(state.config.security.cookie_secure)?,
+        )]),
+        Redirect::temporary(&frontend_redirect(state, oauth_state, success, message)?),
+    )
+        .into_response())
+}
+
+fn oauth_state_cookie_header(
+    cookie_secure: bool,
+    encoded_state: &str,
+) -> Result<HeaderValue, AppError> {
+    let secure_attr = cookie_secure_attr(cookie_secure);
+    HeaderValue::from_str(&format!(
+        "{}={}; HttpOnly; SameSite=Lax; Path={}; Max-Age={}{}",
+        OAUTH_STATE_COOKIE_NAME,
+        oauth_state_cookie_value(encoded_state),
+        OAUTH_STATE_COOKIE_PATH,
+        OAUTH_STATE_TTL_SECONDS,
+        secure_attr
+    ))
+    .map_err(|e| AppError::BadRequest(format!("Invalid OAuth state cookie: {e}")))
+}
+
+fn oauth_state_cookie_clear_header(cookie_secure: bool) -> Result<HeaderValue, AppError> {
+    let secure_attr = cookie_secure_attr(cookie_secure);
+    HeaderValue::from_str(&format!(
+        "{}=; HttpOnly; SameSite=Lax; Path={}; Max-Age=0{}",
+        OAUTH_STATE_COOKIE_NAME, OAUTH_STATE_COOKIE_PATH, secure_attr
+    ))
+    .map_err(|e| AppError::BadRequest(format!("Invalid OAuth state cookie: {e}")))
+}
+
+fn oauth_state_cookie_matches(cookie_jar: &CookieJar, encoded_state: &str) -> Result<(), AppError> {
+    let expected = oauth_state_cookie_value(encoded_state);
+    let Some(cookie) = cookie_jar.get(OAUTH_STATE_COOKIE_NAME) else {
+        return Err(AppError::Unauthorized(
+            "OAuth state cookie is missing".into(),
+        ));
+    };
+    if constant_time_eq(cookie.value().as_bytes(), expected.as_bytes()) {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(
+            "OAuth state cookie does not match".into(),
+        ))
+    }
+}
+
+fn oauth_state_cookie_value(encoded_state: &str) -> String {
+    hash_token(encoded_state)
 }
 
 fn provider_view(provider: &OidcProviderConfig) -> OAuthProviderView {
@@ -1033,6 +1116,7 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum_extra::extract::cookie::Cookie;
     use std::collections::HashMap;
 
     fn test_provider() -> OidcProviderConfig {
@@ -1108,6 +1192,40 @@ mod tests {
         let other_id = UserId(uuid::Uuid::from_bytes([2; 16]));
         let mismatch = bind_cookie_session_matches(user_id, Some(other_id)).unwrap_err();
         assert!(matches!(mismatch, AppError::Forbidden(_)));
+    }
+
+    #[test]
+    fn oauth_state_cookie_binds_callback_to_starting_browser() {
+        let encoded_state = "payload.signature";
+        let cookie_value = oauth_state_cookie_value(encoded_state);
+        assert_ne!(cookie_value, encoded_state);
+
+        let jar = CookieJar::new().add(Cookie::new(OAUTH_STATE_COOKIE_NAME, cookie_value));
+        assert!(oauth_state_cookie_matches(&jar, encoded_state).is_ok());
+
+        let missing = oauth_state_cookie_matches(&CookieJar::new(), encoded_state).unwrap_err();
+        assert!(matches!(missing, AppError::Unauthorized(_)));
+
+        let wrong = CookieJar::new().add(Cookie::new(OAUTH_STATE_COOKIE_NAME, "wrong"));
+        let mismatch = oauth_state_cookie_matches(&wrong, encoded_state).unwrap_err();
+        assert!(matches!(mismatch, AppError::Forbidden(_)));
+    }
+
+    #[test]
+    fn oauth_state_cookie_header_is_http_only_and_path_scoped() {
+        let encoded_state = "payload.signature";
+        let header = oauth_state_cookie_header(false, encoded_state)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        assert!(header.starts_with(&format!("{OAUTH_STATE_COOKIE_NAME}=")));
+        assert!(header.contains("HttpOnly"));
+        assert!(header.contains("SameSite=Lax"));
+        assert!(header.contains(&format!("Path={OAUTH_STATE_COOKIE_PATH}")));
+        assert!(header.contains(&format!("Max-Age={OAUTH_STATE_TTL_SECONDS}")));
+        assert!(!header.contains(encoded_state));
     }
 
     #[test]
