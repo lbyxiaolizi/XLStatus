@@ -141,6 +141,20 @@ https://github.com/lbyxiaolizi/XLStatus/releases/download/<VERSION>/install-agen
 
 两者不能混用。HTTP API 可通过 `/healthz` 检查，gRPC 端口需要确认网络可达。
 
+## 网络探测安全策略
+
+Agent 收到 Dashboard 下发的 HTTP/TCP/ICMP 探测任务时，会在执行端重新解析目标并拒绝私网、loopback、链路本地、组播、未指定、文档网段、CGNAT 和云元数据常见链路本地地址。HTTP 探测会把校验后的解析结果固定到请求客户端；TCP 只连接校验后的地址；ICMP 会把校验后的 IP 字符串传给 `ping`，避免系统 `ping` 再次解析原始主机名。
+
+如果某台 Agent 必须用于内网服务探测，需要在运行环境中显式设置：
+
+```bash
+XLSTATUS_AGENT_ALLOW_PRIVATE_PROBES=1
+```
+
+该开关会放开 Agent 侧私网探测目标，建议只在受信网络内对专用 Agent 启用。兼容旧部署时，`XLSTATUS_ALLOW_PRIVATE_OUTBOUND=1` 也会放开 Agent 探测目标。
+
+远程配置里的 `disable_send_query` 会停止 Agent 主动出口 IP 查询，并拒绝 Dashboard 下发的 HTTP/TCP/ICMP 探测任务。
+
 ## 重新注册
 
 如果配置丢失或私钥泄漏：

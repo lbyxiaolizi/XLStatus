@@ -1,13 +1,15 @@
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use ed25519_dalek::{Signer, SigningKey};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{lookup_host, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::{interval, Duration};
 use tokio_stream::wrappers::ReceiverStream;
@@ -1518,39 +1520,54 @@ async fn run_server_task(
                 }
             }
         }
-        Some(Spec::HttpGet(spec)) => match run_http_probe_task(spec).await {
-            Ok(output) => {
-                result.status = TaskOutcome::Success as i32;
-                result.stdout = output;
+        Some(Spec::HttpGet(spec)) => {
+            if reject_probe_task_when_disabled(&cfg, &mut result, finished()) {
+                return result;
             }
-            Err(e) => {
-                result.status = TaskOutcome::Failure as i32;
-                result.exit_code = 1;
-                result.error = e.to_string();
+            match run_http_probe_task(spec).await {
+                Ok(output) => {
+                    result.status = TaskOutcome::Success as i32;
+                    result.stdout = output;
+                }
+                Err(e) => {
+                    result.status = TaskOutcome::Failure as i32;
+                    result.exit_code = 1;
+                    result.error = e.to_string();
+                }
             }
-        },
-        Some(Spec::TcpPing(spec)) => match run_tcp_probe_task(spec).await {
-            Ok(output) => {
-                result.status = TaskOutcome::Success as i32;
-                result.stdout = output;
+        }
+        Some(Spec::TcpPing(spec)) => {
+            if reject_probe_task_when_disabled(&cfg, &mut result, finished()) {
+                return result;
             }
-            Err(e) => {
-                result.status = TaskOutcome::Failure as i32;
-                result.exit_code = 1;
-                result.error = e.to_string();
+            match run_tcp_probe_task(spec).await {
+                Ok(output) => {
+                    result.status = TaskOutcome::Success as i32;
+                    result.stdout = output;
+                }
+                Err(e) => {
+                    result.status = TaskOutcome::Failure as i32;
+                    result.exit_code = 1;
+                    result.error = e.to_string();
+                }
             }
-        },
-        Some(Spec::IcmpPing(spec)) => match run_icmp_probe_task(spec).await {
-            Ok(output) => {
-                result.status = TaskOutcome::Success as i32;
-                result.stdout = output;
+        }
+        Some(Spec::IcmpPing(spec)) => {
+            if reject_probe_task_when_disabled(&cfg, &mut result, finished()) {
+                return result;
             }
-            Err(e) => {
-                result.status = TaskOutcome::Failure as i32;
-                result.exit_code = 1;
-                result.error = e.to_string();
+            match run_icmp_probe_task(spec).await {
+                Ok(output) => {
+                    result.status = TaskOutcome::Success as i32;
+                    result.stdout = output;
+                }
+                Err(e) => {
+                    result.status = TaskOutcome::Failure as i32;
+                    result.exit_code = 1;
+                    result.error = e.to_string();
+                }
             }
-        },
+        }
         Some(Spec::FileList(spec)) => {
             if cfg.disable_command_execute {
                 result.status = TaskOutcome::Failure as i32;
@@ -1687,6 +1704,7 @@ async fn run_http_probe_task(
 ) -> anyhow::Result<String> {
     let start = std::time::Instant::now();
     let timeout = task_timeout_seconds(spec.timeout_seconds);
+    let validated = validate_agent_probe_url_resolved(&spec.url, "Agent HTTP probe target").await?;
     let mut headers = reqwest::header::HeaderMap::new();
     for (name, value) in spec.headers {
         headers.insert(
@@ -1698,9 +1716,15 @@ async fn run_http_probe_task(
         .timeout(std::time::Duration::from_secs(timeout))
         .redirect(reqwest::redirect::Policy::none())
         .danger_accept_invalid_certs(!spec.verify_tls)
+        .resolve_to_addrs(&validated.host, &validated.addrs)
         .build()?;
 
-    let output = match client.get(&spec.url).headers(headers).send().await {
+    let output = match client
+        .get(validated.url.clone())
+        .headers(headers)
+        .send()
+        .await
+    {
         Ok(response) => {
             let status = response.status();
             probe_output_json(
@@ -1729,14 +1753,15 @@ async fn run_tcp_probe_task(
 ) -> anyhow::Result<String> {
     let start = std::time::Instant::now();
     let timeout = task_timeout_seconds(spec.timeout_seconds);
-    let addr = socket_addr(&spec.host, spec.port);
+    let port = agent_probe_port(spec.port, "Agent TCP probe target")?;
+    let addrs = resolve_agent_probe_host(&spec.host, port, "Agent TCP probe target").await?;
     let output = match tokio::time::timeout(
         std::time::Duration::from_secs(timeout),
-        tokio::net::TcpStream::connect(&addr),
+        connect_agent_probe_addrs(&addrs),
     )
     .await
     {
-        Ok(Ok(_)) => probe_output_json(true, Some(start.elapsed().as_millis() as i32), None, None),
+        Ok(Ok(())) => probe_output_json(true, Some(start.elapsed().as_millis() as i32), None, None),
         Ok(Err(e)) => probe_output_json(
             false,
             Some(start.elapsed().as_millis() as i32),
@@ -1758,6 +1783,8 @@ async fn run_icmp_probe_task(
 ) -> anyhow::Result<String> {
     let start = std::time::Instant::now();
     let timeout = task_timeout_seconds(spec.timeout_seconds);
+    let addrs = resolve_agent_probe_host(&spec.host, 0, "Agent ICMP probe target").await?;
+    let ping_target = agent_ping_target(&addrs, "Agent ICMP probe target")?;
     let count = spec.count.clamp(1, 10).to_string();
     let timeout_text = timeout.to_string();
     let mut command = if cfg!(target_os = "windows") {
@@ -1767,12 +1794,12 @@ async fn run_icmp_probe_task(
             &count,
             "-w",
             &(timeout * 1000).to_string(),
-            &spec.host,
+            &ping_target,
         ]);
         cmd
     } else {
         let mut cmd = tokio::process::Command::new("ping");
-        cmd.args(["-c", &count, "-W", &timeout_text, &spec.host]);
+        cmd.args(["-c", &count, "-W", &timeout_text, &ping_target]);
         cmd
     };
 
@@ -1844,12 +1871,194 @@ fn task_timeout_seconds(value: u32) -> u64 {
     }
 }
 
-fn socket_addr(host: &str, port: u32) -> String {
-    if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
+fn reject_probe_task_when_disabled(
+    config: &AgentConfig,
+    result: &mut xlstatus_proto_gen::xlstatus::v1::TaskResult,
+    finished_at: i64,
+) -> bool {
+    if !config.disable_send_query {
+        return false;
     }
+    result.status = xlstatus_proto_gen::xlstatus::v1::TaskOutcome::Failure as i32;
+    result.exit_code = 126;
+    result.error = "probe task disabled by agent policy".to_string();
+    result.finished_at = finished_at;
+    true
+}
+
+#[derive(Debug, Clone)]
+struct ValidatedAgentProbeUrl {
+    url: reqwest::Url,
+    host: String,
+    addrs: Vec<SocketAddr>,
+}
+
+async fn validate_agent_probe_url_resolved(
+    url: &str,
+    purpose: &str,
+) -> anyhow::Result<ValidatedAgentProbeUrl> {
+    validate_agent_probe_url_resolved_with_policy(url, purpose, agent_private_probes_allowed())
+        .await
+}
+
+async fn validate_agent_probe_url_resolved_with_policy(
+    url: &str,
+    purpose: &str,
+    allow_private: bool,
+) -> anyhow::Result<ValidatedAgentProbeUrl> {
+    let parsed = reqwest::Url::parse(url).with_context(|| format!("{purpose} URL is invalid"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        scheme => anyhow::bail!("{purpose} URL scheme '{scheme}' is not allowed"),
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        anyhow::bail!("{purpose} URL must not include credentials");
+    }
+
+    let host = parsed
+        .host_str()
+        .with_context(|| format!("{purpose} URL must include a host"))?
+        .to_string();
+    let port = parsed
+        .port_or_known_default()
+        .with_context(|| format!("{purpose} URL must include a port or known scheme"))?;
+    let addrs = resolve_agent_probe_host_with_policy(&host, port, purpose, allow_private).await?;
+
+    Ok(ValidatedAgentProbeUrl {
+        url: parsed,
+        host,
+        addrs,
+    })
+}
+
+async fn resolve_agent_probe_host(
+    host: &str,
+    port: u16,
+    purpose: &str,
+) -> anyhow::Result<Vec<SocketAddr>> {
+    resolve_agent_probe_host_with_policy(host, port, purpose, agent_private_probes_allowed()).await
+}
+
+async fn resolve_agent_probe_host_with_policy(
+    host: &str,
+    port: u16,
+    purpose: &str,
+    allow_private: bool,
+) -> anyhow::Result<Vec<SocketAddr>> {
+    let host = host.trim();
+    if host.is_empty() {
+        anyhow::bail!("{purpose} host must not be empty");
+    }
+
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        ensure_agent_probe_ip_allowed(ip, purpose, allow_private)?;
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+
+    let mut addrs = lookup_host((host, port))
+        .await
+        .with_context(|| format!("failed to resolve {purpose} host '{host}'"))?;
+    let mut resolved = Vec::new();
+    for addr in &mut addrs {
+        ensure_agent_probe_ip_allowed(addr.ip(), purpose, allow_private)?;
+        resolved.push(addr);
+    }
+    if resolved.is_empty() {
+        anyhow::bail!("{purpose} host '{host}' did not resolve to any address");
+    }
+    Ok(resolved)
+}
+
+fn ensure_agent_probe_ip_allowed(
+    ip: IpAddr,
+    purpose: &str,
+    allow_private: bool,
+) -> anyhow::Result<()> {
+    if !allow_private && is_agent_blocked_ip(ip) {
+        anyhow::bail!("{purpose} resolves to disallowed private address {ip}");
+    }
+    Ok(())
+}
+
+fn agent_probe_port(value: u32, purpose: &str) -> anyhow::Result<u16> {
+    let port =
+        u16::try_from(value).with_context(|| format!("{purpose} port is out of range: {value}"))?;
+    if port == 0 {
+        anyhow::bail!("{purpose} port must be greater than 0");
+    }
+    Ok(port)
+}
+
+async fn connect_agent_probe_addrs(addrs: &[SocketAddr]) -> anyhow::Result<()> {
+    let mut last_error = None;
+    for addr in addrs {
+        match TcpStream::connect(addr).await {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                last_error = Some(anyhow::anyhow!("failed to connect to {addr}: {e}"));
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no address resolved")))
+}
+
+fn agent_ping_target(addrs: &[SocketAddr], purpose: &str) -> anyhow::Result<String> {
+    let addr = addrs
+        .first()
+        .with_context(|| format!("{purpose} did not resolve to any address"))?;
+    Ok(addr.ip().to_string())
+}
+
+fn agent_private_probes_allowed() -> bool {
+    [
+        "XLSTATUS_AGENT_ALLOW_PRIVATE_PROBES",
+        "XLSTATUS_ALLOW_PRIVATE_OUTBOUND",
+    ]
+    .iter()
+    .any(|name| {
+        std::env::var(name)
+            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false)
+    })
+}
+
+fn is_agent_blocked_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => is_agent_blocked_ipv4(ip),
+        IpAddr::V6(ip) => is_agent_blocked_ipv6(ip),
+    }
+}
+
+fn is_agent_blocked_ipv4(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_multicast()
+        || ip.is_unspecified()
+        || ip.is_documentation()
+        || o[0] == 0
+        || o[0] >= 224
+        || (o[0] == 100 && (64..=127).contains(&o[1]))
+        || (o[0] == 169 && o[1] == 254)
+        || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+        || (o[0] == 198 && (18..=19).contains(&o[1]))
+        || o == [255, 255, 255, 255]
+}
+
+fn is_agent_blocked_ipv6(ip: Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    let first = segments[0];
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || (first & 0xfe00) == 0xfc00
+        || (first & 0xffc0) == 0xfe80
+        || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        || ip
+            .to_ipv4_mapped()
+            .map(is_agent_blocked_ipv4)
+            .unwrap_or(false)
 }
 
 fn parse_ping_latency(output: &str) -> Option<i32> {
@@ -2031,4 +2240,146 @@ fn read_private_key(config_path: &PathBuf) -> anyhow::Result<String> {
     let config_text = std::fs::read_to_string(config_path)?;
     let config: AgentConfig = serde_json::from_str(&config_text)?;
     Ok(config.private_key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_probe_blocks_private_ip_ranges() {
+        assert!(is_agent_blocked_ip("127.0.0.1".parse().unwrap()));
+        assert!(is_agent_blocked_ip("10.1.2.3".parse().unwrap()));
+        assert!(is_agent_blocked_ip("172.16.0.1".parse().unwrap()));
+        assert!(is_agent_blocked_ip("192.168.1.1".parse().unwrap()));
+        assert!(is_agent_blocked_ip("169.254.169.254".parse().unwrap()));
+        assert!(is_agent_blocked_ip("100.64.0.1".parse().unwrap()));
+        assert!(is_agent_blocked_ip("::1".parse().unwrap()));
+        assert!(is_agent_blocked_ip("fc00::1".parse().unwrap()));
+        assert!(is_agent_blocked_ip("fe80::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn agent_probe_allows_public_ip_ranges() {
+        assert!(!is_agent_blocked_ip("1.1.1.1".parse().unwrap()));
+        assert!(!is_agent_blocked_ip(
+            "2606:4700:4700::1111".parse().unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn agent_probe_rejects_private_http_ip_literal() {
+        let err = validate_agent_probe_url_resolved_with_policy(
+            "http://127.0.0.1:8080/status",
+            "test",
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("disallowed private address"));
+    }
+
+    #[tokio::test]
+    async fn agent_probe_pins_public_http_ip_literal() {
+        let validated = validate_agent_probe_url_resolved_with_policy(
+            "https://1.1.1.1/dns-query",
+            "test",
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(validated.host, "1.1.1.1");
+        assert_eq!(validated.addrs.len(), 1);
+        assert_eq!(
+            validated.addrs[0].ip(),
+            "1.1.1.1".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(validated.addrs[0].port(), 443);
+    }
+
+    #[tokio::test]
+    async fn agent_probe_rejects_http_url_credentials() {
+        let err = validate_agent_probe_url_resolved_with_policy(
+            "https://user:pass@example.com/status",
+            "test",
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("must not include credentials"));
+    }
+
+    #[tokio::test]
+    async fn agent_probe_private_policy_escape_hatch_allows_literal() {
+        let resolved = resolve_agent_probe_host_with_policy("127.0.0.1", 8080, "test", true)
+            .await
+            .unwrap();
+        assert_eq!(resolved, vec!["127.0.0.1:8080".parse().unwrap()]);
+    }
+
+    #[test]
+    fn agent_probe_ping_target_uses_resolved_ip_literal() {
+        let addrs = vec![
+            "[2606:4700:4700::1111]:0".parse::<SocketAddr>().unwrap(),
+            "1.1.1.1:0".parse().unwrap(),
+        ];
+        assert_eq!(
+            agent_ping_target(&addrs, "test").unwrap(),
+            "2606:4700:4700::1111"
+        );
+    }
+
+    #[test]
+    fn agent_probe_rejects_invalid_tcp_port() {
+        let err = agent_probe_port(65_536, "test").unwrap_err();
+        assert!(err.to_string().contains("out of range"));
+        let err = agent_probe_port(0, "test").unwrap_err();
+        assert!(err.to_string().contains("greater than 0"));
+    }
+
+    #[tokio::test]
+    async fn agent_probe_task_policy_rejects_when_send_query_disabled() {
+        use xlstatus_proto_gen::xlstatus::v1::server_task::Spec;
+        use xlstatus_proto_gen::xlstatus::v1::{HttpGetTask, ServerTask, TaskOutcome, TaskType};
+
+        let config = AgentConfig {
+            server: "http://dashboard.example".to_string(),
+            grpc_server: "http://dashboard.example:50051".to_string(),
+            grpc_tls_ca_path: None,
+            grpc_tls_domain_name: None,
+            grpc_tls_client_cert_path: None,
+            grpc_tls_client_key_path: None,
+            agent_id: "agent-1".to_string(),
+            name: "agent-1".to_string(),
+            public_key: String::new(),
+            private_key: String::new(),
+            report_interval_seconds: 3,
+            ip_report_interval_seconds: 60,
+            disable_auto_update: false,
+            disable_force_update: false,
+            disable_command_execute: false,
+            disable_nat: false,
+            disable_send_query: true,
+            file_allowed_roots: default_file_allowed_roots(),
+        };
+        let runtime = RuntimeContext {
+            config_path: PathBuf::from("agent.json"),
+            config: Arc::new(Mutex::new(config)),
+        };
+        let task = ServerTask {
+            task_id: "task-1".to_string(),
+            task_type: TaskType::HttpGet as i32,
+            spec: Some(Spec::HttpGet(HttpGetTask {
+                url: "https://1.1.1.1/dns-query".to_string(),
+                timeout_seconds: 1,
+                verify_tls: true,
+                headers: Default::default(),
+            })),
+        };
+
+        let result = run_server_task(runtime, task).await;
+        assert_eq!(result.status, TaskOutcome::Failure as i32);
+        assert_eq!(result.exit_code, 126);
+        assert_eq!(result.error, "probe task disabled by agent policy");
+    }
 }
