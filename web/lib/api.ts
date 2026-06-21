@@ -942,7 +942,11 @@ class ApiClient {
     path: string,
   ): Promise<ApiResponse<FileListResponse>> {
     return this.request<FileListResponse>(
-      `/api/v1/servers/${encodeURIComponent(id)}/files?path=${encodeURIComponent(path)}`,
+      `/api/v1/servers/${encodeURIComponent(id)}/files`,
+      {
+        method: "POST",
+        body: JSON.stringify({ path }),
+      },
     );
   }
 
@@ -952,7 +956,11 @@ class ApiClient {
     encoding = "utf8",
   ): Promise<ApiResponse<FileReadResponse>> {
     return this.request<FileReadResponse>(
-      `/api/v1/servers/${encodeURIComponent(id)}/files/read?path=${encodeURIComponent(path)}&encoding=${encodeURIComponent(encoding)}`,
+      `/api/v1/servers/${encodeURIComponent(id)}/files/read`,
+      {
+        method: "POST",
+        body: JSON.stringify({ path, encoding }),
+      },
     );
   }
 

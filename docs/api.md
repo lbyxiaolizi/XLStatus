@@ -85,8 +85,8 @@
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `GET` | `/api/v1/servers/:id/files` | 文件列表 |
-| `GET` | `/api/v1/servers/:id/files/read` | 读取文件 |
+| `POST` | `/api/v1/servers/:id/files` | 文件列表 |
+| `POST` | `/api/v1/servers/:id/files/read` | 读取文件 |
 | `POST` | `/api/v1/servers/:id/files/write` | 写入文件 |
 | `POST` | `/api/v1/servers/:id/files/delete` | 删除文件 |
 | `POST` | `/api/v1/servers/:id/files/download-url` | 获取下载 URL |

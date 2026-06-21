@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -28,13 +28,13 @@ const FILE_OP_TIMEOUT_SECS: u64 = 30;
 const FILE_READ_MAX_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
-pub struct FileListQuery {
+pub struct FileListRequest {
     #[serde(default = "default_path")]
     pub path: String,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct FileReadQuery {
+pub struct FileReadRequest {
     pub path: String,
     #[serde(default)]
     pub offset: u64,
@@ -133,11 +133,11 @@ pub async fn list_files(
     State(state): State<AppState>,
     auth: AuthSession,
     Path(server_id): Path<String>,
-    Query(query): Query<FileListQuery>,
+    Json(req): Json<FileListRequest>,
 ) -> Result<Json<ApiResponse<FileListResponse>>, AppError> {
     require_transfer_scope(&auth, "transfer:read")?;
     let agent_id = ensure_server_online(&state, &auth, &server_id).await?;
-    let path = validate_abs_path(&query.path)?;
+    let path = validate_abs_path(&req.path)?;
     let result = dispatch_file_task(
         &state,
         agent_id,
@@ -173,12 +173,12 @@ pub async fn read_file(
     State(state): State<AppState>,
     auth: AuthSession,
     Path(server_id): Path<String>,
-    Query(query): Query<FileReadQuery>,
+    Json(req): Json<FileReadRequest>,
 ) -> Result<Json<ApiResponse<FileReadResponse>>, AppError> {
     require_transfer_scope(&auth, "transfer:read")?;
     let agent_id = ensure_server_online(&state, &auth, &server_id).await?;
-    let path = validate_abs_path(&query.path)?;
-    let length = query.length.clamp(1, FILE_READ_MAX_BYTES);
+    let path = validate_abs_path(&req.path)?;
+    let length = req.length.clamp(1, FILE_READ_MAX_BYTES);
     let result = dispatch_file_task(
         &state,
         agent_id,
@@ -187,7 +187,7 @@ pub async fn read_file(
             task_type: TaskType::FileRead as i32,
             spec: Some(Spec::FileRead(FileReadTask {
                 path: path.clone(),
-                offset: query.offset,
+                offset: req.offset,
                 length,
             })),
         },
@@ -197,7 +197,7 @@ pub async fn read_file(
     ensure_task_success(&result)?;
     let bytes = decode_base64(result.stdout.trim())
         .map_err(|e| AppError::BadRequest(format!("agent returned invalid base64: {e}")))?;
-    let encoding = normalize_encoding(&query.encoding)?;
+    let encoding = normalize_encoding(&req.encoding)?;
     let content = if encoding == "base64" {
         result.stdout.trim().to_string()
     } else {

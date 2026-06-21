@@ -494,8 +494,8 @@ async fn main() -> anyhow::Result<()> {
                     "/api/v1/servers/:id/metrics",
                     get(api::v1::servers::get_server_metrics),
                 )
-                .route("/api/v1/servers/:id/files", get(list_files))
-                .route("/api/v1/servers/:id/files/read", get(read_file))
+                .route("/api/v1/servers/:id/files", post(list_files))
+                .route("/api/v1/servers/:id/files/read", post(read_file))
                 .route("/api/v1/servers/:id/files/write", post(write_file))
                 .route("/api/v1/servers/:id/files/delete", post(delete_file))
                 .route("/api/v1/servers/:id/files/download-url", post(download_url))

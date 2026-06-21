@@ -73,7 +73,9 @@ TMP_DIR="$(mktemp -d "$LOG_DIR/files.XXXXXX")"
 FILE="$TMP_DIR/hello.txt"
 echo "hello-from-m5-files" > "$FILE"
 
-LIST=$(curl -s -b "$JAR" "http://127.0.0.1:$HTTP_PORT/api/v1/servers/$AGENT_ID/files?path=$(python3 -c "import urllib.parse; print(urllib.parse.quote('/tmp'))")")
+LIST=$(curl -s -b "$JAR" -H "Content-Type: application/json" -H "X-CSRF-Token: $CSRF" \
+  -X POST "http://127.0.0.1:$HTTP_PORT/api/v1/servers/$AGENT_ID/files" \
+  -d '{"path":"/tmp"}')
 
 echo "$LIST" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d.get('success'); assert isinstance(d.get('data',{}).get('entries',[]), list)"
 LIST_COUNT=$(echo "$LIST" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('data',{}).get('entries',[])))")
@@ -85,7 +87,9 @@ WRITE=$(curl -s -b "$JAR" -H "Content-Type: application/json" -H "X-CSRF-Token: 
 echo "  $WRITE"
 echo "$WRITE" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d.get('success')"
 
-READ=$(curl -s -b "$JAR" "http://127.0.0.1:$HTTP_PORT/api/v1/servers/$AGENT_ID/files/read?path=$(python3 -c "import urllib.parse; print(urllib.parse.quote('/tmp/xlstatus-m5-files.txt'))")")
+READ=$(curl -s -b "$JAR" -H "Content-Type: application/json" -H "X-CSRF-Token: $CSRF" \
+  -X POST "http://127.0.0.1:$HTTP_PORT/api/v1/servers/$AGENT_ID/files/read" \
+  -d '{"path":"/tmp/xlstatus-m5-files.txt","encoding":"utf8"}')
 echo "  $READ"
 echo "$READ" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d.get('success'); assert 'hello-from-m5-files' in d.get('data',{}).get('content','')"
 

@@ -423,13 +423,13 @@ const ROUTES: &[RouteSpec] = &[
         protected: true,
     },
     RouteSpec {
-        method: "get",
+        method: "post",
         path: "/api/v1/servers/{id}/files",
         summary: "List server files",
         protected: true,
     },
     RouteSpec {
-        method: "get",
+        method: "post",
         path: "/api/v1/servers/{id}/files/read",
         summary: "Read server file",
         protected: true,
@@ -1021,6 +1021,8 @@ mod tests {
             "/api/v1/settings",
             "/api/v1/themes",
             "/api/v1/geoip/test",
+            "/api/v1/servers/{id}/files",
+            "/api/v1/servers/{id}/files/read",
             "/api/v1/servers/{id}/files/download-url",
             "/api/v1/servers/{id}/files/upload-url",
         ] {
@@ -1049,6 +1051,18 @@ mod tests {
         assert!(upload["post"].get("security").is_some());
         assert!(download["get"].is_null());
         assert!(upload["get"].is_null());
+    }
+
+    #[test]
+    fn openapi_documents_agent_file_reads_as_post_only() {
+        let doc = openapi_document();
+        let list = &doc["paths"]["/api/v1/servers/{id}/files"];
+        let read = &doc["paths"]["/api/v1/servers/{id}/files/read"];
+
+        assert!(list["post"].get("security").is_some());
+        assert!(read["post"].get("security").is_some());
+        assert!(list["get"].is_null());
+        assert!(read["get"].is_null());
     }
 
     #[test]
