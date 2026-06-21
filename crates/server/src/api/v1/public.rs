@@ -328,15 +328,8 @@ async fn public_services(state: &AppState) -> Result<Vec<PublicServiceView>, App
         DatabaseBackend::Sqlite(pool) => {
             let rows = sqlx::query(
                 r#"
-                SELECT s.id, s.name, s.type, s.server_id,
-                       r.status AS last_status, r.created_at AS last_check_at
+                SELECT s.id, s.name, s.type, s.server_id
                 FROM services s
-                LEFT JOIN service_results r ON r.id = (
-                    SELECT sr.id FROM service_results sr
-                    WHERE sr.service_id = s.id
-                    ORDER BY sr.created_at DESC
-                    LIMIT 1
-                )
                 WHERE s.enabled = 1
                 ORDER BY s.created_at DESC
                 LIMIT 100
@@ -364,6 +357,7 @@ async fn public_services(state: &AppState) -> Result<Vec<PublicServiceView>, App
                     public_service_history_sqlite(pool, &service_id).await?,
                     &public_server_ids,
                 );
+                let (last_status, last_check_at) = public_service_last_from_history(&history);
                 services.push(PublicServiceView {
                     id: service_id,
                     name: row.get("name"),
@@ -372,8 +366,8 @@ async fn public_services(state: &AppState) -> Result<Vec<PublicServiceView>, App
                     service_type_alias: service_type,
                     server_id: visible_server_ids.first().cloned(),
                     server_ids: visible_server_ids,
-                    last_status: row.try_get("last_status").ok(),
-                    last_check_at: row.try_get("last_check_at").ok(),
+                    last_status,
+                    last_check_at,
                     history,
                 });
             }
@@ -382,15 +376,8 @@ async fn public_services(state: &AppState) -> Result<Vec<PublicServiceView>, App
         DatabaseBackend::Postgres(pool) => {
             let rows = sqlx::query(
                 r#"
-                SELECT s.id::text AS id, s.name, s.type, s.server_id::text AS server_id,
-                       r.status AS last_status, r.created_at::text AS last_check_at
+                SELECT s.id::text AS id, s.name, s.type, s.server_id::text AS server_id
                 FROM services s
-                LEFT JOIN service_results r ON r.id = (
-                    SELECT sr.id FROM service_results sr
-                    WHERE sr.service_id = s.id
-                    ORDER BY sr.created_at DESC
-                    LIMIT 1
-                )
                 WHERE s.enabled = true
                 ORDER BY s.created_at DESC
                 LIMIT 100
@@ -418,6 +405,7 @@ async fn public_services(state: &AppState) -> Result<Vec<PublicServiceView>, App
                     public_service_history_postgres(pool, &service_id).await?,
                     &public_server_ids,
                 );
+                let (last_status, last_check_at) = public_service_last_from_history(&history);
                 services.push(PublicServiceView {
                     id: service_id,
                     name: row.get("name"),
@@ -426,8 +414,8 @@ async fn public_services(state: &AppState) -> Result<Vec<PublicServiceView>, App
                     service_type_alias: service_type,
                     server_id: visible_server_ids.first().cloned(),
                     server_ids: visible_server_ids,
-                    last_status: row.try_get("last_status").ok(),
-                    last_check_at: row.try_get("last_check_at").ok(),
+                    last_status,
+                    last_check_at,
                     history,
                 });
             }
@@ -475,9 +463,18 @@ fn filter_public_service_history(
             item.server_id
                 .as_ref()
                 .map(|id| public_server_ids.contains(id))
-                .unwrap_or(true)
+                .unwrap_or(false)
         })
         .collect()
+}
+
+fn public_service_last_from_history(
+    history: &[PublicServiceResultView],
+) -> (Option<String>, Option<String>) {
+    let Some(latest) = history.first() else {
+        return (None, None);
+    };
+    (Some(latest.status.clone()), Some(latest.created_at.clone()))
 }
 
 async fn public_service_history_sqlite(
@@ -1361,6 +1358,40 @@ mod tests {
         let serialized = serde_json::to_value(&samples[1]).expect("metric serializes");
         assert!(serialized.get("fields_json").is_none());
         assert!(serialized.get("agent_id").is_none());
+    }
+
+    #[test]
+    fn public_service_last_status_uses_public_history_only() {
+        let public_server = Uuid::now_v7().to_string();
+        let private_server = Uuid::now_v7().to_string();
+        let public_server_ids = HashSet::from([public_server.clone()]);
+        let history = vec![
+            PublicServiceResultView {
+                server_id: Some(private_server),
+                status: "failure".into(),
+                delay_ms: Some(900),
+                created_at: "2026-06-22T12:00:00Z".into(),
+            },
+            PublicServiceResultView {
+                server_id: None,
+                status: "failure".into(),
+                delay_ms: Some(800),
+                created_at: "2026-06-22T11:00:00Z".into(),
+            },
+            PublicServiceResultView {
+                server_id: Some(public_server),
+                status: "success".into(),
+                delay_ms: Some(20),
+                created_at: "2026-06-22T10:00:00Z".into(),
+            },
+        ];
+
+        let filtered = filter_public_service_history(history, &public_server_ids);
+        assert_eq!(filtered.len(), 1);
+
+        let (last_status, last_check_at) = public_service_last_from_history(&filtered);
+        assert_eq!(last_status.as_deref(), Some("success"));
+        assert_eq!(last_check_at.as_deref(), Some("2026-06-22T10:00:00Z"));
     }
 
     #[test]
