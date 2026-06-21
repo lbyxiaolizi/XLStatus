@@ -185,7 +185,7 @@ DDNS 配置创建请求体上限为 64KiB。`provider` 只允许 `cloudflare`、
 
 MCP POST 入口请求体上限为 1MiB。`/mcp` JSON-RPC batch 最多 16 项，空 batch 或超过上限会返回 `Invalid Request`。`server.exec` 命令最长 8192 字节，timeout 被限制在 1 到 60 秒，默认 30 秒。
 
-GeoIP 测试接口请求体上限为 4KiB。GeoIP JSON provider 响应最多读取 16KiB，返回的 `raw` JSON 会限制字符串长度、数组项数、对象字段数和嵌套深度；MMDB 下载和上传文件上限均为 128MiB，下载路径会在读取过程中按上限中止。
+GeoIP 测试接口请求体上限为 4KiB。GeoIP MMDB update 请求体上限为 16KiB，`source_url` 最长 2048 字节，`source_path` 最长 4096 字节；本地 `source_path` 必须是普通文件，读取前会按 128MiB 上限检查文件大小。GeoIP JSON provider 响应最多读取 16KiB，返回的 `raw` JSON 会限制字符串长度、数组项数、对象字段数和嵌套深度；MMDB 下载和上传文件上限均为 128MiB，下载路径会在读取过程中按上限中止。
 
 ## gRPC
 

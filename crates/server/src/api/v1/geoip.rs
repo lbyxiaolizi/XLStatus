@@ -24,8 +24,11 @@ use std::path::{Path, PathBuf};
 use xlstatus_shared::AgentId;
 
 const GEOIP_MMDB_MAX_BYTES: usize = 128 * 1024 * 1024;
+const GEOIP_UPDATE_MAX_BODY_BYTES: usize = 16 * 1024;
 const GEOIP_TEST_MAX_BODY_BYTES: usize = 4 * 1024;
 const GEOIP_JSON_MAX_BYTES: usize = 16 * 1024;
+const GEOIP_MMDB_SOURCE_URL_MAX_BYTES: usize = 2048;
+const GEOIP_MMDB_SOURCE_PATH_MAX_BYTES: usize = 4096;
 const GEOIP_RAW_MAX_STRING_BYTES: usize = 1024;
 const GEOIP_RAW_MAX_ARRAY_ITEMS: usize = 16;
 const GEOIP_RAW_MAX_OBJECT_FIELDS: usize = 32;
@@ -179,15 +182,17 @@ pub async fn update_geoip_database(
 ) -> Result<Json<ApiResponse<GeoIpMaintenanceResponse>>, AppError> {
     require_admin_cookie_session(&auth)?;
     let req = payload.map(|Json(req)| req).unwrap_or_default();
-    let source_url = req
-        .source_url
-        .or_else(|| std::env::var("XLSTATUS_GEOIP_MMDB_URL").ok())
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let source_path = req
-        .source_path
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+    let source_url = normalize_optional_update_text(
+        req.source_url
+            .or_else(|| std::env::var("XLSTATUS_GEOIP_MMDB_URL").ok()),
+        GEOIP_MMDB_SOURCE_URL_MAX_BYTES,
+        "source_url",
+    )?;
+    let source_path = normalize_optional_update_text(
+        req.source_path,
+        GEOIP_MMDB_SOURCE_PATH_MAX_BYTES,
+        "source_path",
+    )?;
 
     if let Some(url) = source_url {
         let bytes = download_mmdb(&url).await?;
@@ -201,8 +206,7 @@ pub async fn update_geoip_database(
     }
 
     if let Some(path) = source_path {
-        let bytes = std::fs::read(&path)
-            .map_err(|e| AppError::BadRequest(format!("failed to read MMDB source_path: {e}")))?;
+        let bytes = read_limited_mmdb_source_path(&path)?;
         let status = install_mmdb_bytes(&bytes)?;
         return Ok(Json(ApiResponse::success(GeoIpMaintenanceResponse {
             action: "geoip_import".into(),
@@ -264,6 +268,10 @@ pub fn geoip_upload_body_limit() -> DefaultBodyLimit {
 
 pub fn geoip_test_body_limit() -> DefaultBodyLimit {
     DefaultBodyLimit::max(GEOIP_TEST_MAX_BODY_BYTES)
+}
+
+pub fn geoip_update_body_limit() -> DefaultBodyLimit {
+    DefaultBodyLimit::max(GEOIP_UPDATE_MAX_BODY_BYTES)
 }
 
 pub async fn handle_agent_ip_report(
@@ -618,6 +626,24 @@ fn install_mmdb_bytes(bytes: &[u8]) -> Result<GeoIpMmdbStatus, AppError> {
     std::fs::rename(&temp_path, &path)
         .map_err(|e| AppError::BadRequest(format!("failed to install MMDB file: {e}")))?;
     Ok(read_mmdb_status())
+}
+
+fn read_limited_mmdb_source_path(path: &str) -> Result<Vec<u8>, AppError> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| AppError::BadRequest(format!("failed to stat MMDB source_path: {e}")))?;
+    if !metadata.is_file() {
+        return Err(AppError::BadRequest(
+            "MMDB source_path must be a regular file".into(),
+        ));
+    }
+    if metadata.len() > GEOIP_MMDB_MAX_BYTES as u64 {
+        return Err(AppError::BadRequest(format!(
+            "MMDB source_path exceeds {} bytes",
+            GEOIP_MMDB_MAX_BYTES
+        )));
+    }
+    std::fs::read(path)
+        .map_err(|e| AppError::BadRequest(format!("failed to read MMDB source_path: {e}")))
 }
 
 async fn download_mmdb(url: &str) -> Result<Vec<u8>, AppError> {
@@ -1094,6 +1120,24 @@ fn clean_ip(value: Option<&str>) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn normalize_optional_update_text(
+    value: Option<String>,
+    max_bytes: usize,
+    field: &str,
+) -> Result<Option<String>, AppError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() > max_bytes {
+        return Err(AppError::BadRequest(format!("{field} is too long")));
+    }
+    Ok(Some(value.to_string()))
+}
+
 fn json_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
     keys.iter()
         .find_map(|key| value.get(*key).and_then(|item| item.as_str()))
@@ -1188,6 +1232,33 @@ mod tests {
     #[test]
     fn geoip_test_body_limit_is_small() {
         assert_eq!(GEOIP_TEST_MAX_BODY_BYTES, 4 * 1024);
+    }
+
+    #[test]
+    fn geoip_update_resource_limits_are_explicit() {
+        let _ = geoip_update_body_limit();
+        assert_eq!(GEOIP_UPDATE_MAX_BODY_BYTES, 16 * 1024);
+        assert_eq!(GEOIP_MMDB_SOURCE_URL_MAX_BYTES, 2048);
+        assert_eq!(GEOIP_MMDB_SOURCE_PATH_MAX_BYTES, 4096);
+    }
+
+    #[test]
+    fn geoip_update_source_fields_are_bounded() {
+        let err = normalize_optional_update_text(
+            Some("x".repeat(GEOIP_MMDB_SOURCE_URL_MAX_BYTES + 1)),
+            GEOIP_MMDB_SOURCE_URL_MAX_BYTES,
+            "source_url",
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+
+        let err = normalize_optional_update_text(
+            Some("x".repeat(GEOIP_MMDB_SOURCE_PATH_MAX_BYTES + 1)),
+            GEOIP_MMDB_SOURCE_PATH_MAX_BYTES,
+            "source_path",
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
     }
 
     #[test]
