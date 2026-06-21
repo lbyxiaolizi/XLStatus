@@ -6,7 +6,10 @@ use crate::api::v1::notifications::ensure_notification_group_owned_by;
 use crate::auth::middleware::{AuthKind, AuthSession};
 use crate::db::{AgentRepository, DatabaseBackend};
 use crate::secrets::{decrypt_secret_if_needed, encrypt_secret, is_encrypted_secret};
-use axum::{extract::State, Json};
+use axum::{
+    extract::{DefaultBodyLimit, State},
+    Json,
+};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use xlstatus_shared::AgentId;
@@ -29,6 +32,12 @@ const GEOIP_IP_CHANGE_SEVERITY: &str = "geoip_ip_change_severity";
 const DDNS_RESOLVER_URL: &str = "ddns_resolver_url";
 const TSDB_RETENTION_DAYS: &str = "tsdb_retention_days";
 const CLOUDFLARED_TOKEN: &str = "cloudflared_token";
+const SETTINGS_MAX_BODY_BYTES: usize = 64 * 1024;
+const SETTINGS_MAX_URL_BYTES: usize = 2048;
+const SETTINGS_MAX_GEOIP_TOKEN_BYTES: usize = 4096;
+const SETTINGS_MAX_CLOUDFLARED_TOKEN_BYTES: usize = 8192;
+const SETTINGS_MAX_DISABLED_CUSTOM_HTML_BYTES: usize = 1024;
+const SETTINGS_MAX_GEOIP_IP_CHANGE_SERVERS: usize = 64;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PublicSiteBranding {
@@ -79,6 +88,10 @@ pub struct UpdateSystemSettingsRequest {
     pub geoip_ip_change_server_ids: Option<Vec<String>>,
     pub geoip_ip_change_severity: Option<String>,
     pub ddns_resolver_url: Option<String>,
+}
+
+pub fn settings_body_limit() -> DefaultBodyLimit {
+    DefaultBodyLimit::max(SETTINGS_MAX_BODY_BYTES)
 }
 
 pub async fn get_settings(
@@ -168,13 +181,19 @@ pub async fn update_settings(
         .await?;
     }
     if let Some(token) = req.geoip_ipinfo_token {
-        set_secret_string_setting(&state.db, GEOIP_IPINFO_TOKEN, token.trim()).await?;
+        let token = normalize_optional_secret_text(
+            Some(token),
+            SETTINGS_MAX_GEOIP_TOKEN_BYTES,
+            "geoip_ipinfo_token",
+        )?;
+        set_secret_string_setting(&state.db, GEOIP_IPINFO_TOKEN, &token).await?;
     }
     if let Some(enabled) = req.geoip_ip_change_enabled {
         set_bool_setting(&state.db, GEOIP_IP_CHANGE_ENABLED, enabled).await?;
     }
     if let Some(group_id) = req.geoip_ip_change_notification_group_id {
-        let group_id = normalize_optional_id(group_id);
+        let group_id =
+            normalize_optional_uuid_text(group_id, "geoip_ip_change_notification_group_id")?;
         ensure_notification_group_owned_by(&state.db, auth.user_id.0, group_id.as_deref()).await?;
         set_string_setting(
             &state.db,
@@ -184,7 +203,7 @@ pub async fn update_settings(
         .await?;
     }
     if let Some(server_ids) = req.geoip_ip_change_server_ids {
-        let server_ids = normalize_string_list(server_ids);
+        let server_ids = normalize_geoip_ip_change_server_ids(server_ids)?;
         ensure_geoip_ip_change_servers_exist(&state.db, &server_ids).await?;
         set_string_list_setting(&state.db, GEOIP_IP_CHANGE_SERVER_IDS, server_ids).await?;
     }
@@ -197,7 +216,12 @@ pub async fn update_settings(
         .await?;
     }
     if let Some(resolver_url) = req.ddns_resolver_url {
-        set_string_setting(&state.db, DDNS_RESOLVER_URL, resolver_url.trim()).await?;
+        let resolver_url = normalize_optional_url_setting(
+            Some(resolver_url),
+            SETTINGS_MAX_URL_BYTES,
+            "ddns_resolver_url",
+        )?;
+        set_string_setting(&state.db, DDNS_RESOLVER_URL, &resolver_url).await?;
     }
     Ok(Json(ApiResponse::success(
         system_settings_response(&state.db).await?,
@@ -324,7 +348,12 @@ pub async fn set_cloudflared_token(
     db: &DatabaseBackend,
     token: Option<String>,
 ) -> Result<(), AppError> {
-    set_secret_string_setting(db, CLOUDFLARED_TOKEN, token.unwrap_or_default().trim()).await
+    let token = normalize_optional_secret_text(
+        token,
+        SETTINGS_MAX_CLOUDFLARED_TOKEN_BYTES,
+        "cloudflared_token",
+    )?;
+    set_secret_string_setting(db, CLOUDFLARED_TOKEN, &token).await
 }
 
 async fn get_bool_setting(db: &DatabaseBackend, key: &str) -> Result<Option<bool>, AppError> {
@@ -575,7 +604,13 @@ fn default_public_site_enabled(value: Option<bool>) -> bool {
 }
 
 fn normalize_disabled_custom_html(value: Option<String>, field: &str) -> Result<String, AppError> {
-    if value.unwrap_or_default().trim().is_empty() {
+    let value = value.unwrap_or_default();
+    if value.len() > SETTINGS_MAX_DISABLED_CUSTOM_HTML_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "{field} must be at most {SETTINGS_MAX_DISABLED_CUSTOM_HTML_BYTES} bytes"
+        )));
+    }
+    if value.trim().is_empty() {
         Ok(String::new())
     } else {
         Err(AppError::BadRequest(format!(
@@ -611,10 +646,100 @@ fn normalize_string_list(values: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-fn normalize_optional_id(value: Option<String>) -> Option<String> {
-    value
+fn normalize_optional_uuid_text(
+    value: Option<String>,
+    field: &str,
+) -> Result<Option<String>, AppError> {
+    let Some(value) = value
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    uuid::Uuid::parse_str(&value)
+        .map(|id| Some(id.to_string()))
+        .map_err(|e| AppError::BadRequest(format!("invalid {field}: {e}")))
+}
+
+fn normalize_geoip_ip_change_server_ids(values: Vec<String>) -> Result<Vec<String>, AppError> {
+    if values.len() > SETTINGS_MAX_GEOIP_IP_CHANGE_SERVERS {
+        return Err(AppError::BadRequest(format!(
+            "geoip_ip_change_server_ids must contain at most {SETTINGS_MAX_GEOIP_IP_CHANGE_SERVERS} items"
+        )));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for value in values {
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        let parsed = uuid::Uuid::parse_str(value).map_err(|e| {
+            AppError::BadRequest(format!("invalid geoip_ip_change_server_ids item: {e}"))
+        })?;
+        if seen.insert(parsed) {
+            if out.len() >= SETTINGS_MAX_GEOIP_IP_CHANGE_SERVERS {
+                return Err(AppError::BadRequest(format!(
+                    "geoip_ip_change_server_ids must contain at most {SETTINGS_MAX_GEOIP_IP_CHANGE_SERVERS} unique servers"
+                )));
+            }
+            out.push(parsed.to_string());
+        }
+    }
+    Ok(out)
+}
+
+fn normalize_optional_secret_text(
+    value: Option<String>,
+    max_bytes: usize,
+    field: &str,
+) -> Result<String, AppError> {
+    let value = value.unwrap_or_default();
+    let value = value.trim();
+    if value.len() > max_bytes {
+        return Err(AppError::BadRequest(format!(
+            "{field} must be at most {max_bytes} bytes"
+        )));
+    }
+    Ok(value.to_string())
+}
+
+fn normalize_optional_url_setting(
+    value: Option<String>,
+    max_bytes: usize,
+    field: &str,
+) -> Result<String, AppError> {
+    let value = value.unwrap_or_default();
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(String::new());
+    }
+    if value.len() > max_bytes {
+        return Err(AppError::BadRequest(format!(
+            "{field} must be at most {max_bytes} bytes"
+        )));
+    }
+    let parsed = reqwest::Url::parse(value)
+        .map_err(|e| AppError::BadRequest(format!("invalid {field}: {e}")))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(AppError::BadRequest(format!(
+            "{field} must use http or https"
+        )));
+    }
+    if parsed.host_str().is_none() {
+        return Err(AppError::BadRequest(format!("{field} must include a host")));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(AppError::BadRequest(format!(
+            "{field} must not include credentials"
+        )));
+    }
+    if parsed.fragment().is_some() {
+        return Err(AppError::BadRequest(format!(
+            "{field} must not include a fragment"
+        )));
+    }
+    Ok(parsed.to_string())
 }
 
 async fn ensure_geoip_ip_change_servers_exist(
@@ -655,10 +780,26 @@ fn require_admin_cookie_session(auth: &AuthSession) -> Result<(), AppError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_public_site_enabled, normalize_disabled_custom_html, require_admin_cookie_session,
+        default_public_site_enabled, normalize_disabled_custom_html,
+        normalize_geoip_ip_change_server_ids, normalize_optional_secret_text,
+        normalize_optional_url_setting, normalize_optional_uuid_text, require_admin_cookie_session,
+        settings_body_limit, SETTINGS_MAX_BODY_BYTES, SETTINGS_MAX_CLOUDFLARED_TOKEN_BYTES,
+        SETTINGS_MAX_DISABLED_CUSTOM_HTML_BYTES, SETTINGS_MAX_GEOIP_IP_CHANGE_SERVERS,
+        SETTINGS_MAX_GEOIP_TOKEN_BYTES, SETTINGS_MAX_URL_BYTES,
     };
     use crate::auth::middleware::{AuthKind, AuthSession};
     use xlstatus_shared::{UserId, UserRole};
+
+    #[test]
+    fn settings_body_budget_is_explicit() {
+        let _ = settings_body_limit();
+        assert_eq!(SETTINGS_MAX_BODY_BYTES, 64 * 1024);
+        assert_eq!(SETTINGS_MAX_URL_BYTES, 2048);
+        assert_eq!(SETTINGS_MAX_GEOIP_TOKEN_BYTES, 4096);
+        assert_eq!(SETTINGS_MAX_CLOUDFLARED_TOKEN_BYTES, 8192);
+        assert_eq!(SETTINGS_MAX_DISABLED_CUSTOM_HTML_BYTES, 1024);
+        assert_eq!(SETTINGS_MAX_GEOIP_IP_CHANGE_SERVERS, 64);
+    }
 
     #[test]
     fn parses_bool_json_setting() {
@@ -677,6 +818,86 @@ mod tests {
             ""
         );
         assert_eq!(normalize_disabled_custom_html(None, "field").unwrap(), "");
+        assert!(normalize_disabled_custom_html(
+            Some(" ".repeat(SETTINGS_MAX_DISABLED_CUSTOM_HTML_BYTES + 1)),
+            "field",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn bounds_secret_and_url_settings() {
+        assert_eq!(
+            normalize_optional_secret_text(Some(" token ".into()), 16, "token").unwrap(),
+            "token"
+        );
+        assert!(normalize_optional_secret_text(Some("x".repeat(17)), 16, "token").is_err());
+
+        assert_eq!(
+            normalize_optional_url_setting(
+                Some(" https://dns.google/resolve ".into()),
+                SETTINGS_MAX_URL_BYTES,
+                "ddns_resolver_url",
+            )
+            .unwrap(),
+            "https://dns.google/resolve"
+        );
+        assert!(normalize_optional_url_setting(
+            Some(format!(
+                "https://example.com/{}",
+                "a".repeat(SETTINGS_MAX_URL_BYTES)
+            )),
+            SETTINGS_MAX_URL_BYTES,
+            "ddns_resolver_url",
+        )
+        .is_err());
+        assert!(normalize_optional_url_setting(
+            Some("ftp://example.com/resolve".into()),
+            SETTINGS_MAX_URL_BYTES,
+            "ddns_resolver_url",
+        )
+        .is_err());
+        assert!(normalize_optional_url_setting(
+            Some("https://user:pass@example.com/resolve".into()),
+            SETTINGS_MAX_URL_BYTES,
+            "ddns_resolver_url",
+        )
+        .is_err());
+        assert!(normalize_optional_url_setting(
+            Some("https://example.com/resolve#frag".into()),
+            SETTINGS_MAX_URL_BYTES,
+            "ddns_resolver_url",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn normalizes_uuid_settings_and_bounds_server_lists() {
+        let id = uuid::Uuid::now_v7();
+        assert_eq!(
+            normalize_optional_uuid_text(Some(format!(" {id} ")), "group")
+                .unwrap()
+                .as_deref(),
+            Some(id.to_string().as_str())
+        );
+        assert!(normalize_optional_uuid_text(Some("not-a-uuid".into()), "group").is_err());
+
+        let duplicate = uuid::Uuid::now_v7().to_string();
+        let ids = normalize_geoip_ip_change_server_ids(vec![
+            duplicate.clone(),
+            " ".into(),
+            duplicate.clone(),
+            uuid::Uuid::now_v7().to_string(),
+        ])
+        .unwrap();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], duplicate);
+
+        let too_many = (0..=SETTINGS_MAX_GEOIP_IP_CHANGE_SERVERS)
+            .map(|idx| uuid::Uuid::from_u128(idx as u128 + 1).to_string())
+            .collect::<Vec<_>>();
+        assert!(normalize_geoip_ip_change_server_ids(too_many).is_err());
+        assert!(normalize_geoip_ip_change_server_ids(vec!["not-a-uuid".into()]).is_err());
     }
 
     #[test]

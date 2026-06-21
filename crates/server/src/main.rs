@@ -44,6 +44,7 @@ use api::v1::auth::{
     disable_totp, enable_totp, get_totp_status, list_sessions, list_users, list_waf_bans, login,
     login_body_limit, logout, setup_totp, totp_body_limit, update_user, AppState,
 };
+use api::v1::cloudflared::cloudflared_token_body_limit;
 use api::v1::ddns::{
     check_ddns_now, create_ddns_config, ddns_body_limit, delete_ddns_config, list_ddns_configs,
     list_ddns_history, reload_ddns_providers,
@@ -80,7 +81,7 @@ use api::v1::server_ops::{
     server_ops_body_limit, upload_url, write_file,
 };
 use api::v1::service_history::{get_service_history, get_service_uptime};
-use api::v1::settings::{get_settings, update_settings};
+use api::v1::settings::{get_settings, settings_body_limit, update_settings};
 use api::v1::terminal::{create_terminal_session, terminal_body_limit, ws_terminal};
 use api::v1::themes::{delete_theme, import_theme, list_themes, select_theme, update_theme};
 // M3: server list / detail / metrics routes are registered inline below
@@ -350,7 +351,8 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .route(
                     "/api/v1/cloudflared/token",
-                    post(api::v1::cloudflared::save_cloudflared_token),
+                    post(api::v1::cloudflared::save_cloudflared_token)
+                        .layer(cloudflared_token_body_limit()),
                 )
                 .route(
                     "/api/v1/cloudflared/start",
@@ -373,7 +375,9 @@ async fn main() -> anyhow::Result<()> {
                 .route("/api/v1/settings", get(get_settings))
                 .route(
                     "/api/v1/settings",
-                    post(update_settings).patch(update_settings),
+                    post(update_settings)
+                        .patch(update_settings)
+                        .layer(settings_body_limit()),
                 )
                 .route("/api/v1/themes", get(list_themes))
                 .route(

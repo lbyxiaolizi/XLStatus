@@ -6,7 +6,11 @@ use crate::api::v1::settings::{
     cloudflared_token, cloudflared_token_configured, set_cloudflared_token,
 };
 use crate::auth::middleware::{AuthKind, AuthSession};
-use axum::{extract::State, http::HeaderMap, Json};
+use axum::{
+    extract::{DefaultBodyLimit, State},
+    http::HeaderMap,
+    Json,
+};
 use chrono::Utc;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -18,6 +22,7 @@ use tokio::sync::Mutex;
 
 static CLOUDFLARED: Lazy<Mutex<CloudflaredProcess>> =
     Lazy::new(|| Mutex::new(CloudflaredProcess::default()));
+const CLOUDFLARED_TOKEN_MAX_BODY_BYTES: usize = 16 * 1024;
 
 #[derive(Default)]
 struct CloudflaredProcess {
@@ -47,6 +52,10 @@ pub struct CloudflaredActionResponse {
     pub action: String,
     pub success: bool,
     pub status: CloudflaredStatusResponse,
+}
+
+pub fn cloudflared_token_body_limit() -> DefaultBodyLimit {
+    DefaultBodyLimit::max(CLOUDFLARED_TOKEN_MAX_BODY_BYTES)
 }
 
 pub async fn cloudflared_status(
@@ -236,8 +245,15 @@ fn require_admin_cookie_session(auth: &AuthSession) -> Result<(), AppError> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{cloudflared_token_body_limit, require_admin_cookie_session, AppError};
+    use crate::auth::middleware::{AuthKind, AuthSession};
     use xlstatus_shared::{UserId, UserRole};
+
+    #[test]
+    fn cloudflared_token_body_budget_is_explicit() {
+        let _ = cloudflared_token_body_limit();
+        assert_eq!(super::CLOUDFLARED_TOKEN_MAX_BODY_BYTES, 16 * 1024);
+    }
 
     #[test]
     fn cloudflared_control_allows_admin_cookie_session() {
