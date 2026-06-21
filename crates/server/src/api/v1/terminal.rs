@@ -1,7 +1,7 @@
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, State,
+        DefaultBodyLimit, Path, State,
     },
     http::HeaderMap,
     response::Response,
@@ -27,6 +27,12 @@ use crate::db::AgentRepository;
 
 const TERMINAL_SESSION_TTL_SECONDS: i64 = 300;
 const MAX_PENDING_TERMINAL_SESSIONS: usize = 256;
+const TERMINAL_CREATE_MAX_BODY_BYTES: usize = 4 * 1024;
+const TERMINAL_MAX_CLIENT_TEXT_BYTES: usize = 16 * 1024;
+const TERMINAL_MAX_INPUT_BYTES: usize = 8 * 1024;
+const TERMINAL_MAX_AGENT_FRAME_BYTES: usize = 64 * 1024;
+const TERMINAL_MAX_CLOSE_REASON_BYTES: usize = 1024;
+const TERMINAL_MAX_ERROR_BYTES: usize = 4096;
 
 #[derive(Clone, Default)]
 pub struct TerminalSessionRegistry {
@@ -60,6 +66,10 @@ pub struct CreateTerminalSessionResponse {
     pub cols: u16,
     pub rows: u16,
     pub created_at: String,
+}
+
+pub fn terminal_body_limit() -> DefaultBodyLimit {
+    DefaultBodyLimit::max(TERMINAL_CREATE_MAX_BODY_BYTES)
 }
 
 pub async fn create_terminal_session(
@@ -143,9 +153,12 @@ pub async fn ws_terminal(
 
     let io_registry = state.io_registry.clone();
     let terminal_sessions = state.terminal_sessions.clone();
-    Ok(ws.on_upgrade(move |socket| async move {
-        let _ = handle_terminal_socket(socket, io_registry, terminal_sessions, session).await;
-    }))
+    Ok(ws
+        .max_message_size(TERMINAL_MAX_CLIENT_TEXT_BYTES)
+        .max_frame_size(TERMINAL_MAX_CLIENT_TEXT_BYTES)
+        .on_upgrade(move |socket| async move {
+            let _ = handle_terminal_socket(socket, io_registry, terminal_sessions, session).await;
+        }))
 }
 
 fn terminal_session_created_by_auth(session: &TerminalSession, auth: &AuthSession) -> bool {
@@ -304,8 +317,11 @@ async fn handle_terminal_socket(
 }
 
 fn parse_client_message(text: &str) -> Result<TerminalClientMessage, serde_json::Error> {
+    if text.len() > TERMINAL_MAX_CLIENT_TEXT_BYTES {
+        return Err(serde_json::from_str::<TerminalClientMessage>("").unwrap_err());
+    }
     if let Ok(message) = serde_json::from_str::<TerminalClientMessage>(text) {
-        return Ok(message);
+        return normalize_terminal_client_message(message);
     }
     let value = serde_json::from_str::<serde_json::Value>(text)?;
     let ty = value
@@ -314,18 +330,34 @@ fn parse_client_message(text: &str) -> Result<TerminalClientMessage, serde_json:
         .unwrap_or_default();
     match ty {
         "terminal.input" | "input" => Ok(TerminalClientMessage::Input {
-            data: value
-                .get("data")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string(),
+            data: limit_terminal_text(
+                value
+                    .get("data")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+                TERMINAL_MAX_INPUT_BYTES,
+            ),
         }),
         "terminal.resize" | "resize" => Ok(TerminalClientMessage::Resize {
             cols: value.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u16,
             rows: value.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u16,
         }),
         "terminal.close" | "close" => Ok(TerminalClientMessage::Close),
-        _ => serde_json::from_value(value),
+        _ => serde_json::from_value(value).and_then(normalize_terminal_client_message),
+    }
+}
+
+fn normalize_terminal_client_message(
+    message: TerminalClientMessage,
+) -> Result<TerminalClientMessage, serde_json::Error> {
+    match message {
+        TerminalClientMessage::Input { data } => Ok(TerminalClientMessage::Input {
+            data: limit_terminal_text(&data, TERMINAL_MAX_INPUT_BYTES),
+        }),
+        TerminalClientMessage::Resize { cols, rows } => {
+            Ok(TerminalClientMessage::Resize { cols, rows })
+        }
+        TerminalClientMessage::Close => Ok(TerminalClientMessage::Close),
     }
 }
 
@@ -359,35 +391,63 @@ fn build_close_frame(session_id: &str, agent_id: &AgentId, sequence: u64, reason
 fn map_agent_frame(frame: IoFrame) -> Option<TerminalServerMessage> {
     match frame.payload {
         Some(io_frame::Payload::Data(data)) => {
+            if data.data.len() > TERMINAL_MAX_AGENT_FRAME_BYTES {
+                return Some(TerminalServerMessage::Error {
+                    message: "terminal output frame is too large".into(),
+                });
+            }
             if let Ok(bridge) = serde_json::from_slice::<TerminalBridgeMessage>(&data.data) {
                 match bridge {
-                    TerminalBridgeMessage::Output { data } => {
-                        Some(TerminalServerMessage::Output { data })
-                    }
+                    TerminalBridgeMessage::Output { data } => Some(TerminalServerMessage::Output {
+                        data: limit_terminal_text(&data, TERMINAL_MAX_AGENT_FRAME_BYTES),
+                    }),
                     TerminalBridgeMessage::Close { reason } => {
                         Some(TerminalServerMessage::Closed {
-                            reason: reason.unwrap_or_else(|| "terminal closed".into()),
+                            reason: reason
+                                .as_deref()
+                                .map(|value| {
+                                    limit_terminal_text(value, TERMINAL_MAX_CLOSE_REASON_BYTES)
+                                })
+                                .unwrap_or_else(|| "terminal closed".into()),
                         })
                     }
                     TerminalBridgeMessage::Error { message } => {
-                        Some(TerminalServerMessage::Error { message })
+                        Some(TerminalServerMessage::Error {
+                            message: limit_terminal_text(&message, TERMINAL_MAX_ERROR_BYTES),
+                        })
                     }
                     _ => None,
                 }
             } else {
                 Some(TerminalServerMessage::Output {
-                    data: String::from_utf8_lossy(&data.data).to_string(),
+                    data: limit_terminal_text(
+                        &String::from_utf8_lossy(&data.data),
+                        TERMINAL_MAX_AGENT_FRAME_BYTES,
+                    ),
                 })
             }
         }
         Some(io_frame::Payload::Close(close)) => Some(TerminalServerMessage::Closed {
-            reason: close.reason,
+            reason: limit_terminal_text(&close.reason, TERMINAL_MAX_CLOSE_REASON_BYTES),
         }),
         Some(io_frame::Payload::Error(IoError { message, .. })) => {
-            Some(TerminalServerMessage::Error { message })
+            Some(TerminalServerMessage::Error {
+                message: limit_terminal_text(&message, TERMINAL_MAX_ERROR_BYTES),
+            })
         }
         None => None,
     }
+}
+
+fn limit_terminal_text(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
 }
 
 async fn send_terminal_message(
@@ -646,5 +706,112 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn terminal_resource_limits_are_explicit() {
+        assert_eq!(TERMINAL_CREATE_MAX_BODY_BYTES, 4 * 1024);
+        assert_eq!(TERMINAL_MAX_CLIENT_TEXT_BYTES, 16 * 1024);
+        assert_eq!(TERMINAL_MAX_INPUT_BYTES, 8 * 1024);
+        assert_eq!(TERMINAL_MAX_AGENT_FRAME_BYTES, 64 * 1024);
+        assert_eq!(TERMINAL_MAX_CLOSE_REASON_BYTES, 1024);
+        assert_eq!(TERMINAL_MAX_ERROR_BYTES, 4096);
+    }
+
+    #[test]
+    fn terminal_client_input_is_bounded() {
+        let message = serde_json::json!({
+            "type": "input",
+            "data": "a".repeat(TERMINAL_MAX_INPUT_BYTES + 32)
+        })
+        .to_string();
+
+        let parsed = parse_client_message(&message).unwrap();
+
+        match parsed {
+            TerminalClientMessage::Input { data } => {
+                assert_eq!(data.len(), TERMINAL_MAX_INPUT_BYTES);
+            }
+            _ => panic!("expected input message"),
+        }
+    }
+
+    #[test]
+    fn terminal_rejects_oversized_client_text() {
+        let oversized = "a".repeat(TERMINAL_MAX_CLIENT_TEXT_BYTES + 1);
+
+        assert!(parse_client_message(&oversized).is_err());
+    }
+
+    #[test]
+    fn terminal_agent_output_and_errors_are_bounded() {
+        let session_id = uuid::Uuid::now_v7().to_string();
+        let agent_id = AgentId(uuid::Uuid::now_v7());
+        let frame = build_data_frame(
+            &session_id,
+            &agent_id,
+            1,
+            &TerminalBridgeMessage::Output {
+                data: "a".repeat(TERMINAL_MAX_AGENT_FRAME_BYTES + 1),
+            },
+        );
+
+        let mapped = map_agent_frame(frame).unwrap();
+
+        assert!(matches!(mapped, TerminalServerMessage::Error { .. }));
+
+        let raw_frame = IoFrame {
+            stream_id: session_id.clone(),
+            sequence: 2,
+            agent_id: agent_id.0.to_string(),
+            payload: Some(io_frame::Payload::Data(IoData {
+                data: vec![b'a'; TERMINAL_MAX_AGENT_FRAME_BYTES],
+            })),
+        };
+        let mapped = map_agent_frame(raw_frame).unwrap();
+        match mapped {
+            TerminalServerMessage::Output { data } => {
+                assert_eq!(data.len(), TERMINAL_MAX_AGENT_FRAME_BYTES);
+            }
+            _ => panic!("expected output message"),
+        }
+
+        let error_frame = IoFrame {
+            stream_id: session_id,
+            sequence: 3,
+            agent_id: agent_id.0.to_string(),
+            payload: Some(io_frame::Payload::Error(IoError {
+                code: "terminal".into(),
+                message: "e".repeat(TERMINAL_MAX_ERROR_BYTES + 1),
+            })),
+        };
+        let mapped = map_agent_frame(error_frame).unwrap();
+        match mapped {
+            TerminalServerMessage::Error { message } => {
+                assert_eq!(message.len(), TERMINAL_MAX_ERROR_BYTES);
+            }
+            _ => panic!("expected error message"),
+        }
+    }
+
+    #[test]
+    fn terminal_close_reason_is_bounded() {
+        let frame = IoFrame {
+            stream_id: uuid::Uuid::now_v7().to_string(),
+            sequence: 1,
+            agent_id: uuid::Uuid::now_v7().to_string(),
+            payload: Some(io_frame::Payload::Close(IoClose {
+                reason: "r".repeat(TERMINAL_MAX_CLOSE_REASON_BYTES + 1),
+            })),
+        };
+
+        let mapped = map_agent_frame(frame).unwrap();
+
+        match mapped {
+            TerminalServerMessage::Closed { reason } => {
+                assert_eq!(reason.len(), TERMINAL_MAX_CLOSE_REASON_BYTES);
+            }
+            _ => panic!("expected closed message"),
+        }
     }
 }

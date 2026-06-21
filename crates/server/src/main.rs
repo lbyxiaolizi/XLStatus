@@ -81,7 +81,7 @@ use api::v1::server_ops::{
 };
 use api::v1::service_history::{get_service_history, get_service_uptime};
 use api::v1::settings::{get_settings, update_settings};
-use api::v1::terminal::{create_terminal_session, ws_terminal};
+use api::v1::terminal::{create_terminal_session, terminal_body_limit, ws_terminal};
 use api::v1::themes::{delete_theme, import_theme, list_themes, select_theme, update_theme};
 // M3: server list / detail / metrics routes are registered inline below
 use api::v1::services::{
@@ -574,7 +574,10 @@ async fn main() -> anyhow::Result<()> {
                 .route("/api/v1/tasks/:id", delete(delete_task))
                 .route("/api/v1/tasks/:id/run", post(run_task))
                 .route("/api/v1/tasks/:id/runs", get(get_task_runs))
-                .route("/api/v1/terminal/sessions", post(create_terminal_session))
+                .route(
+                    "/api/v1/terminal/sessions",
+                    post(create_terminal_session).layer(terminal_body_limit()),
+                )
                 .route("/ws/terminal/:session_id", get(ws_terminal))
                 // NAT
                 .route(
