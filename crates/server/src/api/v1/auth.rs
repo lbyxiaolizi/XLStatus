@@ -3,7 +3,9 @@ use crate::auth::middleware::{derive_csrf_token, AuthUser, CSRF_COOKIE_NAME, SES
 use crate::auth::totp::{generate_totp_secret, otpauth_uri, verify_totp_code};
 use crate::auth::{generate_session_token, hash_token};
 use crate::config::Config;
-use crate::db::{CreateSessionInput, CreateUserInput, DatabaseBackend, UserRepository};
+use crate::db::{
+    CreateSessionInput, CreateUserInput, DatabaseBackend, PATRepository, UserRepository,
+};
 use axum::{
     extract::{connect_info::ConnectInfo, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
@@ -307,6 +309,7 @@ pub async fn update_user(
             .reset_password(target_id, password.trim())
             .await?
             .ok_or(AppError::NotFound("user not found".to_string()))?;
+        revoke_user_credentials(&state.db, target_id).await?;
     }
 
     let updated = user_repo
@@ -935,6 +938,16 @@ fn user_info(user: crate::db::User) -> UserInfo {
     }
 }
 
+async fn revoke_user_credentials(db: &DatabaseBackend, user_id: UserId) -> Result<(), AppError> {
+    crate::auth::SessionRepository::new(db.clone())
+        .delete_for_user(user_id)
+        .await?;
+    PATRepository::new(db.clone())
+        .revoke_all_for_user(user_id)
+        .await?;
+    Ok(())
+}
+
 fn parse_manual_ban_ips(values: Vec<String>) -> Result<Vec<String>, AppError> {
     let mut seen = HashSet::new();
     let mut ips = Vec::new();
@@ -959,14 +972,18 @@ fn parse_manual_ban_ips(values: Vec<String>) -> Result<Vec<String>, AppError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_manual_ban_ips, require_admin_cookie_session, sensitive_totp_code_from_headers,
-        AppError, SENSITIVE_TOTP_HEADER,
+        parse_manual_ban_ips, require_admin_cookie_session, revoke_user_credentials,
+        sensitive_totp_code_from_headers, AppError, SENSITIVE_TOTP_HEADER,
     };
     use crate::api::types::{ApiResponse, LoginResponse, UserInfo};
     use crate::auth::middleware::{AuthKind, AuthUser};
-    use crate::db::User;
+    use crate::auth::{hash_token, SessionRepository};
+    use crate::db::{
+        CreatePATInput, CreateSessionInput, CreateUserInput, DatabaseBackend, PATRepository, User,
+        UserRepository,
+    };
     use axum::http::{HeaderMap, HeaderValue};
-    use chrono::Utc;
+    use chrono::{Duration, Utc};
     use xlstatus_shared::{UserId, UserRole};
 
     #[test]
@@ -1028,6 +1045,105 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn revoke_user_credentials_removes_sessions_and_pats_for_target_only() {
+        let db = test_db().await;
+        let users = UserRepository::new(db.clone());
+        let sessions = SessionRepository::new(db.clone());
+        let pats = PATRepository::new(db.clone());
+        let target = users
+            .create(CreateUserInput {
+                username: "target".into(),
+                password: "password123".into(),
+                role: UserRole::Member,
+            })
+            .await
+            .unwrap();
+        let other = users
+            .create(CreateUserInput {
+                username: "other".into(),
+                password: "password123".into(),
+                role: UserRole::Member,
+            })
+            .await
+            .unwrap();
+        let target_session_hash = hash_token("target-session");
+        let other_session_hash = hash_token("other-session");
+        sessions
+            .create(
+                CreateSessionInput {
+                    user_id: target.id,
+                    ip: None,
+                    user_agent: None,
+                    expires_at: Utc::now() + Duration::hours(1),
+                },
+                target_session_hash.clone(),
+            )
+            .await
+            .unwrap();
+        sessions
+            .create(
+                CreateSessionInput {
+                    user_id: other.id,
+                    ip: None,
+                    user_agent: None,
+                    expires_at: Utc::now() + Duration::hours(1),
+                },
+                other_session_hash.clone(),
+            )
+            .await
+            .unwrap();
+        let target_pat_hash = hash_token("target-pat");
+        let other_pat_hash = hash_token("other-pat");
+        pats.create(
+            CreatePATInput {
+                user_id: target.id,
+                name: "target".into(),
+                scopes: vec!["server:read".into()],
+                server_ids: Some(vec![uuid::Uuid::now_v7().to_string()]),
+                expires_at: Some(Utc::now() + Duration::days(1)),
+            },
+            target_pat_hash.clone(),
+        )
+        .await
+        .unwrap();
+        pats.create(
+            CreatePATInput {
+                user_id: other.id,
+                name: "other".into(),
+                scopes: vec!["server:read".into()],
+                server_ids: Some(vec![uuid::Uuid::now_v7().to_string()]),
+                expires_at: Some(Utc::now() + Duration::days(1)),
+            },
+            other_pat_hash.clone(),
+        )
+        .await
+        .unwrap();
+
+        revoke_user_credentials(&db, target.id).await.unwrap();
+
+        assert!(sessions
+            .find_by_token_hash(&target_session_hash)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(pats
+            .find_by_token_hash(&target_pat_hash)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(sessions
+            .find_by_token_hash(&other_session_hash)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(pats
+            .find_by_token_hash(&other_pat_hash)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
     fn auth_user(auth_kind: AuthKind) -> AuthUser {
         let now = Utc::now();
         AuthUser {
@@ -1047,6 +1163,17 @@ mod tests {
             server_ids: None,
             pat_id: Some("pat".into()),
         }
+    }
+
+    async fn test_db() -> DatabaseBackend {
+        let path = std::env::temp_dir().join(format!(
+            "xlstatus-auth-credential-revoke-test-{}.db",
+            uuid::Uuid::now_v7()
+        ));
+        let url = format!("sqlite://{}?mode=rwc", path.to_string_lossy());
+        let db = DatabaseBackend::connect(&url, true).await.unwrap();
+        db.run_migrations().await.unwrap();
+        db
     }
 }
 

@@ -469,6 +469,31 @@ impl PATRepository {
 
         Ok(affected > 0)
     }
+
+    pub async fn revoke_all_for_user(&self, user_id: UserId) -> Result<u64> {
+        let now = Utc::now();
+
+        let affected = match &self.db {
+            DatabaseBackend::Sqlite(pool) => sqlx::query(
+                "UPDATE personal_access_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
+            )
+            .bind(now.to_rfc3339())
+            .bind(user_id.0.to_string())
+            .execute(pool)
+            .await?
+            .rows_affected(),
+            DatabaseBackend::Postgres(pool) => sqlx::query(
+                "UPDATE personal_access_tokens SET revoked_at = $1 WHERE user_id = $2 AND revoked_at IS NULL",
+            )
+            .bind(now)
+            .bind(user_id.0)
+            .execute(pool)
+            .await?
+            .rows_affected(),
+        };
+
+        Ok(affected)
+    }
 }
 
 fn parse_pat_uuid(value: &str, field: &str) -> Result<uuid::Uuid> {

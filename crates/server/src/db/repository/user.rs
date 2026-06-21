@@ -443,8 +443,11 @@ fn postgres_user_from_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::{hash_token, SessionRepository};
     use crate::db::DatabaseBackend;
+    use crate::db::{CreatePATInput, CreateSessionInput, PATRepository};
     use crate::secrets::is_encrypted_secret;
+    use chrono::Duration;
     use sqlx::Row;
 
     #[tokio::test]
@@ -470,6 +473,114 @@ mod tests {
         let (secret, enabled) = repo.totp_config(user.id).await.unwrap();
         assert_eq!(secret.as_deref(), Some("BASE32SECRET"));
         assert!(!enabled);
+    }
+
+    #[tokio::test]
+    async fn password_reset_can_revoke_target_sessions_and_pats() {
+        let db = test_db().await;
+        let users = UserRepository::new(db.clone());
+        let sessions = SessionRepository::new(db.clone());
+        let pats = PATRepository::new(db.clone());
+        let target = users
+            .create(CreateUserInput {
+                username: "target".into(),
+                password: "old-password".into(),
+                role: UserRole::Member,
+            })
+            .await
+            .unwrap();
+        let other = users
+            .create(CreateUserInput {
+                username: "other".into(),
+                password: "old-password".into(),
+                role: UserRole::Member,
+            })
+            .await
+            .unwrap();
+        let target_session_hash = hash_token("target-session");
+        let other_session_hash = hash_token("other-session");
+        sessions
+            .create(
+                CreateSessionInput {
+                    user_id: target.id,
+                    ip: None,
+                    user_agent: None,
+                    expires_at: Utc::now() + Duration::hours(1),
+                },
+                target_session_hash.clone(),
+            )
+            .await
+            .unwrap();
+        sessions
+            .create(
+                CreateSessionInput {
+                    user_id: other.id,
+                    ip: None,
+                    user_agent: None,
+                    expires_at: Utc::now() + Duration::hours(1),
+                },
+                other_session_hash.clone(),
+            )
+            .await
+            .unwrap();
+        let target_pat_hash = hash_token("target-pat");
+        let other_pat_hash = hash_token("other-pat");
+        pats.create(
+            CreatePATInput {
+                user_id: target.id,
+                name: "target".into(),
+                scopes: vec!["server:read".into()],
+                server_ids: Some(vec![uuid::Uuid::now_v7().to_string()]),
+                expires_at: Some(Utc::now() + Duration::days(1)),
+            },
+            target_pat_hash.clone(),
+        )
+        .await
+        .unwrap();
+        pats.create(
+            CreatePATInput {
+                user_id: other.id,
+                name: "other".into(),
+                scopes: vec!["server:read".into()],
+                server_ids: Some(vec![uuid::Uuid::now_v7().to_string()]),
+                expires_at: Some(Utc::now() + Duration::days(1)),
+            },
+            other_pat_hash.clone(),
+        )
+        .await
+        .unwrap();
+
+        let reset = users
+            .reset_password(target.id, "new-password")
+            .await
+            .unwrap()
+            .unwrap();
+        let deleted_sessions = sessions.delete_for_user(target.id).await.unwrap();
+        let revoked_pats = pats.revoke_all_for_user(target.id).await.unwrap();
+
+        assert_eq!(reset.token_version, target.token_version + 1);
+        assert_eq!(deleted_sessions, 1);
+        assert_eq!(revoked_pats, 1);
+        assert!(sessions
+            .find_by_token_hash(&target_session_hash)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(pats
+            .find_by_token_hash(&target_pat_hash)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(sessions
+            .find_by_token_hash(&other_session_hash)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(pats
+            .find_by_token_hash(&other_pat_hash)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     async fn test_db() -> DatabaseBackend {

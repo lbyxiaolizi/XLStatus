@@ -197,6 +197,24 @@ impl SessionRepository {
         Ok(())
     }
 
+    pub async fn delete_for_user(&self, user_id: UserId) -> Result<u64> {
+        let affected = match &self.db {
+            DatabaseBackend::Sqlite(pool) => sqlx::query("DELETE FROM sessions WHERE user_id = ?")
+                .bind(user_id.0.to_string())
+                .execute(pool)
+                .await?
+                .rows_affected(),
+            DatabaseBackend::Postgres(pool) => {
+                sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+                    .bind(user_id.0)
+                    .execute(pool)
+                    .await?
+                    .rows_affected()
+            }
+        };
+        Ok(affected)
+    }
+
     pub async fn delete_expired(&self) -> Result<u64> {
         let now = Utc::now();
 
