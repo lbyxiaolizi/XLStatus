@@ -64,7 +64,7 @@ pub struct FileDeleteRequest {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct TempUrlQuery {
+pub struct TempUrlRequest {
     pub path: String,
     #[serde(default = "default_temp_url_expires")]
     pub expires_in: i64,
@@ -293,18 +293,18 @@ pub async fn download_url(
     State(state): State<AppState>,
     auth: AuthSession,
     Path(server_id): Path<String>,
-    Query(query): Query<TempUrlQuery>,
+    Json(req): Json<TempUrlRequest>,
 ) -> Result<Json<ApiResponse<TempUrlResponse>>, AppError> {
-    build_temp_url(state, auth, server_id, query, "download", "GET").await
+    build_temp_url(state, auth, server_id, req, "download", "GET").await
 }
 
 pub async fn upload_url(
     State(state): State<AppState>,
     auth: AuthSession,
     Path(server_id): Path<String>,
-    Query(query): Query<TempUrlQuery>,
+    Json(req): Json<TempUrlRequest>,
 ) -> Result<Json<ApiResponse<TempUrlResponse>>, AppError> {
-    build_temp_url(state, auth, server_id, query, "upload", "PUT").await
+    build_temp_url(state, auth, server_id, req, "upload", "PUT").await
 }
 
 pub async fn get_config(
@@ -425,7 +425,7 @@ async fn build_temp_url(
     state: AppState,
     auth: AuthSession,
     server_id: String,
-    query: TempUrlQuery,
+    req: TempUrlRequest,
     op: &str,
     method: &str,
 ) -> Result<Json<ApiResponse<TempUrlResponse>>, AppError> {
@@ -436,8 +436,8 @@ async fn build_temp_url(
     };
     require_transfer_scope(&auth, scope)?;
     ensure_server_visible(&state, &auth, &server_id).await?;
-    let path = validate_abs_path(&query.path)?;
-    let expires_in = temporary_url_expires_in(query.expires_in);
+    let path = validate_abs_path(&req.path)?;
+    let expires_in = temporary_url_expires_in(req.expires_in);
     let expires_at = temporary_url_expires_at(expires_in);
     let (token, token_hash) = generate_temporary_transfer_token();
     let expires_at_dt = chrono::DateTime::from_timestamp(expires_at, 0)

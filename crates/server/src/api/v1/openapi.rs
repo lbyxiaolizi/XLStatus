@@ -424,6 +424,42 @@ const ROUTES: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "get",
+        path: "/api/v1/servers/{id}/files",
+        summary: "List server files",
+        protected: true,
+    },
+    RouteSpec {
+        method: "get",
+        path: "/api/v1/servers/{id}/files/read",
+        summary: "Read server file",
+        protected: true,
+    },
+    RouteSpec {
+        method: "post",
+        path: "/api/v1/servers/{id}/files/write",
+        summary: "Write server file",
+        protected: true,
+    },
+    RouteSpec {
+        method: "post",
+        path: "/api/v1/servers/{id}/files/delete",
+        summary: "Delete server file",
+        protected: true,
+    },
+    RouteSpec {
+        method: "post",
+        path: "/api/v1/servers/{id}/files/download-url",
+        summary: "Create temporary server file download URL",
+        protected: true,
+    },
+    RouteSpec {
+        method: "post",
+        path: "/api/v1/servers/{id}/files/upload-url",
+        summary: "Create temporary server file upload URL",
+        protected: true,
+    },
+    RouteSpec {
+        method: "get",
         path: "/api/v1/server-groups",
         summary: "List server groups",
         protected: true,
@@ -984,6 +1020,8 @@ mod tests {
             "/api/v1/waf/bans",
             "/api/v1/settings",
             "/api/v1/themes",
+            "/api/v1/servers/{id}/files/download-url",
+            "/api/v1/servers/{id}/files/upload-url",
         ] {
             assert!(paths.contains_key(path), "missing OpenAPI path {path}");
         }
@@ -998,5 +1036,17 @@ mod tests {
         assert!(doc["paths"]["/api/v1/public/status"]["get"]
             .get("security")
             .is_none());
+    }
+
+    #[test]
+    fn openapi_documents_temp_url_creation_as_post_only() {
+        let doc = openapi_document();
+        let download = &doc["paths"]["/api/v1/servers/{id}/files/download-url"];
+        let upload = &doc["paths"]["/api/v1/servers/{id}/files/upload-url"];
+
+        assert!(download["post"].get("security").is_some());
+        assert!(upload["post"].get("security").is_some());
+        assert!(download["get"].is_null());
+        assert!(upload["get"].is_null());
     }
 }

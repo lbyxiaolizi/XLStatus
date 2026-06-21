@@ -310,7 +310,7 @@ pub async fn session_middleware(
     ) {
         match request.extensions().get::<AuthSession>() {
             Some(session) => {
-                if matches!(session.auth_kind, AuthKind::Session) {
+                if session_request_requires_csrf(request.method().as_str(), Some(session)) {
                     let csrf_header = request
                         .headers()
                         .get(CSRF_HEADER_NAME)
@@ -353,6 +353,13 @@ pub async fn csrf_middleware(request: Request, next: Next) -> Result<Response, S
     Ok(next.run(request).await)
 }
 
+fn session_request_requires_csrf(method: &str, session: Option<&AuthSession>) -> bool {
+    matches!(method, "POST" | "PUT" | "PATCH" | "DELETE")
+        && session
+            .map(|session| matches!(session.auth_kind, AuthKind::Session))
+            .unwrap_or(false)
+}
+
 /// Generate a random CSRF token
 pub fn generate_csrf_token() -> String {
     use rand::Rng;
@@ -367,6 +374,47 @@ pub fn derive_csrf_token(token_hash: &str) -> String {
 
 fn client_ip_from_headers(headers: &HeaderMap) -> String {
     crate::security::client_ip_from_headers(headers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{session_request_requires_csrf, AuthKind, AuthSession};
+    use xlstatus_shared::{UserId, UserRole};
+
+    #[test]
+    fn cookie_session_post_requires_csrf() {
+        let session = auth_session(AuthKind::Session);
+
+        assert!(session_request_requires_csrf("POST", Some(&session)));
+        assert!(session_request_requires_csrf("PUT", Some(&session)));
+        assert!(session_request_requires_csrf("PATCH", Some(&session)));
+        assert!(session_request_requires_csrf("DELETE", Some(&session)));
+    }
+
+    #[test]
+    fn safe_methods_and_pat_do_not_require_csrf() {
+        let session = auth_session(AuthKind::Session);
+        let pat = auth_session(AuthKind::PersonalAccessToken);
+
+        assert!(!session_request_requires_csrf("GET", Some(&session)));
+        assert!(!session_request_requires_csrf("HEAD", Some(&session)));
+        assert!(!session_request_requires_csrf("POST", Some(&pat)));
+        assert!(!session_request_requires_csrf("POST", None));
+    }
+
+    fn auth_session(auth_kind: AuthKind) -> AuthSession {
+        AuthSession {
+            session_id: "session".into(),
+            user_id: UserId(uuid::Uuid::now_v7()),
+            username: "user".into(),
+            role: UserRole::Admin,
+            csrf_token: "csrf".into(),
+            auth_kind,
+            scopes: vec!["*".into()],
+            server_ids: None,
+            pat_id: None,
+        }
+    }
 }
 
 fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {

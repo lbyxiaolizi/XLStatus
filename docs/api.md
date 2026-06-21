@@ -89,8 +89,8 @@
 | `GET` | `/api/v1/servers/:id/files/read` | 读取文件 |
 | `POST` | `/api/v1/servers/:id/files/write` | 写入文件 |
 | `POST` | `/api/v1/servers/:id/files/delete` | 删除文件 |
-| `GET` | `/api/v1/servers/:id/files/download-url` | 获取下载 URL |
-| `GET` | `/api/v1/servers/:id/files/upload-url` | 获取上传 URL |
+| `POST` | `/api/v1/servers/:id/files/download-url` | 获取下载 URL |
+| `POST` | `/api/v1/servers/:id/files/upload-url` | 获取上传 URL |
 | `GET` | `/api/v1/servers/:id/config` | 读取 Agent 配置 |
 | `POST` | `/api/v1/servers/:id/config` | 应用 Agent 配置 |
 | `POST` | `/api/v1/servers/:id/force-update` | 触发更新 |

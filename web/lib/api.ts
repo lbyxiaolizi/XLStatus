@@ -931,7 +931,11 @@ class ApiClient {
     path: string,
   ): Promise<ApiResponse<TempUrlResponse>> {
     return this.request<TempUrlResponse>(
-      `/api/v1/servers/${encodeURIComponent(id)}/files/download-url?path=${encodeURIComponent(path)}`,
+      `/api/v1/servers/${encodeURIComponent(id)}/files/download-url`,
+      {
+        method: "POST",
+        body: JSON.stringify({ path }),
+      },
     );
   }
 
@@ -940,7 +944,11 @@ class ApiClient {
     path: string,
   ): Promise<ApiResponse<TempUrlResponse>> {
     return this.request<TempUrlResponse>(
-      `/api/v1/servers/${encodeURIComponent(id)}/files/upload-url?path=${encodeURIComponent(path)}`,
+      `/api/v1/servers/${encodeURIComponent(id)}/files/upload-url`,
+      {
+        method: "POST",
+        body: JSON.stringify({ path }),
+      },
     );
   }
 

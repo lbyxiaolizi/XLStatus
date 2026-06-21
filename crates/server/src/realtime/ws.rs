@@ -17,6 +17,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
+    http::HeaderMap,
     response::Response,
 };
 use futures::{SinkExt, StreamExt};
@@ -34,8 +35,11 @@ enum WsOutbound {
 pub async fn ws_servers(
     State(state): State<AppState>,
     auth: AuthSession,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response, AppError> {
+    crate::security::validate_websocket_origin(&headers, &state.config.server.cors_allowed_origins)
+        .map_err(AppError::Forbidden)?;
     // Reuse the same scope check as the REST read endpoint.
     if !crate::auth::rbac::has_scope(&auth, "server:read") {
         return Err(AppError::Forbidden("missing scope: server:read".into()));

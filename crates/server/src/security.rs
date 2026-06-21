@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use axum::http::HeaderMap;
+use axum::http::{header, HeaderMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::net::lookup_host;
 
@@ -114,6 +114,40 @@ pub fn client_ip_from_headers(headers: &HeaderMap) -> String {
     client_ip_from_headers_and_peer(headers, None)
 }
 
+pub fn validate_websocket_origin(
+    headers: &HeaderMap,
+    allowed_origins: &[String],
+) -> std::result::Result<(), String> {
+    let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+
+    if allowed_origins
+        .iter()
+        .any(|allowed| origin_matches_allowed_origin(origin, allowed))
+    {
+        return Ok(());
+    }
+
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(host) = host {
+        if origin_host_matches_request_host(origin, host) {
+            return Ok(());
+        }
+    }
+
+    Err("WebSocket Origin is not allowed".to_string())
+}
+
 pub fn client_ip_from_headers_and_peer(
     headers: &HeaderMap,
     peer_addr: Option<SocketAddr>,
@@ -163,6 +197,102 @@ fn trust_proxy_headers() -> bool {
     std::env::var("XLSTATUS_TRUST_PROXY_HEADERS")
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false)
+}
+
+fn origin_matches_allowed_origin(origin: &str, allowed: &str) -> bool {
+    if allowed.trim() == "*" {
+        return false;
+    }
+    normalized_origin(origin)
+        .zip(normalized_origin(allowed))
+        .map(|(origin, allowed)| origin == allowed)
+        .unwrap_or(false)
+}
+
+fn origin_host_matches_request_host(origin: &str, request_host: &str) -> bool {
+    let Some(origin) = parse_origin_host(origin) else {
+        return false;
+    };
+    let Some(request) = parse_request_host(request_host) else {
+        return false;
+    };
+    if !origin.host.eq_ignore_ascii_case(&request.host) {
+        return false;
+    }
+    match (origin.port, request.port) {
+        (Some(origin_port), Some(request_port)) => origin_port == request_port,
+        (Some(origin_port), None) => origin_port == origin.default_port,
+        (None, Some(request_port)) => request_port == origin.default_port,
+        (None, None) => true,
+    }
+}
+
+fn normalized_origin(origin: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(origin).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    if parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() {
+        return None;
+    }
+    let host = normalized_host_port(origin, Some(parsed.scheme()))?;
+    Some(format!(
+        "{}://{}",
+        parsed.scheme().to_ascii_lowercase(),
+        host
+    ))
+}
+
+struct OriginHost {
+    host: String,
+    port: Option<u16>,
+    default_port: u16,
+}
+
+struct RequestHost {
+    host: String,
+    port: Option<u16>,
+}
+
+fn parse_origin_host(origin: &str) -> Option<OriginHost> {
+    let parsed = reqwest::Url::parse(origin).ok()?;
+    let default_port = match parsed.scheme() {
+        "http" => 80,
+        "https" => 443,
+        _ => return None,
+    };
+    Some(OriginHost {
+        host: parsed.host_str()?.to_ascii_lowercase(),
+        port: parsed.port(),
+        default_port,
+    })
+}
+
+fn parse_request_host(request_host: &str) -> Option<RequestHost> {
+    let parsed = reqwest::Url::parse(&format!("http://{request_host}")).ok()?;
+    Some(RequestHost {
+        host: parsed.host_str()?.to_ascii_lowercase(),
+        port: parsed.port(),
+    })
+}
+
+fn normalized_host_port(value: &str, default_scheme: Option<&str>) -> Option<String> {
+    let parsed = match default_scheme {
+        Some(_) => reqwest::Url::parse(value).ok()?,
+        None => reqwest::Url::parse(&format!("http://{value}")).ok()?,
+    };
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    let port = parsed.port().or_else(|| {
+        default_scheme.and_then(|scheme| match scheme {
+            "http" => Some(80),
+            "https" => Some(443),
+            _ => None,
+        })
+    });
+    match port {
+        Some(port) => Some(format!("{host}:{port}")),
+        None => Some(host),
+    }
 }
 
 fn sanitize_ip_label(value: Option<String>) -> Option<String> {
@@ -339,5 +469,53 @@ mod tests {
             ),
             "198.51.100.9"
         );
+    }
+
+    #[test]
+    fn websocket_origin_allows_non_browser_clients_without_origin() {
+        let headers = HeaderMap::new();
+        assert!(validate_websocket_origin(&headers, &[]).is_ok());
+    }
+
+    #[test]
+    fn websocket_origin_allows_configured_cors_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ORIGIN, "https://ui.example.com".parse().unwrap());
+
+        assert!(
+            validate_websocket_origin(&headers, &["https://ui.example.com".to_string()]).is_ok()
+        );
+    }
+
+    #[test]
+    fn websocket_origin_allows_same_request_host() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ORIGIN,
+            "https://status.example.com".parse().unwrap(),
+        );
+        headers.insert(header::HOST, "status.example.com:443".parse().unwrap());
+
+        assert!(validate_websocket_origin(&headers, &[]).is_ok());
+    }
+
+    #[test]
+    fn websocket_origin_rejects_cross_site_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ORIGIN, "https://evil.example".parse().unwrap());
+        headers.insert(header::HOST, "status.example.com".parse().unwrap());
+
+        assert!(
+            validate_websocket_origin(&headers, &["https://ui.example.com".to_string()]).is_err()
+        );
+    }
+
+    #[test]
+    fn websocket_origin_does_not_treat_wildcard_as_allowed() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ORIGIN, "https://evil.example".parse().unwrap());
+        headers.insert(header::HOST, "status.example.com".parse().unwrap());
+
+        assert!(validate_websocket_origin(&headers, &["*".to_string()]).is_err());
     }
 }

@@ -3,6 +3,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Path, State,
     },
+    http::HeaderMap,
     response::Response,
     Json,
 };
@@ -96,8 +97,11 @@ pub async fn ws_terminal(
     State(state): State<AppState>,
     auth: AuthSession,
     Path(session_id): Path<String>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response, AppError> {
+    crate::security::validate_websocket_origin(&headers, &state.config.server.cors_allowed_origins)
+        .map_err(AppError::Forbidden)?;
     if !has_scope(&auth, "server:exec") {
         return Err(AppError::Forbidden("missing scope: server:exec".into()));
     }
