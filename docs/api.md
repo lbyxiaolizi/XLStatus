@@ -93,9 +93,11 @@
 | `POST` | `/api/v1/servers/:id/files/upload-url` | 获取上传 URL |
 | `GET` | `/api/v1/servers/:id/config` | 读取 Agent 配置 |
 | `POST` | `/api/v1/servers/:id/config` | 应用 Agent 配置 |
-| `POST` | `/api/v1/servers/:id/force-update` | 触发更新 |
+| `POST` | `/api/v1/servers/:id/force-update` | 触发 Agent 更新 |
 | `POST` | `/api/v1/terminal/sessions` | 创建终端会话 |
 | `GET` | `/ws/terminal/:session_id` | 终端 WebSocket |
+
+强制更新需要 `server:exec` 权限、明确版本、HTTPS 下载 URL 和 SHA-256 校验和。默认只允许 `https://github.com/lbyxiaolizi/XLStatus/releases/download/<VERSION>/xlstatus-agent-*` 这类官方 Agent release 资产；自托管更新源必须显式设置 `XLSTATUS_ALLOW_CUSTOM_FORCE_UPDATE_URL=1`，但仍要求 HTTPS 和 SHA-256。
 
 ### DDNS、NAT、MCP
 

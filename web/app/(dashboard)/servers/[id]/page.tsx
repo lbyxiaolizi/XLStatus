@@ -522,11 +522,18 @@ export default function ServerDetailPage({ params }: PageProps) {
 
   async function forceUpdate(event: FormEvent) {
     event.preventDefault();
+    const version = updateForm.version.trim();
+    const downloadUrl = updateForm.download_url.trim();
+    const checksum = updateForm.checksum.trim();
+    if (!version || !downloadUrl || !checksum) {
+      setError("版本、下载 URL 和 SHA-256 校验和均为必填。");
+      return;
+    }
     setSaving(true);
     const response = await apiClient.forceUpdateServer(serverId, {
-      version: updateForm.version.trim(),
-      download_url: updateForm.download_url.trim(),
-      checksum: updateForm.checksum.trim() || null,
+      version,
+      download_url: downloadUrl,
+      checksum,
     });
     setSaving(false);
     if (response.success) {
@@ -844,13 +851,13 @@ function AgentOpsPanel({
         <h2 className="mb-4 text-xl font-black uppercase">发送更新</h2>
         <form onSubmit={onForceUpdate} className="space-y-4">
           <Field label="版本">
-            <input className={inputClass} value={updateForm.version} onChange={(e) => onUpdateChange({ ...updateForm, version: e.target.value })} />
+            <input className={inputClass} value={updateForm.version} onChange={(e) => onUpdateChange({ ...updateForm, version: e.target.value })} placeholder="v0.1.0-alpha.3" />
           </Field>
           <Field label="下载 URL">
-            <input className={inputClass} value={updateForm.download_url} onChange={(e) => onUpdateChange({ ...updateForm, download_url: e.target.value })} />
+            <input className={inputClass} value={updateForm.download_url} onChange={(e) => onUpdateChange({ ...updateForm, download_url: e.target.value })} placeholder="https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.3/xlstatus-agent-linux-amd64.tar.gz" />
           </Field>
-          <Field label="校验和">
-            <input className={inputClass} value={updateForm.checksum} onChange={(e) => onUpdateChange({ ...updateForm, checksum: e.target.value })} />
+          <Field label="SHA-256">
+            <input className={inputClass} value={updateForm.checksum} onChange={(e) => onUpdateChange({ ...updateForm, checksum: e.target.value })} placeholder="64 位十六进制摘要" />
           </Field>
           <button disabled={saving} className={buttonClass("danger")}>发送更新</button>
         </form>

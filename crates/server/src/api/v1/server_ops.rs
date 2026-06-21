@@ -26,6 +26,8 @@ use crate::mcp::executor::{
 
 const FILE_OP_TIMEOUT_SECS: u64 = 30;
 const FILE_READ_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const FORCE_UPDATE_REPO_HOST: &str = "github.com";
+const FORCE_UPDATE_REPO_PATH_PREFIX: &str = "/lbyxiaolizi/XLStatus/releases/download/";
 
 #[derive(Debug, Deserialize)]
 pub struct FileListRequest {
@@ -391,32 +393,22 @@ pub async fn force_update(
     Path(server_id): Path<String>,
     Json(req): Json<ForceUpdateRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
-    if !has_scope(&auth, "server:write") {
-        return Err(AppError::Forbidden("missing scope: server:write".into()));
-    }
+    require_force_update_scope(&auth)?;
     let agent_id = ensure_server_online(&state, &auth, &server_id).await?;
-    if req.version.trim().is_empty() || req.download_url.trim().is_empty() {
-        return Err(AppError::BadRequest(
-            "version and download_url are required".into(),
-        ));
-    }
+    let force_update = validate_force_update_request(req)?;
     state
         .session_registry
         .send(
             &agent_id,
             ServerMessage {
-                payload: Some(ServerPayload::ForceUpdate(ForceUpdate {
-                    version: req.version.clone(),
-                    download_url: req.download_url.clone(),
-                    checksum: req.checksum.unwrap_or_default(),
-                })),
+                payload: Some(ServerPayload::ForceUpdate(force_update.clone())),
             },
         )
         .await
         .map_err(AppError::BadRequest)?;
     Ok(Json(ApiResponse::success(serde_json::json!({
         "server_id": server_id,
-        "version": req.version,
+        "version": force_update.version,
         "sent": true,
     }))))
 }
@@ -578,6 +570,146 @@ fn validate_abs_path(path: &str) -> Result<String, AppError> {
     Ok(trimmed.to_string())
 }
 
+fn require_force_update_scope(auth: &AuthSession) -> Result<(), AppError> {
+    if has_scope(auth, "server:exec") {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden("missing scope: server:exec".into()))
+    }
+}
+
+fn validate_force_update_request(req: ForceUpdateRequest) -> Result<ForceUpdate, AppError> {
+    validate_force_update_request_with_custom_source(req, force_update_custom_source_allowed())
+}
+
+fn validate_force_update_request_with_custom_source(
+    req: ForceUpdateRequest,
+    allow_custom_source: bool,
+) -> Result<ForceUpdate, AppError> {
+    let version = validate_force_update_version(&req.version)?;
+    let checksum = validate_force_update_checksum(req.checksum.as_deref())?;
+    let download_url =
+        validate_force_update_download_url(&req.download_url, &version, allow_custom_source)?;
+    Ok(ForceUpdate {
+        version,
+        download_url,
+        checksum,
+    })
+}
+
+fn validate_force_update_version(version: &str) -> Result<String, AppError> {
+    let trimmed = version.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::BadRequest("version is required".into()));
+    }
+    if trimmed == "latest" {
+        return Err(AppError::BadRequest(
+            "force update requires an explicit release version".into(),
+        ));
+    }
+    if trimmed.len() > 80
+        || !trimmed
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(AppError::BadRequest(
+            "version contains unsupported characters".into(),
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn validate_force_update_checksum(checksum: Option<&str>) -> Result<String, AppError> {
+    let checksum = checksum.map(str::trim).filter(|value| !value.is_empty());
+    let Some(checksum) = checksum else {
+        return Err(AppError::BadRequest(
+            "sha256 checksum is required for force update".into(),
+        ));
+    };
+    let normalized = checksum
+        .strip_prefix("sha256:")
+        .unwrap_or(checksum)
+        .to_ascii_lowercase();
+    if normalized.len() != 64 || !normalized.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(AppError::BadRequest(
+            "checksum must be a sha256 hex digest".into(),
+        ));
+    }
+    Ok(normalized)
+}
+
+fn validate_force_update_download_url(
+    download_url: &str,
+    version: &str,
+    allow_custom_source: bool,
+) -> Result<String, AppError> {
+    let trimmed = download_url.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::BadRequest("download_url is required".into()));
+    }
+    let url = reqwest::Url::parse(trimmed)
+        .map_err(|e| AppError::BadRequest(format!("download_url is invalid: {e}")))?;
+    if url.scheme() != "https" {
+        return Err(AppError::BadRequest("download_url must use https".into()));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(AppError::BadRequest(
+            "download_url must not contain credentials".into(),
+        ));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(AppError::BadRequest(
+            "download_url must not contain query or fragment".into(),
+        ));
+    }
+    if !allow_custom_source {
+        validate_default_force_update_download_url(&url, version)?;
+    }
+    Ok(url.to_string())
+}
+
+fn validate_default_force_update_download_url(
+    url: &reqwest::Url,
+    version: &str,
+) -> Result<(), AppError> {
+    if url.host_str() != Some(FORCE_UPDATE_REPO_HOST) {
+        return Err(AppError::BadRequest(
+            "download_url must use the XLStatus GitHub release host".into(),
+        ));
+    }
+    if url.port().is_some() {
+        return Err(AppError::BadRequest(
+            "download_url must use the default https port".into(),
+        ));
+    }
+    let path = url.path();
+    let expected_prefix = format!("{FORCE_UPDATE_REPO_PATH_PREFIX}{version}/");
+    if !path.starts_with(&expected_prefix) {
+        return Err(AppError::BadRequest(
+            "download_url must point to the requested XLStatus release version".into(),
+        ));
+    }
+    let filename = path
+        .rsplit('/')
+        .next()
+        .filter(|part| !part.is_empty())
+        .ok_or_else(|| AppError::BadRequest("download_url missing release asset name".into()))?;
+    if filename.contains('/') || filename.contains('\\') || !filename.starts_with("xlstatus-agent-")
+    {
+        return Err(AppError::BadRequest(
+            "download_url must point to an XLStatus Agent release asset".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn force_update_custom_source_allowed() -> bool {
+    matches!(
+        std::env::var("XLSTATUS_ALLOW_CUSTOM_FORCE_UPDATE_URL").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
+}
+
 fn normalize_encoding(value: &str) -> Result<String, AppError> {
     match value {
         "" | "utf8" | "text" => Ok("utf8".into()),
@@ -640,4 +772,177 @@ fn default_encoding() -> String {
 
 fn default_temp_url_expires() -> i64 {
     TEMP_URL_DEFAULT_EXPIRES_SECS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_checksum() -> String {
+        "a".repeat(64)
+    }
+
+    fn force_update_req(download_url: &str) -> ForceUpdateRequest {
+        ForceUpdateRequest {
+            version: "v0.1.0-alpha.3".into(),
+            download_url: download_url.into(),
+            checksum: Some(valid_checksum()),
+        }
+    }
+
+    fn auth_session(
+        auth_kind: AuthKind,
+        role: xlstatus_shared::UserRole,
+        scopes: Vec<&str>,
+    ) -> AuthSession {
+        AuthSession {
+            session_id: "sess".into(),
+            user_id: xlstatus_shared::UserId(
+                uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+            ),
+            username: "user".into(),
+            role,
+            csrf_token: "csrf".into(),
+            auth_kind,
+            scopes: scopes.into_iter().map(str::to_string).collect(),
+            server_ids: None,
+            pat_id: None,
+        }
+    }
+
+    #[test]
+    fn force_update_requires_server_exec_scope() {
+        let server_write_pat = auth_session(
+            AuthKind::PersonalAccessToken,
+            xlstatus_shared::UserRole::Admin,
+            vec!["server:write"],
+        );
+        let err = require_force_update_scope(&server_write_pat).unwrap_err();
+        assert!(app_error_message(&err).contains("server:exec"));
+
+        let server_exec_pat = auth_session(
+            AuthKind::PersonalAccessToken,
+            xlstatus_shared::UserRole::Admin,
+            vec!["server:exec"],
+        );
+        assert!(require_force_update_scope(&server_exec_pat).is_ok());
+
+        let admin_cookie = auth_session(
+            AuthKind::Session,
+            xlstatus_shared::UserRole::Admin,
+            Vec::new(),
+        );
+        assert!(require_force_update_scope(&admin_cookie).is_ok());
+    }
+
+    #[test]
+    fn force_update_accepts_project_agent_release_asset() {
+        let update = validate_force_update_request_with_custom_source(force_update_req(
+            "https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.3/xlstatus-agent-linux-amd64.tar.gz",
+        ), false)
+        .unwrap();
+
+        assert_eq!(update.version, "v0.1.0-alpha.3");
+        assert_eq!(update.checksum, valid_checksum());
+    }
+
+    #[test]
+    fn force_update_requires_sha256_checksum() {
+        let err = validate_force_update_request_with_custom_source(ForceUpdateRequest {
+            version: "v0.1.0-alpha.3".into(),
+            download_url: "https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.3/xlstatus-agent-linux-amd64.tar.gz".into(),
+            checksum: None,
+        }, false)
+        .unwrap_err();
+
+        assert!(app_error_message(&err).contains("sha256 checksum is required"));
+    }
+
+    #[test]
+    fn force_update_rejects_latest_version() {
+        let err = validate_force_update_request_with_custom_source(ForceUpdateRequest {
+            version: "latest".into(),
+            download_url: "https://github.com/lbyxiaolizi/XLStatus/releases/download/latest/xlstatus-agent-linux-amd64.tar.gz".into(),
+            checksum: Some(valid_checksum()),
+        }, false)
+        .unwrap_err();
+
+        assert!(app_error_message(&err).contains("explicit release version"));
+    }
+
+    #[test]
+    fn force_update_rejects_non_project_release_host_by_default() {
+        let err = validate_force_update_request_with_custom_source(force_update_req(
+            "https://example.com/releases/download/v0.1.0-alpha.3/xlstatus-agent-linux-amd64.tar.gz",
+        ), false)
+        .unwrap_err();
+
+        assert!(app_error_message(&err).contains("GitHub release host"));
+    }
+
+    #[test]
+    fn force_update_rejects_wrong_release_version_in_url() {
+        let err = validate_force_update_request_with_custom_source(force_update_req(
+            "https://github.com/lbyxiaolizi/XLStatus/releases/download/v9.9.9/xlstatus-agent-linux-amd64.tar.gz",
+        ), false)
+        .unwrap_err();
+
+        assert!(app_error_message(&err).contains("requested XLStatus release version"));
+    }
+
+    #[test]
+    fn force_update_rejects_non_agent_release_asset() {
+        let err = validate_force_update_request_with_custom_source(force_update_req(
+            "https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.3/install-agent.sh",
+        ), false)
+        .unwrap_err();
+
+        assert!(app_error_message(&err).contains("XLStatus Agent release asset"));
+    }
+
+    #[test]
+    fn force_update_rejects_url_credentials_query_and_fragment() {
+        for url in [
+            "https://user@github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.3/xlstatus-agent-linux-amd64.tar.gz",
+            "https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.3/xlstatus-agent-linux-amd64.tar.gz?token=secret",
+            "https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.3/xlstatus-agent-linux-amd64.tar.gz#sha256",
+        ] {
+            assert!(
+                validate_force_update_request_with_custom_source(force_update_req(url), false)
+                    .is_err(),
+                "{url} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn force_update_custom_source_escape_hatch_still_requires_https_and_checksum() {
+        let update = validate_force_update_request_with_custom_source(
+            force_update_req("https://updates.example.net/xlstatus-agent-linux-amd64.tar.gz"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            update.download_url,
+            "https://updates.example.net/xlstatus-agent-linux-amd64.tar.gz"
+        );
+
+        let err = validate_force_update_request_with_custom_source(
+            force_update_req("http://updates.example.net/xlstatus-agent-linux-amd64.tar.gz"),
+            true,
+        )
+        .unwrap_err();
+        assert!(app_error_message(&err).contains("https"));
+    }
+
+    fn app_error_message(err: &AppError) -> String {
+        match err {
+            AppError::BadRequest(message)
+            | AppError::Forbidden(message)
+            | AppError::Unauthorized(message)
+            | AppError::NotFound(message)
+            | AppError::TooManyRequests(message) => message.clone(),
+            AppError::Database(err) => err.to_string(),
+        }
+    }
 }

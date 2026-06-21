@@ -459,6 +459,12 @@ const ROUTES: &[RouteSpec] = &[
         protected: true,
     },
     RouteSpec {
+        method: "post",
+        path: "/api/v1/servers/{id}/force-update",
+        summary: "Send a checked Agent force-update request",
+        protected: true,
+    },
+    RouteSpec {
         method: "get",
         path: "/api/v1/server-groups",
         summary: "List server groups",
