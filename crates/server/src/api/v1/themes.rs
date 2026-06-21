@@ -5,7 +5,7 @@ use crate::api::v1::auth::{AppError, AppState};
 use crate::auth::middleware::{AuthKind, AuthSession};
 use crate::db::DatabaseBackend;
 use axum::{
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     Json,
 };
 use chrono::Utc;
@@ -15,6 +15,9 @@ use std::collections::HashMap;
 const CUSTOM_THEMES_KEY: &str = "theme_custom_catalog";
 const SELECTED_PUBLIC_THEME_KEY: &str = "theme_selected_public";
 const SELECTED_DASHBOARD_THEME_KEY: &str = "theme_selected_dashboard";
+const THEME_API_MAX_BODY_BYTES: usize = 64 * 1024;
+const THEME_MAX_CUSTOM_THEMES: usize = 32;
+const THEME_MAX_CUSTOM_CATALOG_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThemeDefinition {
@@ -78,6 +81,10 @@ pub struct ThemeDefinitionInput {
     pub light_variables: HashMap<String, String>,
     #[serde(default)]
     pub dark_variables: HashMap<String, String>,
+}
+
+pub fn theme_body_limit() -> DefaultBodyLimit {
+    DefaultBodyLimit::max(THEME_API_MAX_BODY_BYTES)
 }
 
 pub async fn list_themes(
@@ -526,6 +533,12 @@ async fn upsert_custom_theme(db: &DatabaseBackend, theme: ThemeDefinition) -> Re
     let mut themes = custom_themes(db).await?;
     let mut theme = theme;
     clear_custom_theme_css(&mut theme);
+    let replacing_existing = themes.iter().any(|item| item.id == theme.id);
+    if !replacing_existing && themes.len() >= THEME_MAX_CUSTOM_THEMES {
+        return Err(AppError::BadRequest(format!(
+            "custom theme catalog can contain at most {THEME_MAX_CUSTOM_THEMES} themes"
+        )));
+    }
     themes.retain(|item| item.id != theme.id);
     themes.push(theme);
     themes.sort_by(|a, b| a.name.cmp(&b.name));
@@ -542,8 +555,23 @@ async fn set_custom_themes(
     db: &DatabaseBackend,
     themes: &[ThemeDefinition],
 ) -> Result<(), AppError> {
-    let value = serde_json::to_string(themes).map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let value = custom_theme_catalog_json(themes)?;
     set_string_setting(db, CUSTOM_THEMES_KEY, &value).await
+}
+
+fn custom_theme_catalog_json(themes: &[ThemeDefinition]) -> Result<String, AppError> {
+    if themes.len() > THEME_MAX_CUSTOM_THEMES {
+        return Err(AppError::BadRequest(format!(
+            "custom theme catalog can contain at most {THEME_MAX_CUSTOM_THEMES} themes"
+        )));
+    }
+    let value = serde_json::to_string(themes).map_err(|e| AppError::BadRequest(e.to_string()))?;
+    if value.len() > THEME_MAX_CUSTOM_CATALOG_BYTES {
+        return Err(AppError::BadRequest(
+            "custom theme catalog is too large".into(),
+        ));
+    }
+    Ok(value)
 }
 
 async fn selected_public_theme_id(db: &DatabaseBackend) -> Result<Option<String>, AppError> {
@@ -652,6 +680,40 @@ mod tests {
     }
 
     #[test]
+    fn theme_resource_limits_are_explicit() {
+        let _ = theme_body_limit();
+        assert_eq!(THEME_API_MAX_BODY_BYTES, 64 * 1024);
+        assert_eq!(THEME_MAX_CUSTOM_THEMES, 32);
+        assert_eq!(THEME_MAX_CUSTOM_CATALOG_BYTES, 256 * 1024);
+    }
+
+    #[test]
+    fn rejects_too_many_theme_variables() {
+        let variables = (0..=60)
+            .map(|idx| (format!("--color-{idx}"), "#ffffff".to_string()))
+            .collect();
+        let err = normalize_theme_variables(variables).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn custom_theme_catalog_rejects_too_many_themes() {
+        let themes: Vec<_> = (0..=THEME_MAX_CUSTOM_THEMES)
+            .map(|idx| sample_custom_theme(&format!("custom-{idx}")))
+            .collect();
+        let err = custom_theme_catalog_json(&themes).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn custom_theme_catalog_rejects_oversized_json() {
+        let mut theme = sample_custom_theme("custom");
+        theme.description = Some("x".repeat(THEME_MAX_CUSTOM_CATALOG_BYTES));
+        let err = custom_theme_catalog_json(&[theme]).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
     fn theme_admin_mutations_reject_admin_pat() {
         let auth = auth_session(AuthKind::PersonalAccessToken);
         let err = require_admin_cookie_session(&auth).unwrap_err();
@@ -685,6 +747,24 @@ mod tests {
         assert!(theme.custom_css.is_none());
         assert!(theme.light_custom_css.is_none());
         assert!(theme.dark_custom_css.is_none());
+    }
+
+    fn sample_custom_theme(id: &str) -> ThemeDefinition {
+        ThemeDefinition {
+            id: id.into(),
+            name: id.into(),
+            description: None,
+            target: "both".into(),
+            variables: HashMap::from([("--accent-color".into(), "#16a34a".into())]),
+            light_variables: HashMap::new(),
+            dark_variables: HashMap::new(),
+            custom_css: None,
+            light_custom_css: None,
+            dark_custom_css: None,
+            builtin: false,
+            created_at: None,
+            updated_at: None,
+        }
     }
 
     fn auth_session(auth_kind: AuthKind) -> AuthSession {

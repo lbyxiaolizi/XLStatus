@@ -83,7 +83,9 @@ use api::v1::server_ops::{
 use api::v1::service_history::{get_service_history, get_service_uptime};
 use api::v1::settings::{get_settings, settings_body_limit, update_settings};
 use api::v1::terminal::{create_terminal_session, terminal_body_limit, ws_terminal};
-use api::v1::themes::{delete_theme, import_theme, list_themes, select_theme, update_theme};
+use api::v1::themes::{
+    delete_theme, import_theme, list_themes, select_theme, theme_body_limit, update_theme,
+};
 // M3: server list / detail / metrics routes are registered inline below
 use api::v1::services::{
     create_service, delete_service, get_service, list_services, service_body_limit, test_probe,
@@ -382,13 +384,21 @@ async fn main() -> anyhow::Result<()> {
                 .route("/api/v1/themes", get(list_themes))
                 .route(
                     "/api/v1/themes/import",
-                    post(import_theme).put(import_theme),
+                    post(import_theme)
+                        .put(import_theme)
+                        .layer(theme_body_limit()),
                 )
                 .route(
                     "/api/v1/themes/:id",
-                    post(update_theme).patch(update_theme).delete(delete_theme),
+                    post(update_theme)
+                        .patch(update_theme)
+                        .delete(delete_theme)
+                        .layer(theme_body_limit()),
                 )
-                .route("/api/v1/themes/:id/select", post(select_theme))
+                .route(
+                    "/api/v1/themes/:id/select",
+                    post(select_theme).layer(theme_body_limit()),
+                )
                 .route("/api/v1/tokens", post(create_pat).layer(pat_body_limit()))
                 .route("/api/v1/tokens", get(list_pats))
                 .route("/api/v1/tokens/:id", axum::routing::delete(revoke_pat))
