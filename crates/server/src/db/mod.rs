@@ -182,6 +182,13 @@ impl DatabaseBackend {
                 sqlite_add_column_if_missing(
                     pool,
                     "services",
+                    "owner_user_id",
+                    "owner_user_id TEXT REFERENCES users(id) ON DELETE SET NULL",
+                )
+                .await?;
+                sqlite_add_column_if_missing(
+                    pool,
+                    "services",
                     "server_id",
                     "server_id TEXT REFERENCES agents(id) ON DELETE SET NULL",
                 )
@@ -241,6 +248,31 @@ impl DatabaseBackend {
                 sqlx::query(include_str!(
                     "../../migrations/sqlite/010_service_servers.sql"
                 ))
+                .execute(pool)
+                .await?;
+                sqlx::query(
+                    r#"
+                    UPDATE services
+                    SET owner_user_id = (
+                        SELECT MIN(a.owner_user_id)
+                        FROM service_servers ss
+                        JOIN agents a ON a.id = ss.server_id
+                        WHERE ss.service_id = services.id
+                    )
+                    WHERE owner_user_id IS NULL
+                      AND 1 = (
+                          SELECT COUNT(DISTINCT a.owner_user_id)
+                          FROM service_servers ss
+                          JOIN agents a ON a.id = ss.server_id
+                          WHERE ss.service_id = services.id
+                      )
+                    "#,
+                )
+                .execute(pool)
+                .await?;
+                sqlx::query(
+                    "CREATE INDEX IF NOT EXISTS idx_services_owner ON services(owner_user_id)",
+                )
                 .execute(pool)
                 .await?;
                 sqlx::query(include_str!("../../migrations/sqlite/007_m4_m6.sql"))
@@ -340,7 +372,7 @@ impl DatabaseBackend {
                 // raw_sql calls causes "foreign key constraint cannot be implemented"
                 // errors on later files.
                 let batch = format!(
-                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
                     include_str!("../../migrations/postgres/001_initial.sql"),
                     include_str!("../../migrations/postgres/002_agents.sql"),
                     include_str!("../../migrations/postgres/003_services.sql"),
@@ -362,6 +394,7 @@ impl DatabaseBackend {
                     include_str!("../../migrations/postgres/019_server_owner_transfers.sql"),
                     include_str!("../../migrations/postgres/020_temporary_transfer_tokens.sql"),
                     include_str!("../../migrations/postgres/021_pat_expiration_backfill.sql"),
+                    include_str!("../../migrations/postgres/022_service_owner.sql"),
                 );
                 sqlx::raw_sql(batch.as_str()).execute(pool).await?;
                 Ok(())

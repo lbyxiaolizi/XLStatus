@@ -15,6 +15,7 @@
 
 CREATE TABLE IF NOT EXISTS services (
     id TEXT PRIMARY KEY NOT NULL,
+    owner_user_id TEXT,
     name TEXT NOT NULL,
     type TEXT NOT NULL, -- 'http' | 'tcp' | 'icmp'
     target TEXT NOT NULL,
@@ -23,10 +24,12 @@ CREATE TABLE IF NOT EXISTS services (
     enabled INTEGER NOT NULL DEFAULT 1,
     notification_group_id TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE SET NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_services_enabled ON services(enabled);
+CREATE INDEX IF NOT EXISTS idx_services_owner ON services(owner_user_id);
 
 CREATE TABLE IF NOT EXISTS service_results (
     id TEXT PRIMARY KEY NOT NULL,

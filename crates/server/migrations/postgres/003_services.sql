@@ -3,6 +3,7 @@
 
 CREATE TABLE IF NOT EXISTS services (
     id UUID PRIMARY KEY NOT NULL,
+    owner_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
     name VARCHAR(255) NOT NULL,
     type VARCHAR(50) NOT NULL,
     target TEXT NOT NULL,
@@ -15,6 +16,7 @@ CREATE TABLE IF NOT EXISTS services (
 );
 
 CREATE INDEX IF NOT EXISTS idx_services_enabled ON services(enabled);
+CREATE INDEX IF NOT EXISTS idx_services_owner ON services(owner_user_id);
 
 CREATE TABLE IF NOT EXISTS service_results (
     id UUID PRIMARY KEY NOT NULL,

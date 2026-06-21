@@ -10,7 +10,7 @@ use crate::tasks::spawn_triggered_tasks;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -24,6 +24,7 @@ use xlstatus_shared::AgentId;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceConfig {
     pub id: String,
+    pub owner_user_id: Option<String>,
     pub name: String,
     pub kind: String,
     pub target: String,
@@ -208,6 +209,7 @@ impl ServiceMonitor {
             crate::db::DatabaseBackend::Sqlite(pool) => {
                 let rows: Vec<(
                     String,
+                    Option<String>,
                     String,
                     String,
                     String,
@@ -221,7 +223,7 @@ impl ServiceMonitor {
                     Option<String>,
                     Option<String>,
                 )> = sqlx::query_as(
-                    "SELECT id, name, type, target, interval_seconds, timeout_seconds, enabled, server_id, notification_group_id, COALESCE(cover_mode, 'local'), exclude_server_ids_json, failure_task_ids_json, recovery_task_ids_json FROM services WHERE enabled = 1",
+                    "SELECT id, owner_user_id, name, type, target, interval_seconds, timeout_seconds, enabled, server_id, notification_group_id, COALESCE(cover_mode, 'local'), exclude_server_ids_json, failure_task_ids_json, recovery_task_ids_json FROM services WHERE enabled = 1",
                 )
                 .fetch_all(pool)
                 .await?;
@@ -230,6 +232,7 @@ impl ServiceMonitor {
                     .map(
                         |(
                             id,
+                            owner_user_id,
                             name,
                             kind,
                             target,
@@ -246,6 +249,7 @@ impl ServiceMonitor {
                             let server_ids = server_id.into_iter().collect();
                             ServiceConfig {
                                 id,
+                                owner_user_id,
                                 name,
                                 kind,
                                 target,
@@ -268,6 +272,7 @@ impl ServiceMonitor {
             crate::db::DatabaseBackend::Postgres(pool) => {
                 let rows: Vec<(
                     String,
+                    Option<String>,
                     String,
                     String,
                     String,
@@ -281,7 +286,7 @@ impl ServiceMonitor {
                     Option<String>,
                     Option<String>,
                 )> = sqlx::query_as(
-                    "SELECT id::text, name, type, target, interval_seconds, timeout_seconds, enabled, server_id::text, notification_group_id::text, COALESCE(cover_mode, 'local'), exclude_server_ids_json, failure_task_ids_json, recovery_task_ids_json FROM services WHERE enabled = 1",
+                    "SELECT id::text, owner_user_id::text, name, type, target, interval_seconds, timeout_seconds, enabled, server_id::text, notification_group_id::text, COALESCE(cover_mode, 'local'), exclude_server_ids_json, failure_task_ids_json, recovery_task_ids_json FROM services WHERE enabled = 1",
                 )
                 .fetch_all(pool)
                 .await?;
@@ -290,6 +295,7 @@ impl ServiceMonitor {
                     .map(
                         |(
                             id,
+                            owner_user_id,
                             name,
                             kind,
                             target,
@@ -306,6 +312,7 @@ impl ServiceMonitor {
                             let server_ids = server_id.into_iter().collect();
                             ServiceConfig {
                                 id,
+                                owner_user_id,
                                 name,
                                 kind,
                                 target,
@@ -508,6 +515,23 @@ impl ServiceMonitor {
         if task_ids.is_empty() {
             return;
         }
+        let owner_user_id = match self.service_trigger_owner(service).await {
+            Ok(Some(owner_user_id)) => owner_user_id,
+            Ok(None) => {
+                warn!(
+                    "service {} trigger skipped: cannot determine trusted owner",
+                    service.id
+                );
+                return;
+            }
+            Err(err) => {
+                warn!(
+                    "service {} trigger owner lookup failed: {}",
+                    service.id, err
+                );
+                return;
+            }
+        };
         spawn_triggered_tasks(
             self.db.clone(),
             self.session_registry.clone(),
@@ -520,8 +544,62 @@ impl ServiceMonitor {
                 if success { "recovered" } else { "failed" }
             ),
             server_id.map(str::to_string),
-            None,
+            Some(owner_user_id),
         );
+    }
+
+    async fn service_trigger_owner(&self, service: &ServiceConfig) -> Result<Option<String>> {
+        if let Some(owner_user_id) = trusted_service_owner_from_config(service) {
+            return Ok(Some(owner_user_id));
+        }
+        self.unique_owner_from_service_servers(service).await
+    }
+
+    async fn unique_owner_from_service_servers(
+        &self,
+        service: &ServiceConfig,
+    ) -> Result<Option<String>> {
+        let server_ids = service_effective_server_ids(service);
+        if server_ids.is_empty() {
+            return Ok(None);
+        }
+        let owner_ids = self.load_agent_owner_ids(&server_ids).await?;
+        if owner_ids.len() != server_ids.len() {
+            return Ok(None);
+        }
+        Ok(unique_nonempty_value(owner_ids))
+    }
+
+    async fn load_agent_owner_ids(&self, server_ids: &[String]) -> Result<Vec<String>> {
+        match &self.db {
+            crate::db::DatabaseBackend::Sqlite(pool) => {
+                let mut owner_ids = Vec::new();
+                for server_id in server_ids {
+                    let row: Option<(String,)> =
+                        sqlx::query_as("SELECT owner_user_id FROM agents WHERE id = ?")
+                            .bind(server_id)
+                            .fetch_optional(pool)
+                            .await?;
+                    if let Some((owner_user_id,)) = row {
+                        owner_ids.push(owner_user_id);
+                    }
+                }
+                Ok(owner_ids)
+            }
+            crate::db::DatabaseBackend::Postgres(pool) => {
+                let parsed_ids = server_ids
+                    .iter()
+                    .map(|id| uuid::Uuid::parse_str(id).context("invalid server_id"))
+                    .collect::<Result<Vec<_>>>()?;
+                let rows: Vec<(String,)> = sqlx::query_as(
+                    "SELECT owner_user_id::text FROM agents WHERE id = ANY($1::uuid[])",
+                )
+                .bind(parsed_ids)
+                .fetch_all(pool)
+                .await?;
+                Ok(rows.into_iter().map(|(id,)| id).collect())
+            }
+        }
     }
 
     async fn prune_old_sqlite(&self, pool: &sqlx::Pool<sqlx::Sqlite>) -> Result<()> {
@@ -671,6 +749,42 @@ fn parse_task_ids_json(value: Option<String>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn trusted_service_owner_from_config(service: &ServiceConfig) -> Option<String> {
+    service
+        .owner_user_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|owner| !owner.is_empty())
+        .map(str::to_string)
+}
+
+fn service_effective_server_ids(service: &ServiceConfig) -> Vec<String> {
+    if service.cover_mode != "specific" {
+        return Vec::new();
+    }
+    let mut server_ids = Vec::new();
+    for server_id in &service.server_ids {
+        let trimmed = server_id.trim();
+        if !trimmed.is_empty() && !server_ids.iter().any(|existing| existing == trimmed) {
+            server_ids.push(trimmed.to_string());
+        }
+    }
+    server_ids
+}
+
+fn unique_nonempty_value(values: Vec<String>) -> Option<String> {
+    let values = values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<HashSet<_>>();
+    if values.len() == 1 {
+        values.into_iter().next()
+    } else {
+        None
+    }
+}
+
 fn service_state_key(service_id: &str, server_id: Option<&str>) -> String {
     format!("{}:{}", service_id, server_id.unwrap_or("local"))
 }
@@ -678,11 +792,14 @@ fn service_state_key(service_id: &str, server_id: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::DatabaseBackend;
+    use crate::grpc::{SessionRegistry, TaskResponseRegistry};
 
     #[test]
     fn config_round_trip() {
         let cfg = ServiceConfig {
             id: "x".into(),
+            owner_user_id: Some("owner".into()),
             name: "demo".into(),
             kind: "http".into(),
             target: "http://127.0.0.1:9".into(),
@@ -699,5 +816,150 @@ mod tests {
         let s = serde_json::to_string(&cfg).unwrap();
         let back: ServiceConfig = serde_json::from_str(&s).unwrap();
         assert_eq!(back.id, "x");
+        assert_eq!(back.owner_user_id.as_deref(), Some("owner"));
+    }
+
+    #[test]
+    fn trusted_owner_uses_service_owner_only_when_present() {
+        let mut service = test_service_config();
+        assert_eq!(trusted_service_owner_from_config(&service), None);
+
+        service.owner_user_id = Some(" owner-1 ".into());
+        assert_eq!(
+            trusted_service_owner_from_config(&service).as_deref(),
+            Some("owner-1")
+        );
+
+        service.owner_user_id = Some(" ".into());
+        assert_eq!(trusted_service_owner_from_config(&service), None);
+    }
+
+    #[test]
+    fn service_owner_fallback_only_uses_specific_server_scope() {
+        let mut service = test_service_config();
+        service.cover_mode = "specific".into();
+        service.server_ids = vec!["srv-a".into(), "srv-a".into(), " srv-b ".into()];
+        assert_eq!(
+            service_effective_server_ids(&service),
+            vec!["srv-a".to_string(), "srv-b".to_string()]
+        );
+
+        service.cover_mode = "exclude".into();
+        assert!(service_effective_server_ids(&service).is_empty());
+    }
+
+    #[test]
+    fn unique_owner_requires_exactly_one_nonempty_value() {
+        assert_eq!(
+            unique_nonempty_value(vec![" owner ".into(), "owner".into()]).as_deref(),
+            Some("owner")
+        );
+        assert_eq!(
+            unique_nonempty_value(vec!["owner".into(), "other".into()]),
+            None
+        );
+        assert_eq!(unique_nonempty_value(vec![" ".into()]), None);
+    }
+
+    #[tokio::test]
+    async fn service_trigger_owner_falls_back_to_unique_specific_server_owner() {
+        let db = test_db().await;
+        let owner = "00000000-0000-0000-0000-000000000001";
+        let other = "00000000-0000-0000-0000-000000000002";
+        let own_server = "00000000-0000-0000-0000-000000000101";
+        let other_server = "00000000-0000-0000-0000-000000000202";
+        seed_user(&db, owner, "owner").await;
+        seed_user(&db, other, "other").await;
+        seed_agent(&db, own_server, owner, "own").await;
+        seed_agent(&db, other_server, other, "other").await;
+
+        let monitor = ServiceMonitor::new(
+            db,
+            SessionRegistry::new(),
+            Arc::new(TaskResponseRegistry::new()),
+        );
+
+        let mut service = test_service_config();
+        service.cover_mode = "specific".into();
+        service.server_ids = vec![own_server.into()];
+        assert_eq!(
+            monitor
+                .service_trigger_owner(&service)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(owner)
+        );
+
+        service.server_ids = vec![own_server.into(), other_server.into()];
+        assert!(monitor
+            .service_trigger_owner(&service)
+            .await
+            .unwrap()
+            .is_none());
+
+        service.cover_mode = "local".into();
+        service.server_ids = vec![own_server.into()];
+        assert!(monitor
+            .service_trigger_owner(&service)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    async fn test_db() -> DatabaseBackend {
+        let db = DatabaseBackend::connect("sqlite::memory:", true)
+            .await
+            .unwrap();
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    async fn seed_user(db: &DatabaseBackend, id: &str, username: &str) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, role, created_at, updated_at) VALUES (?, ?, 'x', 'member', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(username)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_agent(db: &DatabaseBackend, id: &str, owner: &str, name: &str) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO agents (id, name, public_key, owner_user_id, created_at, updated_at) VALUES (?, ?, 'pk', ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(owner)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn test_service_config() -> ServiceConfig {
+        ServiceConfig {
+            id: "00000000-0000-0000-0000-000000000301".into(),
+            owner_user_id: None,
+            name: "demo".into(),
+            kind: "http".into(),
+            target: "http://127.0.0.1:9".into(),
+            interval_seconds: 30,
+            timeout_seconds: 5,
+            enabled: true,
+            cover_mode: "local".into(),
+            server_ids: Vec::new(),
+            exclude_server_ids: Vec::new(),
+            notification_group_id: None,
+            failure_task_ids: Vec::new(),
+            recovery_task_ids: Vec::new(),
+        }
     }
 }

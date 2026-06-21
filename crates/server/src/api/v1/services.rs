@@ -305,9 +305,10 @@ pub async fn create_service(
     match &state.db {
         crate::db::DatabaseBackend::Sqlite(pool) => {
             sqlx::query(
-                "INSERT INTO services (id, name, type, target, interval_seconds, timeout_seconds, enabled, server_id, notification_group_id, failure_task_ids_json, recovery_task_ids_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO services (id, owner_user_id, name, type, target, interval_seconds, timeout_seconds, enabled, server_id, notification_group_id, failure_task_ids_json, recovery_task_ids_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&id)
+            .bind(&owner)
             .bind(&input.name)
             .bind(input.service_type.as_db())
             .bind(&input.target)
@@ -340,9 +341,10 @@ pub async fn create_service(
                 .transpose()
                 .map_err(|e| AppError::BadRequest(format!("invalid notification_group_id: {e}")))?;
             sqlx::query(
-                "INSERT INTO services (id, name, type, target, interval_seconds, timeout_seconds, enabled, server_id, notification_group_id, failure_task_ids_json, recovery_task_ids_json, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                "INSERT INTO services (id, owner_user_id, name, type, target, interval_seconds, timeout_seconds, enabled, server_id, notification_group_id, failure_task_ids_json, recovery_task_ids_json, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
             )
             .bind(service_id)
+            .bind(auth.user_id.0)
             .bind(&input.name)
             .bind(input.service_type.as_db())
             .bind(&input.target)
@@ -396,8 +398,9 @@ pub async fn update_service(
     let affected = match &state.db {
         crate::db::DatabaseBackend::Sqlite(pool) => {
             sqlx::query(
-                "UPDATE services SET name = ?, type = ?, target = ?, interval_seconds = ?, timeout_seconds = ?, enabled = ?, server_id = ?, notification_group_id = ?, failure_task_ids_json = ?, recovery_task_ids_json = ?, updated_at = ? WHERE id = ?",
+                "UPDATE services SET owner_user_id = ?, name = ?, type = ?, target = ?, interval_seconds = ?, timeout_seconds = ?, enabled = ?, server_id = ?, notification_group_id = ?, failure_task_ids_json = ?, recovery_task_ids_json = ?, updated_at = ? WHERE id = ?",
             )
+            .bind(&owner)
             .bind(&input.name)
             .bind(input.service_type.as_db())
             .bind(&input.target)
@@ -431,8 +434,9 @@ pub async fn update_service(
                 .transpose()
                 .map_err(|e| AppError::BadRequest(format!("invalid notification_group_id: {e}")))?;
             sqlx::query(
-                "UPDATE services SET name = $1, type = $2, target = $3, interval_seconds = $4, timeout_seconds = $5, enabled = $6, server_id = $7, notification_group_id = $8, failure_task_ids_json = $9, recovery_task_ids_json = $10, updated_at = $11 WHERE id = $12",
+                "UPDATE services SET owner_user_id = $1, name = $2, type = $3, target = $4, interval_seconds = $5, timeout_seconds = $6, enabled = $7, server_id = $8, notification_group_id = $9, failure_task_ids_json = $10, recovery_task_ids_json = $11, updated_at = $12 WHERE id = $13",
             )
+            .bind(auth.user_id.0)
             .bind(&input.name)
             .bind(input.service_type.as_db())
             .bind(&input.target)
@@ -1169,13 +1173,18 @@ async fn ensure_service_input_servers_visible(
     if auth_has_global_service_visibility(auth) {
         return Ok(());
     }
-    let mut server_ids = input.server_ids.clone();
-    server_ids.extend(input.exclude_server_ids.clone());
-    if server_ids.is_empty() {
+    if input.cover_mode != "specific" {
         return Err(AppError::Forbidden(
-            "non-admin services must be scoped to owned servers".into(),
+            "non-global service monitors must use specific servers".into(),
         ));
     }
+    if input.server_ids.is_empty() {
+        return Err(AppError::Forbidden(
+            "non-global services must be scoped to owned servers".into(),
+        ));
+    }
+    let mut server_ids = input.server_ids.clone();
+    server_ids.extend(input.exclude_server_ids.clone());
     for server_id in server_ids {
         if !server_visible_to_auth(db, auth, &server_id).await? {
             return Err(AppError::Forbidden("server not in scope".into()));
@@ -1537,6 +1546,56 @@ mod tests {
         let err = ensure_service_input_servers_visible(
             &db,
             &admin_pat_session(admin, vec![allowed_server.to_string()]),
+            &input,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn non_global_service_write_rejects_expanding_cover_modes() {
+        let db = test_db().await;
+        let admin = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let server = Uuid::parse_str("00000000-0000-0000-0000-000000000101").unwrap();
+
+        seed_user(&db, admin, "admin", "admin").await;
+        seed_agent(&db, server, admin, "allowed").await;
+
+        let mut input = valid_service_input();
+        input.cover_mode = "exclude".into();
+        input.exclude_server_ids = vec![server.to_string()];
+
+        let err = ensure_service_input_servers_visible(
+            &db,
+            &admin_pat_session(admin, vec![server.to_string()]),
+            &input,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn non_global_specific_service_requires_explicit_server_ids() {
+        let db = test_db().await;
+        let admin = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let server = Uuid::parse_str("00000000-0000-0000-0000-000000000101").unwrap();
+
+        seed_user(&db, admin, "admin", "admin").await;
+        seed_agent(&db, server, admin, "allowed").await;
+
+        let mut input = valid_service_input();
+        input.cover_mode = "specific".into();
+        input.server_ids = Vec::new();
+        input.server_id = None;
+        input.exclude_server_ids = vec![server.to_string()];
+
+        let err = ensure_service_input_servers_visible(
+            &db,
+            &admin_pat_session(admin, vec![server.to_string()]),
             &input,
         )
         .await
