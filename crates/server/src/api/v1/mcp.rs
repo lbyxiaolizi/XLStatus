@@ -1,4 +1,9 @@
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{
+    extract::{DefaultBodyLimit, State},
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -7,6 +12,9 @@ use crate::api::v1::auth::AppState;
 use crate::auth::middleware::AuthUser;
 use crate::mcp::executor::McpExecutor;
 use crate::mcp::tools::{get_available_tools, McpTool, McpToolRequest};
+
+const MCP_MAX_BODY_BYTES: usize = 1024 * 1024;
+const MCP_MAX_BATCH_ITEMS: usize = 16;
 
 #[derive(Debug, Serialize)]
 pub struct McpToolsResponse {
@@ -82,8 +90,8 @@ pub async fn handle_mcp_jsonrpc(
     auth_user.require_pat().map_err(forbidden)?;
 
     if let Some(batch) = payload.as_array() {
-        if batch.is_empty() {
-            return Ok(Json(jsonrpc_error(Value::Null, -32600, "Invalid Request")));
+        if let Err(error) = validate_jsonrpc_batch(batch) {
+            return Ok(Json(error));
         }
         let mut responses = Vec::with_capacity(batch.len());
         for item in batch {
@@ -95,6 +103,20 @@ pub async fn handle_mcp_jsonrpc(
     Ok(Json(
         handle_jsonrpc_request(&state, &auth_user, payload).await,
     ))
+}
+
+pub fn mcp_body_limit() -> DefaultBodyLimit {
+    DefaultBodyLimit::max(MCP_MAX_BODY_BYTES)
+}
+
+fn validate_jsonrpc_batch(batch: &[Value]) -> Result<(), Value> {
+    if batch.is_empty() {
+        return Err(jsonrpc_error(Value::Null, -32600, "Invalid Request"));
+    }
+    if batch.len() > MCP_MAX_BATCH_ITEMS {
+        return Err(jsonrpc_error(Value::Null, -32600, "Batch too large"));
+    }
+    Ok(())
 }
 
 /// Get MCP server information
@@ -300,4 +322,34 @@ fn forbidden(_: StatusCode) -> (StatusCode, Json<ApiResponse<()>>) {
             error: Some("permission denied".to_string()),
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jsonrpc_batch_rejects_empty_batch() {
+        let err = validate_jsonrpc_batch(&[]).unwrap_err();
+        assert_eq!(err["error"]["code"], -32600);
+        assert_eq!(err["error"]["message"], "Invalid Request");
+    }
+
+    #[test]
+    fn jsonrpc_batch_rejects_oversized_batch() {
+        let batch = vec![
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+            MCP_MAX_BATCH_ITEMS + 1
+        ];
+        let err = validate_jsonrpc_batch(&batch).unwrap_err();
+        assert_eq!(err["error"]["code"], -32600);
+        assert_eq!(err["error"]["message"], "Batch too large");
+    }
+
+    #[test]
+    fn jsonrpc_batch_allows_configured_maximum() {
+        let batch =
+            vec![json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}); MCP_MAX_BATCH_ITEMS];
+        assert!(validate_jsonrpc_batch(&batch).is_ok());
+    }
 }

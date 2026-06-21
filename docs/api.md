@@ -118,9 +118,11 @@
 | `GET` | `/api/v1/mcp/tools` | MCP 工具列表 |
 | `POST` | `/api/v1/mcp/execute` | 执行 MCP 工具 |
 | `GET` | `/api/v1/mcp/info` | MCP 信息 |
+| `POST` | `/mcp` | MCP JSON-RPC |
 
 NAT 创建/更新支持安全策略字段：`allowed_sources`、`max_active_tunnels`、`idle_timeout_seconds`、`max_bytes_per_tunnel`、`max_bandwidth_bytes_per_second`、`rate_limit_window_seconds`、`max_connections_per_window`、`max_bytes_per_window`。窗口字段按 mapping 和来源 IP 计数，用于限制窗口内连接数和累计双向流量。`local_host` 默认只能是 Agent 本机 loopback 目标；如需转发到 Agent 所在内网其他主机，必须显式启用私网 NAT 目标环境变量。
-| `POST` | `/mcp` | MCP JSON-RPC |
+
+MCP POST 入口请求体上限为 1MiB。`/mcp` JSON-RPC batch 最多 16 项，空 batch 或超过上限会返回 `Invalid Request`。`server.exec` 命令最长 8192 字节，timeout 被限制在 1 到 60 秒，默认 30 秒。
 
 ## gRPC
 

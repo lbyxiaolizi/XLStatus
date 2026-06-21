@@ -18,6 +18,9 @@ use crate::db::{CreateTemporaryTransferTokenInput, TemporaryTransferTokenReposit
 
 const MCP_FILE_OP_TIMEOUT_SECS: u64 = 30;
 const MCP_FILE_READ_MAX_BYTES: u64 = 1024 * 1024;
+const MCP_EXEC_MAX_COMMAND_BYTES: usize = 8192;
+const MCP_EXEC_DEFAULT_TIMEOUT_SECS: u32 = 30;
+const MCP_EXEC_MAX_TIMEOUT_SECS: u32 = 60;
 pub(crate) const TEMP_URL_DEFAULT_EXPIRES_SECS: i64 = 300;
 pub(crate) const TEMP_URL_MAX_EXPIRES_SECS: i64 = 600;
 
@@ -151,8 +154,8 @@ impl McpExecutor {
     ) -> Result<serde_json::Value> {
         let server_id = args["server_id"].as_str().context("Missing server_id")?;
         let agent_id = self.ensure_agent_visible(auth, server_id).await?.id;
-        let command = args["command"].as_str().context("Missing command")?;
-        let timeout = args["timeout"].as_i64().unwrap_or(30);
+        let command = validate_exec_command(args["command"].as_str().context("Missing command")?)?;
+        let timeout = normalize_exec_timeout(args["timeout"].as_i64());
 
         // M6: dispatch the command to the live agent over gRPC and
         // wait up to `timeout` seconds for the `TaskResult`.
@@ -164,16 +167,14 @@ impl McpExecutor {
         let rx = response_registry.register(run_id.clone()).await;
         if let Err(e) = self
             .session_registry
-            .send_task(&agent_id, &run_id, command, timeout.max(1) as u32)
+            .send_task(&agent_id, &run_id, command, timeout)
             .await
         {
             response_registry.cancel(&run_id).await;
             return Err(anyhow::anyhow!(e));
         }
         let result =
-            match tokio::time::timeout(std::time::Duration::from_secs(timeout.max(1) as u64), rx)
-                .await
-            {
+            match tokio::time::timeout(std::time::Duration::from_secs(timeout as u64), rx).await {
                 Ok(Ok(r)) => r,
                 Ok(Err(_)) => anyhow::bail!("agent disconnected before reply"),
                 Err(_) => {
@@ -192,6 +193,7 @@ impl McpExecutor {
         Ok(json!({
             "server_id": server_id,
             "command": command,
+            "timeout_seconds": timeout,
             "exit_code": result.exit_code,
             "stdout": result.stdout,
             "stderr": result.stderr,
@@ -491,6 +493,8 @@ impl McpExecutor {
         command: &str,
         timeout_seconds: u32,
     ) -> Result<serde_json::Value> {
+        let command = validate_exec_command(command)?;
+        let timeout_seconds = normalize_exec_timeout(Some(timeout_seconds as i64));
         let agent_uuid = uuid::Uuid::parse_str(server_id).context("server_id must be a UUID")?;
         let agent_id = AgentId(agent_uuid);
         if !self.session_registry.is_online(&agent_id).await {
@@ -592,6 +596,25 @@ pub(crate) fn temporary_url_expires_at(expires_in: i64) -> i64 {
     chrono::Utc::now()
         .timestamp()
         .saturating_add(temporary_url_expires_in(expires_in))
+}
+
+fn normalize_exec_timeout(timeout: Option<i64>) -> u32 {
+    timeout
+        .unwrap_or(MCP_EXEC_DEFAULT_TIMEOUT_SECS as i64)
+        .clamp(1, MCP_EXEC_MAX_TIMEOUT_SECS as i64) as u32
+}
+
+fn validate_exec_command(command: &str) -> Result<&str> {
+    if command.trim().is_empty() {
+        anyhow::bail!("command must not be empty");
+    }
+    if command.len() > MCP_EXEC_MAX_COMMAND_BYTES {
+        anyhow::bail!(
+            "command is too large; maximum is {} bytes",
+            MCP_EXEC_MAX_COMMAND_BYTES
+        );
+    }
+    Ok(command)
 }
 
 pub(crate) fn temporary_url_token(
@@ -866,6 +889,26 @@ mod tests {
             temporary_url_expires_in(60 * 60 * 24),
             TEMP_URL_MAX_EXPIRES_SECS
         );
+    }
+
+    #[test]
+    fn server_exec_timeout_is_bounded() {
+        assert_eq!(normalize_exec_timeout(None), MCP_EXEC_DEFAULT_TIMEOUT_SECS);
+        assert_eq!(normalize_exec_timeout(Some(-10)), 1);
+        assert_eq!(normalize_exec_timeout(Some(0)), 1);
+        assert_eq!(normalize_exec_timeout(Some(45)), 45);
+        assert_eq!(
+            normalize_exec_timeout(Some(60 * 60)),
+            MCP_EXEC_MAX_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn server_exec_command_rejects_empty_or_oversized_values() {
+        assert!(validate_exec_command("echo ok").is_ok());
+        assert!(validate_exec_command("   ").is_err());
+        let oversized = "x".repeat(MCP_EXEC_MAX_COMMAND_BYTES + 1);
+        assert!(validate_exec_command(&oversized).is_err());
     }
 
     #[test]

@@ -81,12 +81,16 @@ pub fn get_available_tools() -> Vec<McpTool> {
                     },
                     "command": {
                         "type": "string",
-                        "description": "Command to execute"
+                        "description": "Command to execute",
+                        "minLength": 1,
+                        "maxLength": 8192
                     },
                     "timeout": {
                         "type": "integer",
                         "description": "Timeout in seconds",
-                        "default": 30
+                        "default": 30,
+                        "minimum": 1,
+                        "maximum": 60
                     }
                 },
                 "required": ["server_id", "command"]

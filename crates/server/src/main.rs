@@ -53,7 +53,9 @@ use api::v1::maintenance::{
     compact_tsdb, download_archive, download_backup, maintenance_status, restore_backup,
     restore_body_limit, update_tsdb_retention, vacuum_sqlite,
 };
-use api::v1::mcp::{execute_mcp_tool, get_mcp_info, handle_mcp_jsonrpc, list_mcp_tools};
+use api::v1::mcp::{
+    execute_mcp_tool, get_mcp_info, handle_mcp_jsonrpc, list_mcp_tools, mcp_body_limit,
+};
 use api::v1::nat::{
     create_nat_mapping, delete_nat_mapping, get_nat_mapping, list_all_nat_mappings,
     list_nat_mappings, update_nat_mapping,
@@ -369,9 +371,12 @@ async fn main() -> anyhow::Result<()> {
                     post(api::v1::agent::revoke_agent),
                 )
                 .route("/api/v1/mcp/tools", get(list_mcp_tools))
-                .route("/api/v1/mcp/execute", post(execute_mcp_tool))
+                .route(
+                    "/api/v1/mcp/execute",
+                    post(execute_mcp_tool).layer(mcp_body_limit()),
+                )
                 .route("/api/v1/mcp/info", get(get_mcp_info))
-                .route("/mcp", post(handle_mcp_jsonrpc))
+                .route("/mcp", post(handle_mcp_jsonrpc).layer(mcp_body_limit()))
                 .route("/api/v1/services", get(list_services))
                 .route("/api/v1/services", post(create_service))
                 .route("/api/v1/services/test-probe", post(test_probe))
