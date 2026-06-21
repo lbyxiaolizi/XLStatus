@@ -45,8 +45,8 @@ use api::v1::auth::{
     setup_totp, update_user, AppState,
 };
 use api::v1::ddns::{
-    check_ddns_now, create_ddns_config, delete_ddns_config, list_ddns_configs, list_ddns_history,
-    reload_ddns_providers,
+    check_ddns_now, create_ddns_config, ddns_body_limit, delete_ddns_config, list_ddns_configs,
+    list_ddns_history, reload_ddns_providers,
 };
 use api::v1::geoip::{
     geoip_status, geoip_test_body_limit, geoip_upload_body_limit, test_geoip,
@@ -454,7 +454,10 @@ async fn main() -> anyhow::Result<()> {
                     get(list_notification_providers),
                 )
                 // M6: DDNS config + history endpoints
-                .route("/api/v1/ddns/configs", post(create_ddns_config))
+                .route(
+                    "/api/v1/ddns/configs",
+                    post(create_ddns_config).layer(ddns_body_limit()),
+                )
                 .route("/api/v1/ddns/configs", get(list_ddns_configs))
                 .route(
                     "/api/v1/ddns/configs/:id",

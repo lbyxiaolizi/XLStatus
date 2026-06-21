@@ -2,7 +2,7 @@
 #![allow(unused_imports)]
 
 use axum::{
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
@@ -16,7 +16,17 @@ use crate::auth::middleware::{AuthKind, AuthSession, AuthUser};
 use crate::auth::rbac::has_scope;
 use crate::db::repository::ddns::{DdnsConfigRepository, DdnsConfigRow, DdnsHistoryRepository};
 use crate::security::validate_outbound_url;
-use xlstatus_shared::ddns::DdnsHistoryEntry;
+use xlstatus_shared::ddns::{DdnsHistoryEntry, ProviderType};
+
+const DDNS_API_MAX_BODY_BYTES: usize = 64 * 1024;
+const DDNS_MAX_NAME_BYTES: usize = 128;
+const DDNS_MAX_PROVIDER_BYTES: usize = 64;
+const DDNS_MAX_DOMAIN_BYTES: usize = 253;
+const DDNS_MAX_AGENT_ID_BYTES: usize = 64;
+const DDNS_MAX_RECORD_ID_BYTES: usize = 128;
+const DDNS_MAX_ZONE_ID_BYTES: usize = 128;
+const DDNS_MAX_SECRET_BYTES: usize = 4096;
+const DDNS_MAX_WEBHOOK_URL_BYTES: usize = 2048;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateDdnsConfigRequest {
@@ -66,6 +76,25 @@ pub struct DdnsConfigView {
     pub updated_at: String,
 }
 
+#[derive(Debug)]
+struct NormalizedDdnsConfigRequest {
+    agent_id: Option<String>,
+    name: String,
+    provider: String,
+    domain: String,
+    record_id: Option<String>,
+    zone_id: Option<String>,
+    api_token: Option<String>,
+    api_key: Option<String>,
+    api_secret: Option<String>,
+    webhook_url: Option<String>,
+    enabled: bool,
+}
+
+pub fn ddns_body_limit() -> DefaultBodyLimit {
+    DefaultBodyLimit::max(DDNS_API_MAX_BODY_BYTES)
+}
+
 pub async fn create_ddns_config(
     State(state): State<AppState>,
     auth_user: AuthUser,
@@ -76,18 +105,14 @@ pub async fn create_ddns_config(
 > {
     let db = state.db.clone();
     require_ddns_scope(&auth_user, "ddns:write")?;
+    let req = normalize_create_ddns_request(req)
+        .map_err(|message| api_error::<DdnsConfigResponse>(StatusCode::BAD_REQUEST, message))?;
     ensure_ddns_agent_scope(&auth_user, req.agent_id.as_deref())?;
-    if req.provider == "webhook" {
-        let Some(url) = req.webhook_url.as_deref() else {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(ApiResponse {
-                    success: false,
-                    data: None,
-                    error: Some("webhook_url is required for webhook provider".to_string()),
-                }),
-            ));
-        };
+    if req.provider == ProviderType::Webhook.as_str() {
+        let url = req
+            .webhook_url
+            .as_deref()
+            .expect("webhook_url is normalized as required for webhook provider");
         let probe_url = url
             .replace("{{ip}}", "198.51.100.10")
             .replace("{{hostname}}", "example.com");
@@ -119,7 +144,7 @@ pub async fn create_ddns_config(
         current_ip: None,
         last_applied_ip: None,
         last_applied_at: None,
-        enabled: req.enabled.unwrap_or(true),
+        enabled: req.enabled,
         created_at: now.clone(),
         updated_at: now,
     };
@@ -207,6 +232,102 @@ fn has_secret(value: &Option<String>) -> bool {
         .as_deref()
         .map(|value| !value.trim().is_empty())
         .unwrap_or(false)
+}
+
+fn normalize_create_ddns_request(
+    req: CreateDdnsConfigRequest,
+) -> Result<NormalizedDdnsConfigRequest, String> {
+    let agent_id = normalize_ddns_agent_id(req.agent_id)?;
+    let name = normalize_required_ddns_text(req.name, DDNS_MAX_NAME_BYTES, "name")?;
+    let provider = normalize_ddns_provider(&req.provider)?;
+    let domain = normalize_required_ddns_text(req.domain, DDNS_MAX_DOMAIN_BYTES, "domain")?;
+    let record_id =
+        normalize_optional_ddns_text(req.record_id, DDNS_MAX_RECORD_ID_BYTES, "record_id")?;
+    let zone_id = normalize_optional_ddns_text(req.zone_id, DDNS_MAX_ZONE_ID_BYTES, "zone_id")?;
+    let api_token =
+        normalize_optional_ddns_text(req.api_token, DDNS_MAX_SECRET_BYTES, "api_token")?;
+    let api_key = normalize_optional_ddns_text(req.api_key, DDNS_MAX_SECRET_BYTES, "api_key")?;
+    let api_secret =
+        normalize_optional_ddns_text(req.api_secret, DDNS_MAX_SECRET_BYTES, "api_secret")?;
+    let webhook_url =
+        normalize_optional_ddns_text(req.webhook_url, DDNS_MAX_WEBHOOK_URL_BYTES, "webhook_url")?;
+
+    if provider == ProviderType::Webhook.as_str() && webhook_url.is_none() {
+        return Err("webhook_url is required for webhook provider".to_string());
+    }
+
+    Ok(NormalizedDdnsConfigRequest {
+        agent_id,
+        name,
+        provider,
+        domain,
+        record_id,
+        zone_id,
+        api_token,
+        api_key,
+        api_secret,
+        webhook_url,
+        enabled: req.enabled.unwrap_or(true),
+    })
+}
+
+fn normalize_required_ddns_text(
+    value: String,
+    max_bytes: usize,
+    field: &str,
+) -> Result<String, String> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return Err(format!("{field} is required"));
+    }
+    if value.len() > max_bytes {
+        return Err(format!("{field} must be at most {max_bytes} bytes"));
+    }
+    Ok(value)
+}
+
+fn normalize_optional_ddns_text(
+    value: Option<String>,
+    max_bytes: usize,
+    field: &str,
+) -> Result<Option<String>, String> {
+    let Some(value) = value.map(|value| value.trim().to_string()) else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() > max_bytes {
+        return Err(format!("{field} must be at most {max_bytes} bytes"));
+    }
+    Ok(Some(value))
+}
+
+fn normalize_ddns_provider(value: &str) -> Result<String, String> {
+    let provider =
+        normalize_required_ddns_text(value.to_string(), DDNS_MAX_PROVIDER_BYTES, "provider")?;
+    ProviderType::from_str(&provider)
+        .map(|provider| provider.as_str().to_string())
+        .ok_or_else(|| {
+            "provider must be one of: cloudflare, tencent_cloud, he, webhook, dummy".to_string()
+        })
+}
+
+fn normalize_ddns_agent_id(value: Option<String>) -> Result<Option<String>, String> {
+    let Some(value) = value.map(|value| value.trim().to_string()) else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() > DDNS_MAX_AGENT_ID_BYTES {
+        return Err(format!(
+            "agent_id must be at most {DDNS_MAX_AGENT_ID_BYTES} bytes"
+        ));
+    }
+    uuid::Uuid::parse_str(&value)
+        .map(|value| Some(value.to_string()))
+        .map_err(|_| "agent_id must be a UUID".to_string())
 }
 
 pub async fn delete_ddns_config(
@@ -443,7 +564,7 @@ fn ensure_ddns_agent_scope<T>(
             "PAT-scoped DDNS configs must target a server in the allowlist",
         ));
     };
-    if allowed.iter().any(|allowed_id| allowed_id == agent_id) {
+    if ddns_server_id_allowed(allowed, agent_id) {
         Ok(())
     } else {
         Err(api_error(
@@ -481,8 +602,20 @@ fn ddns_config_visible_to_auth(auth_user: &AuthUser, config: &DdnsConfigRow) -> 
     config
         .agent_id
         .as_ref()
-        .map(|agent_id| allowed.iter().any(|allowed_id| allowed_id == agent_id))
+        .map(|agent_id| ddns_server_id_allowed(allowed, agent_id))
         .unwrap_or(false)
+}
+
+fn ddns_server_id_allowed(allowed: &[String], agent_id: &str) -> bool {
+    let Ok(agent_uuid) = uuid::Uuid::parse_str(agent_id) else {
+        return false;
+    };
+    allowed.iter().any(|allowed_id| {
+        allowed_id == agent_id
+            || uuid::Uuid::parse_str(allowed_id)
+                .map(|allowed_uuid| allowed_uuid == agent_uuid)
+                .unwrap_or(false)
+    })
 }
 
 fn auth_session(auth_user: &AuthUser) -> AuthSession {
@@ -531,15 +664,17 @@ mod tests {
 
     #[test]
     fn admin_pat_ddns_visibility_respects_server_allowlist() {
-        let auth = admin_pat(vec!["ddns:read"], Some(vec!["server-a".into()]));
+        let allowed_server = uuid::Uuid::from_bytes([7; 16]).to_string();
+        let denied_server = uuid::Uuid::from_bytes([8; 16]).to_string();
+        let auth = admin_pat(vec!["ddns:read"], Some(vec![allowed_server.clone()]));
 
         assert!(ddns_config_visible_to_auth(
             &auth,
-            &ddns_config(Some("server-a"))
+            &ddns_config(Some(&allowed_server))
         ));
         assert!(!ddns_config_visible_to_auth(
             &auth,
-            &ddns_config(Some("server-b"))
+            &ddns_config(Some(&denied_server))
         ));
         assert!(!ddns_config_visible_to_auth(&auth, &ddns_config(None)));
     }
@@ -569,6 +704,123 @@ mod tests {
         let err = require_ddns_global_admin(&auth, "ddns:write").unwrap_err();
 
         assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn ddns_config_resource_limits_are_explicit() {
+        assert_eq!(DDNS_API_MAX_BODY_BYTES, 64 * 1024);
+        assert_eq!(DDNS_MAX_NAME_BYTES, 128);
+        assert_eq!(DDNS_MAX_PROVIDER_BYTES, 64);
+        assert_eq!(DDNS_MAX_DOMAIN_BYTES, 253);
+        assert_eq!(DDNS_MAX_AGENT_ID_BYTES, 64);
+        assert_eq!(DDNS_MAX_RECORD_ID_BYTES, 128);
+        assert_eq!(DDNS_MAX_ZONE_ID_BYTES, 128);
+        assert_eq!(DDNS_MAX_SECRET_BYTES, 4096);
+        assert_eq!(DDNS_MAX_WEBHOOK_URL_BYTES, 2048);
+    }
+
+    #[test]
+    fn ddns_provider_is_allowlisted_and_canonicalized() {
+        assert_eq!(normalize_ddns_provider(" webhook ").unwrap(), "webhook");
+        assert_eq!(
+            normalize_ddns_provider("tencent_cloud").unwrap(),
+            "tencent_cloud"
+        );
+        assert!(normalize_ddns_provider("route53").is_err());
+        assert!(normalize_ddns_provider(&"a".repeat(DDNS_MAX_PROVIDER_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn ddns_agent_id_is_uuid_canonicalized() {
+        let id = uuid::Uuid::from_bytes([3; 16]);
+
+        assert_eq!(
+            normalize_ddns_agent_id(Some(id.simple().to_string())).unwrap(),
+            Some(id.to_string())
+        );
+        assert_eq!(normalize_ddns_agent_id(Some(" ".into())).unwrap(), None);
+        assert!(normalize_ddns_agent_id(Some("server-a".into())).is_err());
+        assert!(normalize_ddns_agent_id(Some("a".repeat(DDNS_MAX_AGENT_ID_BYTES + 1))).is_err());
+    }
+
+    #[test]
+    fn ddns_server_allowlist_uses_uuid_semantics() {
+        let id = uuid::Uuid::from_bytes([5; 16]);
+
+        assert!(ddns_server_id_allowed(
+            &[id.simple().to_string()],
+            &id.to_string()
+        ));
+        assert!(!ddns_server_id_allowed(
+            &[uuid::Uuid::from_bytes([6; 16]).to_string()],
+            &id.to_string()
+        ));
+        assert!(!ddns_server_id_allowed(
+            &["server-a".into()],
+            &id.to_string()
+        ));
+    }
+
+    #[test]
+    fn ddns_config_rejects_oversized_fields_and_requires_webhook_url() {
+        assert!(normalize_required_ddns_text("cfg".into(), DDNS_MAX_NAME_BYTES, "name").is_ok());
+        assert!(normalize_required_ddns_text(
+            "a".repeat(DDNS_MAX_NAME_BYTES + 1),
+            DDNS_MAX_NAME_BYTES,
+            "name"
+        )
+        .is_err());
+        assert!(normalize_required_ddns_text(
+            "a".repeat(DDNS_MAX_DOMAIN_BYTES + 1),
+            DDNS_MAX_DOMAIN_BYTES,
+            "domain"
+        )
+        .is_err());
+        assert!(normalize_optional_ddns_text(
+            Some("a".repeat(DDNS_MAX_SECRET_BYTES + 1)),
+            DDNS_MAX_SECRET_BYTES,
+            "api_secret"
+        )
+        .is_err());
+        assert!(normalize_optional_ddns_text(
+            Some(format!(
+                "https://example.com/{}",
+                "a".repeat(DDNS_MAX_WEBHOOK_URL_BYTES)
+            )),
+            DDNS_MAX_WEBHOOK_URL_BYTES,
+            "webhook_url"
+        )
+        .is_err());
+
+        let mut req = ddns_create_request();
+        req.provider = "webhook".into();
+        req.webhook_url = None;
+        assert!(normalize_create_ddns_request(req).is_err());
+    }
+
+    #[test]
+    fn ddns_config_normalization_trims_and_defaults_enabled() {
+        let mut req = ddns_create_request();
+        let agent_id = uuid::Uuid::from_bytes([4; 16]);
+        req.agent_id = Some(format!(" {} ", agent_id.simple()));
+        req.name = " cfg ".into();
+        req.provider = " cloudflare ".into();
+        req.domain = " example.com ".into();
+        req.record_id = Some(" rec ".into());
+        req.zone_id = Some(" ".into());
+        req.api_token = Some(" token ".into());
+        req.enabled = None;
+
+        let normalized = normalize_create_ddns_request(req).unwrap();
+
+        assert_eq!(normalized.agent_id, Some(agent_id.to_string()));
+        assert_eq!(normalized.name, "cfg");
+        assert_eq!(normalized.provider, "cloudflare");
+        assert_eq!(normalized.domain, "example.com");
+        assert_eq!(normalized.record_id, Some("rec".into()));
+        assert_eq!(normalized.zone_id, None);
+        assert_eq!(normalized.api_token, Some("token".into()));
+        assert!(normalized.enabled);
     }
 
     fn admin_pat(scopes: Vec<&str>, server_ids: Option<Vec<String>>) -> AuthUser {
@@ -612,6 +864,22 @@ mod tests {
             enabled: true,
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    fn ddns_create_request() -> CreateDdnsConfigRequest {
+        CreateDdnsConfigRequest {
+            agent_id: None,
+            name: "cfg".into(),
+            provider: "cloudflare".into(),
+            domain: "example.com".into(),
+            record_id: None,
+            zone_id: None,
+            api_token: None,
+            api_key: None,
+            api_secret: None,
+            webhook_url: None,
+            enabled: Some(true),
         }
     }
 }
