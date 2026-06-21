@@ -28,6 +28,8 @@ hex = "0.4"
 reqwest = { workspace = true }
 portable-pty = "0.8"
 prost-types.workspace = true
+
+[target.'cfg(not(target_os = "freebsd"))'.dependencies]
 sysinfo.workspace = true
 
 [dev-dependencies]

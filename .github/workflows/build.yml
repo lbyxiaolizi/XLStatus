@@ -73,11 +73,11 @@ jobs:
             verify_glibc: true
           - os_name: linux
             arch: arm64
-            runner: ubuntu-22.04
+            runner: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             binary_ext: ""
-            use_zigbuild: true
-            verify_glibc: false
+            use_zigbuild: false
+            verify_glibc: true
           - os_name: linux
             arch: i386
             runner: ubuntu-22.04
@@ -95,10 +95,10 @@ jobs:
             verify_glibc: false
           - os_name: windows
             arch: arm64
-            runner: windows-latest
+            runner: windows-11-arm
             target: aarch64-pc-windows-msvc
             binary_ext: ".exe"
-            msvc_arch: amd64_arm64
+            msvc_arch: arm64
             use_zigbuild: false
             verify_glibc: false
           - os_name: windows

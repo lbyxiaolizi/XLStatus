@@ -1,7 +1,13 @@
-// Linux x86_64 collectors for M3.
-// On other platforms (e.g. macOS), we degrade to whatever sysinfo offers
-// for that platform; the Dashboard treats the report as best-effort.
+// Collectors are best-effort across platforms. FreeBSD uses command-based
+// fallbacks to avoid sysinfo's kvm/procstat link requirements in cross builds.
 use serde::Serialize;
+#[cfg(target_os = "freebsd")]
+use std::{
+    collections::BTreeMap,
+    process::Command,
+    time::{SystemTime, UNIX_EPOCH},
+};
+#[cfg(not(target_os = "freebsd"))]
 use sysinfo::{Components, Disks, Networks, System};
 
 /// HostInfo: stable per-host info, sent once on enroll and on demand.
@@ -70,6 +76,7 @@ pub struct DiskUsage {
     pub total: u64,
 }
 
+#[cfg(not(target_os = "freebsd"))]
 pub fn collect_host_info() -> HostInfo {
     let mut sys = System::new_all();
     sys.refresh_all();
@@ -94,6 +101,7 @@ pub fn collect_host_info() -> HostInfo {
     }
 }
 
+#[cfg(not(target_os = "freebsd"))]
 fn collect_host_disks() -> Vec<HostDisk> {
     let disks = Disks::new_with_refreshed_list();
     let mut list: Vec<HostDisk> = disks
@@ -109,6 +117,7 @@ fn collect_host_disks() -> Vec<HostDisk> {
     list
 }
 
+#[cfg(not(target_os = "freebsd"))]
 pub fn collect_host_state() -> HostState {
     let mut sys = System::new_all();
     sys.refresh_all();
@@ -188,6 +197,243 @@ pub fn collect_host_state() -> HostState {
         disks: disk_list,
         temperatures,
     }
+}
+
+#[cfg(target_os = "freebsd")]
+pub fn collect_host_info() -> HostInfo {
+    let (swap_total, _) = freebsd_swap_bytes();
+
+    HostInfo {
+        hostname: command_output("hostname", &[]).unwrap_or_else(|| "unknown".to_string()),
+        os: "FreeBSD".to_string(),
+        os_version: command_output("uname", &["-r"]).unwrap_or_else(|| "unknown".to_string()),
+        kernel_version: command_output("uname", &["-v"]).unwrap_or_else(|| "unknown".to_string()),
+        arch: command_output("uname", &["-m"]).unwrap_or_else(|| "unknown".to_string()),
+        cpu_brand: sysctl_string("hw.model").unwrap_or_else(|| "unknown".to_string()),
+        cpu_cores: sysctl_u64("hw.ncpu").unwrap_or(0) as usize,
+        total_memory: sysctl_u64("hw.physmem").unwrap_or(0),
+        total_swap: swap_total,
+        boot_time: freebsd_boot_time(),
+        agent_version: env!("CARGO_PKG_VERSION").to_string(),
+        disks: freebsd_host_disks(),
+    }
+}
+
+#[cfg(target_os = "freebsd")]
+pub fn collect_host_state() -> HostState {
+    let memory_total = sysctl_u64("hw.physmem").unwrap_or(0);
+    let page_size = sysctl_u64("hw.pagesize").unwrap_or(4096);
+    let free_pages = sysctl_u64("vm.stats.vm.v_free_count").unwrap_or(0);
+    let memory_free = free_pages.saturating_mul(page_size);
+    let memory_used = memory_total.saturating_sub(memory_free);
+    let (swap_total, swap_used) = freebsd_swap_bytes();
+    let (load1, load5, load15) = freebsd_load_average();
+    let (tcp_connections, udp_connections) = freebsd_connection_counts();
+    let network_interfaces = freebsd_network_interfaces();
+    let (network_in_total, network_out_total) =
+        network_interfaces
+            .iter()
+            .fold((0u64, 0u64), |(rx, tx), iface| {
+                (
+                    rx.saturating_add(iface.rx_bytes),
+                    tx.saturating_add(iface.tx_bytes),
+                )
+            });
+
+    HostState {
+        cpu_percent: 0.0,
+        memory_used,
+        memory_total,
+        swap_used,
+        swap_total,
+        load1,
+        load5,
+        load15,
+        uptime_seconds: freebsd_uptime(),
+        tcp_connections,
+        udp_connections,
+        process_count: freebsd_process_count(),
+        network_in_total,
+        network_out_total,
+        network_interfaces,
+        disks: freebsd_disk_usage(),
+        temperatures: Vec::new(),
+    }
+}
+
+#[cfg(target_os = "freebsd")]
+fn command_output(command: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(command).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+#[cfg(target_os = "freebsd")]
+fn sysctl_string(name: &str) -> Option<String> {
+    command_output("sysctl", &["-n", name])
+}
+
+#[cfg(target_os = "freebsd")]
+fn sysctl_u64(name: &str) -> Option<u64> {
+    sysctl_string(name)?.trim().parse().ok()
+}
+
+#[cfg(target_os = "freebsd")]
+fn freebsd_boot_time() -> u64 {
+    let output = sysctl_string("kern.boottime").unwrap_or_default();
+    output
+        .split("sec = ")
+        .nth(1)
+        .and_then(|rest| rest.split([',', '}']).next())
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+#[cfg(target_os = "freebsd")]
+fn freebsd_uptime() -> u64 {
+    let boot_time = freebsd_boot_time();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    now.saturating_sub(boot_time)
+}
+
+#[cfg(target_os = "freebsd")]
+fn freebsd_swap_bytes() -> (u64, u64) {
+    let Some(output) = command_output("swapinfo", &["-k"]) else {
+        return (0, 0);
+    };
+    let mut total = 0u64;
+    let mut used = 0u64;
+    for line in output.lines().skip(1) {
+        let columns: Vec<&str> = line.split_whitespace().collect();
+        if columns.len() < 3 {
+            continue;
+        }
+        total = total.saturating_add(columns[1].parse::<u64>().unwrap_or(0).saturating_mul(1024));
+        used = used.saturating_add(columns[2].parse::<u64>().unwrap_or(0).saturating_mul(1024));
+    }
+    (total, used)
+}
+
+#[cfg(target_os = "freebsd")]
+fn freebsd_load_average() -> (f64, f64, f64) {
+    let Some(output) = sysctl_string("vm.loadavg") else {
+        return (0.0, 0.0, 0.0);
+    };
+    let values: Vec<f64> = output
+        .trim_matches(|ch| ch == '{' || ch == '}')
+        .split_whitespace()
+        .filter_map(|value| value.parse().ok())
+        .collect();
+    (
+        values.first().copied().unwrap_or(0.0),
+        values.get(1).copied().unwrap_or(0.0),
+        values.get(2).copied().unwrap_or(0.0),
+    )
+}
+
+#[cfg(target_os = "freebsd")]
+fn freebsd_host_disks() -> Vec<HostDisk> {
+    let Some(output) = command_output("df", &["-kP"]) else {
+        return Vec::new();
+    };
+    let mut disks: Vec<HostDisk> = output
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let columns: Vec<&str> = line.split_whitespace().collect();
+            if columns.len() < 6 {
+                return None;
+            }
+            Some(HostDisk {
+                device: columns[0].to_string(),
+                mount_point: columns[5].to_string(),
+                fs_type: "unknown".to_string(),
+                total: columns[1].parse::<u64>().unwrap_or(0).saturating_mul(1024),
+            })
+        })
+        .collect();
+    disks.sort_by(|a, b| a.mount_point.cmp(&b.mount_point));
+    disks
+}
+
+#[cfg(target_os = "freebsd")]
+fn freebsd_disk_usage() -> Vec<DiskUsage> {
+    let Some(output) = command_output("df", &["-kP"]) else {
+        return Vec::new();
+    };
+    let mut disks: Vec<DiskUsage> = output
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let columns: Vec<&str> = line.split_whitespace().collect();
+            if columns.len() < 6 {
+                return None;
+            }
+            Some(DiskUsage {
+                mount_point: columns[5].to_string(),
+                used: columns[2].parse::<u64>().unwrap_or(0).saturating_mul(1024),
+                total: columns[1].parse::<u64>().unwrap_or(0).saturating_mul(1024),
+            })
+        })
+        .collect();
+    disks.sort_by(|a, b| a.mount_point.cmp(&b.mount_point));
+    disks
+}
+
+#[cfg(target_os = "freebsd")]
+fn freebsd_network_interfaces() -> Vec<NetworkInterface> {
+    let Some(output) = command_output("netstat", &["-ibn"]) else {
+        return Vec::new();
+    };
+    let mut interfaces: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    for line in output.lines().skip(1) {
+        let columns: Vec<&str> = line.split_whitespace().collect();
+        if columns.len() < 10 {
+            continue;
+        }
+        let name = columns[0].to_string();
+        let rx = columns[6].parse::<u64>().unwrap_or(0);
+        let tx = columns[9].parse::<u64>().unwrap_or(0);
+        let entry = interfaces.entry(name).or_insert((0, 0));
+        entry.0 = entry.0.max(rx);
+        entry.1 = entry.1.max(tx);
+    }
+    interfaces
+        .into_iter()
+        .map(|(name, (rx_bytes, tx_bytes))| NetworkInterface {
+            name,
+            rx_bytes,
+            tx_bytes,
+        })
+        .collect()
+}
+
+#[cfg(target_os = "freebsd")]
+fn freebsd_process_count() -> u64 {
+    command_output("ps", &["-ax", "-o", "pid="])
+        .map(|output| output.lines().count() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(target_os = "freebsd")]
+fn freebsd_connection_counts() -> (u64, u64) {
+    fn count(protocol: &str) -> u64 {
+        command_output("netstat", &["-an", "-p", protocol])
+            .map(|output| output.lines().skip(2).count() as u64)
+            .unwrap_or(0)
+    }
+    (count("tcp"), count("udp"))
 }
 
 #[cfg(target_os = "linux")]
