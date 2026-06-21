@@ -29,6 +29,7 @@ const ONLINE_THRESHOLD_SECS: i64 = 30;
 const MJPEG_BOUNDARY: &str = "xlstatus-status";
 const PUBLIC_MJPEG_MAX_CONNECTIONS: usize = 32;
 const PUBLIC_METRIC_SAMPLE_LIMIT: usize = 240;
+const PUBLIC_SERVICE_HISTORY_LIMIT: i64 = 240;
 
 static PUBLIC_MJPEG_CONNECTIONS: once_cell::sync::Lazy<Arc<Semaphore>> =
     once_cell::sync::Lazy::new(|| Arc::new(Semaphore::new(PUBLIC_MJPEG_MAX_CONNECTIONS)));
@@ -353,10 +354,8 @@ async fn public_services(state: &AppState) -> Result<Vec<PublicServiceView>, App
                 if visible_server_ids.is_empty() {
                     continue;
                 }
-                let history = filter_public_service_history(
-                    public_service_history_sqlite(pool, &service_id).await?,
-                    &public_server_ids,
-                );
+                let history =
+                    public_service_history_sqlite(pool, &service_id, &visible_server_ids).await?;
                 let (last_status, last_check_at) = public_service_last_from_history(&history);
                 services.push(PublicServiceView {
                     id: service_id,
@@ -401,10 +400,8 @@ async fn public_services(state: &AppState) -> Result<Vec<PublicServiceView>, App
                 if visible_server_ids.is_empty() {
                     continue;
                 }
-                let history = filter_public_service_history(
-                    public_service_history_postgres(pool, &service_id).await?,
-                    &public_server_ids,
-                );
+                let history =
+                    public_service_history_postgres(pool, &service_id, &visible_server_ids).await?;
                 let (last_status, last_check_at) = public_service_last_from_history(&history);
                 services.push(PublicServiceView {
                     id: service_id,
@@ -453,21 +450,6 @@ fn visible_public_service_server_ids(
     ids
 }
 
-fn filter_public_service_history(
-    history: Vec<PublicServiceResultView>,
-    public_server_ids: &HashSet<String>,
-) -> Vec<PublicServiceResultView> {
-    history
-        .into_iter()
-        .filter(|item| {
-            item.server_id
-                .as_ref()
-                .map(|id| public_server_ids.contains(id))
-                .unwrap_or(false)
-        })
-        .collect()
-}
-
 fn public_service_last_from_history(
     history: &[PublicServiceResultView],
 ) -> (Option<String>, Option<String>) {
@@ -480,59 +462,95 @@ fn public_service_last_from_history(
 async fn public_service_history_sqlite(
     pool: &sqlx::SqlitePool,
     service_id: &str,
+    visible_server_ids: &[String],
 ) -> Result<Vec<PublicServiceResultView>, AppError> {
-    let rows = sqlx::query(
+    if visible_server_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = std::iter::repeat_n("?", visible_server_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
         r#"
         SELECT server_id, status, delay_ms, created_at
         FROM service_results
-        WHERE service_id = ?
+        WHERE service_id = ? AND server_id IN ({placeholders})
         ORDER BY created_at DESC
-        LIMIT 1200
-        "#,
-    )
-    .bind(service_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| AppError::Database(e.into()))?;
+        LIMIT ?
+        "#
+    );
+    let mut query = sqlx::query(&sql).bind(service_id);
+    for server_id in visible_server_ids {
+        query = query.bind(server_id);
+    }
+    let rows = query
+        .bind(PUBLIC_SERVICE_HISTORY_LIMIT)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AppError::Database(e.into()))?;
 
-    Ok(rows
+    let history = rows
         .into_iter()
-        .map(|row| PublicServiceResultView {
-            server_id: row.try_get("server_id").ok(),
-            status: row.try_get("status").unwrap_or_default(),
-            delay_ms: row.try_get("delay_ms").ok(),
-            created_at: row.try_get("created_at").unwrap_or_default(),
+        .filter_map(|row| {
+            let server_id = row.try_get("server_id").ok();
+            visible_server_ids
+                .contains(server_id.as_ref()?)
+                .then(|| PublicServiceResultView {
+                    server_id,
+                    status: row.try_get("status").unwrap_or_default(),
+                    delay_ms: row.try_get("delay_ms").ok(),
+                    created_at: row.try_get("created_at").unwrap_or_default(),
+                })
         })
-        .collect())
+        .collect();
+    Ok(history)
 }
 
 async fn public_service_history_postgres(
     pool: &sqlx::PgPool,
     service_id: &str,
+    visible_server_ids: &[String],
 ) -> Result<Vec<PublicServiceResultView>, AppError> {
+    if visible_server_ids.is_empty() {
+        return Ok(Vec::new());
+    }
     let sid = Uuid::parse_str(service_id)
         .map_err(|e| AppError::BadRequest(format!("invalid service id: {e}")))?;
+    let server_ids = visible_server_ids
+        .iter()
+        .map(|server_id| {
+            Uuid::parse_str(server_id)
+                .map_err(|e| AppError::BadRequest(format!("invalid server id: {e}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let rows = sqlx::query(
         r#"
         SELECT server_id::text AS server_id, status, delay_ms, created_at::text AS created_at
         FROM service_results
-        WHERE service_id = $1
+        WHERE service_id = $1 AND server_id = ANY($2)
         ORDER BY created_at DESC
-        LIMIT 1200
+        LIMIT $3
         "#,
     )
     .bind(sid)
+    .bind(&server_ids)
+    .bind(PUBLIC_SERVICE_HISTORY_LIMIT)
     .fetch_all(pool)
     .await
     .map_err(|e| AppError::Database(e.into()))?;
 
     Ok(rows
         .into_iter()
-        .map(|row| PublicServiceResultView {
-            server_id: row.try_get("server_id").ok(),
-            status: row.try_get("status").unwrap_or_default(),
-            delay_ms: row.try_get("delay_ms").ok(),
-            created_at: row.try_get("created_at").unwrap_or_default(),
+        .filter_map(|row| {
+            let server_id = row.try_get("server_id").ok();
+            visible_server_ids
+                .contains(server_id.as_ref()?)
+                .then(|| PublicServiceResultView {
+                    server_id,
+                    status: row.try_get("status").unwrap_or_default(),
+                    delay_ms: row.try_get("delay_ms").ok(),
+                    created_at: row.try_get("created_at").unwrap_or_default(),
+                })
         })
         .collect())
 }
@@ -1361,37 +1379,73 @@ mod tests {
     }
 
     #[test]
-    fn public_service_last_status_uses_public_history_only() {
+    fn public_service_last_status_uses_first_public_history_row() {
         let public_server = Uuid::now_v7().to_string();
-        let private_server = Uuid::now_v7().to_string();
-        let public_server_ids = HashSet::from([public_server.clone()]);
-        let history = vec![
-            PublicServiceResultView {
-                server_id: Some(private_server),
-                status: "failure".into(),
-                delay_ms: Some(900),
-                created_at: "2026-06-22T12:00:00Z".into(),
-            },
-            PublicServiceResultView {
-                server_id: None,
-                status: "failure".into(),
-                delay_ms: Some(800),
-                created_at: "2026-06-22T11:00:00Z".into(),
-            },
-            PublicServiceResultView {
-                server_id: Some(public_server),
-                status: "success".into(),
-                delay_ms: Some(20),
-                created_at: "2026-06-22T10:00:00Z".into(),
-            },
-        ];
+        let history = vec![PublicServiceResultView {
+            server_id: Some(public_server),
+            status: "success".into(),
+            delay_ms: Some(20),
+            created_at: "2026-06-22T10:00:00Z".into(),
+        }];
 
-        let filtered = filter_public_service_history(history, &public_server_ids);
-        assert_eq!(filtered.len(), 1);
-
-        let (last_status, last_check_at) = public_service_last_from_history(&filtered);
+        let (last_status, last_check_at) = public_service_last_from_history(&history);
         assert_eq!(last_status.as_deref(), Some("success"));
         assert_eq!(last_check_at.as_deref(), Some("2026-06-22T10:00:00Z"));
+    }
+
+    #[tokio::test]
+    async fn public_service_history_query_filters_servers_and_bounds_rows() {
+        let db = DatabaseBackend::connect("sqlite::memory:", true)
+            .await
+            .unwrap();
+        db.run_migrations().await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        let service_id = Uuid::now_v7().to_string();
+        let public_server = Uuid::now_v7().to_string();
+        let private_server = Uuid::now_v7().to_string();
+
+        sqlx::query(
+            "INSERT INTO services (id, name, type, target, interval_seconds, timeout_seconds, enabled, created_at, updated_at) VALUES (?, 'svc', 'http', 'https://example.com', 60, 10, 1, '2026-06-22T00:00:00Z', '2026-06-22T00:00:00Z')",
+        )
+        .bind(&service_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for idx in 0..300 {
+            sqlx::query(
+                "INSERT INTO service_results (id, service_id, server_id, status, delay_ms, created_at) VALUES (?, ?, ?, 'success', 20, ?)",
+            )
+            .bind(Uuid::now_v7().to_string())
+            .bind(&service_id)
+            .bind(&public_server)
+            .bind(format!("2026-06-22T00:{:02}:{:02}Z", idx / 60, idx % 60))
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO service_results (id, service_id, server_id, status, delay_ms, created_at) VALUES (?, ?, ?, 'failure', 900, ?)",
+            )
+            .bind(Uuid::now_v7().to_string())
+            .bind(&service_id)
+            .bind(&private_server)
+            .bind(format!("2026-06-22T01:{:02}:{:02}Z", idx / 60, idx % 60))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let history = public_service_history_sqlite(&pool, &service_id, &[public_server.clone()])
+            .await
+            .unwrap();
+
+        assert_eq!(history.len(), PUBLIC_SERVICE_HISTORY_LIMIT as usize);
+        assert!(history
+            .iter()
+            .all(|item| item.server_id.as_deref() == Some(public_server.as_str())));
+        assert!(history.iter().all(|item| item.status == "success"));
     }
 
     #[test]

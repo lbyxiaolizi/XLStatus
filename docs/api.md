@@ -26,6 +26,8 @@
 
 Agent 注册、JWT challenge 和 JWT 签发请求体上限为 4KiB。JWT nonce 为 32 字节 hex，signature 为 64 字节 hex；JWT challenge 只有在 Agent 签名验证通过后才会被消费。
 
+公开状态页只返回显式公开服务器和归属于公开服务器的服务结果。公开服务历史在 SQL 层按公开 `server_id` 过滤，每个服务最多返回最近 240 条结果；公开服务器详情监控图表最多返回 240 个采样点。
+
 ## 需要登录的接口
 
 ### 用户和认证
