@@ -206,7 +206,7 @@ Agent gRPC 服务定义在 `proto/xlstatus/v1/agent.proto`，生成代码在 `cr
 
 `GET /api/v1/agents/install.sh` 接收查询参数并返回一个很小的 bootstrap shell 脚本。真正的 `install-agent.sh` 放在 GitHub Release 资产中，bootstrap 只负责导出参数并下载执行 GitHub 脚本。
 
-安全约束：`server_url` 与 `grpc_server` 只能是 `http` / `https` origin URL，不能包含 path、query、fragment 或 userinfo；若显式传入，host 必须与本次请求的 `Host` 相同，端口可以不同。未传 `server_url` 时使用当前请求 Host；未传 `grpc_server` 时在同 Host 上推导 `:50051`。
+安全约束：公开 bootstrap 的原始 query 最长 16KiB，请求 `Host` authority 最长 512 字节。`server_url` 与 `grpc_server` 最长 2048 字节，只能是 `http` / `https` origin URL，不能包含 path、query、fragment 或 userinfo；若显式传入，host 必须与本次请求的 `Host` 相同，端口可以不同。未传 `server_url` 时使用当前请求 Host；未传 `grpc_server` 时在同 Host 上推导 `:50051`。会回显到 shell 脚本的参数会 trim 后校验长度并拒绝控制字符。
 
 支持的参数：
 
@@ -214,12 +214,12 @@ Agent gRPC 服务定义在 `proto/xlstatus/v1/agent.proto`，生成代码在 `cr
 |---|---|
 | `server_url` | Dashboard HTTP API origin，必须与请求 Host 同主机 |
 | `grpc_server` | Agent gRPC origin，必须与请求 Host 同主机，端口可不同 |
-| `grpc_tls_ca_path` | 可选，Agent 侧用于验证 gRPC 服务端的 PEM CA 路径 |
-| `grpc_tls_domain_name` | 可选，Agent 侧 gRPC TLS 证书校验的服务名覆盖 |
-| `grpc_tls_client_cert_path` | 可选，Agent 侧 mTLS 客户端 PEM 证书路径 |
-| `grpc_tls_client_key_path` | 可选，Agent 侧 mTLS 客户端 PEM 私钥路径 |
-| `enrollment_token` | enrollment token |
-| `agent_name` | Agent 名称；默认 `$(hostname)` |
+| `grpc_tls_ca_path` | 可选，Agent 侧用于验证 gRPC 服务端的 PEM CA 路径，最长 1024 字节 |
+| `grpc_tls_domain_name` | 可选，Agent 侧 gRPC TLS 证书校验的服务名覆盖，最长 253 字节 |
+| `grpc_tls_client_cert_path` | 可选，Agent 侧 mTLS 客户端 PEM 证书路径，最长 1024 字节 |
+| `grpc_tls_client_key_path` | 可选，Agent 侧 mTLS 客户端 PEM 私钥路径，最长 1024 字节 |
+| `enrollment_token` | enrollment token，最长 128 字节 |
+| `agent_name` | Agent 名称，最长 255 字节；默认 `$(hostname)` |
 | `version` | GitHub Release 版本，默认 `v0.1.0-alpha.3`；后台设置页默认会从 GitHub Releases 获取最新非草稿版本后传入 |
 
 示例：

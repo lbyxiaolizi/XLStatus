@@ -1,7 +1,7 @@
 use anyhow::Context;
 use axum::{
     extract::Query,
-    http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
     middleware,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -105,6 +105,13 @@ use xlstatus_shared::UserRole;
 
 const GRPC_MESSAGE_LIMIT: usize = 256 * 1024 * 1024;
 const DEFAULT_AGENT_INSTALL_VERSION: &str = "v0.1.0-alpha.3";
+const INSTALL_BOOTSTRAP_MAX_QUERY_BYTES: usize = 16 * 1024;
+const INSTALL_BOOTSTRAP_MAX_HOST_BYTES: usize = 512;
+const INSTALL_BOOTSTRAP_MAX_URL_BYTES: usize = 2048;
+const INSTALL_BOOTSTRAP_MAX_TLS_PATH_BYTES: usize = 1024;
+const INSTALL_BOOTSTRAP_MAX_TLS_DOMAIN_BYTES: usize = 253;
+const INSTALL_BOOTSTRAP_MAX_ENROLLMENT_TOKEN_BYTES: usize = 128;
+const INSTALL_BOOTSTRAP_MAX_AGENT_NAME_BYTES: usize = 255;
 
 // M4: the alert engine is started in main() and then needs to be
 // reachable from the gRPC `Session` task so HostState updates are
@@ -869,11 +876,10 @@ struct AgentInstallQuery {
     version: Option<String>,
 }
 
-async fn install_agent_script(
-    headers: HeaderMap,
-    Query(query): Query<AgentInstallQuery>,
-) -> Response {
-    match build_install_agent_script(&headers, query) {
+async fn install_agent_script(headers: HeaderMap, uri: Uri) -> Response {
+    match parse_agent_install_query(&uri)
+        .and_then(|query| build_install_agent_script(&headers, query))
+    {
         Ok(body) => (
             [
                 (
@@ -900,6 +906,18 @@ async fn install_agent_script(
     }
 }
 
+fn parse_agent_install_query(uri: &Uri) -> Result<AgentInstallQuery, String> {
+    let raw_query = uri.query().unwrap_or_default();
+    if raw_query.len() > INSTALL_BOOTSTRAP_MAX_QUERY_BYTES {
+        return Err(format!(
+            "install query must be at most {INSTALL_BOOTSTRAP_MAX_QUERY_BYTES} bytes"
+        ));
+    }
+    Query::<AgentInstallQuery>::try_from_uri(uri)
+        .map(|Query(query)| query)
+        .map_err(|_| "install query is invalid".to_string())
+}
+
 fn build_install_agent_script(
     headers: &HeaderMap,
     query: AgentInstallQuery,
@@ -917,7 +935,7 @@ fn build_install_agent_script(
     let script_url = format!(
         "https://github.com/lbyxiaolizi/XLStatus/releases/download/{version}/install-agent.sh"
     );
-    let request_authority = request_authority(headers);
+    let request_authority = request_authority(headers)?;
     let request_host = request_authority.as_deref().and_then(authority_hostname);
     let server_url = normalize_install_control_url(
         query.server_url.as_deref(),
@@ -930,32 +948,38 @@ fn build_install_agent_script(
         &server_url,
         request_host.as_deref(),
     )?;
-    let grpc_tls_ca_path = query
-        .grpc_tls_ca_path
-        .as_deref()
-        .filter(|value| !value.trim().is_empty());
-    let grpc_tls_domain_name = query
-        .grpc_tls_domain_name
-        .as_deref()
-        .filter(|value| !value.trim().is_empty());
-    let grpc_tls_client_cert_path = query
-        .grpc_tls_client_cert_path
-        .as_deref()
-        .filter(|value| !value.trim().is_empty());
-    let grpc_tls_client_key_path = query
-        .grpc_tls_client_key_path
-        .as_deref()
-        .filter(|value| !value.trim().is_empty());
-    let enrollment_token = query
-        .enrollment_token
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("");
-    let agent_name = query
-        .agent_name
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("$(hostname)");
+    let grpc_tls_ca_path = normalize_optional_install_text(
+        query.grpc_tls_ca_path.as_deref(),
+        INSTALL_BOOTSTRAP_MAX_TLS_PATH_BYTES,
+        "grpc_tls_ca_path",
+    )?;
+    let grpc_tls_domain_name = normalize_optional_install_text(
+        query.grpc_tls_domain_name.as_deref(),
+        INSTALL_BOOTSTRAP_MAX_TLS_DOMAIN_BYTES,
+        "grpc_tls_domain_name",
+    )?;
+    let grpc_tls_client_cert_path = normalize_optional_install_text(
+        query.grpc_tls_client_cert_path.as_deref(),
+        INSTALL_BOOTSTRAP_MAX_TLS_PATH_BYTES,
+        "grpc_tls_client_cert_path",
+    )?;
+    let grpc_tls_client_key_path = normalize_optional_install_text(
+        query.grpc_tls_client_key_path.as_deref(),
+        INSTALL_BOOTSTRAP_MAX_TLS_PATH_BYTES,
+        "grpc_tls_client_key_path",
+    )?;
+    let enrollment_token = normalize_optional_install_text(
+        query.enrollment_token.as_deref(),
+        INSTALL_BOOTSTRAP_MAX_ENROLLMENT_TOKEN_BYTES,
+        "enrollment_token",
+    )?
+    .unwrap_or("");
+    let agent_name = normalize_optional_install_text(
+        query.agent_name.as_deref(),
+        INSTALL_BOOTSTRAP_MAX_AGENT_NAME_BYTES,
+        "agent_name",
+    )?
+    .unwrap_or("$(hostname)");
     let agent_name_line = if agent_name == "$(hostname)" {
         r#"export AGENT_NAME="$(hostname)""#.to_string()
     } else {
@@ -1027,16 +1051,24 @@ fn valid_release_version(value: &str) -> bool {
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')))
 }
 
-fn request_authority(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .and_then(|value| {
-            let url = reqwest::Url::parse(&format!("http://{value}")).ok()?;
-            Some(url_origin_authority(&url))
-        })
+fn request_authority(headers: &HeaderMap) -> Result<Option<String>, String> {
+    let Some(value) = headers.get(header::HOST) else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| "Host header is invalid".to_string())?
+        .trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    ensure_install_text_size(value, 1, INSTALL_BOOTSTRAP_MAX_HOST_BYTES, "Host header")?;
+    if value.chars().any(char::is_control) {
+        return Err("Host header must not contain control characters".to_string());
+    }
+    let url =
+        reqwest::Url::parse(&format!("http://{value}")).map_err(|_| "Host header is invalid")?;
+    Ok(Some(url_origin_authority(&url)))
 }
 
 fn normalize_install_control_url(
@@ -1059,6 +1091,7 @@ fn normalize_install_control_url(
         .map(str::to_string)
         .or_else(|| request_authority.map(|authority| format!("http://{authority}")))
         .unwrap_or_else(|| "http://localhost:8080".to_string());
+    ensure_install_text_size(&raw, 1, INSTALL_BOOTSTRAP_MAX_URL_BYTES, field)?;
     let url = parse_install_endpoint_url(&raw, field)?;
     if let Some(host) = request_host {
         ensure_install_url_host(&url, host, field)?;
@@ -1086,6 +1119,7 @@ fn normalize_install_grpc_url(
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| default_grpc_endpoint(&server));
+    ensure_install_text_size(&raw, 1, INSTALL_BOOTSTRAP_MAX_URL_BYTES, "grpc_server")?;
     let url = parse_install_endpoint_url(&raw, "grpc_server")?;
     if let Some(host) = request_host {
         ensure_install_url_host(&url, host, "grpc_server")?;
@@ -1093,6 +1127,36 @@ fn normalize_install_grpc_url(
         ensure_install_url_host(&url, server_host, "grpc_server")?;
     }
     Ok(url_origin(&url))
+}
+
+fn normalize_optional_install_text<'a>(
+    value: Option<&'a str>,
+    max_bytes: usize,
+    field: &str,
+) -> Result<Option<&'a str>, String> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    ensure_install_text_size(value, 1, max_bytes, field)?;
+    if value.chars().any(char::is_control) {
+        return Err(format!("{field} must not contain control characters"));
+    }
+    Ok(Some(value))
+}
+
+fn ensure_install_text_size(
+    value: &str,
+    min_bytes: usize,
+    max_bytes: usize,
+    field: &str,
+) -> Result<(), String> {
+    let len = value.len();
+    if len < min_bytes || len > max_bytes {
+        return Err(format!(
+            "{field} must be between {min_bytes} and {max_bytes} bytes"
+        ));
+    }
+    Ok(())
 }
 
 fn parse_install_endpoint_url(value: &str, field: &str) -> Result<reqwest::Url, String> {
@@ -1257,6 +1321,23 @@ mod tests {
     }
 
     #[test]
+    fn install_bootstrap_query_resource_budget_is_bounded() {
+        assert_eq!(INSTALL_BOOTSTRAP_MAX_QUERY_BYTES, 16 * 1024);
+        assert_eq!(INSTALL_BOOTSTRAP_MAX_HOST_BYTES, 512);
+        assert_eq!(INSTALL_BOOTSTRAP_MAX_URL_BYTES, 2048);
+        assert_eq!(INSTALL_BOOTSTRAP_MAX_TLS_PATH_BYTES, 1024);
+        assert_eq!(INSTALL_BOOTSTRAP_MAX_TLS_DOMAIN_BYTES, 253);
+        assert_eq!(INSTALL_BOOTSTRAP_MAX_ENROLLMENT_TOKEN_BYTES, 128);
+        assert_eq!(INSTALL_BOOTSTRAP_MAX_AGENT_NAME_BYTES, 255);
+
+        let uri: Uri = format!("/install-agent.sh?agent_name={}", "a".repeat(16 * 1024))
+            .parse()
+            .unwrap();
+        let err = parse_agent_install_query(&uri).unwrap_err();
+        assert!(err.contains("install query must be at most"));
+    }
+
+    #[test]
     fn install_bootstrap_rejects_cross_host_control_urls() {
         let headers = headers_with_host("status.example.com");
 
@@ -1340,5 +1421,64 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("must not include userinfo"));
+    }
+
+    #[test]
+    fn install_bootstrap_rejects_oversized_reflected_fields() {
+        let headers = headers_with_host("status.example.com");
+
+        let mut query = install_query(None, None);
+        query.enrollment_token = Some("x".repeat(INSTALL_BOOTSTRAP_MAX_ENROLLMENT_TOKEN_BYTES + 1));
+        let err = build_install_agent_script(&headers, query).unwrap_err();
+        assert!(err.contains("enrollment_token must be between"));
+
+        let mut query = install_query(None, None);
+        query.agent_name = Some("a".repeat(INSTALL_BOOTSTRAP_MAX_AGENT_NAME_BYTES + 1));
+        let err = build_install_agent_script(&headers, query).unwrap_err();
+        assert!(err.contains("agent_name must be between"));
+
+        let mut query = install_query(None, None);
+        query.grpc_tls_ca_path = Some("a".repeat(INSTALL_BOOTSTRAP_MAX_TLS_PATH_BYTES + 1));
+        let err = build_install_agent_script(&headers, query).unwrap_err();
+        assert!(err.contains("grpc_tls_ca_path must be between"));
+
+        let mut query = install_query(None, None);
+        query.grpc_tls_domain_name = Some("a".repeat(INSTALL_BOOTSTRAP_MAX_TLS_DOMAIN_BYTES + 1));
+        let err = build_install_agent_script(&headers, query).unwrap_err();
+        assert!(err.contains("grpc_tls_domain_name must be between"));
+    }
+
+    #[test]
+    fn install_bootstrap_rejects_control_characters_in_reflected_fields() {
+        let headers = headers_with_host("status.example.com");
+        let mut query = install_query(None, None);
+        query.agent_name = Some("agent\nname".into());
+
+        let err = build_install_agent_script(&headers, query).unwrap_err();
+        assert!(err.contains("agent_name must not contain control characters"));
+    }
+
+    #[test]
+    fn install_bootstrap_rejects_oversized_control_urls() {
+        let headers = headers_with_host("status.example.com");
+        let long_host = format!(
+            "https://{}.status.example.com",
+            "a".repeat(INSTALL_BOOTSTRAP_MAX_URL_BYTES)
+        );
+
+        let err = build_install_agent_script(&headers, install_query(Some(&long_host), None))
+            .unwrap_err();
+        assert!(err.contains("server_url must be between"));
+    }
+
+    #[test]
+    fn install_bootstrap_rejects_oversized_host_header() {
+        let headers = headers_with_host(&format!(
+            "{}.example.com",
+            "a".repeat(INSTALL_BOOTSTRAP_MAX_HOST_BYTES)
+        ));
+
+        let err = build_install_agent_script(&headers, install_query(None, None)).unwrap_err();
+        assert!(err.contains("Host header must be between"));
     }
 }
