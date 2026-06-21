@@ -7,7 +7,7 @@ use crate::db::{
     CreateSessionInput, CreateUserInput, DatabaseBackend, PATRepository, UserRepository,
 };
 use axum::{
-    extract::{connect_info::ConnectInfo, Path, Query, State},
+    extract::{connect_info::ConnectInfo, DefaultBodyLimit, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{AppendHeaders, IntoResponse, Response},
     Json,
@@ -28,6 +28,18 @@ const LOGIN_FAILURE_THRESHOLD: i64 = 5;
 const LOGIN_FAILURE_WINDOW_MINUTES: i64 = 15;
 const LOGIN_BAN_MINUTES: i64 = 30;
 pub(crate) const SENSITIVE_TOTP_HEADER: &str = "x-totp-code";
+const AUTH_API_MAX_BODY_BYTES: usize = 64 * 1024;
+const AUTH_LOGIN_MAX_BODY_BYTES: usize = 4 * 1024;
+const AUTH_TOTP_MAX_BODY_BYTES: usize = 1024;
+const AUTH_MAX_USERNAME_BYTES: usize = 128;
+const AUTH_MIN_PASSWORD_BYTES: usize = 8;
+const AUTH_MAX_PASSWORD_BYTES: usize = 1024;
+const AUTH_MAX_ROLE_BYTES: usize = 32;
+const AUTH_TOTP_CODE_BYTES: usize = 6;
+const AUTH_MAX_WAF_BAN_IPS: usize = 128;
+const AUTH_MAX_WAF_IP_FIELD_BYTES: usize = 4096;
+const AUTH_MAX_WAF_REASON_BYTES: usize = 255;
+const AUTH_MAX_WAF_BAN_MINUTES: i64 = 43_200;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -50,19 +62,34 @@ pub struct AppState {
     pub io_registry: crate::grpc::IoRegistry,
 }
 
+pub fn auth_body_limit() -> DefaultBodyLimit {
+    DefaultBodyLimit::max(AUTH_API_MAX_BODY_BYTES)
+}
+
+pub fn login_body_limit() -> DefaultBodyLimit {
+    DefaultBodyLimit::max(AUTH_LOGIN_MAX_BODY_BYTES)
+}
+
+pub fn totp_body_limit() -> DefaultBodyLimit {
+    DefaultBodyLimit::max(AUTH_TOTP_MAX_BODY_BYTES)
+}
+
 pub async fn login(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<Response, AppError> {
+    let username = normalize_username(req.username)?;
+    let password = normalize_password(req.password)?;
+    let totp_code = normalize_optional_totp_code(req.totp_code)?;
     let client_ip = crate::security::client_ip_from_headers_and_peer(&headers, Some(peer_addr));
     let user_agent = header_value(&headers, header::USER_AGENT.as_str());
     if active_waf_ban(&state.db, &client_ip).await?.is_some() {
         record_waf_event(
             &state.db,
             &client_ip,
-            Some(&req.username),
+            Some(&username),
             "login_blocked",
             Some("active WAF ban"),
         )
@@ -75,19 +102,19 @@ pub async fn login(
     let user_repo = UserRepository::new(state.db.clone());
 
     // Find user by username
-    let Some(user) = user_repo.find_by_username(&req.username).await? else {
-        register_login_failure(&state.db, &client_ip, &req.username, "unknown user").await?;
+    let Some(user) = user_repo.find_by_username(&username).await? else {
+        register_login_failure(&state.db, &client_ip, &username, "unknown user").await?;
         return Err(AppError::Unauthorized("Invalid credentials".to_string()));
     };
 
     // Verify password
-    if !user_repo.verify_password(&user, &req.password)? {
-        register_login_failure(&state.db, &client_ip, &req.username, "invalid password").await?;
+    if !user_repo.verify_password(&user, &password)? {
+        register_login_failure(&state.db, &client_ip, &username, "invalid password").await?;
         return Err(AppError::Unauthorized("Invalid credentials".to_string()));
     }
     let (totp_secret, totp_enabled) = user_repo.totp_config(user.id).await?;
     if totp_enabled {
-        let Some(totp_code) = req.totp_code.as_deref() else {
+        let Some(totp_code) = totp_code.as_deref() else {
             return Ok(Json(ApiResponse::success(LoginResponse {
                 user: None,
                 mfa_required: true,
@@ -98,7 +125,7 @@ pub async fn login(
             return Err(AppError::Unauthorized("Invalid credentials".to_string()));
         };
         if !verify_totp_code(secret, totp_code, Utc::now()) {
-            register_login_failure(&state.db, &client_ip, &req.username, "invalid totp").await?;
+            register_login_failure(&state.db, &client_ip, &username, "invalid totp").await?;
             return Err(AppError::Unauthorized("Invalid TOTP code".to_string()));
         }
     }
@@ -125,7 +152,7 @@ pub async fn login(
     record_waf_event(
         &state.db,
         &client_ip,
-        Some(&req.username),
+        Some(&username),
         "login_success",
         None,
     )
@@ -210,18 +237,15 @@ pub async fn create_user(
     require_sensitive_totp(&state.db, auth_user.user.id, &headers).await?;
 
     let user_repo = UserRepository::new(state.db.clone());
-
-    // Parse role
-    let role = req
-        .role
-        .parse::<UserRole>()
-        .map_err(|e| AppError::BadRequest(e))?;
+    let username = normalize_username(req.username)?;
+    let password = normalize_new_password(req.password)?;
+    let role = normalize_role(req.role)?;
 
     // Create user
     let user = user_repo
         .create(CreateUserInput {
-            username: req.username,
-            password: req.password,
+            username,
+            password,
             role,
         })
         .await?;
@@ -280,7 +304,7 @@ pub async fn update_user(
         .ok_or(AppError::NotFound("user not found".to_string()))?;
 
     if let Some(role) = req.role {
-        let next_role = role.parse::<UserRole>().map_err(AppError::BadRequest)?;
+        let next_role = normalize_role(role)?;
         if existing.role.is_admin() && !next_role.is_admin() {
             if existing.id == auth_user.user.id {
                 return Err(AppError::BadRequest(
@@ -300,13 +324,9 @@ pub async fn update_user(
     }
 
     if let Some(password) = req.password {
-        if password.trim().len() < 8 {
-            return Err(AppError::BadRequest(
-                "password must be at least 8 characters".to_string(),
-            ));
-        }
+        let password = normalize_new_password(password)?;
         user_repo
-            .reset_password(target_id, password.trim())
+            .reset_password(target_id, &password)
             .await?
             .ok_or(AppError::NotFound("user not found".to_string()))?;
         revoke_user_credentials(&state.db, target_id).await?;
@@ -394,10 +414,12 @@ pub async fn setup_totp(
         let code = req
             .as_ref()
             .and_then(|Json(req)| req.code.as_deref())
+            .map(|code| normalize_totp_code(code.to_string()))
+            .transpose()?
             .ok_or(AppError::BadRequest(
                 "Current TOTP code is required".to_string(),
             ))?;
-        if !verify_totp_code(&existing_secret, code, Utc::now()) {
+        if !verify_totp_code(&existing_secret, &code, Utc::now()) {
             return Err(AppError::BadRequest("Invalid TOTP code".to_string()));
         }
     }
@@ -425,9 +447,10 @@ pub async fn enable_totp(
     ))?;
     let code = req
         .code
-        .as_deref()
+        .map(normalize_totp_code)
+        .transpose()?
         .ok_or(AppError::BadRequest("TOTP code is required".to_string()))?;
-    if !verify_totp_code(&secret, code, Utc::now()) {
+    if !verify_totp_code(&secret, &code, Utc::now()) {
         return Err(AppError::BadRequest("Invalid TOTP code".to_string()));
     }
     user_repo.set_totp_enabled(auth_user.user.id, true).await?;
@@ -449,9 +472,10 @@ pub async fn disable_totp(
         let secret = secret.ok_or(AppError::BadRequest("TOTP secret is missing".to_string()))?;
         let code = req
             .code
-            .as_deref()
+            .map(normalize_totp_code)
+            .transpose()?
             .ok_or(AppError::BadRequest("TOTP code is required".to_string()))?;
-        if !verify_totp_code(&secret, code, Utc::now()) {
+        if !verify_totp_code(&secret, &code, Utc::now()) {
             return Err(AppError::BadRequest("Invalid TOTP code".to_string()));
         }
     }
@@ -788,16 +812,8 @@ pub async fn create_waf_bans(
     if ips.is_empty() {
         return Err(AppError::BadRequest("at least one IP is required".into()));
     }
-    let reason = req
-        .reason
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("manual WAF ban")
-        .chars()
-        .take(255)
-        .collect::<String>();
-    let minutes = req.minutes.unwrap_or(LOGIN_BAN_MINUTES).clamp(1, 43_200);
+    let reason = normalize_waf_reason(req.reason);
+    let minutes = normalize_waf_minutes(req.minutes);
     let banned_until = Utc::now() + Duration::minutes(minutes);
     let mut bans = Vec::with_capacity(ips.len());
     for ip in ips {
@@ -928,6 +944,66 @@ fn parse_user_id(id: &str) -> Result<UserId, AppError> {
         .map_err(|e| AppError::BadRequest(format!("invalid user id: {e}")))
 }
 
+fn normalize_username(value: String) -> Result<String, AppError> {
+    normalize_required_auth_text(value, AUTH_MAX_USERNAME_BYTES, "username")
+}
+
+fn normalize_password(value: String) -> Result<String, AppError> {
+    if value.len() > AUTH_MAX_PASSWORD_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "password must be at most {AUTH_MAX_PASSWORD_BYTES} bytes"
+        )));
+    }
+    if value.trim().is_empty() {
+        return Err(AppError::BadRequest("password is required".into()));
+    }
+    Ok(value)
+}
+
+fn normalize_new_password(value: String) -> Result<String, AppError> {
+    let value = normalize_password(value)?;
+    if value.len() < AUTH_MIN_PASSWORD_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "password must be at least {AUTH_MIN_PASSWORD_BYTES} bytes"
+        )));
+    }
+    Ok(value)
+}
+
+fn normalize_role(value: String) -> Result<UserRole, AppError> {
+    let value = normalize_required_auth_text(value, AUTH_MAX_ROLE_BYTES, "role")?;
+    value.parse::<UserRole>().map_err(AppError::BadRequest)
+}
+
+fn normalize_optional_totp_code(value: Option<String>) -> Result<Option<String>, AppError> {
+    value.map(normalize_totp_code).transpose()
+}
+
+fn normalize_totp_code(value: String) -> Result<String, AppError> {
+    let value = value.trim().to_string();
+    if value.len() != AUTH_TOTP_CODE_BYTES || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(AppError::BadRequest("TOTP code must be 6 digits".into()));
+    }
+    Ok(value)
+}
+
+fn normalize_required_auth_text(
+    value: String,
+    max_bytes: usize,
+    field: &str,
+) -> Result<String, AppError> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return Err(AppError::BadRequest(format!("{field} is required")));
+    }
+    if value.len() > max_bytes {
+        return Err(AppError::BadRequest(format!(
+            "{field} must be at most {max_bytes} bytes"
+        )));
+    }
+    Ok(value)
+}
+
 fn user_info(user: crate::db::User) -> UserInfo {
     UserInfo {
         id: user.id.0.to_string(),
@@ -949,9 +1025,19 @@ async fn revoke_user_credentials(db: &DatabaseBackend, user_id: UserId) -> Resul
 }
 
 fn parse_manual_ban_ips(values: Vec<String>) -> Result<Vec<String>, AppError> {
+    if values.len() > AUTH_MAX_WAF_BAN_IPS {
+        return Err(AppError::BadRequest(format!(
+            "ips must contain at most {AUTH_MAX_WAF_BAN_IPS} items"
+        )));
+    }
     let mut seen = HashSet::new();
     let mut ips = Vec::new();
     for raw in values {
+        if raw.len() > AUTH_MAX_WAF_IP_FIELD_BYTES {
+            return Err(AppError::BadRequest(format!(
+                "ip field must be at most {AUTH_MAX_WAF_IP_FIELD_BYTES} bytes"
+            )));
+        }
         for value in raw.split(|ch: char| ch == ',' || ch == ';' || ch.is_whitespace()) {
             let value = value.trim();
             if value.is_empty() {
@@ -962,6 +1048,11 @@ fn parse_manual_ban_ips(values: Vec<String>) -> Result<Vec<String>, AppError> {
                 .map_err(|_| AppError::BadRequest(format!("invalid IP address: {value}")))?
                 .to_string();
             if seen.insert(ip.clone()) {
+                if ips.len() >= AUTH_MAX_WAF_BAN_IPS {
+                    return Err(AppError::BadRequest(format!(
+                        "ips must contain at most {AUTH_MAX_WAF_BAN_IPS} unique addresses"
+                    )));
+                }
                 ips.push(ip);
             }
         }
@@ -969,11 +1060,47 @@ fn parse_manual_ban_ips(values: Vec<String>) -> Result<Vec<String>, AppError> {
     Ok(ips)
 }
 
+fn normalize_waf_reason(value: Option<String>) -> String {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| truncate_utf8_to_bytes(value, AUTH_MAX_WAF_REASON_BYTES).to_string())
+        .unwrap_or_else(|| "manual WAF ban".to_string())
+}
+
+fn normalize_waf_minutes(value: Option<i64>) -> i64 {
+    value
+        .unwrap_or(LOGIN_BAN_MINUTES)
+        .clamp(1, AUTH_MAX_WAF_BAN_MINUTES)
+}
+
+fn truncate_utf8_to_bytes(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = 0;
+    for (idx, ch) in value.char_indices() {
+        let next = idx + ch.len_utf8();
+        if next > max_bytes {
+            break;
+        }
+        end = next;
+    }
+    &value[..end]
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_manual_ban_ips, require_admin_cookie_session, revoke_user_credentials,
-        sensitive_totp_code_from_headers, AppError, SENSITIVE_TOTP_HEADER,
+        normalize_new_password, normalize_optional_totp_code, normalize_role, normalize_username,
+        normalize_waf_minutes, normalize_waf_reason, parse_manual_ban_ips,
+        require_admin_cookie_session, revoke_user_credentials, sensitive_totp_code_from_headers,
+        AppError, AUTH_API_MAX_BODY_BYTES, AUTH_LOGIN_MAX_BODY_BYTES, AUTH_MAX_PASSWORD_BYTES,
+        AUTH_MAX_ROLE_BYTES, AUTH_MAX_USERNAME_BYTES, AUTH_MAX_WAF_BAN_IPS,
+        AUTH_MAX_WAF_BAN_MINUTES, AUTH_MAX_WAF_IP_FIELD_BYTES, AUTH_MAX_WAF_REASON_BYTES,
+        AUTH_MIN_PASSWORD_BYTES, AUTH_TOTP_CODE_BYTES, AUTH_TOTP_MAX_BODY_BYTES,
+        SENSITIVE_TOTP_HEADER,
     };
     use crate::api::types::{ApiResponse, LoginResponse, UserInfo};
     use crate::auth::middleware::{AuthKind, AuthUser};
@@ -1000,6 +1127,70 @@ mod tests {
     #[test]
     fn rejects_invalid_manual_ban_ip() {
         assert!(parse_manual_ban_ips(vec!["not-an-ip".into()]).is_err());
+    }
+
+    #[test]
+    fn auth_resource_limits_are_explicit() {
+        assert_eq!(AUTH_API_MAX_BODY_BYTES, 64 * 1024);
+        assert_eq!(AUTH_LOGIN_MAX_BODY_BYTES, 4 * 1024);
+        assert_eq!(AUTH_TOTP_MAX_BODY_BYTES, 1024);
+        assert_eq!(AUTH_MAX_USERNAME_BYTES, 128);
+        assert_eq!(AUTH_MIN_PASSWORD_BYTES, 8);
+        assert_eq!(AUTH_MAX_PASSWORD_BYTES, 1024);
+        assert_eq!(AUTH_MAX_ROLE_BYTES, 32);
+        assert_eq!(AUTH_TOTP_CODE_BYTES, 6);
+        assert_eq!(AUTH_MAX_WAF_BAN_IPS, 128);
+        assert_eq!(AUTH_MAX_WAF_IP_FIELD_BYTES, 4096);
+        assert_eq!(AUTH_MAX_WAF_REASON_BYTES, 255);
+        assert_eq!(AUTH_MAX_WAF_BAN_MINUTES, 43_200);
+    }
+
+    #[test]
+    fn auth_text_fields_are_bounded() {
+        assert_eq!(normalize_username(" alice ".into()).unwrap(), "alice");
+        assert!(normalize_username("a".repeat(AUTH_MAX_USERNAME_BYTES + 1)).is_err());
+        assert!(normalize_new_password("a".repeat(AUTH_MIN_PASSWORD_BYTES)).is_ok());
+        assert_eq!(
+            normalize_new_password(" secret-space ".into()).unwrap(),
+            " secret-space "
+        );
+        assert!(normalize_new_password("short".into()).is_err());
+        assert!(normalize_new_password("a".repeat(AUTH_MAX_PASSWORD_BYTES + 1)).is_err());
+        assert!(normalize_role(" admin ".into()).is_ok());
+        assert!(normalize_role("a".repeat(AUTH_MAX_ROLE_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn totp_codes_are_shape_checked() {
+        assert_eq!(
+            normalize_optional_totp_code(Some(" 123456 ".into()))
+                .unwrap()
+                .as_deref(),
+            Some("123456")
+        );
+        assert!(normalize_optional_totp_code(Some("12345".into())).is_err());
+        assert!(normalize_optional_totp_code(Some("abcdef".into())).is_err());
+    }
+
+    #[test]
+    fn waf_manual_bans_are_bounded() {
+        let too_many = (0..=AUTH_MAX_WAF_BAN_IPS)
+            .map(|idx| format!("192.0.2.{idx}"))
+            .collect::<Vec<_>>();
+        assert!(parse_manual_ban_ips(too_many).is_err());
+        assert!(parse_manual_ban_ips(vec!["1".repeat(AUTH_MAX_WAF_IP_FIELD_BYTES + 1)]).is_err());
+
+        let reason = normalize_waf_reason(Some("x".repeat(AUTH_MAX_WAF_REASON_BYTES + 1)));
+        assert_eq!(reason.len(), AUTH_MAX_WAF_REASON_BYTES);
+        let unicode_reason = normalize_waf_reason(Some("测".repeat(AUTH_MAX_WAF_REASON_BYTES)));
+        assert!(unicode_reason.len() <= AUTH_MAX_WAF_REASON_BYTES);
+        assert!(unicode_reason.is_char_boundary(unicode_reason.len()));
+        assert_eq!(normalize_waf_reason(Some(" ".into())), "manual WAF ban");
+        assert_eq!(normalize_waf_minutes(Some(0)), 1);
+        assert_eq!(
+            normalize_waf_minutes(Some(AUTH_MAX_WAF_BAN_MINUTES + 1)),
+            AUTH_MAX_WAF_BAN_MINUTES
+        );
     }
 
     #[test]

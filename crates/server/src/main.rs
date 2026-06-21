@@ -40,9 +40,9 @@ use api::v1::alerts::{
     alert_body_limit, create_alert_rule, delete_alert_rule, list_alert_events, list_alert_rules,
 };
 use api::v1::auth::{
-    create_user, create_waf_bans, delete_session, delete_user, delete_waf_ban, disable_totp,
-    enable_totp, get_totp_status, list_sessions, list_users, list_waf_bans, login, logout,
-    setup_totp, update_user, AppState,
+    auth_body_limit, create_user, create_waf_bans, delete_session, delete_user, delete_waf_ban,
+    disable_totp, enable_totp, get_totp_status, list_sessions, list_users, list_waf_bans, login,
+    login_body_limit, logout, setup_totp, totp_body_limit, update_user, AppState,
 };
 use api::v1::ddns::{
     check_ddns_now, create_ddns_config, ddns_body_limit, delete_ddns_config, list_ddns_configs,
@@ -291,9 +291,18 @@ async fn main() -> anyhow::Result<()> {
             let protected = Router::new()
                 .route("/api/v1/auth/logout", post(logout))
                 .route("/api/v1/auth/totp/status", get(get_totp_status))
-                .route("/api/v1/auth/totp/setup", post(setup_totp))
-                .route("/api/v1/auth/totp/enable", post(enable_totp))
-                .route("/api/v1/auth/totp/disable", post(disable_totp))
+                .route(
+                    "/api/v1/auth/totp/setup",
+                    post(setup_totp).layer(totp_body_limit()),
+                )
+                .route(
+                    "/api/v1/auth/totp/enable",
+                    post(enable_totp).layer(totp_body_limit()),
+                )
+                .route(
+                    "/api/v1/auth/totp/disable",
+                    post(disable_totp).layer(totp_body_limit()),
+                )
                 .route("/api/v1/profile", get(get_profile))
                 .route("/api/v1/oauth2/bindings", get(list_oauth_bindings))
                 .route("/api/v1/oauth2/:provider/bind", get(start_oauth_bind))
@@ -302,8 +311,11 @@ async fn main() -> anyhow::Result<()> {
                     post(unbind_oauth_provider),
                 )
                 .route("/api/v1/users", get(list_users))
-                .route("/api/v1/users", post(create_user))
-                .route("/api/v1/users/:id", post(update_user))
+                .route("/api/v1/users", post(create_user).layer(auth_body_limit()))
+                .route(
+                    "/api/v1/users/:id",
+                    post(update_user).layer(auth_body_limit()),
+                )
                 .route("/api/v1/users/:id", axum::routing::delete(delete_user))
                 .route("/api/v1/sessions", get(list_sessions))
                 .route(
@@ -311,7 +323,10 @@ async fn main() -> anyhow::Result<()> {
                     axum::routing::delete(delete_session),
                 )
                 .route("/api/v1/waf/bans", get(list_waf_bans))
-                .route("/api/v1/waf/bans", post(create_waf_bans))
+                .route(
+                    "/api/v1/waf/bans",
+                    post(create_waf_bans).layer(auth_body_limit()),
+                )
                 .route(
                     "/api/v1/waf/bans/:id",
                     axum::routing::delete(delete_waf_ban),
@@ -604,7 +619,7 @@ async fn main() -> anyhow::Result<()> {
                 .route("/healthz", get(healthz))
                 .route("/install-agent.sh", get(install_agent_script))
                 .route("/api/v1/agents/install.sh", get(install_agent_script))
-                .route("/api/v1/auth/login", post(login))
+                .route("/api/v1/auth/login", post(login).layer(login_body_limit()))
                 .route("/api/v1/openapi.json", get(openapi_json))
                 .route("/api/v1/oauth2/providers", get(list_oauth_providers))
                 .route("/api/v1/oauth2/:provider", get(start_oauth_login))
