@@ -13,7 +13,8 @@ use crate::db::repository::tasks::{TaskRepository, TaskRunRepository};
 use crate::db::Db;
 use crate::grpc::{SessionRegistry, TaskResponseRegistry};
 use crate::notifications::sender::{
-    NotificationChannel, NotificationMessage, NotificationSender, NotificationSeverity,
+    ensure_notification_channel_count_allowed, NotificationChannel, NotificationMessage,
+    NotificationSender, NotificationSeverity, NOTIFICATION_MAX_GROUP_CHANNELS,
 };
 
 pub(crate) const TASK_API_MAX_BODY_BYTES: usize = 256 * 1024;
@@ -839,23 +840,26 @@ async fn notification_channels_for_group(
         bool,
     )> = match db {
         crate::db::DatabaseBackend::Sqlite(pool) => {
-            sqlx::query_as("SELECT n.id, n.name, n.url, n.request_method, n.request_type, n.headers_json, n.body_template, n.verify_tls FROM notifications n JOIN notification_group_members ngm ON ngm.notification_id = n.id JOIN notification_groups ng ON ng.id = ngm.group_id WHERE ngm.group_id = ? AND ng.owner_user_id = ? AND n.owner_user_id = ?")
+            sqlx::query_as("SELECT n.id, n.name, n.url, n.request_method, n.request_type, n.headers_json, n.body_template, n.verify_tls FROM notifications n JOIN notification_group_members ngm ON ngm.notification_id = n.id JOIN notification_groups ng ON ng.id = ngm.group_id WHERE ngm.group_id = ? AND ng.owner_user_id = ? AND n.owner_user_id = ? ORDER BY n.created_at ASC LIMIT ?")
                 .bind(group_id)
                 .bind(owner_user_id)
                 .bind(owner_user_id)
+                .bind((NOTIFICATION_MAX_GROUP_CHANNELS + 1) as i64)
                 .fetch_all(pool)
                 .await?
         }
         crate::db::DatabaseBackend::Postgres(pool) => {
             let group_uuid = uuid::Uuid::parse_str(group_id)?;
             let owner_uuid = uuid::Uuid::parse_str(owner_user_id)?;
-            sqlx::query_as("SELECT n.id::text, n.name, n.url, n.request_method, n.request_type, n.headers_json, n.body_template, n.verify_tls FROM notifications n JOIN notification_group_members ngm ON ngm.notification_id = n.id JOIN notification_groups ng ON ng.id = ngm.group_id WHERE ngm.group_id = $1 AND ng.owner_user_id = $2 AND n.owner_user_id = $2")
+            sqlx::query_as("SELECT n.id::text, n.name, n.url, n.request_method, n.request_type, n.headers_json, n.body_template, n.verify_tls FROM notifications n JOIN notification_group_members ngm ON ngm.notification_id = n.id JOIN notification_groups ng ON ng.id = ngm.group_id WHERE ngm.group_id = $1 AND ng.owner_user_id = $2 AND n.owner_user_id = $2 ORDER BY n.created_at ASC LIMIT $3")
                 .bind(group_uuid)
                 .bind(owner_uuid)
+                .bind((NOTIFICATION_MAX_GROUP_CHANNELS + 1) as i64)
                 .fetch_all(pool)
                 .await?
         }
     };
+    ensure_notification_channel_count_allowed(rows.len())?;
 
     Ok(rows
         .into_iter()

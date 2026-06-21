@@ -6,7 +6,8 @@ use crate::api::v1::settings;
 use crate::auth::middleware::{AuthKind, AuthSession};
 use crate::db::{AgentRepository, DatabaseBackend};
 use crate::notifications::sender::{
-    NotificationChannel, NotificationMessage, NotificationSender, NotificationSeverity,
+    ensure_notification_channel_count_allowed, NotificationChannel, NotificationMessage,
+    NotificationSender, NotificationSeverity, NOTIFICATION_MAX_GROUP_CHANNELS,
 };
 use crate::security::{secure_reqwest_client_builder, validate_outbound_url_resolved};
 use axum::{
@@ -848,12 +849,15 @@ async fn list_notification_channels_for_group(
                 JOIN notification_groups ng ON ng.id = ngm.group_id
                 WHERE ng.id = ? AND ng.owner_user_id = ?
                 ORDER BY n.created_at ASC
+                LIMIT ?
                 "#,
             )
             .bind(group_id)
             .bind(owner_user_id.0.to_string())
+            .bind((NOTIFICATION_MAX_GROUP_CHANNELS + 1) as i64)
             .fetch_all(pool)
             .await?;
+            ensure_notification_channel_count_allowed(rows.len())?;
             rows.into_iter().map(channel_from_sqlite_row).collect()
         }
         DatabaseBackend::Postgres(pool) => {
@@ -865,12 +869,15 @@ async fn list_notification_channels_for_group(
                 JOIN notification_groups ng ON ng.id = ngm.group_id
                 WHERE ng.id = $1 AND ng.owner_user_id = $2
                 ORDER BY n.created_at ASC
+                LIMIT $3
                 "#,
             )
             .bind(group_id)
             .bind(owner_user_id.0)
+            .bind((NOTIFICATION_MAX_GROUP_CHANNELS + 1) as i64)
             .fetch_all(pool)
             .await?;
+            ensure_notification_channel_count_allowed(rows.len())?;
             rows.into_iter().map(channel_from_pg_row).collect()
         }
     }
@@ -888,11 +895,14 @@ async fn list_notification_channels_for_owner(
                 FROM notifications
                 WHERE owner_user_id = ?
                 ORDER BY created_at ASC
+                LIMIT ?
                 "#,
             )
             .bind(owner_user_id.0.to_string())
+            .bind((NOTIFICATION_MAX_GROUP_CHANNELS + 1) as i64)
             .fetch_all(pool)
             .await?;
+            ensure_notification_channel_count_allowed(rows.len())?;
             rows.into_iter().map(channel_from_sqlite_row).collect()
         }
         DatabaseBackend::Postgres(pool) => {
@@ -902,11 +912,14 @@ async fn list_notification_channels_for_owner(
                 FROM notifications
                 WHERE owner_user_id = $1
                 ORDER BY created_at ASC
+                LIMIT $2
                 "#,
             )
             .bind(owner_user_id.0)
+            .bind((NOTIFICATION_MAX_GROUP_CHANNELS + 1) as i64)
             .fetch_all(pool)
             .await?;
+            ensure_notification_channel_count_allowed(rows.len())?;
             rows.into_iter().map(channel_from_pg_row).collect()
         }
     }

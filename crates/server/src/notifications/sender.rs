@@ -6,6 +6,18 @@ use serde::Serialize;
 use std::collections::HashMap;
 use tracing::{error, info};
 
+pub const NOTIFICATION_HTTP_TIMEOUT_SECONDS: u64 = 30;
+pub const NOTIFICATION_MAX_NAME_BYTES: usize = 128;
+pub const NOTIFICATION_MAX_URL_BYTES: usize = 2048;
+pub const NOTIFICATION_MAX_RENDERED_URL_BYTES: usize = 4096;
+pub const NOTIFICATION_MAX_HEADERS: usize = 32;
+pub const NOTIFICATION_MAX_HEADER_NAME_BYTES: usize = 128;
+pub const NOTIFICATION_MAX_HEADER_VALUE_BYTES: usize = 4096;
+pub const NOTIFICATION_MAX_HEADERS_JSON_BYTES: usize = 16 * 1024;
+pub const NOTIFICATION_MAX_BODY_TEMPLATE_BYTES: usize = 64 * 1024;
+pub const NOTIFICATION_MAX_RENDERED_BODY_BYTES: usize = 128 * 1024;
+pub const NOTIFICATION_MAX_GROUP_CHANNELS: usize = 32;
+
 /// Notification channel type
 #[derive(Debug, Clone)]
 pub enum NotificationType {
@@ -54,7 +66,9 @@ impl NotificationSender {
     pub fn new() -> Self {
         Self {
             client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
+                .timeout(std::time::Duration::from_secs(
+                    NOTIFICATION_HTTP_TIMEOUT_SECONDS,
+                ))
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("Failed to build HTTP client"),
@@ -67,6 +81,7 @@ impl NotificationSender {
         channel: &NotificationChannel,
         message: &NotificationMessage,
     ) -> Result<()> {
+        validate_notification_channel(channel)?;
         info!(
             "Sending notification via channel {} ({})",
             channel.id, channel.name
@@ -85,7 +100,7 @@ impl NotificationSender {
         channel: &NotificationChannel,
         message: &NotificationMessage,
     ) -> Result<()> {
-        let url_text = self.render_url_template(&channel.url, message);
+        let url_text = self.render_url_template(&channel.url, message)?;
         let validated = validate_outbound_url_resolved(&url_text, "notification webhook").await?;
         let url = validated.url.clone();
         let body = self.render_template(&channel.body_template, message)?;
@@ -122,7 +137,7 @@ impl NotificationSender {
         channel: &NotificationChannel,
         message: &NotificationMessage,
     ) -> Result<()> {
-        let url_text = self.render_url_template(&channel.url, message);
+        let url_text = self.render_url_template(&channel.url, message)?;
         let validated = validate_outbound_url_resolved(&url_text, "notification webhook").await?;
         let url = validated.url.clone();
         let body = self.render_template(&channel.body_template, message)?;
@@ -158,7 +173,7 @@ impl NotificationSender {
         channel: &NotificationChannel,
         message: &NotificationMessage,
     ) -> Result<()> {
-        let url_text = self.render_url_template(&channel.url, message);
+        let url_text = self.render_url_template(&channel.url, message)?;
         let validated = validate_outbound_url_resolved(&url_text, "notification webhook").await?;
         let url = validated.url.clone();
         let body = self.render_template(&channel.body_template, message)?;
@@ -190,17 +205,40 @@ impl NotificationSender {
     /// Render notification template
     fn render_template(&self, template: &str, message: &NotificationMessage) -> Result<String> {
         if template.trim().is_empty() {
-            return Ok(serde_json::to_string(&message)?);
+            let body = serde_json::to_string(&message)?;
+            ensure_text_size(
+                &body,
+                0,
+                NOTIFICATION_MAX_RENDERED_BODY_BYTES,
+                "notification rendered body",
+            )?;
+            return Ok(body);
         }
 
-        Ok(self.render_value_template(template, message))
+        self.render_value_template_limited(
+            template,
+            message,
+            NOTIFICATION_MAX_RENDERED_BODY_BYTES,
+            "notification rendered body",
+        )
     }
 
-    fn render_url_template(&self, template: &str, message: &NotificationMessage) -> String {
-        self.render_value_template(template, message)
+    fn render_url_template(&self, template: &str, message: &NotificationMessage) -> Result<String> {
+        self.render_value_template_limited(
+            template,
+            message,
+            NOTIFICATION_MAX_RENDERED_URL_BYTES,
+            "notification rendered url",
+        )
     }
 
-    fn render_value_template(&self, template: &str, message: &NotificationMessage) -> String {
+    fn render_value_template_limited(
+        &self,
+        template: &str,
+        message: &NotificationMessage,
+        max_bytes: usize,
+        field: &str,
+    ) -> Result<String> {
         let mut rendered = template.to_string();
 
         rendered = rendered.replace("{{title}}", &message.title);
@@ -212,7 +250,8 @@ impl NotificationSender {
             rendered = rendered.replace(&format!("{{{{metadata.{}}}}}", key), value);
         }
 
-        rendered
+        ensure_text_size(&rendered, 0, max_bytes, field)?;
+        Ok(rendered)
     }
 
     fn client_for_channel(
@@ -220,8 +259,9 @@ impl NotificationSender {
         channel: &NotificationChannel,
         validated: &ValidatedOutboundUrl,
     ) -> Result<reqwest::Client> {
-        let builder =
-            secure_reqwest_client_builder(validated).timeout(std::time::Duration::from_secs(30));
+        let builder = secure_reqwest_client_builder(validated).timeout(
+            std::time::Duration::from_secs(NOTIFICATION_HTTP_TIMEOUT_SECONDS),
+        );
         let builder = if channel.verify_tls {
             builder
         } else {
@@ -246,6 +286,71 @@ impl NotificationSender {
             _ => client.post(url),
         }
     }
+}
+
+pub fn validate_notification_channel(channel: &NotificationChannel) -> Result<()> {
+    ensure_text_size(
+        &channel.name,
+        1,
+        NOTIFICATION_MAX_NAME_BYTES,
+        "notification channel name",
+    )?;
+    ensure_text_size(
+        &channel.url,
+        1,
+        NOTIFICATION_MAX_URL_BYTES,
+        "notification url",
+    )?;
+    ensure_headers_allowed(&channel.headers)?;
+    ensure_text_size(
+        &channel.body_template,
+        0,
+        NOTIFICATION_MAX_BODY_TEMPLATE_BYTES,
+        "notification body_template",
+    )?;
+    Ok(())
+}
+
+pub fn ensure_headers_allowed(headers: &HashMap<String, String>) -> Result<()> {
+    if headers.len() > NOTIFICATION_MAX_HEADERS {
+        anyhow::bail!("notification headers contain too many entries");
+    }
+    for (key, value) in headers {
+        ensure_text_size(
+            key.trim(),
+            1,
+            NOTIFICATION_MAX_HEADER_NAME_BYTES,
+            "notification header name",
+        )?;
+        ensure_text_size(
+            value,
+            0,
+            NOTIFICATION_MAX_HEADER_VALUE_BYTES,
+            "notification header value",
+        )?;
+        if key.contains('\n') || key.contains('\r') || value.contains('\n') || value.contains('\r')
+        {
+            anyhow::bail!("notification headers must not contain newline characters");
+        }
+    }
+    Ok(())
+}
+
+pub fn ensure_notification_channel_count_allowed(count: usize) -> Result<()> {
+    if count > NOTIFICATION_MAX_GROUP_CHANNELS {
+        anyhow::bail!(
+            "notification group contains {count} channels; maximum is {NOTIFICATION_MAX_GROUP_CHANNELS}"
+        );
+    }
+    Ok(())
+}
+
+fn ensure_text_size(value: &str, min_bytes: usize, max_bytes: usize, field: &str) -> Result<()> {
+    let len = value.len();
+    if len < min_bytes || len > max_bytes {
+        anyhow::bail!("{field} must be between {min_bytes} and {max_bytes} bytes");
+    }
+    Ok(())
 }
 
 impl Default for NotificationSender {
@@ -280,6 +385,56 @@ mod tests {
         assert!(rendered.contains("Test Alert"));
         assert!(rendered.contains("This is a test"));
         assert!(rendered.contains("server-1"));
+    }
+
+    #[test]
+    fn notification_channel_rejects_oversized_headers_and_templates() {
+        let mut channel = NotificationChannel {
+            id: "channel".into(),
+            name: "webhook".into(),
+            url: "https://example.com/hook".into(),
+            request_method: "POST".into(),
+            request_type: "json".into(),
+            headers: HashMap::new(),
+            body_template: "x".repeat(NOTIFICATION_MAX_BODY_TEMPLATE_BYTES + 1),
+            verify_tls: true,
+        };
+
+        assert!(validate_notification_channel(&channel)
+            .unwrap_err()
+            .to_string()
+            .contains("body_template"));
+
+        channel.body_template.clear();
+        channel.headers = (0..=NOTIFICATION_MAX_HEADERS)
+            .map(|idx| (format!("X-Test-{idx}"), "value".to_string()))
+            .collect();
+
+        assert!(validate_notification_channel(&channel)
+            .unwrap_err()
+            .to_string()
+            .contains("too many entries"));
+    }
+
+    #[test]
+    fn notification_rendering_rejects_oversized_output() {
+        let sender = NotificationSender::new();
+        let message = NotificationMessage {
+            title: "t".to_string(),
+            message: "m".to_string(),
+            severity: NotificationSeverity::Info,
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            metadata: HashMap::from([(
+                "large".to_string(),
+                "x".repeat(NOTIFICATION_MAX_RENDERED_BODY_BYTES + 1),
+            )]),
+        };
+
+        assert!(sender
+            .render_template("{{metadata.large}}", &message)
+            .unwrap_err()
+            .to_string()
+            .contains("rendered body"));
     }
 
     #[test]

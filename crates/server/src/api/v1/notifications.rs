@@ -6,11 +6,13 @@ use crate::auth::middleware::AuthSession;
 use crate::auth::rbac::has_scope;
 use crate::db::DatabaseBackend;
 use crate::notifications::sender::{
-    NotificationChannel, NotificationMessage, NotificationSender, NotificationSeverity,
+    ensure_headers_allowed, NotificationChannel, NotificationMessage, NotificationSender,
+    NotificationSeverity, NOTIFICATION_MAX_BODY_TEMPLATE_BYTES, NOTIFICATION_MAX_GROUP_CHANNELS,
+    NOTIFICATION_MAX_HEADERS_JSON_BYTES, NOTIFICATION_MAX_NAME_BYTES, NOTIFICATION_MAX_URL_BYTES,
 };
 use crate::security::validate_outbound_url;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     Json,
 };
 use chrono::{DateTime, Utc};
@@ -171,6 +173,7 @@ struct NotificationInput {
 }
 
 const REDACTED_NOTIFICATION_SECRET: &str = "[redacted]";
+pub(crate) const NOTIFICATION_API_MAX_BODY_BYTES: usize = 128 * 1024;
 
 #[derive(Debug, Clone)]
 struct NotificationRecord {
@@ -439,6 +442,10 @@ pub async fn test_notification(
     )))
 }
 
+pub fn notification_body_limit() -> DefaultBodyLimit {
+    DefaultBodyLimit::max(NOTIFICATION_API_MAX_BODY_BYTES)
+}
+
 pub async fn list_notification_groups(
     State(state): State<AppState>,
     auth: AuthSession,
@@ -584,15 +591,23 @@ pub async fn add_notification_group_member(
 ) -> Result<Json<ApiResponse<NotificationGroupView>>, AppError> {
     require_scope(&auth, "notification:write")?;
     let owner = auth.user_id.0;
-    ensure_group_exists(&state.db, &id, owner).await?;
-    ensure_notification_exists(&state.db, &req.notification_id, owner).await?;
+    let group_id = require_uuid_text(id, "group_id")?;
+    ensure_group_exists(&state.db, &group_id, owner).await?;
+    let notification_id = require_uuid_text(req.notification_id, "notification_id")?;
+    ensure_notification_exists(&state.db, &notification_id, owner).await?;
+    if notification_group_member_exists(&state.db, &group_id, &notification_id, owner).await? {
+        return Ok(Json(ApiResponse::success(
+            load_group_for_owner(&state.db, &group_id, owner).await?,
+        )));
+    }
+    ensure_group_member_count_allowed(&state.db, &group_id, owner).await?;
     match &state.db {
         DatabaseBackend::Sqlite(pool) => {
             sqlx::query(
                 "INSERT INTO notification_group_members (group_id, notification_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
             )
-            .bind(&id)
-            .bind(&req.notification_id)
+            .bind(&group_id)
+            .bind(&notification_id)
             .execute(pool)
             .await
             .map_err(db_err)?;
@@ -601,15 +616,15 @@ pub async fn add_notification_group_member(
             sqlx::query(
                 "INSERT INTO notification_group_members (group_id, notification_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
             )
-            .bind(&id)
-            .bind(&req.notification_id)
+            .bind(&group_id)
+            .bind(&notification_id)
             .execute(pool)
             .await
             .map_err(db_err)?;
         }
     }
     Ok(Json(ApiResponse::success(
-        load_group_for_owner(&state.db, &id, owner).await?,
+        load_group_for_owner(&state.db, &group_id, owner).await?,
     )))
 }
 
@@ -728,13 +743,14 @@ async fn build_create_notification_input(
     let request_method = normalize_method(req.request_method.as_deref().unwrap_or("POST"))?;
     let request_type = normalize_request_type(req.request_type.as_deref().unwrap_or("json"))?;
     let headers_json = normalize_headers(req.headers, req.headers_json.as_deref())?;
+    let body_template = normalize_body_template(req.body_template)?;
     Ok(NotificationInput {
         name,
         url,
         request_method,
         request_type,
         headers_json,
-        body_template: req.body_template.unwrap_or_default(),
+        body_template,
         verify_tls: req.verify_tls.unwrap_or(true),
         format_metric_units: req.format_metric_units.unwrap_or(true),
     })
@@ -771,15 +787,17 @@ async fn build_update_notification_input(
     } else {
         existing.headers_json.clone()
     };
+    let body_template = normalize_body_template(
+        req.body_template
+            .or_else(|| Some(existing.body_template.clone())),
+    )?;
     Ok(NotificationInput {
         name,
         url,
         request_method,
         request_type,
         headers_json,
-        body_template: req
-            .body_template
-            .unwrap_or_else(|| existing.body_template.clone()),
+        body_template,
         verify_tls: req.verify_tls.unwrap_or(existing.verify_tls),
         format_metric_units: req
             .format_metric_units
@@ -1032,11 +1050,13 @@ async fn list_group_members(
                 JOIN notification_groups ng ON ng.id = ngm.group_id
                 WHERE ngm.group_id = ? AND ng.owner_user_id = ? AND n.owner_user_id = ?
                 ORDER BY n.name ASC
+                LIMIT ?
                 "#,
             )
             .bind(group_id)
             .bind(owner.to_string())
             .bind(owner.to_string())
+            .bind(NOTIFICATION_MAX_GROUP_CHANNELS as i64)
             .fetch_all(pool)
             .await
             .map_err(db_err)?;
@@ -1053,10 +1073,12 @@ async fn list_group_members(
                 JOIN notification_groups ng ON ng.id = ngm.group_id
                 WHERE ngm.group_id = $1 AND ng.owner_user_id = $2 AND n.owner_user_id = $2
                 ORDER BY n.name ASC
+                LIMIT $3
                 "#,
             )
             .bind(group_id)
             .bind(owner)
+            .bind(NOTIFICATION_MAX_GROUP_CHANNELS as i64)
             .fetch_all(pool)
             .await
             .map_err(db_err)?;
@@ -1174,6 +1196,112 @@ async fn ensure_notification_exists(
         Ok(())
     } else {
         Err(AppError::NotFound("notification not found".into()))
+    }
+}
+
+async fn ensure_group_member_count_allowed(
+    db: &DatabaseBackend,
+    group_id: &str,
+    owner: Uuid,
+) -> Result<(), AppError> {
+    let count = match db {
+        DatabaseBackend::Sqlite(pool) => {
+            let row: (i64,) = sqlx::query_as(
+                r#"
+                SELECT COUNT(*)
+                FROM notification_group_members ngm
+                JOIN notification_groups ng ON ng.id = ngm.group_id
+                WHERE ngm.group_id = ? AND ng.owner_user_id = ?
+                "#,
+            )
+            .bind(group_id)
+            .bind(owner.to_string())
+            .fetch_one(pool)
+            .await
+            .map_err(db_err)?;
+            row.0 as usize
+        }
+        DatabaseBackend::Postgres(pool) => {
+            let group_uuid = Uuid::parse_str(group_id)
+                .map_err(|e| AppError::BadRequest(format!("invalid group_id: {e}")))?;
+            let row: (i64,) = sqlx::query_as(
+                r#"
+                SELECT COUNT(*)::BIGINT
+                FROM notification_group_members ngm
+                JOIN notification_groups ng ON ng.id = ngm.group_id
+                WHERE ngm.group_id = $1 AND ng.owner_user_id = $2
+                "#,
+            )
+            .bind(group_uuid)
+            .bind(owner)
+            .fetch_one(pool)
+            .await
+            .map_err(db_err)?;
+            row.0 as usize
+        }
+    };
+    if count >= NOTIFICATION_MAX_GROUP_CHANNELS {
+        return Err(AppError::BadRequest(format!(
+            "notification group contains too many members; maximum is {NOTIFICATION_MAX_GROUP_CHANNELS}"
+        )));
+    }
+    Ok(())
+}
+
+async fn notification_group_member_exists(
+    db: &DatabaseBackend,
+    group_id: &str,
+    notification_id: &str,
+    owner: Uuid,
+) -> Result<bool, AppError> {
+    match db {
+        DatabaseBackend::Sqlite(pool) => {
+            let row: Option<(i64,)> = sqlx::query_as(
+                r#"
+                SELECT 1
+                FROM notification_group_members ngm
+                JOIN notification_groups ng ON ng.id = ngm.group_id
+                JOIN notifications n ON n.id = ngm.notification_id
+                WHERE ngm.group_id = ?
+                  AND ngm.notification_id = ?
+                  AND ng.owner_user_id = ?
+                  AND n.owner_user_id = ?
+                "#,
+            )
+            .bind(group_id)
+            .bind(notification_id)
+            .bind(owner.to_string())
+            .bind(owner.to_string())
+            .fetch_optional(pool)
+            .await
+            .map_err(db_err)?;
+            Ok(row.is_some())
+        }
+        DatabaseBackend::Postgres(pool) => {
+            let group_uuid = Uuid::parse_str(group_id)
+                .map_err(|e| AppError::BadRequest(format!("invalid group_id: {e}")))?;
+            let notification_uuid = Uuid::parse_str(notification_id)
+                .map_err(|e| AppError::BadRequest(format!("invalid notification_id: {e}")))?;
+            let row: Option<(i64,)> = sqlx::query_as(
+                r#"
+                SELECT 1::BIGINT
+                FROM notification_group_members ngm
+                JOIN notification_groups ng ON ng.id = ngm.group_id
+                JOIN notifications n ON n.id = ngm.notification_id
+                WHERE ngm.group_id = $1
+                  AND ngm.notification_id = $2
+                  AND ng.owner_user_id = $3
+                  AND n.owner_user_id = $3
+                "#,
+            )
+            .bind(group_uuid)
+            .bind(notification_uuid)
+            .bind(owner)
+            .fetch_optional(pool)
+            .await
+            .map_err(db_err)?;
+            Ok(row.is_some())
+        }
     }
 }
 
@@ -1332,8 +1460,10 @@ fn require_name(value: String, field: &str) -> Result<String, AppError> {
     if value.is_empty() {
         return Err(AppError::BadRequest(format!("{field} is required")));
     }
-    if value.len() > 255 {
-        return Err(AppError::BadRequest(format!("{field} is too long")));
+    if value.len() > NOTIFICATION_MAX_NAME_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "{field} must be at most {NOTIFICATION_MAX_NAME_BYTES} bytes"
+        )));
     }
     Ok(value)
 }
@@ -1343,7 +1473,21 @@ async fn require_url(value: String) -> Result<String, AppError> {
     if value.is_empty() {
         return Err(AppError::BadRequest("url is required".into()));
     }
+    if value.len() > NOTIFICATION_MAX_URL_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "url must be at most {NOTIFICATION_MAX_URL_BYTES} bytes"
+        )));
+    }
     validate_notification_url(&value).await?;
+    Ok(value)
+}
+
+fn require_uuid_text(value: String, field: &str) -> Result<String, AppError> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return Err(AppError::BadRequest(format!("{field} is required")));
+    }
+    Uuid::parse_str(&value).map_err(|e| AppError::BadRequest(format!("invalid {field}: {e}")))?;
     Ok(value)
 }
 
@@ -1379,6 +1523,14 @@ fn normalize_headers(
     headers: Option<HashMap<String, String>>,
     headers_json: Option<&str>,
 ) -> Result<Option<String>, AppError> {
+    if let Some(headers_json) = headers_json {
+        let trimmed = headers_json.trim();
+        if trimmed.len() > NOTIFICATION_MAX_HEADERS_JSON_BYTES {
+            return Err(AppError::BadRequest(format!(
+                "headers_json must be at most {NOTIFICATION_MAX_HEADERS_JSON_BYTES} bytes"
+            )));
+        }
+    }
     let headers = match headers {
         Some(headers) => headers,
         None => parse_headers_json(headers_json)?,
@@ -1397,6 +1549,7 @@ fn normalize_headers(
         }
         cleaned.insert(key.to_string(), value);
     }
+    ensure_headers_allowed(&cleaned).map_err(|e| AppError::BadRequest(e.to_string()))?;
     if cleaned.is_empty() {
         Ok(None)
     } else {
@@ -1410,8 +1563,23 @@ fn parse_headers_json(value: Option<&str>) -> Result<HashMap<String, String>, Ap
     let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(HashMap::new());
     };
+    if value.len() > NOTIFICATION_MAX_HEADERS_JSON_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "headers_json must be at most {NOTIFICATION_MAX_HEADERS_JSON_BYTES} bytes"
+        )));
+    }
     serde_json::from_str(value)
         .map_err(|e| AppError::BadRequest(format!("headers_json must be a string map: {e}")))
+}
+
+fn normalize_body_template(value: Option<String>) -> Result<String, AppError> {
+    let value = value.unwrap_or_default();
+    if value.len() > NOTIFICATION_MAX_BODY_TEMPLATE_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "body_template must be at most {NOTIFICATION_MAX_BODY_TEMPLATE_BYTES} bytes"
+        )));
+    }
+    Ok(value)
 }
 
 fn redacted_headers_json(value: Option<&str>) -> Result<Option<String>, AppError> {
@@ -1565,5 +1733,147 @@ mod tests {
             redact_notification_url("https://example.com/"),
             "https://example.com/"
         );
+    }
+
+    #[tokio::test]
+    async fn notification_input_rejects_oversized_headers_and_body_template() {
+        let mut req = CreateNotificationRequest {
+            name: "webhook".into(),
+            url: "https://example.com/hook".into(),
+            request_method: Some("POST".into()),
+            request_type: Some("json".into()),
+            headers: Some(
+                (0..=crate::notifications::sender::NOTIFICATION_MAX_HEADERS)
+                    .map(|idx| (format!("X-Test-{idx}"), "value".to_string()))
+                    .collect(),
+            ),
+            headers_json: None,
+            body_template: None,
+            verify_tls: Some(true),
+            format_metric_units: Some(true),
+        };
+        let err = build_create_notification_input(req).await.unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+
+        req = CreateNotificationRequest {
+            name: "webhook".into(),
+            url: "https://example.com/hook".into(),
+            request_method: Some("POST".into()),
+            request_type: Some("json".into()),
+            headers: None,
+            headers_json: None,
+            body_template: Some("x".repeat(NOTIFICATION_MAX_BODY_TEMPLATE_BYTES + 1)),
+            verify_tls: Some(true),
+            format_metric_units: Some(true),
+        };
+        let err = build_create_notification_input(req).await.unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn notification_group_member_count_is_bounded() {
+        let db = test_db().await;
+        let owner = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let group_id = "00000000-0000-0000-0000-000000000101";
+        seed_user(&db, owner, "owner").await;
+        seed_notification_group(&db, group_id, owner, "group").await;
+
+        for idx in 0..NOTIFICATION_MAX_GROUP_CHANNELS {
+            let notification_id = format!("00000000-0000-0000-0000-{:012}", idx + 1);
+            seed_notification(&db, &notification_id, owner, &format!("n-{idx}")).await;
+            seed_notification_group_member(&db, group_id, &notification_id).await;
+        }
+
+        let err = ensure_group_member_count_allowed(&db, group_id, owner)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+
+        assert!(notification_group_member_exists(
+            &db,
+            group_id,
+            "00000000-0000-0000-0000-000000000001",
+            owner,
+        )
+        .await
+        .unwrap());
+        assert!(!notification_group_member_exists(
+            &db,
+            group_id,
+            "00000000-0000-0000-0000-000000000999",
+            owner,
+        )
+        .await
+        .unwrap());
+    }
+
+    async fn test_db() -> DatabaseBackend {
+        let db = DatabaseBackend::connect("sqlite::memory:", true)
+            .await
+            .unwrap();
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    async fn seed_user(db: &DatabaseBackend, id: Uuid, username: &str) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, role, created_at, updated_at) VALUES (?, ?, 'hash', 'member', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id.to_string())
+        .bind(username)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_notification_group(db: &DatabaseBackend, id: &str, owner: Uuid, name: &str) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO notification_groups (id, owner_user_id, name, created_at, updated_at) VALUES (?, ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(owner.to_string())
+        .bind(name)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_notification(db: &DatabaseBackend, id: &str, owner: Uuid, name: &str) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO notifications (id, owner_user_id, name, url, request_method, request_type, verify_tls, format_metric_units, created_at, updated_at) VALUES (?, ?, ?, 'https://example.com/hook', 'POST', 'json', 1, 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(owner.to_string())
+        .bind(name)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_notification_group_member(
+        db: &DatabaseBackend,
+        group_id: &str,
+        notification_id: &str,
+    ) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO notification_group_members (group_id, notification_id) VALUES (?, ?)",
+        )
+        .bind(group_id)
+        .bind(notification_id)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 }

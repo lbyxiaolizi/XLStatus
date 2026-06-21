@@ -63,8 +63,8 @@ use api::v1::nat::{
 use api::v1::notifications::{
     add_notification_group_member, create_notification, create_notification_group,
     delete_notification, delete_notification_group, delete_notification_group_member,
-    list_notification_groups, list_notification_providers, list_notifications, test_notification,
-    update_notification, update_notification_group,
+    list_notification_groups, list_notification_providers, list_notifications,
+    notification_body_limit, test_notification, update_notification, update_notification_group,
 };
 use api::v1::oauth::{
     get_profile, list_oauth_bindings, list_oauth_providers, oauth_callback, start_oauth_bind,
@@ -405,21 +405,28 @@ async fn main() -> anyhow::Result<()> {
                 .route("/api/v1/alert-events", get(list_alert_events))
                 // Notifications
                 .route("/api/v1/notifications", get(list_notifications))
-                .route("/api/v1/notifications", post(create_notification))
+                .route(
+                    "/api/v1/notifications",
+                    post(create_notification).layer(notification_body_limit()),
+                )
                 .route(
                     "/api/v1/notifications/:id",
-                    post(update_notification).patch(update_notification),
+                    post(update_notification)
+                        .patch(update_notification)
+                        .layer(notification_body_limit()),
                 )
                 .route("/api/v1/notifications/:id", delete(delete_notification))
                 .route("/api/v1/notifications/:id/test", post(test_notification))
                 .route("/api/v1/notification-groups", get(list_notification_groups))
                 .route(
                     "/api/v1/notification-groups",
-                    post(create_notification_group),
+                    post(create_notification_group).layer(notification_body_limit()),
                 )
                 .route(
                     "/api/v1/notification-groups/:id",
-                    post(update_notification_group).patch(update_notification_group),
+                    post(update_notification_group)
+                        .patch(update_notification_group)
+                        .layer(notification_body_limit()),
                 )
                 .route(
                     "/api/v1/notification-groups/:id",
@@ -427,7 +434,7 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .route(
                     "/api/v1/notification-groups/:id/members",
-                    post(add_notification_group_member),
+                    post(add_notification_group_member).layer(notification_body_limit()),
                 )
                 .route(
                     "/api/v1/notification-groups/:id/members/:notification_id",

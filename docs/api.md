@@ -71,6 +71,8 @@
 | `DELETE` | `/api/v1/alert-rules/:id` | 删除告警规则 |
 | `GET` | `/api/v1/alert-events` | 告警事件 |
 
+通知创建、更新、通知组创建/更新和通知组加成员请求体上限为 128KiB。通知名称最长 128 字节，Webhook URL 最长 2048 字节，headers JSON 最长 16KiB、最多 32 个 header、单个 header name 最长 128 字节、value 最长 4096 字节，body template 最长 64KiB，渲染后的 URL 最长 4096 字节、请求体最长 128KiB。单个通知组最多 32 个渠道；告警、任务和 GeoIP IP 变更后台通知单次最多发送 32 个 Webhook。
+
 ### 任务
 
 | 方法 | 路径 | 说明 |
