@@ -1,5 +1,5 @@
 use axum::{
-    body::Bytes,
+    body::{to_bytes, Body, Bytes},
     extract::{connect_info::ConnectInfo, DefaultBodyLimit, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
@@ -212,7 +212,7 @@ pub async fn temp_upload(
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(query): Query<TempTransferQuery>,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     let client_ip = crate::security::client_ip_from_headers_and_peer(&headers, Some(peer_addr));
     match run_temp_upload(state, query, client_ip, body).await {
@@ -374,19 +374,27 @@ async fn run_temp_upload(
     state: AppState,
     query: TempTransferQuery,
     client_ip: String,
-    body: Bytes,
+    body: Body,
 ) -> Result<Response, (StatusCode, String)> {
     let transfer = validate_temporary_transfer(&state, &query.token, "upload").await?;
     let path = transfer.path;
     let server_id = transfer.server_id;
     check_rate_limit(&query.token)?;
-    if body.len() > TEMP_TRANSFER_MAX_BYTES {
-        return Err((
-            StatusCode::PAYLOAD_TOO_LARGE,
-            format!("upload is larger than {} bytes", TEMP_TRANSFER_MAX_BYTES),
-        ));
-    }
     consume_temporary_transfer(&state, &transfer.token_id, Some(&client_ip)).await?;
+    let body = match read_limited_upload_body(body).await {
+        Ok(body) => body,
+        Err(err) => {
+            record_temporary_transfer_result(
+                &state,
+                &transfer.token_id,
+                "failed",
+                None,
+                Some(&err.1),
+            )
+            .await;
+            return Err(err);
+        }
+    };
     let dispatched = match dispatch_server_task(
         &state,
         &server_id,
@@ -476,6 +484,30 @@ async fn run_temp_upload(
         "bytes_written": written,
     })))
     .into_response())
+}
+
+async fn read_limited_upload_body(body: Body) -> Result<Bytes, (StatusCode, String)> {
+    read_limited_body(body, TEMP_TRANSFER_MAX_BYTES).await
+}
+
+async fn read_limited_body(body: Body, max_bytes: usize) -> Result<Bytes, (StatusCode, String)> {
+    let limit = max_bytes.saturating_add(1);
+    let body = to_bytes(body, limit).await.map_err(|err| {
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "upload is larger than {} bytes or could not be read: {err}",
+                max_bytes
+            ),
+        )
+    })?;
+    if body.len() > max_bytes {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("upload is larger than {} bytes", max_bytes),
+        ));
+    }
+    Ok(body)
 }
 
 #[derive(Debug)]
@@ -927,5 +959,16 @@ mod tests {
         assert_eq!(serialized["used_ip"], "203.0.113.10");
         assert_eq!(serialized["used_status"], "success");
         assert_eq!(serialized["agent_task_id"], "task-1");
+    }
+
+    #[tokio::test]
+    async fn upload_body_reader_allows_exact_limit_and_rejects_larger_body() {
+        let exact = Body::from(vec![0u8; 16]);
+        assert_eq!(read_limited_body(exact, 16).await.unwrap().len(), 16);
+
+        let too_large = Body::from(vec![0u8; 17]);
+        let err = read_limited_body(too_large, 16).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(err.1.contains("upload is larger than"));
     }
 }
