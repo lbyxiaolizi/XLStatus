@@ -35,6 +35,9 @@ import {
   type TsdbRetentionResponse,
 } from "@/lib/api";
 
+const DEFAULT_AGENT_VERSION = "v0.1.0-alpha.3";
+const GITHUB_RELEASES_API = "https://api.github.com/repos/lbyxiaolizi/XLStatus/releases?per_page=20";
+
 interface UserAccount {
   id: string;
   username: string;
@@ -129,7 +132,10 @@ export default function SettingsPage() {
   const [agentServerUrl, setAgentServerUrl] = useState(() => getApiBaseUrl());
   const [agentGrpcUrl, setAgentGrpcUrl] = useState(() => defaultGrpcUrl(getApiBaseUrl()));
   const [agentName, setAgentName] = useState("$(hostname)");
-  const [agentVersion, setAgentVersion] = useState("v0.1.0-alpha.3");
+  const [agentVersion, setAgentVersion] = useState(DEFAULT_AGENT_VERSION);
+  const [agentUseLatestVersion, setAgentUseLatestVersion] = useState(true);
+  const [agentLatestVersionStatus, setAgentLatestVersionStatus] = useState("等待获取 GitHub 最新版");
+  const [agentLatestVersionLoading, setAgentLatestVersionLoading] = useState(false);
   const [enrollmentHours, setEnrollmentHours] = useState("24");
   const [enrollmentToken, setEnrollmentToken] = useState("");
   const [enrollmentExpiresAt, setEnrollmentExpiresAt] = useState("");
@@ -162,6 +168,14 @@ export default function SettingsPage() {
     void loadCloudflaredStatus();
     void loadThemes();
   }, []);
+
+  useEffect(() => {
+    if (agentUseLatestVersion) {
+      void refreshLatestAgentVersion();
+    }
+    // Refresh only when the auto-latest switch changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentUseLatestVersion]);
 
   async function loadTokens() {
     const response = await apiClient.listPats();
@@ -846,6 +860,34 @@ export default function SettingsPage() {
     }
   }
 
+  async function refreshLatestAgentVersion() {
+    setAgentLatestVersionLoading(true);
+    try {
+      const response = await fetch(GITHUB_RELEASES_API, {
+        headers: { Accept: "application/vnd.github+json" },
+      });
+      if (!response.ok) {
+        throw new Error(`GitHub 返回 HTTP ${response.status}`);
+      }
+      const data = (await response.json()) as Array<{ tag_name?: string; draft?: boolean }>;
+      const release = data.find((item) => !item.draft && item.tag_name?.trim());
+      const tagName = release?.tag_name?.trim();
+      if (!tagName) {
+        throw new Error("GitHub release 响应没有 tag_name");
+      }
+      setAgentVersion(tagName);
+      setAgentLatestVersionStatus(`已获取 GitHub 最新版：${tagName}`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "未知错误";
+      setAgentLatestVersionStatus(`获取失败，继续使用 ${agentVersion || DEFAULT_AGENT_VERSION}：${message}`);
+      if (!agentVersion.trim()) {
+        setAgentVersion(DEFAULT_AGENT_VERSION);
+      }
+    } finally {
+      setAgentLatestVersionLoading(false);
+    }
+  }
+
   async function copyAgentCommand() {
     try {
       await navigator.clipboard.writeText(agentInstallCommand);
@@ -895,7 +937,12 @@ export default function SettingsPage() {
                   <input className={inputClass} value={agentGrpcUrl} onChange={(e) => setAgentGrpcUrl(e.target.value)} />
                 </Field>
                 <Field label="Release 版本">
-                  <input className={inputClass} value={agentVersion} onChange={(e) => setAgentVersion(e.target.value)} />
+                  <input
+                    className={inputClass}
+                    value={agentVersion}
+                    onChange={(e) => setAgentVersion(e.target.value)}
+                    disabled={agentUseLatestVersion}
+                  />
                 </Field>
                 <Field label="Agent 名称">
                   <input className={inputClass} value={agentName} onChange={(e) => setAgentName(e.target.value)} />
@@ -904,6 +951,27 @@ export default function SettingsPage() {
                   <input className={inputClass} type="number" min="1" value={enrollmentHours} onChange={(e) => setEnrollmentHours(e.target.value)} />
                 </Field>
               </div>
+              <div className="mt-4 flex flex-wrap items-center gap-2">
+                <label className="inline-flex cursor-pointer items-center gap-2 border-2 border-black bg-[var(--accent-bg)] px-3 py-2 text-sm font-black shadow-[var(--shadow-brutal-sm)]">
+                  <input
+                    type="checkbox"
+                    checked={agentUseLatestVersion}
+                    onChange={(event) => setAgentUseLatestVersion(event.target.checked)}
+                  />
+                  从 GitHub 获取最新版
+                </label>
+                <button
+                  type="button"
+                  className={buttonClass("secondary")}
+                  onClick={() => void refreshLatestAgentVersion()}
+                  disabled={agentLatestVersionLoading}
+                >
+                  {agentLatestVersionLoading ? "获取中" : "刷新版本"}
+                </button>
+              </div>
+              <p className="mt-2 text-xs font-bold text-[var(--text-muted)]">
+                {agentLatestVersionStatus}
+              </p>
               <div className="mt-4 flex flex-wrap gap-2">
                 <button type="button" className={buttonClass("primary")} onClick={createEnrollmentToken}>
                   生成安装令牌

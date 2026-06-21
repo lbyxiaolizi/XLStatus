@@ -20,7 +20,7 @@ web/ Next.js UI  --->  xlstatus-server HTTP API
 - `xlstatus-agent`：被监控主机上的 Agent，负责注册、主机状态采集、gRPC 会话、任务执行、文件操作、终端、NAT IO 和配置应用。
 - `web/`：Next.js Dashboard 与公开状态页。生产构建时会把 `NEXT_PUBLIC_API_URL` 写入浏览器 bundle。
 - 数据库：SQLite 或 PostgreSQL。Server 内置迁移，启动时创建/迁移应用表。
-- Release 资产：Linux x86_64 server/agent 二进制和 `install-server.sh`、`install-agent.sh`。
+- Release 资产：多平台 server/agent 二进制和 `install-server.sh`、`install-agent.sh`。
 
 ## 请求路径
 
@@ -74,8 +74,26 @@ XLSTATUS_CORS_ALLOWED_ORIGINS=https://status.example.com
 ```text
 xlstatus-server-linux-x86_64
 xlstatus-agent-linux-x86_64
+xlstatus-server-linux-arm64
+xlstatus-agent-linux-arm64
+xlstatus-server-linux-i386
+xlstatus-agent-linux-i386
+xlstatus-server-windows-x86_64.exe
+xlstatus-agent-windows-x86_64.exe
+xlstatus-server-windows-arm64.exe
+xlstatus-agent-windows-arm64.exe
+xlstatus-server-windows-i386.exe
+xlstatus-agent-windows-i386.exe
+xlstatus-server-darwin-x86_64
+xlstatus-agent-darwin-x86_64
+xlstatus-server-darwin-arm64
+xlstatus-agent-darwin-arm64
+xlstatus-server-freebsd-x86_64
+xlstatus-agent-freebsd-x86_64
+xlstatus-server-freebsd-i386
+xlstatus-agent-freebsd-i386
 install-server.sh
 install-agent.sh
 ```
 
-带参数 Agent bootstrap 会从该 Release 下载 `install-agent.sh`。
+带参数 Agent bootstrap 会从该 Release 下载 `install-agent.sh`。Linux 安装脚本会按当前机器架构选择 `linux-x86_64`、`linux-arm64` 或 `linux-i386` 资产。

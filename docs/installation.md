@@ -4,7 +4,8 @@
 
 ## 平台要求
 
-- Linux x86_64：systemd 安装脚本当前支持的平台。
+- Linux x86_64 / arm64 / i386：systemd 安装脚本当前支持的平台。
+- Windows、macOS、FreeBSD：GitHub Release 发布 Server 和 Agent 二进制，可手动运行或自行接入系统服务。
 - Docker 20.10+ 和 Docker Compose v2：用于容器部署。
 - Rust 工具链：用于从源码构建 Server 和 Agent。
 - Node.js 20+、Corepack、pnpm：用于构建 `web/`。
@@ -74,27 +75,39 @@ cd ..
 仓库包含 GitHub Actions workflow：
 
 - PR 和 `main` push：运行 Rust 格式、workspace check/test、Web lint/build。
-- tag `v*`：构建 Linux x86_64 release 二进制，并发布 GitHub Release 资产。
+- tag `v*`：构建多平台 Server/Agent release 二进制，并发布 GitHub Release 资产。
 
 Release 资产名称：
 
 ```text
-xlstatus-server-linux-x86_64
-xlstatus-agent-linux-x86_64
+xlstatus-server-<os>-<arch>[.exe]
+xlstatus-agent-<os>-<arch>[.exe]
 install-server.sh
 install-agent.sh
 ```
 
+当前 release 矩阵覆盖：
+
+```text
+linux:   x86_64, arm64, i386
+windows: x86_64, arm64, i386
+darwin:  x86_64, arm64
+freebsd: x86_64, i386
+```
+
+Rust stable 当前没有 macOS i386 和 FreeBSD arm64 release target，因此这两个组合不会产出资产。
+Windows 资产带 `.exe` 后缀。`install-server.sh` 和 `install-agent.sh` 是 Linux systemd 安装脚本，只随 Linux x86_64 构建上传一次。
+
 安装脚本默认从下面路径下载二进制：
 
 ```text
-https://github.com/lbyxiaolizi/XLStatus/releases/download/<VERSION>/xlstatus-server-linux-x86_64
-https://github.com/lbyxiaolizi/XLStatus/releases/download/<VERSION>/xlstatus-agent-linux-x86_64
+https://github.com/lbyxiaolizi/XLStatus/releases/download/<VERSION>/xlstatus-server-linux-<arch>
+https://github.com/lbyxiaolizi/XLStatus/releases/download/<VERSION>/xlstatus-agent-linux-<arch>
 ```
 
 ## systemd 安装 Server
 
-Release 安装脚本默认下载 `v0.1.0-alpha.3` 的 Linux x86_64 二进制：
+Release 安装脚本默认下载 `v0.1.0-alpha.3` 的 Linux 二进制，并按当前机器选择 `x86_64`、`arm64` 或 `i386`：
 
 ```bash
 curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.3/install-server.sh | sudo bash
@@ -297,7 +310,7 @@ https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.3/install
 
 `enrollment_token` 会出现在安装链接里，应只给受信任的主机使用；令牌过期或使用后需要重新生成。
 
-## 远端 Linux x86_64 验证
+## 远端 Linux 验证
 
 在目标服务器上：
 

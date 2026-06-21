@@ -666,16 +666,16 @@ async fn install_agent_script(Query(query): Query<AgentInstallQuery>) -> impl In
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(DEFAULT_AGENT_INSTALL_VERSION);
-    let script_url = query
+    let custom_script_url = query
         .script_url
         .as_deref()
         .filter(|value| !value.trim().is_empty())
-        .map(ToString::to_string)
-        .unwrap_or_else(|| {
-            format!(
-                "https://github.com/lbyxiaolizi/XLStatus/releases/download/{version}/install-agent.sh"
-            )
-        });
+        .map(ToString::to_string);
+    let script_url = custom_script_url.clone().unwrap_or_else(|| {
+        format!(
+            "https://github.com/lbyxiaolizi/XLStatus/releases/download/{version}/install-agent.sh"
+        )
+    });
     let server_url = query
         .server_url
         .as_deref()
@@ -701,6 +701,18 @@ async fn install_agent_script(Query(query): Query<AgentInstallQuery>) -> impl In
     } else {
         format!("export AGENT_NAME={}", shell_quote(agent_name))
     };
+    let script_url_block = if version == "latest" && custom_script_url.is_none() {
+        r#"LATEST_RELEASE_API="https://api.github.com/repos/lbyxiaolizi/XLStatus/releases?per_page=20"
+VERSION="$(curl -fsSL "$LATEST_RELEASE_API" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+if [ -z "$VERSION" ]; then
+  echo "Failed to resolve latest XLStatus release" >&2
+  exit 1
+fi
+SCRIPT_URL="https://github.com/lbyxiaolizi/XLStatus/releases/download/${VERSION}/install-agent.sh""#
+            .to_string()
+    } else {
+        format!("SCRIPT_URL={}", shell_quote(&script_url))
+    };
     let body = format!(
         r#"#!/bin/bash
 set -e
@@ -716,14 +728,16 @@ if ! command -v curl >/dev/null 2>&1; then
   exit 1
 fi
 
-curl -fsSL {script_url} | bash
+{script_url_block}
+
+curl -fsSL "$SCRIPT_URL" | bash
 "#,
         version = shell_quote(version),
         server_url = shell_quote(server_url),
         grpc_server = shell_quote(grpc_server),
         enrollment_token = shell_quote(enrollment_token),
         agent_name_line = agent_name_line,
-        script_url = shell_quote(&script_url),
+        script_url_block = script_url_block,
     );
 
     (

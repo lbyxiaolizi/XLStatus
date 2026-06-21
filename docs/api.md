@@ -141,7 +141,7 @@ Agent gRPC 服务定义在 `proto/xlstatus/v1/agent.proto`，生成代码在 `cr
 | `grpc_server` | Agent gRPC 地址 |
 | `enrollment_token` | enrollment token |
 | `agent_name` | Agent 名称；默认 `$(hostname)` |
-| `version` | GitHub Release 版本，默认 `v0.1.0-alpha.3` |
+| `version` | GitHub Release 版本，默认 `v0.1.0-alpha.3`；后台设置页默认会从 GitHub Releases 获取最新非草稿版本后传入 |
 | `script_url` | 可选，自定义 GitHub 脚本地址 |
 
 示例：

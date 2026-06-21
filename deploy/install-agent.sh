@@ -12,6 +12,29 @@ BINARY_PATH="${BINARY_PATH:-}"  # User can provide compiled binary path
 CONFIG_FILE="${CONFIG_FILE:-/etc/xlstatus-agent/agent.json}"
 ENROLLMENT_TOKEN="${ENROLLMENT_TOKEN:-}"
 
+normalize_arch() {
+  case "$1" in
+    x86_64|amd64) printf 'x86_64' ;;
+    aarch64|arm64) printf 'arm64' ;;
+    i386|i486|i586|i686) printf 'i386' ;;
+    *) return 1 ;;
+  esac
+}
+
+resolve_version() {
+  if [ "$VERSION" != "latest" ]; then
+    return
+  fi
+  local api_url="https://api.github.com/repos/lbyxiaolizi/XLStatus/releases?per_page=20"
+  local latest
+  latest="$(curl -fsSL "$api_url" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+  if [ -z "$latest" ]; then
+    echo "❌ Failed to resolve latest GitHub Release"
+    exit 1
+  fi
+  VERSION="$latest"
+}
+
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║                                                              ║"
 echo "║   Installing XLStatus Agent                                  ║"
@@ -28,12 +51,17 @@ fi
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m)
 
-if [ "$OS" != "linux" ] || [ "$ARCH" != "x86_64" ]; then
-  echo "❌ Unsupported platform: $OS $ARCH"
+if [ "$OS" != "linux" ]; then
+  echo "❌ Unsupported OS for the systemd installer: $OS"
   exit 1
 fi
 
-echo "✓ Detected: Linux x86_64"
+if ! ASSET_ARCH="$(normalize_arch "$ARCH")"; then
+  echo "❌ Unsupported architecture: $ARCH"
+  exit 1
+fi
+
+echo "✓ Detected: Linux $ASSET_ARCH"
 
 # Install dependencies
 echo ""
@@ -63,7 +91,9 @@ if [ -n "$BINARY_PATH" ] && [ -f "$BINARY_PATH" ]; then
   echo "✓ Binary installed from: $BINARY_PATH"
 else
   # Try to download from GitHub releases
-  DOWNLOAD_URL="https://github.com/lbyxiaolizi/XLStatus/releases/download/${VERSION}/xlstatus-agent-linux-x86_64"
+  resolve_version
+  echo "✓ Release version: $VERSION"
+  DOWNLOAD_URL="https://github.com/lbyxiaolizi/XLStatus/releases/download/${VERSION}/xlstatus-agent-linux-${ASSET_ARCH}"
   echo "   Trying to download from: $DOWNLOAD_URL"
 
   if curl -fsSL "$DOWNLOAD_URL" -o /usr/local/bin/xlstatus-agent 2>/dev/null; then

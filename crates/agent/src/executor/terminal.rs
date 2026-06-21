@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;

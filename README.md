@@ -15,7 +15,7 @@ The current pre-release is `v0.1.0-alpha.3`. Start from the documentation index 
 - Agent operations: task scheduler, command execution, file read/write/download/upload, web terminal, config push, and force update hooks.
 - Network utilities: DDNS providers, NAT reverse tunnels, GeoIP metadata, and public world map distribution.
 - Dashboard: Chinese-first Next.js UI, RBAC, PAT scopes, CSRF protection, audit-friendly API boundaries, public `/status` page, and theme settings.
-- Release path: Docker Compose, source builds, systemd install scripts, and Linux x86_64 GitHub Release assets.
+- Release path: Docker Compose, source builds, Linux systemd install scripts, and multi-platform GitHub Release assets.
 
 ## Quick Start
 
@@ -58,7 +58,7 @@ sudo SERVER_URL=http://dashboard.example.com:8080 \
   bash -c 'curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.3/install-agent.sh | bash'
 ```
 
-The dashboard Settings page can generate a parameterized Agent bootstrap link. That link points to the same `v0.1.0-alpha.3` GitHub Release installer by default.
+The dashboard Settings page can generate a parameterized Agent bootstrap link. By default it fetches the newest non-draft GitHub Release version and falls back to `v0.1.0-alpha.3` if GitHub is unavailable.
 
 ## Documentation
 

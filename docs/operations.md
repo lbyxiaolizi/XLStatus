@@ -117,7 +117,7 @@ curl -fsS http://localhost:8080/healthz
 
 ## 远端 smoke
 
-在 Linux x86_64 目标机：
+在 Linux 目标机：
 
 ```bash
 cargo build --release --bin xlstatus-server

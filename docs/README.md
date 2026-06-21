@@ -37,8 +37,8 @@
 - Web UI：Next.js，当前语言为简体中文，i18n 配置位于 `web/lib/i18n.ts`。
 - 数据库：SQLite 和 PostgreSQL，应用表由内置迁移自动创建。
 - 发布方式：Docker Compose、本地源码运行、systemd 安装脚本、GitHub Release 资产。
-- 平台：Server 和 Agent 的 systemd 安装脚本当前支持 Linux x86_64。
-- 当前默认 Release 安装版本：`v0.1.0-alpha.3`。
+- 平台：GitHub Release 构建 Linux、Windows、macOS、FreeBSD 多平台二进制；Server 和 Agent 的 systemd 安装脚本当前支持 Linux x86_64/arm64/i386。
+- 当前 Release 安装 fallback 版本：`v0.1.0-alpha.3`；后台 Agent 安装页默认从 GitHub Releases 获取最新非草稿版本。
 
 ## 重要约定
 

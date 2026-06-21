@@ -27,15 +27,17 @@ cargo build --release --bin xlstatus-agent
 test-run/verify-m9-install.sh
 ```
 
-GitHub Actions 会在 `main` 和 PR 上运行 Rust/Web 检查，并在 tag `v*` 时发布这些 Release 资产：
+GitHub Actions 会在 `main` 和 PR 上运行 Rust/Web 检查，并在 tag `v*` 时发布多平台 Release 资产：
 
-- `xlstatus-server-linux-x86_64`
-- `xlstatus-agent-linux-x86_64`
+- `xlstatus-server-<os>-<arch>[.exe]`
+- `xlstatus-agent-<os>-<arch>[.exe]`
 - `install-server.sh`
 - `install-agent.sh`
 
+当前矩阵覆盖 Linux x86_64/arm64/i386、Windows x86_64/arm64/i386、macOS x86_64/arm64、FreeBSD x86_64/i386。macOS i386 和 FreeBSD arm64 没有 Rust stable release target，不在资产列表中。
+
 Server 后台生成的 Agent 一键安装链接会从 GitHub Release 下载 `install-agent.sh`。
-发布前确认 `deploy/install*.sh`、Server bootstrap 默认版本、Web 设置页默认 Agent 版本和文档示例使用同一个 tag。
+Web 设置页默认从 GitHub Releases 获取最新版；发布前确认 `deploy/install*.sh`、Server bootstrap 默认版本和文档示例使用同一个 fallback tag。
 
 Linux x86_64 smoke：
 
@@ -83,5 +85,5 @@ timeout 8s env \
 
 - 推送 `main`。
 - 创建 tag。
-- 构建并上传 Linux x86_64 二进制。
+- 构建并上传多平台二进制。
 - 在目标生产环境跑至少一次 24 小时稳定性观察。

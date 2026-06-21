@@ -2,6 +2,7 @@
 #![allow(unused_imports)]
 
 use anyhow::{bail, Context, Result};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use tokio::fs;
@@ -73,11 +74,7 @@ pub async fn list_files(path: &str) -> Result<Vec<FileEntry>> {
             None
         };
 
-        let mode = if cfg!(unix) {
-            metadata.permissions().mode()
-        } else {
-            0o644 // Default mode for Windows
-        };
+        let mode = metadata_mode(&metadata);
 
         let modified_at = metadata
             .modified()
@@ -175,14 +172,8 @@ pub async fn write_file(
 
     file.flush().await.context("Failed to flush file")?;
 
-    // Set permissions on Unix
-    if cfg!(unix) {
-        if let Some(mode) = mode {
-            let permissions = std::fs::Permissions::from_mode(mode);
-            fs::set_permissions(path, permissions)
-                .await
-                .context("Failed to set permissions")?;
-        }
+    if let Some(mode) = mode {
+        set_file_mode(path, mode).await?;
     }
 
     Ok(data.len() as u64)
@@ -222,6 +213,29 @@ pub async fn delete_path(path: &str, recursive: bool) -> Result<()> {
             .context("Failed to delete file")?;
     }
 
+    Ok(())
+}
+
+#[cfg(unix)]
+fn metadata_mode(metadata: &std::fs::Metadata) -> u32 {
+    metadata.permissions().mode()
+}
+
+#[cfg(not(unix))]
+fn metadata_mode(_metadata: &std::fs::Metadata) -> u32 {
+    0o644
+}
+
+#[cfg(unix)]
+async fn set_file_mode(path: &Path, mode: u32) -> Result<()> {
+    let permissions = std::fs::Permissions::from_mode(mode);
+    fs::set_permissions(path, permissions)
+        .await
+        .context("Failed to set permissions")
+}
+
+#[cfg(not(unix))]
+async fn set_file_mode(_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
 }
 
