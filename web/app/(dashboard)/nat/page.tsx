@@ -101,7 +101,7 @@ export default function NatPage() {
         <PageHeader
           eyebrow="网络"
           title="NAT"
-          detail="Agent 端口映射与远程访问配置。"
+          detail="Agent loopback 端口映射与远程访问配置。"
           actions={<button className={buttonClass("primary")} onClick={() => setModal(true)}>新增映射</button>}
         />
         <div className="mb-5 space-y-3">
@@ -110,7 +110,7 @@ export default function NatPage() {
         </div>
 
         {mappings.length === 0 ? (
-          <EmptyState title="暂无 NAT 映射" detail="创建映射后即可通过隧道暴露 Agent 侧目标。" />
+          <EmptyState title="暂无 NAT 映射" detail="创建映射后即可通过隧道暴露 Agent 本机 loopback 目标。" />
         ) : (
           <div className="overflow-x-auto border-2 border-black bg-[var(--bg-card)] shadow-[var(--shadow-brutal)]">
             <table className="w-full">
@@ -155,7 +155,7 @@ export default function NatPage() {
               <div className="grid gap-4 sm:grid-cols-3">
                 <Field label="协议"><select className={selectClass} value={form.protocol} onChange={(e) => setForm((f) => ({ ...f, protocol: e.target.value }))}><option value="tcp">tcp</option><option value="udp">udp</option></select></Field>
                 <Field label="公网端口"><input className={inputClass} value={form.public_port} onChange={(e) => setForm((f) => ({ ...f, public_port: e.target.value }))} /></Field>
-                <Field label="本地主机"><input className={inputClass} value={form.local_host} onChange={(e) => setForm((f) => ({ ...f, local_host: e.target.value }))} /></Field>
+                <Field label="本地主机"><input className={inputClass} value={form.local_host} onChange={(e) => setForm((f) => ({ ...f, local_host: e.target.value }))} placeholder="127.0.0.1" /></Field>
               </div>
               <div className="grid gap-4 sm:grid-cols-3">
                 <Field label="本地端口"><input className={inputClass} value={form.local_port} onChange={(e) => setForm((f) => ({ ...f, local_port: e.target.value }))} /></Field>

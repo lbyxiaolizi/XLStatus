@@ -155,6 +155,19 @@ XLSTATUS_AGENT_ALLOW_PRIVATE_PROBES=1
 
 远程配置里的 `disable_send_query` 会停止 Agent 主动出口 IP 查询，并拒绝 Dashboard 下发的 HTTP/TCP/ICMP 探测任务。
 
+## NAT 目标安全策略
+
+NAT 隧道默认只允许 Agent 连接本机 loopback 目标，例如 `127.0.0.1`、`::1` 或 `localhost`。Server 在创建/更新 NAT 映射时会拒绝非 loopback `local_host`，Agent 收到 NAT open 后也会重新解析目标并只连接已校验的 loopback 地址。
+
+如果某台专用 Agent 必须把 Dashboard NAT 暴露到 Agent 所在内网的其他主机，需要同时在控制面和对应 Agent 的运行环境显式启用私网 NAT 目标：
+
+```bash
+XLSTATUS_ALLOW_PRIVATE_NAT_TARGETS=1
+XLSTATUS_AGENT_ALLOW_PRIVATE_NAT_TARGETS=1
+```
+
+该能力会把 Agent 变成受控 TCP 转发出口，生产环境应只给专用 Agent 和受信管理员开放，并配合来源 CIDR、隧道并发、流量上限和主机防火墙限制使用范围。兼容旧部署时，`XLSTATUS_ALLOW_PRIVATE_OUTBOUND=1` 也会放开该限制。
+
 ## 重新注册
 
 如果配置丢失或私钥泄漏：

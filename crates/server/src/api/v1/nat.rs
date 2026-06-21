@@ -18,6 +18,7 @@ use crate::db::repository::NatMappingRepository;
 use crate::db::AgentRepository;
 use crate::db::Db;
 use crate::nat::tunnel::nat_public_port_allowed;
+use std::net::IpAddr;
 use xlstatus_shared::nat::*;
 
 #[derive(Debug, Deserialize)]
@@ -77,6 +78,7 @@ pub async fn create_nat_mapping(
 
     require_scope_or_403(&auth_user, "nat:write")?;
     validate_nat_agent_or_403(&db, &auth_user, &req.agent_id).await?;
+    validate_nat_local_target_or_403(&req.local_host)?;
     validate_public_port_or_403(req.public_port)?;
     let allowed_sources = normalize_allowed_sources_or_403(req.allowed_sources.as_deref())?;
     validate_positive_i32_or_403(req.max_active_tunnels, "max_active_tunnels")?;
@@ -300,6 +302,7 @@ pub async fn update_nat_mapping(
 
     // Apply updates
     if let Some(local_host) = req.local_host {
+        validate_nat_local_target_or_403(&local_host)?;
         mapping.local_host = local_host;
     }
     if let Some(local_port) = req.local_port {
@@ -546,6 +549,41 @@ fn validate_public_port_or_403(port: u16) -> Result<(), (StatusCode, Json<ApiRes
     ))
 }
 
+fn validate_nat_local_target_or_403(host: &str) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
+    if nat_private_targets_allowed() || nat_local_target_is_loopback(host) {
+        return Ok(());
+    }
+    Err(bad_request_with(
+        "NAT local_host must resolve to the Agent loopback interface unless private NAT targets are explicitly enabled".to_string(),
+    ))
+}
+
+fn nat_local_target_is_loopback(host: &str) -> bool {
+    let host = host.trim();
+    if host.is_empty() {
+        return false;
+    }
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+fn nat_private_targets_allowed() -> bool {
+    [
+        "XLSTATUS_ALLOW_PRIVATE_NAT_TARGETS",
+        "XLSTATUS_ALLOW_PRIVATE_OUTBOUND",
+    ]
+    .iter()
+    .any(|name| {
+        std::env::var(name)
+            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false)
+    })
+}
+
 fn normalize_allowed_sources_or_403(
     value: Option<&str>,
 ) -> Result<Option<String>, (StatusCode, Json<ApiResponse<()>>)> {
@@ -695,6 +733,32 @@ mod tests {
     #[test]
     fn nat_allowed_sources_rejects_invalid_entries() {
         assert!(normalize_allowed_sources_or_403(Some("not-a-cidr")).is_err());
+    }
+
+    #[test]
+    fn nat_local_target_allows_loopback_by_default() {
+        std::env::remove_var("XLSTATUS_ALLOW_PRIVATE_NAT_TARGETS");
+        std::env::remove_var("XLSTATUS_ALLOW_PRIVATE_OUTBOUND");
+
+        assert!(validate_nat_local_target_or_403("127.0.0.1").is_ok());
+        assert!(validate_nat_local_target_or_403("localhost").is_ok());
+        assert!(validate_nat_local_target_or_403("::1").is_ok());
+    }
+
+    #[test]
+    fn nat_local_target_rejects_private_non_loopback_by_default() {
+        std::env::remove_var("XLSTATUS_ALLOW_PRIVATE_NAT_TARGETS");
+        std::env::remove_var("XLSTATUS_ALLOW_PRIVATE_OUTBOUND");
+
+        assert!(validate_nat_local_target_or_403("192.168.1.10").is_err());
+        assert!(validate_nat_local_target_or_403("10.0.0.5").is_err());
+    }
+
+    #[test]
+    fn nat_local_target_escape_hatch_allows_private_targets() {
+        std::env::set_var("XLSTATUS_ALLOW_PRIVATE_NAT_TARGETS", "1");
+        assert!(validate_nat_local_target_or_403("192.168.1.10").is_ok());
+        std::env::remove_var("XLSTATUS_ALLOW_PRIVATE_NAT_TARGETS");
     }
 
     #[test]

@@ -920,8 +920,13 @@ async fn handle_nat_control_message(
             local_host,
             local_port,
         } => {
-            let local_addr = format!("{}:{}", local_host, local_port);
-            match TcpStream::connect(&local_addr).await {
+            let local_addr_label = format_nat_target_label(&local_host, local_port);
+            let connect_result = async {
+                let addrs = resolve_agent_nat_target(&local_host, local_port).await?;
+                connect_agent_nat_addrs(&addrs).await
+            }
+            .await;
+            match connect_result {
                 Ok(stream) => {
                     let (mut reader, mut writer) = stream.into_split();
                     let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
@@ -1030,7 +1035,7 @@ async fn handle_nat_control_message(
                             agent_id,
                             sequence,
                             "nat_open_failed",
-                            &format!("failed to connect to {}: {}", local_addr, e),
+                            &format!("failed to connect to {}: {}", local_addr_label, e),
                         ))
                         .await;
                 }
@@ -1886,6 +1891,81 @@ fn reject_probe_task_when_disabled(
     true
 }
 
+async fn resolve_agent_nat_target(host: &str, port: u16) -> anyhow::Result<Vec<SocketAddr>> {
+    resolve_agent_nat_target_with_policy(host, port, agent_private_nat_targets_allowed()).await
+}
+
+async fn resolve_agent_nat_target_with_policy(
+    host: &str,
+    port: u16,
+    allow_private: bool,
+) -> anyhow::Result<Vec<SocketAddr>> {
+    let host = host.trim();
+    if host.is_empty() {
+        anyhow::bail!("Agent NAT target host must not be empty");
+    }
+
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        ensure_agent_nat_ip_allowed(ip, allow_private)?;
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+
+    let mut addrs = lookup_host((host, port))
+        .await
+        .with_context(|| format!("failed to resolve Agent NAT target host '{host}'"))?;
+    let mut resolved = Vec::new();
+    for addr in &mut addrs {
+        ensure_agent_nat_ip_allowed(addr.ip(), allow_private)?;
+        resolved.push(addr);
+    }
+    if resolved.is_empty() {
+        anyhow::bail!("Agent NAT target host '{host}' did not resolve to any address");
+    }
+    Ok(resolved)
+}
+
+fn ensure_agent_nat_ip_allowed(ip: IpAddr, allow_private: bool) -> anyhow::Result<()> {
+    if allow_private || ip.is_loopback() {
+        return Ok(());
+    }
+    anyhow::bail!("Agent NAT target resolves to disallowed non-loopback address {ip}");
+}
+
+async fn connect_agent_nat_addrs(addrs: &[SocketAddr]) -> anyhow::Result<TcpStream> {
+    let mut last_error = None;
+    for addr in addrs {
+        match TcpStream::connect(addr).await {
+            Ok(stream) => return Ok(stream),
+            Err(e) => {
+                last_error = Some(anyhow::anyhow!("failed to connect to {addr}: {e}"));
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no Agent NAT target address resolved")))
+}
+
+fn agent_private_nat_targets_allowed() -> bool {
+    [
+        "XLSTATUS_AGENT_ALLOW_PRIVATE_NAT_TARGETS",
+        "XLSTATUS_ALLOW_PRIVATE_NAT_TARGETS",
+        "XLSTATUS_ALLOW_PRIVATE_OUTBOUND",
+    ]
+    .iter()
+    .any(|name| {
+        std::env::var(name)
+            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false)
+    })
+}
+
+fn format_nat_target_label(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ValidatedAgentProbeUrl {
     url: reqwest::Url,
@@ -2335,6 +2415,41 @@ mod tests {
         assert!(err.to_string().contains("out of range"));
         let err = agent_probe_port(0, "test").unwrap_err();
         assert!(err.to_string().contains("greater than 0"));
+    }
+
+    #[tokio::test]
+    async fn agent_nat_target_allows_loopback_by_default() {
+        let addrs = resolve_agent_nat_target_with_policy("127.0.0.1", 8080, false)
+            .await
+            .unwrap();
+        assert_eq!(addrs, vec!["127.0.0.1:8080".parse().unwrap()]);
+
+        let addrs = resolve_agent_nat_target_with_policy("::1", 8080, false)
+            .await
+            .unwrap();
+        assert_eq!(addrs, vec!["[::1]:8080".parse().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn agent_nat_target_rejects_private_non_loopback_by_default() {
+        let err = resolve_agent_nat_target_with_policy("192.168.1.10", 8080, false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("disallowed non-loopback address"));
+    }
+
+    #[tokio::test]
+    async fn agent_nat_target_escape_hatch_allows_private_literal() {
+        let addrs = resolve_agent_nat_target_with_policy("192.168.1.10", 8080, true)
+            .await
+            .unwrap();
+        assert_eq!(addrs, vec!["192.168.1.10:8080".parse().unwrap()]);
+    }
+
+    #[test]
+    fn agent_nat_target_label_formats_ipv6() {
+        assert_eq!(format_nat_target_label("::1", 8080), "[::1]:8080");
+        assert_eq!(format_nat_target_label("127.0.0.1", 8080), "127.0.0.1:8080");
     }
 
     #[tokio::test]
