@@ -19,7 +19,7 @@ use crate::db::{Agent, AgentRepository, DatabaseBackend, UserRepository};
 
 pub use crate::realtime::ws::ws_servers;
 use axum::{
-    extract::{connect_info::ConnectInfo, Path, Query, State},
+    extract::{connect_info::ConnectInfo, DefaultBodyLimit, Path, Query, State},
     http::HeaderMap,
     Json,
 };
@@ -35,6 +35,14 @@ use xlstatus_shared::{AgentId, UserId};
 use xlstatus_tsdb::{MetricSeries, QueryRange};
 
 const ONLINE_THRESHOLD_SECS: i64 = 30;
+const SERVER_MANAGEMENT_API_MAX_BODY_BYTES: usize = 64 * 1024;
+const SERVER_NAME_MAX_BYTES: usize = 128;
+const SERVER_LABEL_MAX_BYTES: usize = 512;
+const SERVER_DASHBOARD_METADATA_MAX_BYTES: usize = 16 * 1024;
+const SERVER_TAG_INPUT_MAX_ITEMS: usize = 64;
+const SERVER_TAG_INPUT_MAX_BYTES: usize = 128;
+const SERVER_BATCH_MAX_SERVER_IDS: usize = 200;
+const SERVER_UUID_TEXT_MAX_BYTES: usize = 64;
 
 #[derive(Debug, Deserialize)]
 pub struct ListQuery {
@@ -46,6 +54,10 @@ pub struct ListQuery {
 
 fn default_limit() -> i64 {
     50
+}
+
+pub fn server_management_body_limit() -> DefaultBodyLimit {
+    DefaultBodyLimit::max(SERVER_MANAGEMENT_API_MAX_BODY_BYTES)
 }
 
 #[derive(Debug, Serialize)]
@@ -567,48 +579,44 @@ pub async fn update_server(
     let name = req
         .name
         .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    if req.name.is_some() && name.is_none() {
-        return Err(AppError::BadRequest("name is required".into()));
-    }
+        .map(|value| normalize_server_name(value, "name"))
+        .transpose()?;
 
-    let remark = normalize_optional_label(req.remark);
-    let expires_at = normalize_optional_label(req.expires_at);
-    let renewal_price = normalize_optional_label(req.renewal_price);
+    let remark = normalize_optional_label(req.remark, "remark")?;
+    let expires_at = normalize_optional_label(req.expires_at, "expires_at")?;
+    let renewal_price = normalize_optional_label(req.renewal_price, "renewal_price")?;
     if matches!(req.traffic_quota_bytes, Some(value) if value < 0) {
         return Err(AppError::BadRequest(
             "traffic_quota_bytes must be greater than or equal to 0".into(),
         ));
     }
     let dashboard_metadata = DashboardMetadata {
-        public_note: normalize_optional_label(req.public_note),
-        provider: normalize_optional_label(req.provider),
-        region: normalize_optional_label(req.region),
-        country: normalize_optional_label(req.country),
-        city: normalize_optional_label(req.city),
+        public_note: normalize_optional_label(req.public_note, "public_note")?,
+        provider: normalize_optional_label(req.provider, "provider")?,
+        region: normalize_optional_label(req.region, "region")?,
+        country: normalize_optional_label(req.country, "country")?,
+        city: normalize_optional_label(req.city, "city")?,
         latitude: normalize_optional_coordinate(req.latitude, "latitude", -90.0, 90.0)?,
         longitude: normalize_optional_coordinate(req.longitude, "longitude", -180.0, 180.0)?,
-        plan: normalize_optional_label(req.plan),
-        price: normalize_optional_label(req.price),
-        currency: normalize_optional_label(req.currency),
-        billing_cycle: normalize_optional_label(req.billing_cycle),
+        plan: normalize_optional_label(req.plan, "plan")?,
+        price: normalize_optional_label(req.price, "price")?,
+        currency: normalize_optional_label(req.currency, "currency")?,
+        billing_cycle: normalize_optional_label(req.billing_cycle, "billing_cycle")?,
         auto_renew: req.auto_renew,
         traffic_quota_bytes: req.traffic_quota_bytes,
-        traffic_quota_type: normalize_optional_label(req.traffic_quota_type),
-        tags: normalize_tags(req.tags.unwrap_or_default()),
+        traffic_quota_type: normalize_optional_label(req.traffic_quota_type, "traffic_quota_type")?,
+        tags: normalize_tag_input(req.tags.unwrap_or_default())?,
         accent_color: normalize_accent_color(req.accent_color)?,
         dashboard_visible: req.dashboard_visible,
         hide_for_guest: req.hide_for_guest,
-        display_order: req.display_order,
+        display_order: normalize_display_order(req.display_order, "display_order")?,
     };
-    let dashboard_metadata_json = serde_json::to_string(&dashboard_metadata)
-        .map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let dashboard_metadata_json = dashboard_metadata_json(&dashboard_metadata)?;
     let agent_repo = AgentRepository::new(state.db.clone());
     let updated = agent_repo
         .update_dashboard_metadata(
             agent_id,
-            name,
+            name.as_deref(),
             remark.as_deref(),
             expires_at.as_deref(),
             renewal_price.as_deref(),
@@ -638,13 +646,9 @@ pub async fn batch_update_servers(
     ) {
         require_sensitive_totp(&state.db, auth.user_id, &headers).await?;
     }
-    if req.server_ids.is_empty() {
+    let server_ids = dedupe_ids(req.server_ids, SERVER_BATCH_MAX_SERVER_IDS, "server_ids")?;
+    if server_ids.is_empty() {
         return Err(AppError::BadRequest("server_ids is required".into()));
-    }
-    if req.server_ids.len() > 200 {
-        return Err(AppError::BadRequest(
-            "server_ids must contain at most 200 items".into(),
-        ));
     }
 
     let target_owner = if matches!(req.action, ServerBatchAction::TransferOwner) {
@@ -658,7 +662,8 @@ pub async fn batch_update_servers(
             .owner_user_id
             .as_deref()
             .ok_or_else(|| AppError::BadRequest("owner_user_id is required".into()))
-            .and_then(parse_user_id)?;
+            .and_then(|id| normalize_uuid_text(id, "owner_user_id"))
+            .and_then(|id| parse_user_id(&id))?;
         let user_repo = UserRepository::new(state.db.clone());
         if user_repo.find_by_id(owner).await?.is_none() {
             return Err(AppError::NotFound("target user not found".into()));
@@ -676,11 +681,16 @@ pub async fn batch_update_servers(
     if matches!(req.action, ServerBatchAction::MoveGroup) && req.group_id.is_none() {
         return Err(AppError::BadRequest("group_id is required".into()));
     }
-    if let (ServerBatchAction::MoveGroup, Some(group_id)) = (req.action, req.group_id.as_deref()) {
+    let group_id = req
+        .group_id
+        .as_deref()
+        .map(|id| normalize_uuid_text(id, "group_id"))
+        .transpose()?;
+    if let (ServerBatchAction::MoveGroup, Some(group_id)) = (req.action, group_id.as_deref()) {
         load_server_group(&state.db, &auth, group_id).await?;
     }
 
-    let normalized_tags = normalize_tags(req.tags);
+    let normalized_tags = normalize_tag_input(req.tags)?;
     if matches!(
         req.action,
         ServerBatchAction::SetTags | ServerBatchAction::AddTags | ServerBatchAction::RemoveTags
@@ -692,7 +702,7 @@ pub async fn batch_update_servers(
     let agent_repo = AgentRepository::new(state.db.clone());
     let actor_ip = client_ip_from_headers(&headers, peer_addr);
     let mut results = Vec::new();
-    for id in dedupe_ids(req.server_ids) {
+    for id in server_ids {
         let result = match apply_batch_action(
             &state.db,
             &agent_repo,
@@ -703,7 +713,7 @@ pub async fn batch_update_servers(
             &normalized_tags,
             req.dashboard_visible,
             target_owner,
-            req.group_id.as_deref(),
+            group_id.as_deref(),
         )
         .await
         {
@@ -918,7 +928,8 @@ pub async fn create_server_group(
         return Err(AppError::Forbidden("missing scope: server:write".into()));
     }
     let name = normalize_group_name(&req.name)?;
-    let color = normalize_optional_label(req.color);
+    let color = normalize_optional_label(req.color, "color")?;
+    let display_order = normalize_display_order(req.display_order, "display_order")?;
     let id = Uuid::now_v7();
     let now = Utc::now();
     match &state.db {
@@ -930,7 +941,7 @@ pub async fn create_server_group(
             .bind(auth.user_id.0.to_string())
             .bind(&name)
             .bind(&color)
-            .bind(req.display_order)
+            .bind(display_order)
             .bind(now.to_rfc3339())
             .bind(now.to_rfc3339())
             .execute(pool)
@@ -944,7 +955,7 @@ pub async fn create_server_group(
             .bind(auth.user_id.0)
             .bind(&name)
             .bind(&color)
-            .bind(req.display_order.map(|value| value as i32))
+            .bind(display_order.map(|value| value as i32))
             .bind(now)
             .bind(now)
             .execute(pool)
@@ -969,8 +980,11 @@ pub async fn update_server_group(
         Some(value) => normalize_group_name(&value)?,
         None => existing.name,
     };
-    let color = normalize_optional_label(req.color).or(existing.color);
-    let display_order = req.display_order.or(existing.display_order);
+    let color = normalize_optional_label(req.color, "color")?.or(existing.color);
+    let display_order = match req.display_order {
+        Some(value) => normalize_display_order(Some(value), "display_order")?,
+        None => existing.display_order,
+    };
     let now = Utc::now();
     let affected = match &state.db {
         DatabaseBackend::Sqlite(pool) => sqlx::query(
@@ -1049,16 +1063,11 @@ pub async fn add_server_group_members(
     if !has_scope(&auth, "server:write") {
         return Err(AppError::Forbidden("missing scope: server:write".into()));
     }
-    if req.server_ids.is_empty() {
+    let server_ids = dedupe_ids(req.server_ids, SERVER_BATCH_MAX_SERVER_IDS, "server_ids")?;
+    if server_ids.is_empty() {
         return Err(AppError::BadRequest("server_ids is required".into()));
     }
-    if req.server_ids.len() > 200 {
-        return Err(AppError::BadRequest(
-            "server_ids must contain at most 200 items".into(),
-        ));
-    }
     load_server_group(&state.db, &auth, &id).await?;
-    let server_ids = dedupe_ids(req.server_ids);
     for server_id in &server_ids {
         ensure_group_server_access(&state.db, &auth, server_id).await?;
     }
@@ -1600,7 +1609,7 @@ async fn apply_batch_action(
                 | ServerBatchAction::Delete
                 | ServerBatchAction::MoveGroup => unreachable!(),
             }
-            let metadata_json = serde_json::to_string(&metadata).map_err(|e| e.to_string())?;
+            let metadata_json = dashboard_metadata_json(&metadata).map_err(error_message)?;
             update_agent_dashboard_metadata(db, agent_id, &metadata_json)
                 .await
                 .map_err(error_message)
@@ -2469,17 +2478,22 @@ async fn move_agent_to_server_group(
     Ok(())
 }
 
-fn dedupe_ids(ids: Vec<String>) -> Vec<String> {
+fn dedupe_ids(ids: Vec<String>, max_items: usize, field: &str) -> Result<Vec<String>, AppError> {
+    if ids.len() > max_items {
+        return Err(AppError::BadRequest(format!(
+            "{field} must contain at most {max_items} items"
+        )));
+    }
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for id in ids {
-        let id = id.trim();
-        if id.is_empty() || !seen.insert(id.to_string()) {
+        let id = normalize_uuid_text(&id, field)?;
+        if !seen.insert(id.clone()) {
             continue;
         }
-        out.push(id.to_string());
+        out.push(id);
     }
-    out
+    Ok(out)
 }
 
 fn error_message(error: AppError) -> String {
@@ -2757,10 +2771,65 @@ fn json_label(value: &serde_json::Value) -> Option<String> {
     }
 }
 
-fn normalize_optional_label(value: Option<String>) -> Option<String> {
-    value
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+fn normalize_server_name(value: &str, field: &str) -> Result<String, AppError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(AppError::BadRequest(format!("{field} is required")));
+    }
+    if value.len() > SERVER_NAME_MAX_BYTES {
+        return Err(AppError::BadRequest(format!("{field} is too long")));
+    }
+    Ok(value.to_string())
+}
+
+fn normalize_optional_label(
+    value: Option<String>,
+    field: &str,
+) -> Result<Option<String>, AppError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() > SERVER_LABEL_MAX_BYTES {
+        return Err(AppError::BadRequest(format!("{field} is too long")));
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn normalize_uuid_text(value: &str, field: &str) -> Result<String, AppError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(AppError::BadRequest(format!("{field} is required")));
+    }
+    if value.len() > SERVER_UUID_TEXT_MAX_BYTES {
+        return Err(AppError::BadRequest(format!("{field} is too long")));
+    }
+    let uuid =
+        Uuid::parse_str(value).map_err(|_| AppError::BadRequest(format!("invalid {field}")))?;
+    Ok(uuid.to_string())
+}
+
+fn normalize_display_order(value: Option<i64>, field: &str) -> Result<Option<i64>, AppError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value < i32::MIN as i64 || value > i32::MAX as i64 {
+        return Err(AppError::BadRequest(format!("{field} is out of range")));
+    }
+    Ok(Some(value))
+}
+
+fn dashboard_metadata_json(metadata: &DashboardMetadata) -> Result<String, AppError> {
+    let value = serde_json::to_string(metadata).map_err(|e| AppError::BadRequest(e.to_string()))?;
+    if value.len() > SERVER_DASHBOARD_METADATA_MAX_BYTES {
+        return Err(AppError::BadRequest(
+            "dashboard metadata is too large".into(),
+        ));
+    }
+    Ok(value)
 }
 
 fn normalize_optional_coordinate(
@@ -2954,6 +3023,21 @@ fn tags_from_json(value: &serde_json::Value) -> Vec<String> {
     }
 }
 
+fn normalize_tag_input(tags: Vec<String>) -> Result<Vec<String>, AppError> {
+    if tags.len() > SERVER_TAG_INPUT_MAX_ITEMS {
+        return Err(AppError::BadRequest(format!(
+            "tags must contain at most {SERVER_TAG_INPUT_MAX_ITEMS} items"
+        )));
+    }
+    for tag in &tags {
+        let cleaned = tag.trim();
+        if cleaned.len() > SERVER_TAG_INPUT_MAX_BYTES {
+            return Err(AppError::BadRequest("tag is too long".into()));
+        }
+    }
+    Ok(normalize_tags(tags))
+}
+
 fn normalize_tags(tags: Vec<String>) -> Vec<String> {
     let mut out = Vec::new();
     for tag in tags {
@@ -2970,7 +3054,7 @@ fn normalize_tags(tags: Vec<String>) -> Vec<String> {
 }
 
 fn normalize_accent_color(value: Option<String>) -> Result<Option<String>, AppError> {
-    let Some(value) = normalize_optional_label(value) else {
+    let Some(value) = normalize_optional_label(value, "accent_color")? else {
         return Ok(None);
     };
     let is_hex = value.len() == 7
@@ -3243,6 +3327,79 @@ mod tests {
     fn ownership_transfer_allows_admin_cookie_session() {
         let auth = auth_session(AuthKind::Session, UserRole::Admin);
         assert!(require_transfer_admin(&auth).is_ok());
+    }
+
+    #[test]
+    fn server_management_resource_limits_are_explicit() {
+        let _ = server_management_body_limit();
+        assert_eq!(SERVER_MANAGEMENT_API_MAX_BODY_BYTES, 64 * 1024);
+        assert_eq!(SERVER_NAME_MAX_BYTES, 128);
+        assert_eq!(SERVER_LABEL_MAX_BYTES, 512);
+        assert_eq!(SERVER_DASHBOARD_METADATA_MAX_BYTES, 16 * 1024);
+        assert_eq!(SERVER_TAG_INPUT_MAX_ITEMS, 64);
+        assert_eq!(SERVER_BATCH_MAX_SERVER_IDS, 200);
+    }
+
+    #[test]
+    fn server_dashboard_labels_are_bounded() {
+        let err =
+            normalize_server_name(&"n".repeat(SERVER_NAME_MAX_BYTES + 1), "name").unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+
+        let err =
+            normalize_optional_label(Some("x".repeat(SERVER_LABEL_MAX_BYTES + 1)), "public_note")
+                .unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn server_dashboard_metadata_json_is_bounded() {
+        let metadata = DashboardMetadata {
+            public_note: Some("x".repeat(SERVER_DASHBOARD_METADATA_MAX_BYTES)),
+            ..Default::default()
+        };
+        let err = dashboard_metadata_json(&metadata).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn server_tag_input_is_bounded_before_truncation() {
+        let tags = (0..=SERVER_TAG_INPUT_MAX_ITEMS)
+            .map(|idx| format!("tag-{idx}"))
+            .collect();
+        let err = normalize_tag_input(tags).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+
+        let err =
+            normalize_tag_input(vec!["x".repeat(SERVER_TAG_INPUT_MAX_BYTES + 1)]).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn server_id_lists_are_bounded_and_canonicalized() {
+        let ids = (0..=SERVER_BATCH_MAX_SERVER_IDS)
+            .map(|idx| Uuid::from_u128(idx as u128 + 1).to_string())
+            .collect();
+        let err = dedupe_ids(ids, SERVER_BATCH_MAX_SERVER_IDS, "server_ids").unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+
+        let canonical = dedupe_ids(
+            vec![
+                "00000000000000000000000000000001".into(),
+                "00000000-0000-0000-0000-000000000001".into(),
+            ],
+            SERVER_BATCH_MAX_SERVER_IDS,
+            "server_ids",
+        )
+        .unwrap();
+        assert_eq!(canonical, vec!["00000000-0000-0000-0000-000000000001"]);
+    }
+
+    #[test]
+    fn server_display_order_matches_database_integer_range() {
+        assert!(normalize_display_order(Some(i32::MAX as i64), "display_order").is_ok());
+        let err = normalize_display_order(Some(i32::MAX as i64 + 1), "display_order").unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
     }
 
     #[test]

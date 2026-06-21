@@ -81,8 +81,18 @@ PAT 创建请求体上限为 16KiB。PAT 名称最长 128 字节，scopes 最多
 | `POST` | `/api/v1/agents/:id/revoke` | 撤销 Agent |
 | `GET` | `/api/v1/servers` | 服务器列表 |
 | `GET` | `/api/v1/servers/:id` | 服务器详情 |
+| `POST` | `/api/v1/servers/:id` | 更新服务器展示元数据 |
+| `POST` | `/api/v1/servers/batch` | 批量服务器管理 |
+| `GET` | `/api/v1/server-groups` | 服务器分组列表 |
+| `POST` | `/api/v1/server-groups` | 创建服务器分组 |
+| `POST` / `PATCH` | `/api/v1/server-groups/:id` | 更新服务器分组 |
+| `DELETE` | `/api/v1/server-groups/:id` | 删除服务器分组 |
+| `POST` | `/api/v1/server-groups/:id/members` | 添加服务器分组成员 |
+| `DELETE` | `/api/v1/server-groups/:id/members/:server_id` | 删除服务器分组成员 |
 | `GET` | `/api/v1/servers/:id/metrics` | 指标查询 |
 | `GET` | `/ws/servers` | 服务器实时 WebSocket |
+
+服务器展示元数据更新、批量管理、服务器分组创建/更新/加成员请求体上限为 64KiB。服务器名称最长 128 字节，备注、公开说明、供应商、地域、套餐、价格、计费周期等展示 label 最长 512 字节；dashboard metadata 序列化后最多 16KiB。标签输入最多 64 项、单项最长 128 字节，保存后最多保留 8 个展示标签。批量服务器 ID 和分组成员单次最多 200 个 UUID，并会规范化为 canonical 文本。`display_order` 必须在数据库 `INTEGER` 范围内。
 
 ### 服务监控
 

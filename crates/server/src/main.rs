@@ -80,6 +80,7 @@ use api::v1::server_ops::{
     apply_config, delete_file, download_url, force_update, get_config, list_files, read_file,
     server_ops_body_limit, upload_url, write_file,
 };
+use api::v1::servers::server_management_body_limit;
 use api::v1::service_history::{get_service_history, get_service_uptime};
 use api::v1::settings::{get_settings, settings_body_limit, update_settings};
 use api::v1::terminal::{create_terminal_session, terminal_body_limit, ws_terminal};
@@ -505,7 +506,8 @@ async fn main() -> anyhow::Result<()> {
                 .route("/api/v1/servers", get(api::v1::servers::list_servers))
                 .route(
                     "/api/v1/servers/batch",
-                    post(api::v1::servers::batch_update_servers),
+                    post(api::v1::servers::batch_update_servers)
+                        .layer(server_management_body_limit()),
                 )
                 .route(
                     "/api/v1/server-transfers",
@@ -533,12 +535,14 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .route(
                     "/api/v1/server-groups",
-                    post(api::v1::servers::create_server_group),
+                    post(api::v1::servers::create_server_group)
+                        .layer(server_management_body_limit()),
                 )
                 .route(
                     "/api/v1/server-groups/:id",
                     post(api::v1::servers::update_server_group)
-                        .patch(api::v1::servers::update_server_group),
+                        .patch(api::v1::servers::update_server_group)
+                        .layer(server_management_body_limit()),
                 )
                 .route(
                     "/api/v1/server-groups/:id",
@@ -546,14 +550,18 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .route(
                     "/api/v1/server-groups/:id/members",
-                    post(api::v1::servers::add_server_group_members),
+                    post(api::v1::servers::add_server_group_members)
+                        .layer(server_management_body_limit()),
                 )
                 .route(
                     "/api/v1/server-groups/:id/members/:server_id",
                     delete(api::v1::servers::delete_server_group_member),
                 )
                 .route("/api/v1/servers/:id", get(api::v1::servers::get_server))
-                .route("/api/v1/servers/:id", post(api::v1::servers::update_server))
+                .route(
+                    "/api/v1/servers/:id",
+                    post(api::v1::servers::update_server).layer(server_management_body_limit()),
+                )
                 .route(
                     "/api/v1/servers/:id/metrics",
                     get(api::v1::servers::get_server_metrics),
