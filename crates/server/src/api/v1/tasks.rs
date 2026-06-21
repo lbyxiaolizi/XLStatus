@@ -2,7 +2,7 @@
 #![allow(unused_imports)]
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
@@ -17,7 +17,9 @@ use crate::auth::middleware::{AuthSession, AuthUser};
 use crate::auth::rbac::{can_access_servers, has_scope};
 use crate::db::repository::tasks::{TaskRepository, TaskRunRepository};
 use crate::db::Db;
-use crate::tasks::{dispatch_task_to_agents, parse_task_schedule};
+use crate::tasks::{
+    dispatch_task_to_agents, parse_task_schedule, validate_task_definition, TASK_API_MAX_BODY_BYTES,
+};
 use xlstatus_shared::tasks::*;
 
 #[derive(Debug, Deserialize)]
@@ -120,6 +122,7 @@ pub async fn create_task(
         created_at: now.clone(),
         updated_at: now,
     };
+    validate_task_definition_or_403(&task)?;
 
     TaskRepository::create(&db, &task).await.map_err(|e| {
         (
@@ -324,6 +327,7 @@ pub async fn update_task(
         .await?;
 
     task.updated_at = Utc::now().to_rfc3339();
+    validate_task_definition_or_403(&task)?;
 
     TaskRepository::update(&db, &task).await.map_err(|e| {
         (
@@ -555,6 +559,10 @@ pub async fn get_task_runs(
     }))
 }
 
+pub fn task_body_limit() -> DefaultBodyLimit {
+    DefaultBodyLimit::max(TASK_API_MAX_BODY_BYTES)
+}
+
 fn require_scope_or_403(
     auth_user: &AuthUser,
     required_scope: &str,
@@ -619,6 +627,11 @@ fn ensure_task_visible_to_auth(
     task: &Task,
 ) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
     validate_task_selector_or_403(auth_user, &task.server_selector_json)
+}
+
+fn validate_task_definition_or_403(task: &Task) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
+    validate_task_definition(task)
+        .map_err(|err| api_error(StatusCode::BAD_REQUEST, err.to_string()))
 }
 
 fn task_visible_to_auth(auth_user: &AuthUser, task: &Task) -> bool {
@@ -740,6 +753,42 @@ mod tests {
 
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].server_id, "server-a");
+    }
+
+    #[test]
+    fn task_definition_rejects_oversized_command() {
+        let mut task = task(CoverMode::Specific, json!({ "server_ids": ["server-a"] }));
+        task.command = Some("x".repeat(crate::tasks::TASK_MAX_COMMAND_BYTES + 1));
+
+        let err = validate_task_definition_or_403(&task).unwrap_err();
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err
+            .1
+             .0
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("task.command"));
+    }
+
+    #[test]
+    fn task_definition_rejects_oversized_selector_shape() {
+        let server_ids = (0..=crate::tasks::TASK_MAX_SELECTOR_IDS)
+            .map(|idx| format!("server-{idx}"))
+            .collect::<Vec<_>>();
+        let task = task(CoverMode::Specific, json!({ "server_ids": server_ids }));
+
+        let err = validate_task_definition_or_403(&task).unwrap_err();
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err
+            .1
+             .0
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("too many entries"));
     }
 
     fn pat_with_servers(server_ids: Vec<&str>) -> AuthUser {

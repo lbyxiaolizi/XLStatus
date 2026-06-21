@@ -81,6 +81,8 @@
 | `POST` | `/api/v1/tasks/:id/run` | 手动运行任务 |
 | `GET` | `/api/v1/tasks/:id/runs` | 任务运行记录 |
 
+任务创建/更新请求体上限为 256KiB。任务名称最长 128 字节，Shell 命令最长 8192 字节，`payload_json` 最长 64KiB，`server_selector_json` 最长 16KiB。选择器中每类显式 ID 最多 64 项、标签最多 32 项；一次任务执行最多解析并下发到 64 台服务器。
+
 ### 文件、配置和终端
 
 | 方法 | 路径 | 说明 |

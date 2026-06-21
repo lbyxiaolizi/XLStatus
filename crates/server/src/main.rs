@@ -85,7 +85,8 @@ use api::v1::services::{
     create_service, delete_service, get_service, list_services, test_probe, update_service,
 };
 use api::v1::tasks::{
-    create_task, delete_task, get_task, get_task_runs, list_tasks, run_task, update_task,
+    create_task, delete_task, get_task, get_task_runs, list_tasks, run_task, task_body_limit,
+    update_task,
 };
 use api::v1::transfers::{
     list_temporary_transfers, revoke_temporary_transfer, temp_download, temp_upload,
@@ -510,10 +511,13 @@ async fn main() -> anyhow::Result<()> {
                 .route("/api/v1/servers/:id/force-update", post(force_update))
                 .route("/ws/servers", get(api::v1::servers::ws_servers))
                 // Tasks
-                .route("/api/v1/tasks", post(create_task))
+                .route("/api/v1/tasks", post(create_task).layer(task_body_limit()))
                 .route("/api/v1/tasks", get(list_tasks))
                 .route("/api/v1/tasks/:id", get(get_task))
-                .route("/api/v1/tasks/:id", post(update_task))
+                .route(
+                    "/api/v1/tasks/:id",
+                    post(update_task).layer(task_body_limit()),
+                )
                 .route("/api/v1/tasks/:id", delete(delete_task))
                 .route("/api/v1/tasks/:id/run", post(run_task))
                 .route("/api/v1/tasks/:id/runs", get(get_task_runs))

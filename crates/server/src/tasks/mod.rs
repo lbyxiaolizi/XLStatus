@@ -16,6 +16,17 @@ use crate::notifications::sender::{
     NotificationChannel, NotificationMessage, NotificationSender, NotificationSeverity,
 };
 
+pub(crate) const TASK_API_MAX_BODY_BYTES: usize = 256 * 1024;
+pub(crate) const TASK_MAX_NAME_BYTES: usize = 128;
+pub(crate) const TASK_MAX_SCHEDULE_BYTES: usize = 128;
+pub(crate) const TASK_MAX_COMMAND_BYTES: usize = 8192;
+pub(crate) const TASK_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
+pub(crate) const TASK_MAX_SELECTOR_BYTES: usize = 16 * 1024;
+pub(crate) const TASK_MAX_SELECTOR_IDS: usize = 64;
+pub(crate) const TASK_MAX_SELECTOR_TAGS: usize = 32;
+pub(crate) const TASK_MAX_SELECTOR_TOKEN_BYTES: usize = 128;
+pub(crate) const TASK_MAX_DISPATCH_TARGETS: usize = 64;
+
 pub(crate) fn parse_task_schedule(schedule: &str) -> Result<Schedule> {
     let trimmed = schedule.trim();
     let field_count = trimmed.split_whitespace().count();
@@ -26,6 +37,84 @@ pub(crate) fn parse_task_schedule(schedule: &str) -> Result<Schedule> {
     };
 
     Schedule::from_str(&normalized).map_err(|err| anyhow!(err))
+}
+
+pub(crate) fn validate_task_definition(task: &Task) -> Result<()> {
+    validate_sized_text(&task.name, 1, TASK_MAX_NAME_BYTES, "task.name")?;
+    if let Some(schedule) = task.schedule.as_deref() {
+        validate_sized_text(schedule, 1, TASK_MAX_SCHEDULE_BYTES, "task.schedule")?;
+        parse_task_schedule(schedule).context("task.schedule is invalid")?;
+    }
+    if let Some(command) = task.command.as_deref() {
+        let min = if task.task_type == TaskType::Shell {
+            1
+        } else {
+            0
+        };
+        validate_sized_text(command, min, TASK_MAX_COMMAND_BYTES, "task.command")?;
+    } else if task.task_type == TaskType::Shell {
+        anyhow::bail!("task.command must be between 1 and {TASK_MAX_COMMAND_BYTES} bytes");
+    }
+    if let Some(payload) = task.payload_json.as_deref() {
+        validate_sized_text(payload, 0, TASK_MAX_PAYLOAD_BYTES, "task.payload_json")?;
+    }
+    validate_sized_text(
+        &task.server_selector_json,
+        1,
+        TASK_MAX_SELECTOR_BYTES,
+        "task.server_selector_json",
+    )?;
+    let selector: ServerSelector = serde_json::from_str(&task.server_selector_json)
+        .context("task.server_selector_json is invalid")?;
+    validate_task_selector_shape(&selector)?;
+    Ok(())
+}
+
+fn validate_sized_text(value: &str, min_bytes: usize, max_bytes: usize, field: &str) -> Result<()> {
+    let len = value.len();
+    if len < min_bytes || len > max_bytes {
+        anyhow::bail!("{field} must be between {min_bytes} and {max_bytes} bytes");
+    }
+    Ok(())
+}
+
+fn validate_task_selector_shape(selector: &ServerSelector) -> Result<()> {
+    ensure_selector_vec_allowed(&selector.server_ids, "server_ids")?;
+    ensure_selector_vec_allowed(&selector.exclude_server_ids, "exclude_server_ids")?;
+    ensure_selector_vec_allowed(&selector.group_ids, "group_ids")?;
+    if selector.tag_names.len() > TASK_MAX_SELECTOR_TAGS {
+        anyhow::bail!("tag_names contains too many entries");
+    }
+    for tag in &selector.tag_names {
+        validate_sized_text(tag, 1, TASK_MAX_SELECTOR_TOKEN_BYTES, "tag_names entry")?;
+    }
+    if selector.tags.len() > TASK_MAX_SELECTOR_TAGS {
+        anyhow::bail!("tags contains too many entries");
+    }
+    for (key, value) in &selector.tags {
+        validate_sized_text(key, 1, TASK_MAX_SELECTOR_TOKEN_BYTES, "tags key")?;
+        validate_sized_text(value, 0, TASK_MAX_SELECTOR_TOKEN_BYTES, "tags value")?;
+    }
+    Ok(())
+}
+
+fn ensure_selector_vec_allowed(values: &[String], field: &str) -> Result<()> {
+    if values.len() > TASK_MAX_SELECTOR_IDS {
+        anyhow::bail!("{field} contains too many entries");
+    }
+    for value in values {
+        validate_sized_text(value, 1, TASK_MAX_SELECTOR_TOKEN_BYTES, field)?;
+    }
+    Ok(())
+}
+
+fn ensure_task_target_count_allowed(count: usize) -> Result<()> {
+    if count > TASK_MAX_DISPATCH_TARGETS {
+        anyhow::bail!(
+            "task resolves to {count} target servers; maximum is {TASK_MAX_DISPATCH_TARGETS}"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -60,6 +149,7 @@ pub async fn dispatch_task_to_agents_with_source(
     task: &Task,
     source_agent_id: Option<&str>,
 ) -> Result<TaskDispatchReport> {
+    validate_task_definition(task).context("task definition is outside allowed safety limits")?;
     let selector: ServerSelector = serde_json::from_str(&task.server_selector_json)
         .context("task.server_selector_json is invalid")?;
 
@@ -82,6 +172,7 @@ pub async fn dispatch_task_to_agents_with_source(
     if target_agent_ids.is_empty() {
         anyhow::bail!("No target servers resolved from selector");
     }
+    ensure_task_target_count_allowed(target_agent_ids.len())?;
 
     let mut runs = Vec::with_capacity(target_agent_ids.len());
     let mut success = 0usize;
@@ -894,6 +985,36 @@ mod tests {
         assert!(err.to_string().contains("owner does not match"));
     }
 
+    #[test]
+    fn task_definition_bounds_command_and_selector() {
+        let mut task = sample_task();
+        task.command = Some("x".repeat(TASK_MAX_COMMAND_BYTES + 1));
+        assert!(validate_task_definition(&task)
+            .unwrap_err()
+            .to_string()
+            .contains("task.command"));
+
+        let mut task = sample_task();
+        task.server_selector_json = serde_json::to_string(&ServerSelector {
+            server_ids: (0..=TASK_MAX_SELECTOR_IDS)
+                .map(|idx| format!("server-{idx}"))
+                .collect(),
+            ..ServerSelector::default()
+        })
+        .unwrap();
+        assert!(validate_task_definition(&task)
+            .unwrap_err()
+            .to_string()
+            .contains("too many entries"));
+    }
+
+    #[test]
+    fn task_dispatch_target_count_is_bounded() {
+        assert!(ensure_task_target_count_allowed(TASK_MAX_DISPATCH_TARGETS).is_ok());
+        let err = ensure_task_target_count_allowed(TASK_MAX_DISPATCH_TARGETS + 1).unwrap_err();
+        assert!(err.to_string().contains("maximum"));
+    }
+
     async fn test_db() -> Db {
         let db = Db::connect("sqlite::memory:", true).await.unwrap();
         db.run_migrations().await.unwrap();
@@ -915,10 +1036,18 @@ mod tests {
     }
 
     async fn seed_task(db: &Db, id: &str, owner: &str, name: &str) {
-        let task = Task {
-            id: id.to_string(),
-            owner_user_id: owner.to_string(),
-            name: name.to_string(),
+        let mut task = sample_task();
+        task.id = id.to_string();
+        task.owner_user_id = owner.to_string();
+        task.name = name.to_string();
+        TaskRepository::create(db, &task).await.unwrap();
+    }
+
+    fn sample_task() -> Task {
+        Task {
+            id: "00000000-0000-0000-0000-000000000101".to_string(),
+            owner_user_id: "00000000-0000-0000-0000-000000000001".to_string(),
+            name: "task".to_string(),
             task_type: TaskType::Shell,
             schedule: None,
             command: Some("true".to_string()),
@@ -940,7 +1069,6 @@ mod tests {
             enabled: true,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-        };
-        TaskRepository::create(db, &task).await.unwrap();
+        }
     }
 }
