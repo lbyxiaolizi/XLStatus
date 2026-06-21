@@ -520,6 +520,7 @@ impl ServiceMonitor {
                 if success { "recovered" } else { "failed" }
             ),
             server_id.map(str::to_string),
+            None,
         );
     }
 

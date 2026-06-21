@@ -306,6 +306,7 @@ pub fn spawn_triggered_tasks(
     task_ids: Vec<String>,
     source: String,
     source_agent_id: Option<String>,
+    owner_user_id: Option<String>,
 ) {
     let mut seen = std::collections::HashSet::new();
     for task_id in task_ids
@@ -321,6 +322,7 @@ pub fn spawn_triggered_tasks(
         let response_registry = response_registry.clone();
         let source = source.clone();
         let source_agent_id = source_agent_id.clone();
+        let owner_user_id = owner_user_id.clone();
         tokio::spawn(async move {
             if let Err(err) = run_triggered_task(
                 db,
@@ -329,6 +331,7 @@ pub fn spawn_triggered_tasks(
                 &task_id,
                 &source,
                 source_agent_id.as_deref(),
+                owner_user_id.as_deref(),
             )
             .await
             {
@@ -345,10 +348,16 @@ async fn run_triggered_task(
     task_id: &str,
     source: &str,
     source_agent_id: Option<&str>,
+    owner_user_id: Option<&str>,
 ) -> Result<()> {
     let task = TaskRepository::get_by_id(&db, task_id)
         .await?
         .context("Task not found")?;
+    if let Some(owner_user_id) = owner_user_id {
+        if task.owner_user_id != owner_user_id {
+            anyhow::bail!("Task owner does not match trigger owner");
+        }
+    }
     if !task.enabled {
         info!(
             "triggered task {} from {} skipped: disabled",
@@ -848,4 +857,90 @@ async fn update_and_build_run(
         error,
         created_at,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xlstatus_shared::tasks::{CoverMode, ServerSelector, Task, TaskType};
+
+    #[tokio::test]
+    async fn triggered_task_requires_matching_owner_when_provided() {
+        let db = test_db().await;
+        let owner = "00000000-0000-0000-0000-000000000001";
+        let other = "00000000-0000-0000-0000-000000000002";
+        seed_user(&db, owner, "owner").await;
+        seed_user(&db, other, "other").await;
+        seed_task(
+            &db,
+            "00000000-0000-0000-0000-000000000301",
+            other,
+            "other-task",
+        )
+        .await;
+
+        let err = run_triggered_task(
+            db,
+            crate::grpc::SessionRegistry::new(),
+            crate::current_task_response_registry(),
+            "00000000-0000-0000-0000-000000000301",
+            "alert:dirty",
+            None,
+            Some(owner),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("owner does not match"));
+    }
+
+    async fn test_db() -> Db {
+        let db = Db::connect("sqlite::memory:", true).await.unwrap();
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    async fn seed_user(db: &Db, id: &str, username: &str) {
+        let Db::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, role, created_at, updated_at) VALUES (?, ?, 'hash', 'member', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(username)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_task(db: &Db, id: &str, owner: &str, name: &str) {
+        let task = Task {
+            id: id.to_string(),
+            owner_user_id: owner.to_string(),
+            name: name.to_string(),
+            task_type: TaskType::Shell,
+            schedule: None,
+            command: Some("true".to_string()),
+            payload_json: None,
+            cover_mode: CoverMode::Specific,
+            server_selector_json: serde_json::to_string(&ServerSelector {
+                server_ids: Vec::new(),
+                group_ids: Vec::new(),
+                tag_names: Vec::new(),
+                tags: HashMap::new(),
+                exclude_server_ids: Vec::new(),
+                source_server: false,
+            })
+            .unwrap(),
+            push_successful: false,
+            notification_group_id: None,
+            last_executed_at: None,
+            last_result: None,
+            enabled: true,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        TaskRepository::create(db, &task).await.unwrap();
+    }
 }

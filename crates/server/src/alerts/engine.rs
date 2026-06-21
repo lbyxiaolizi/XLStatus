@@ -21,6 +21,7 @@ use tracing::{info, warn};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlertRule {
     pub id: String,
+    pub owner_user_id: String,
     pub name: String,
     pub enabled: bool,
     pub trigger_mode: TriggerMode,
@@ -708,6 +709,7 @@ impl AlertEngine {
             task_ids.clone(),
             format!("alert:{}:{}", rule.id, kind),
             source_agent_id.map(str::to_string),
+            Some(rule.owner_user_id.clone()),
         );
     }
 
@@ -726,14 +728,23 @@ impl AlertEngine {
             bool,
         )> = match &self.db {
             crate::db::DatabaseBackend::Sqlite(pool) => {
-                sqlx::query_as("SELECT n.id, n.name, n.url, n.request_method, n.request_type, n.headers_json, n.body_template, n.verify_tls FROM notifications n JOIN notification_group_members ngm ON ngm.notification_id = n.id WHERE ngm.group_id = ?")
+                sqlx::query_as("SELECT n.id, n.name, n.url, n.request_method, n.request_type, n.headers_json, n.body_template, n.verify_tls FROM notifications n JOIN notification_group_members ngm ON ngm.notification_id = n.id JOIN notification_groups ng ON ng.id = ngm.group_id WHERE ngm.group_id = ? AND ng.owner_user_id = ? AND n.owner_user_id = ?")
                     .bind(ng)
+                    .bind(&rule.owner_user_id)
+                    .bind(&rule.owner_user_id)
                     .fetch_all(pool)
                     .await?
             }
             crate::db::DatabaseBackend::Postgres(pool) => {
-                sqlx::query_as("SELECT n.id::text, n.name, n.url, n.request_method, n.request_type, n.headers_json, n.body_template, n.verify_tls FROM notifications n JOIN notification_group_members ngm ON ngm.notification_id = n.id WHERE ngm.group_id = $1")
-                    .bind(ng)
+                let Ok(group_id) = uuid::Uuid::parse_str(ng) else {
+                    return Ok(Vec::new());
+                };
+                let Ok(owner_id) = uuid::Uuid::parse_str(&rule.owner_user_id) else {
+                    return Ok(Vec::new());
+                };
+                sqlx::query_as("SELECT n.id::text, n.name, n.url, n.request_method, n.request_type, n.headers_json, n.body_template, n.verify_tls FROM notifications n JOIN notification_group_members ngm ON ngm.notification_id = n.id JOIN notification_groups ng ON ng.id = ngm.group_id WHERE ngm.group_id = $1 AND ng.owner_user_id = $2 AND n.owner_user_id = $2")
+                    .bind(group_id)
+                    .bind(owner_id)
                     .fetch_all(pool)
                     .await?
             }
@@ -775,6 +786,7 @@ impl AlertEngine {
                 let rows: Vec<(
                     String,
                     String,
+                    String,
                     i64,
                     String,
                     String,
@@ -782,12 +794,13 @@ impl AlertEngine {
                     Option<String>,
                     Option<String>,
                 )> = sqlx::query_as(
-                    "SELECT id, name, enabled, trigger_mode, rules_json, notification_group_id, fail_task_ids_json, recover_task_ids_json FROM alert_rules WHERE enabled = 1",
+                    "SELECT id, owner_user_id, name, enabled, trigger_mode, rules_json, notification_group_id, fail_task_ids_json, recover_task_ids_json FROM alert_rules WHERE enabled = 1",
                 )
                 .fetch_all(pool)
                 .await?;
                 for (
                     id,
+                    owner_user_id,
                     name,
                     enabled,
                     trigger_mode,
@@ -799,6 +812,7 @@ impl AlertEngine {
                 {
                     out.push(AlertRule {
                         id,
+                        owner_user_id,
                         name,
                         enabled: enabled != 0,
                         trigger_mode: TriggerMode::from_db(&trigger_mode),
@@ -814,6 +828,7 @@ impl AlertEngine {
                 let rows: Vec<(
                     String,
                     String,
+                    String,
                     bool,
                     String,
                     String,
@@ -821,12 +836,13 @@ impl AlertEngine {
                     Option<String>,
                     Option<String>,
                 )> = sqlx::query_as(
-                    "SELECT id::text, name, enabled, trigger_mode, rules_json, notification_group_id::text, fail_task_ids_json, recover_task_ids_json FROM alert_rules WHERE enabled = 1",
+                    "SELECT id::text, owner_user_id::text, name, enabled, trigger_mode, rules_json, notification_group_id::text, fail_task_ids_json, recover_task_ids_json FROM alert_rules WHERE enabled = 1",
                 )
                 .fetch_all(pool)
                 .await?;
                 for (
                     id,
+                    owner_user_id,
                     name,
                     enabled,
                     trigger_mode,
@@ -838,6 +854,7 @@ impl AlertEngine {
                 {
                     out.push(AlertRule {
                         id,
+                        owner_user_id,
                         name,
                         enabled,
                         trigger_mode: TriggerMode::from_db(&trigger_mode),
@@ -1296,5 +1313,104 @@ mod tests {
                 .unwrap(),
             42.0
         );
+    }
+
+    #[tokio::test]
+    async fn channels_for_rule_requires_notification_group_owner() {
+        let db = test_db().await;
+        let owner = "00000000-0000-0000-0000-000000000001";
+        let other = "00000000-0000-0000-0000-000000000002";
+        let group = "00000000-0000-0000-0000-000000000301";
+        let notification = "00000000-0000-0000-0000-000000000401";
+
+        seed_user(&db, owner, "owner").await;
+        seed_user(&db, other, "other").await;
+        seed_notification_group(&db, group, other, "other-group").await;
+        seed_notification(&db, notification, other, "other-channel").await;
+        seed_notification_group_member(&db, group, notification).await;
+
+        let engine = AlertEngine::new(
+            db,
+            crate::grpc::SessionRegistry::new(),
+            crate::current_task_response_registry(),
+        );
+        let dirty_rule = AlertRule {
+            id: "00000000-0000-0000-0000-000000000501".into(),
+            owner_user_id: owner.into(),
+            name: "dirty-rule".into(),
+            enabled: true,
+            trigger_mode: TriggerMode::Once,
+            conditions: Vec::new(),
+            notification_group_id: Some(group.into()),
+            failure_task_ids: Vec::new(),
+            recovery_task_ids: Vec::new(),
+        };
+
+        let channels = engine.channels_for_rule(&dirty_rule).await.unwrap();
+        assert!(channels.is_empty());
+    }
+
+    async fn test_db() -> Db {
+        let db = Db::connect("sqlite::memory:", true).await.unwrap();
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    async fn seed_user(db: &Db, id: &str, username: &str) {
+        let Db::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, role, created_at, updated_at) VALUES (?, ?, 'hash', 'member', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(username)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_notification_group(db: &Db, id: &str, owner: &str, name: &str) {
+        let Db::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO notification_groups (id, owner_user_id, name, created_at, updated_at) VALUES (?, ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(owner)
+        .bind(name)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_notification(db: &Db, id: &str, owner: &str, name: &str) {
+        let Db::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO notifications (id, owner_user_id, name, url, request_method, request_type, verify_tls, format_metric_units, created_at, updated_at) VALUES (?, ?, ?, 'https://example.com/hook', 'POST', 'json', 1, 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(owner)
+        .bind(name)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_notification_group_member(db: &Db, group_id: &str, notification_id: &str) {
+        let Db::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO notification_group_members (group_id, notification_id) VALUES (?, ?)",
+        )
+        .bind(group_id)
+        .bind(notification_id)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 }
