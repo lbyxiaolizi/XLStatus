@@ -297,7 +297,7 @@ const ROUTES: &[RouteSpec] = &[
         protected: true,
     },
     RouteSpec {
-        method: "get",
+        method: "post",
         path: "/api/v1/geoip/test",
         summary: "Test GeoIP lookup",
         protected: true,
@@ -1020,6 +1020,7 @@ mod tests {
             "/api/v1/waf/bans",
             "/api/v1/settings",
             "/api/v1/themes",
+            "/api/v1/geoip/test",
             "/api/v1/servers/{id}/files/download-url",
             "/api/v1/servers/{id}/files/upload-url",
         ] {
@@ -1048,5 +1049,14 @@ mod tests {
         assert!(upload["post"].get("security").is_some());
         assert!(download["get"].is_null());
         assert!(upload["get"].is_null());
+    }
+
+    #[test]
+    fn openapi_documents_geoip_test_as_post_only() {
+        let doc = openapi_document();
+        let geoip_test = &doc["paths"]["/api/v1/geoip/test"];
+
+        assert!(geoip_test["post"].get("security").is_some());
+        assert!(geoip_test["get"].is_null());
     }
 }

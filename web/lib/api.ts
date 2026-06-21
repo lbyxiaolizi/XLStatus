@@ -1441,9 +1441,14 @@ class ApiClient {
     provider = "empty",
     token = "",
   ): Promise<ApiResponse<GeoIpLookupResponse>> {
-    const query = new URLSearchParams({ ip, provider });
-    if (token.trim()) query.set("token", token.trim());
-    return this.request<GeoIpLookupResponse>(`/api/v1/geoip/test?${query.toString()}`);
+    return this.request<GeoIpLookupResponse>("/api/v1/geoip/test", {
+      method: "POST",
+      body: JSON.stringify({
+        ip,
+        provider,
+        ...(token.trim() ? { token: token.trim() } : {}),
+      }),
+    });
   }
 
   async getGeoIpStatus(): Promise<ApiResponse<GeoIpMmdbStatus>> {

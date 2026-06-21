@@ -339,7 +339,7 @@ async fn main() -> anyhow::Result<()> {
                     post(api::v1::cloudflared::stop_cloudflared),
                 )
                 .route("/api/v1/geoip/status", get(geoip_status))
-                .route("/api/v1/geoip/test", get(test_geoip))
+                .route("/api/v1/geoip/test", post(test_geoip))
                 .route("/api/v1/geoip/update", post(update_geoip_database))
                 .route(
                     "/api/v1/geoip/upload",

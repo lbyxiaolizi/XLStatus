@@ -10,7 +10,7 @@ use crate::notifications::sender::{
 };
 use crate::security::{secure_reqwest_client_builder, validate_outbound_url_resolved};
 use axum::{
-    extract::{DefaultBodyLimit, Multipart, Query, State},
+    extract::{DefaultBodyLimit, Multipart, State},
     Json,
 };
 use chrono::Utc;
@@ -24,7 +24,7 @@ use xlstatus_shared::AgentId;
 const GEOIP_MMDB_MAX_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
-pub struct GeoIpTestQuery {
+pub struct GeoIpTestRequest {
     pub ip: String,
     #[serde(default)]
     pub provider: Option<String>,
@@ -100,18 +100,18 @@ struct AgentIpSnapshot {
 pub async fn test_geoip(
     State(state): State<AppState>,
     auth: AuthSession,
-    Query(query): Query<GeoIpTestQuery>,
+    Json(req): Json<GeoIpTestRequest>,
 ) -> Result<Json<ApiResponse<GeoIpLookupResponse>>, AppError> {
     require_admin(&auth)?;
-    let ip = query.ip.trim();
+    let ip = req.ip.trim();
     if ip.is_empty() {
         return Err(AppError::BadRequest("ip is required".into()));
     }
     if ip.parse::<std::net::IpAddr>().is_err() {
         return Err(AppError::BadRequest("ip is invalid".into()));
     }
-    let provider = query.provider.as_deref().map(str::trim);
-    let token = query.token.as_deref();
+    let provider = req.provider.as_deref().map(str::trim);
+    let token = req.token.as_deref();
     let result = lookup_ip_with_provider(&state.db, ip, provider, token).await?;
     Ok(Json(ApiResponse::success(result)))
 }
