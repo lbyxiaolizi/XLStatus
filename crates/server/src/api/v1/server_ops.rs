@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,11 @@ use crate::mcp::executor::{
 
 const FILE_OP_TIMEOUT_SECS: u64 = 30;
 const FILE_READ_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const FILE_WRITE_MAX_BYTES: usize = 2 * 1024 * 1024;
+const SERVER_OPS_API_MAX_BODY_BYTES: usize = 3 * 1024 * 1024;
+const SERVER_OPS_MAX_PATH_BYTES: usize = 4096;
+const CONFIG_PATCH_MAX_BYTES: usize = 128 * 1024;
+const FORCE_UPDATE_MAX_URL_BYTES: usize = 2048;
 const FORCE_UPDATE_REPO_HOST: &str = "github.com";
 const FORCE_UPDATE_REPO_PATH_PREFIX: &str = "/lbyxiaolizi/XLStatus/releases/download/";
 
@@ -131,6 +136,10 @@ pub struct TempUrlResponse {
     pub expires_at: i64,
 }
 
+pub fn server_ops_body_limit() -> DefaultBodyLimit {
+    DefaultBodyLimit::max(SERVER_OPS_API_MAX_BODY_BYTES)
+}
+
 pub async fn list_files(
     State(state): State<AppState>,
     auth: AuthSession,
@@ -231,6 +240,8 @@ pub async fn write_file(
     } else {
         req.content.into_bytes()
     };
+    ensure_file_write_size(&data)?;
+    let bytes_len = data.len();
     let result = dispatch_file_task(
         &state,
         agent_id,
@@ -239,7 +250,7 @@ pub async fn write_file(
             task_type: TaskType::FileWrite as i32,
             spec: Some(Spec::FileWrite(FileWriteTask {
                 path: path.clone(),
-                data: data.clone(),
+                data,
                 mode: req.mode.unwrap_or(0),
                 create_dirs: req.create_dirs,
             })),
@@ -251,7 +262,7 @@ pub async fn write_file(
     Ok(Json(ApiResponse::success(serde_json::json!({
         "server_id": server_id,
         "path": path,
-        "bytes_written": result.stdout.trim().parse::<u64>().unwrap_or(data.len() as u64),
+        "bytes_written": result.stdout.trim().parse::<u64>().unwrap_or(bytes_len as u64),
     }))))
 }
 
@@ -367,8 +378,7 @@ pub async fn apply_config(
             "config patch must not be empty".into(),
         ));
     }
-    let payload = serde_json::to_vec(&req.config)
-        .map_err(|e| AppError::BadRequest(format!("invalid config patch: {e}")))?;
+    let payload = serialize_config_patch(&req.config)?;
     state
         .session_registry
         .send(
@@ -564,10 +574,35 @@ fn validate_abs_path(path: &str) -> Result<String, AppError> {
     if !trimmed.starts_with('/') {
         return Err(AppError::BadRequest("path must be absolute".into()));
     }
+    if trimmed.len() > SERVER_OPS_MAX_PATH_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "path exceeds {SERVER_OPS_MAX_PATH_BYTES} bytes"
+        )));
+    }
     if trimmed.contains('\0') {
         return Err(AppError::BadRequest("path contains NUL byte".into()));
     }
     Ok(trimmed.to_string())
+}
+
+fn ensure_file_write_size(data: &[u8]) -> Result<(), AppError> {
+    if data.len() > FILE_WRITE_MAX_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "file write content exceeds {FILE_WRITE_MAX_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn serialize_config_patch(config: &serde_json::Value) -> Result<Vec<u8>, AppError> {
+    let payload = serde_json::to_vec(config)
+        .map_err(|e| AppError::BadRequest(format!("invalid config patch: {e}")))?;
+    if payload.len() > CONFIG_PATCH_MAX_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "config patch exceeds {CONFIG_PATCH_MAX_BYTES} bytes"
+        )));
+    }
+    Ok(payload)
 }
 
 fn require_force_update_scope(auth: &AuthSession) -> Result<(), AppError> {
@@ -646,6 +681,11 @@ fn validate_force_update_download_url(
     let trimmed = download_url.trim();
     if trimmed.is_empty() {
         return Err(AppError::BadRequest("download_url is required".into()));
+    }
+    if trimmed.len() > FORCE_UPDATE_MAX_URL_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "download_url exceeds {FORCE_UPDATE_MAX_URL_BYTES} bytes"
+        )));
     }
     let url = reqwest::Url::parse(trimmed)
         .map_err(|e| AppError::BadRequest(format!("download_url is invalid: {e}")))?;
@@ -836,6 +876,31 @@ mod tests {
     }
 
     #[test]
+    fn server_ops_resource_limits_are_explicit() {
+        assert_eq!(SERVER_OPS_API_MAX_BODY_BYTES, 3 * 1024 * 1024);
+        assert_eq!(FILE_WRITE_MAX_BYTES, 2 * 1024 * 1024);
+        assert_eq!(CONFIG_PATCH_MAX_BYTES, 128 * 1024);
+    }
+
+    #[test]
+    fn file_path_and_write_content_have_resource_bounds() {
+        assert!(validate_abs_path("/var/log/app.log").is_ok());
+        assert!(validate_abs_path(&format!("/{}", "a".repeat(SERVER_OPS_MAX_PATH_BYTES))).is_err());
+        assert!(ensure_file_write_size(&vec![0_u8; FILE_WRITE_MAX_BYTES]).is_ok());
+        assert!(ensure_file_write_size(&vec![0_u8; FILE_WRITE_MAX_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn config_patch_has_resource_bounds() {
+        let config = serde_json::json!({ "name": "agent-1" });
+        assert!(serialize_config_patch(&config).is_ok());
+
+        let oversized = serde_json::json!({ "blob": "a".repeat(CONFIG_PATCH_MAX_BYTES) });
+        let err = serialize_config_patch(&oversized).unwrap_err();
+        assert!(app_error_message(&err).contains("config patch exceeds"));
+    }
+
+    #[test]
     fn force_update_accepts_project_agent_release_asset() {
         let update = validate_force_update_request_with_custom_source(force_update_req(
             "https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.3/xlstatus-agent-linux-amd64.tar.gz",
@@ -868,6 +933,21 @@ mod tests {
         .unwrap_err();
 
         assert!(app_error_message(&err).contains("explicit release version"));
+    }
+
+    #[test]
+    fn force_update_rejects_oversized_download_url() {
+        let err = validate_force_update_download_url(
+            &format!(
+                "https://updates.example.net/{}",
+                "a".repeat(FORCE_UPDATE_MAX_URL_BYTES)
+            ),
+            "v0.1.0-alpha.3",
+            true,
+        )
+        .unwrap_err();
+
+        assert!(app_error_message(&err).contains("download_url exceeds"));
     }
 
     #[test]

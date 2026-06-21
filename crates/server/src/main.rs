@@ -75,7 +75,7 @@ use api::v1::openapi::openapi_json;
 use api::v1::pat::{create_pat, list_pats, revoke_pat};
 use api::v1::server_ops::{
     apply_config, delete_file, download_url, force_update, get_config, list_files, read_file,
-    upload_url, write_file,
+    server_ops_body_limit, upload_url, write_file,
 };
 use api::v1::service_history::{get_service_history, get_service_uptime};
 use api::v1::settings::{get_settings, update_settings};
@@ -521,15 +521,39 @@ async fn main() -> anyhow::Result<()> {
                     "/api/v1/servers/:id/metrics",
                     get(api::v1::servers::get_server_metrics),
                 )
-                .route("/api/v1/servers/:id/files", post(list_files))
-                .route("/api/v1/servers/:id/files/read", post(read_file))
-                .route("/api/v1/servers/:id/files/write", post(write_file))
-                .route("/api/v1/servers/:id/files/delete", post(delete_file))
-                .route("/api/v1/servers/:id/files/download-url", post(download_url))
-                .route("/api/v1/servers/:id/files/upload-url", post(upload_url))
+                .route(
+                    "/api/v1/servers/:id/files",
+                    post(list_files).layer(server_ops_body_limit()),
+                )
+                .route(
+                    "/api/v1/servers/:id/files/read",
+                    post(read_file).layer(server_ops_body_limit()),
+                )
+                .route(
+                    "/api/v1/servers/:id/files/write",
+                    post(write_file).layer(server_ops_body_limit()),
+                )
+                .route(
+                    "/api/v1/servers/:id/files/delete",
+                    post(delete_file).layer(server_ops_body_limit()),
+                )
+                .route(
+                    "/api/v1/servers/:id/files/download-url",
+                    post(download_url).layer(server_ops_body_limit()),
+                )
+                .route(
+                    "/api/v1/servers/:id/files/upload-url",
+                    post(upload_url).layer(server_ops_body_limit()),
+                )
                 .route("/api/v1/servers/:id/config", get(get_config))
-                .route("/api/v1/servers/:id/config", post(apply_config))
-                .route("/api/v1/servers/:id/force-update", post(force_update))
+                .route(
+                    "/api/v1/servers/:id/config",
+                    post(apply_config).layer(server_ops_body_limit()),
+                )
+                .route(
+                    "/api/v1/servers/:id/force-update",
+                    post(force_update).layer(server_ops_body_limit()),
+                )
                 .route("/ws/servers", get(api::v1::servers::ws_servers))
                 // Tasks
                 .route("/api/v1/tasks", post(create_task).layer(task_body_limit()))
