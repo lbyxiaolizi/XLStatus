@@ -75,7 +75,7 @@ use api::v1::oauth::{
     start_oauth_login, unbind_oauth_provider,
 };
 use api::v1::openapi::openapi_json;
-use api::v1::pat::{create_pat, list_pats, revoke_pat};
+use api::v1::pat::{create_pat, list_pats, pat_body_limit, revoke_pat};
 use api::v1::server_ops::{
     apply_config, delete_file, download_url, force_update, get_config, list_files, read_file,
     server_ops_body_limit, upload_url, write_file,
@@ -389,7 +389,7 @@ async fn main() -> anyhow::Result<()> {
                     post(update_theme).patch(update_theme).delete(delete_theme),
                 )
                 .route("/api/v1/themes/:id/select", post(select_theme))
-                .route("/api/v1/tokens", post(create_pat))
+                .route("/api/v1/tokens", post(create_pat).layer(pat_body_limit()))
                 .route("/api/v1/tokens", get(list_pats))
                 .route("/api/v1/tokens/:id", axum::routing::delete(revoke_pat))
                 .route("/api/v1/enrollment-tokens", post(create_enrollment_token))

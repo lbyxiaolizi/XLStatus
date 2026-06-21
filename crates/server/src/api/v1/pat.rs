@@ -3,7 +3,11 @@ use crate::auth::generate_pat;
 use crate::auth::middleware::AuthUser;
 use crate::auth::rbac;
 use crate::db::{AgentRepository, CreatePATInput, DatabaseBackend, PATRepository};
-use axum::{extract::Path, extract::State, http::HeaderMap, Json};
+use axum::{
+    extract::{DefaultBodyLimit, Path, State},
+    http::HeaderMap,
+    Json,
+};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use xlstatus_shared::UserId;
@@ -12,6 +16,12 @@ use super::auth::AppError;
 
 const DEFAULT_PAT_TTL_DAYS: i64 = 90;
 const MAX_PAT_TTL_DAYS: i64 = 365;
+const PAT_CREATE_MAX_BODY_BYTES: usize = 16 * 1024;
+const PAT_MAX_NAME_BYTES: usize = 128;
+const PAT_MAX_SCOPES: usize = 64;
+const PAT_MAX_SCOPE_BYTES: usize = 128;
+const PAT_MAX_SERVER_IDS: usize = 64;
+const PAT_MAX_EXPIRES_AT_BYTES: usize = 64;
 
 #[derive(Debug, Deserialize)]
 pub struct CreatePATRequest {
@@ -19,6 +29,13 @@ pub struct CreatePATRequest {
     pub scopes: Vec<String>,
     pub server_ids: Option<Vec<String>>,
     pub expires_at: Option<String>,
+}
+
+struct NormalizedPATRequest {
+    name: String,
+    scopes: Vec<String>,
+    server_ids: Option<Vec<String>>,
+    expires_at: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -40,6 +57,10 @@ pub struct PATInfo {
     pub expires_at: Option<String>,
     pub last_used_at: Option<String>,
     pub created_at: String,
+}
+
+pub fn pat_body_limit() -> DefaultBodyLimit {
+    DefaultBodyLimit::max(PAT_CREATE_MAX_BODY_BYTES)
 }
 
 fn validate_scopes(scopes: &[String], is_admin: bool) -> Result<(), AppError> {
@@ -100,6 +121,111 @@ async fn validate_server_allowlist_ownership(
     Ok(())
 }
 
+fn normalize_create_pat_request(req: CreatePATRequest) -> Result<NormalizedPATRequest, AppError> {
+    let name = normalize_required_text(req.name, PAT_MAX_NAME_BYTES, "name")?;
+    let scopes = normalize_scopes(req.scopes)?;
+    let server_ids = normalize_server_ids(req.server_ids)?;
+    let expires_at = normalize_expires_at(req.expires_at)?;
+    Ok(NormalizedPATRequest {
+        name,
+        scopes,
+        server_ids,
+        expires_at,
+    })
+}
+
+fn normalize_required_text(
+    value: String,
+    max_bytes: usize,
+    field: &str,
+) -> Result<String, AppError> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return Err(AppError::BadRequest(format!("{field} is required")));
+    }
+    if value.len() > max_bytes {
+        return Err(AppError::BadRequest(format!(
+            "{field} must be at most {max_bytes} bytes"
+        )));
+    }
+    Ok(value)
+}
+
+fn normalize_scopes(values: Vec<String>) -> Result<Vec<String>, AppError> {
+    if values.is_empty() {
+        return Err(AppError::BadRequest("scopes must not be empty".into()));
+    }
+    if values.len() > PAT_MAX_SCOPES {
+        return Err(AppError::BadRequest(format!(
+            "scopes must contain at most {PAT_MAX_SCOPES} items"
+        )));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut scopes = Vec::new();
+    for value in values {
+        let value = value.trim().to_string();
+        if value.is_empty() {
+            continue;
+        }
+        if value.len() > PAT_MAX_SCOPE_BYTES {
+            return Err(AppError::BadRequest(format!(
+                "scope must be at most {PAT_MAX_SCOPE_BYTES} bytes"
+            )));
+        }
+        if seen.insert(value.clone()) {
+            scopes.push(value);
+        }
+    }
+    if scopes.is_empty() {
+        return Err(AppError::BadRequest("scopes must not be empty".into()));
+    }
+    Ok(scopes)
+}
+
+fn normalize_server_ids(values: Option<Vec<String>>) -> Result<Option<Vec<String>>, AppError> {
+    let Some(values) = values else {
+        return Ok(None);
+    };
+    if values.len() > PAT_MAX_SERVER_IDS {
+        return Err(AppError::BadRequest(format!(
+            "server_ids must contain at most {PAT_MAX_SERVER_IDS} items"
+        )));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut server_ids = Vec::new();
+    for value in values {
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        let parsed = uuid::Uuid::parse_str(value)
+            .map_err(|e| AppError::BadRequest(format!("invalid server id in allowlist: {e}")))?;
+        if seen.insert(parsed) {
+            server_ids.push(parsed.to_string());
+        }
+    }
+    if server_ids.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(server_ids))
+    }
+}
+
+fn normalize_expires_at(value: Option<String>) -> Result<Option<String>, AppError> {
+    let Some(value) = value.map(|value| value.trim().to_string()) else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() > PAT_MAX_EXPIRES_AT_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "expires_at must be at most {PAT_MAX_EXPIRES_AT_BYTES} bytes"
+        )));
+    }
+    Ok(Some(value))
+}
+
 fn resolve_pat_expires_at(
     input: Option<&str>,
     now: DateTime<Utc>,
@@ -138,6 +264,7 @@ pub async fn create_pat(
         .map_err(|_| AppError::Forbidden("PAT cannot manage API tokens".to_string()))?;
     super::auth::require_sensitive_totp(&state.db, auth_user.user.id, &headers).await?;
     let is_admin = auth_user.user.role.is_admin();
+    let req = normalize_create_pat_request(req)?;
     validate_scopes(&req.scopes, is_admin)?;
     validate_servers(req.server_ids.as_deref(), &req.scopes, is_admin)?;
     validate_server_allowlist_ownership(
@@ -238,6 +365,94 @@ mod tests {
     use crate::db::{CreateAgentInput, CreateUserInput, UserRepository};
     use chrono::TimeZone;
     use xlstatus_shared::UserRole;
+
+    #[test]
+    fn pat_create_resource_limits_are_explicit() {
+        let _ = pat_body_limit();
+        assert_eq!(PAT_CREATE_MAX_BODY_BYTES, 16 * 1024);
+        assert_eq!(PAT_MAX_NAME_BYTES, 128);
+        assert_eq!(PAT_MAX_SCOPES, 64);
+        assert_eq!(PAT_MAX_SCOPE_BYTES, 128);
+        assert_eq!(PAT_MAX_SERVER_IDS, 64);
+        assert_eq!(PAT_MAX_EXPIRES_AT_BYTES, 64);
+    }
+
+    #[test]
+    fn create_pat_request_fields_are_bounded_and_normalized() {
+        let server_id = uuid::Uuid::now_v7();
+        let req = normalize_create_pat_request(CreatePATRequest {
+            name: " deploy token ".into(),
+            scopes: vec![
+                " server:read ".into(),
+                "server:read".into(),
+                "service:read".into(),
+            ],
+            server_ids: Some(vec![
+                server_id.to_string(),
+                server_id.to_string(),
+                " ".into(),
+            ]),
+            expires_at: Some(" 2026-07-01T00:00:00Z ".into()),
+        })
+        .unwrap();
+
+        assert_eq!(req.name, "deploy token");
+        assert_eq!(req.scopes, vec!["server:read", "service:read"]);
+        assert_eq!(
+            req.server_ids.as_deref(),
+            Some(&[server_id.to_string()][..])
+        );
+        assert_eq!(req.expires_at.as_deref(), Some("2026-07-01T00:00:00Z"));
+
+        assert!(normalize_create_pat_request(CreatePATRequest {
+            name: "x".repeat(PAT_MAX_NAME_BYTES + 1),
+            scopes: vec!["server:read".into()],
+            server_ids: None,
+            expires_at: None,
+        })
+        .is_err());
+        assert!(normalize_create_pat_request(CreatePATRequest {
+            name: "token".into(),
+            scopes: vec!["x".repeat(PAT_MAX_SCOPE_BYTES + 1)],
+            server_ids: None,
+            expires_at: None,
+        })
+        .is_err());
+        assert!(normalize_create_pat_request(CreatePATRequest {
+            name: "token".into(),
+            scopes: (0..=PAT_MAX_SCOPES)
+                .map(|idx| format!("scope:{idx}"))
+                .collect(),
+            server_ids: None,
+            expires_at: None,
+        })
+        .is_err());
+        assert!(normalize_create_pat_request(CreatePATRequest {
+            name: "token".into(),
+            scopes: vec!["server:read".into()],
+            server_ids: Some(vec!["not-a-uuid".into()]),
+            expires_at: None,
+        })
+        .is_err());
+        assert!(normalize_create_pat_request(CreatePATRequest {
+            name: "token".into(),
+            scopes: vec!["server:read".into()],
+            server_ids: Some(
+                (0..=PAT_MAX_SERVER_IDS)
+                    .map(|idx| uuid::Uuid::from_u128(idx as u128 + 1).to_string())
+                    .collect(),
+            ),
+            expires_at: None,
+        })
+        .is_err());
+        assert!(normalize_create_pat_request(CreatePATRequest {
+            name: "token".into(),
+            scopes: vec!["server:read".into()],
+            server_ids: None,
+            expires_at: Some("x".repeat(PAT_MAX_EXPIRES_AT_BYTES + 1)),
+        })
+        .is_err());
+    }
 
     #[test]
     fn pat_expiration_defaults_to_ninety_days() {
