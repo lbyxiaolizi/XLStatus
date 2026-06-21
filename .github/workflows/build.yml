@@ -16,7 +16,7 @@ jobs:
     name: Rust check and test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler sqlite3 binutils
       - name: Install Rust
@@ -35,16 +35,16 @@ jobs:
       run:
         working-directory: web
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
         with:
           version: 10.23.0
           run_install: false
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
-          node-version: "20"
+          node-version: "24"
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
       - name: Install dependencies
@@ -138,7 +138,7 @@ jobs:
             use_zigbuild: true
             verify_glibc: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y binutils protobuf-compiler
@@ -155,11 +155,6 @@ jobs:
           if (-not (Get-Command protoc.exe -ErrorAction SilentlyContinue)) {
             choco install protoc --no-progress -y
           }
-      - name: Configure MSVC
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: ${{ matrix.msvc_arch }}
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -169,7 +164,21 @@ jobs:
         uses: taiki-e/install-action@cargo-zigbuild
       - name: Install Zig
         if: matrix.use_zigbuild
-        uses: mlugg/setup-zig@v2
+        shell: bash
+        run: |
+          set -euo pipefail
+          zig_version="0.16.0"
+          case "$(uname -m)" in
+            x86_64) zig_arch="x86_64" ;;
+            aarch64|arm64) zig_arch="aarch64" ;;
+            *) echo "::error::Unsupported Zig host architecture: $(uname -m)"; exit 1 ;;
+          esac
+          zig_dir="$RUNNER_TEMP/zig"
+          mkdir -p "$zig_dir"
+          curl -fsSL "https://ziglang.org/download/${zig_version}/zig-linux-${zig_arch}-${zig_version}.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$zig_dir" --strip-components=1
+          echo "$zig_dir" >> "$GITHUB_PATH"
+          "$zig_dir/zig" version
       - name: Build release binaries
         if: runner.os != 'Windows'
         shell: bash
@@ -183,7 +192,17 @@ jobs:
       - name: Build release binaries
         if: runner.os == 'Windows'
         shell: pwsh
-        run: cargo build --release --target "${{ matrix.target }}" --bin xlstatus-server --bin xlstatus-agent
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsInstall = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsInstall) {
+            throw "Visual Studio C++ build tools not found"
+          }
+          $devCmd = Join-Path $vsInstall "Common7\Tools\VsDevCmd.bat"
+          cmd /c "`"$devCmd`" -arch=${{ matrix.msvc_arch }} && cargo build --release --target `"${{ matrix.target }}`" --bin xlstatus-server --bin xlstatus-agent"
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
       - name: Verify glibc compatibility
         if: matrix.verify_glibc
         run: |
@@ -219,7 +238,7 @@ jobs:
           Copy-Item "target/${{ matrix.target }}/release/xlstatus-server${{ matrix.binary_ext }}" "dist/xlstatus-server-${{ matrix.os_name }}-${{ matrix.arch }}${{ matrix.binary_ext }}"
           Copy-Item "target/${{ matrix.target }}/release/xlstatus-agent${{ matrix.binary_ext }}" "dist/xlstatus-agent-${{ matrix.os_name }}-${{ matrix.arch }}${{ matrix.binary_ext }}"
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: xlstatus-${{ matrix.os_name }}-${{ matrix.arch }}
           path: dist/*
@@ -233,12 +252,12 @@ jobs:
       - web
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
       - name: Publish release assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
           overwrite_files: true
