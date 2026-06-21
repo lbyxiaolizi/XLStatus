@@ -116,6 +116,8 @@ const emptyGroupForm = {
   name: "",
 };
 
+const redactedSecret = "[redacted]";
+
 export default function NotificationsPage() {
   const [notifications, setNotifications] = useState<NotificationChannel[]>([]);
   const [groups, setGroups] = useState<NotificationGroup[]>([]);
@@ -125,6 +127,11 @@ export default function NotificationsPage() {
   const [notice, setNotice] = useState<string | null>(null);
   const [modal, setModal] = useState<ModalState>(null);
   const [notificationForm, setNotificationForm] = useState(emptyNotificationForm);
+  const [notificationOriginals, setNotificationOriginals] = useState({
+    url: "",
+    headers_json: "",
+    body_template: "",
+  });
   const [groupForm, setGroupForm] = useState(emptyGroupForm);
 
   const load = useCallback(async () => {
@@ -170,11 +177,12 @@ export default function NotificationsPage() {
 
   function openCreateNotification() {
     setNotificationForm(emptyNotificationForm);
+    setNotificationOriginals({ url: "", headers_json: "", body_template: "" });
     setModal({ type: "notification" });
   }
 
   function openEditNotification(item: NotificationChannel) {
-    setNotificationForm({
+    const nextForm = {
       name: item.name || "",
       url: item.url || "",
       request_method: item.request_method || "POST",
@@ -183,6 +191,14 @@ export default function NotificationsPage() {
       body_template: item.body_template || "",
       verify_tls: item.verify_tls !== false,
       format_metric_units: item.format_metric_units !== false,
+    };
+    setNotificationForm({
+      ...nextForm,
+    });
+    setNotificationOriginals({
+      url: nextForm.url,
+      headers_json: nextForm.headers_json,
+      body_template: nextForm.body_template,
     });
     setModal({ type: "notification", item });
   }
@@ -211,19 +227,26 @@ export default function NotificationsPage() {
   async function submitNotification(event: FormEvent) {
     event.preventDefault();
     setError(null);
+    const editingItem = modal?.type === "notification" ? modal.item : undefined;
     const payload: JsonObject = {
       name: notificationForm.name.trim(),
-      url: notificationForm.url.trim(),
       request_method: notificationForm.request_method,
       request_type: notificationForm.request_type,
-      headers_json: notificationForm.headers_json.trim() || null,
-      body_template: notificationForm.body_template,
       verify_tls: notificationForm.verify_tls,
       format_metric_units: notificationForm.format_metric_units,
     };
+    if (!editingItem || notificationForm.url !== notificationOriginals.url || !isRedactedValue(notificationForm.url)) {
+      payload.url = notificationForm.url.trim();
+    }
+    if (!editingItem || notificationForm.headers_json !== notificationOriginals.headers_json || !isRedactedValue(notificationForm.headers_json)) {
+      payload.headers_json = notificationForm.headers_json.trim() || null;
+    }
+    if (!editingItem || notificationForm.body_template !== notificationOriginals.body_template || !isRedactedValue(notificationForm.body_template)) {
+      payload.body_template = notificationForm.body_template;
+    }
     const response =
-      modal?.type === "notification" && modal.item
-        ? await apiClient.updateNotification(modal.item.id, payload)
+      editingItem
+        ? await apiClient.updateNotification(editingItem.id, payload)
         : await apiClient.createNotification(payload);
 
     if (response.success) {
@@ -570,4 +593,10 @@ export default function NotificationsPage() {
 function formatHeaders(headers?: Record<string, string>): string {
   if (!headers || Object.keys(headers).length === 0) return "";
   return JSON.stringify(headers, null, 2);
+}
+
+function isRedactedValue(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  return trimmed === redactedSecret || trimmed.includes(redactedSecret);
 }

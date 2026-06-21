@@ -170,6 +170,46 @@ struct NotificationInput {
     format_metric_units: bool,
 }
 
+const REDACTED_NOTIFICATION_SECRET: &str = "[redacted]";
+
+#[derive(Debug, Clone)]
+struct NotificationRecord {
+    id: String,
+    owner_user_id: String,
+    name: String,
+    url: String,
+    request_method: String,
+    request_type: String,
+    headers_json: Option<String>,
+    body_template: String,
+    verify_tls: bool,
+    format_metric_units: bool,
+    created_at: String,
+    updated_at: String,
+}
+
+impl NotificationRecord {
+    fn to_view(&self) -> Result<NotificationView, AppError> {
+        let headers_json = redacted_headers_json(self.headers_json.as_deref())?;
+        let headers = parse_headers_json(headers_json.as_deref())?;
+        Ok(NotificationView {
+            id: self.id.clone(),
+            owner_user_id: self.owner_user_id.clone(),
+            name: self.name.clone(),
+            url: redact_notification_url(&self.url),
+            request_method: self.request_method.clone(),
+            request_type: self.request_type.clone(),
+            headers_json,
+            headers,
+            body_template: redact_body_template(&self.body_template),
+            verify_tls: self.verify_tls,
+            format_metric_units: self.format_metric_units,
+            created_at: self.created_at.clone(),
+            updated_at: self.updated_at.clone(),
+        })
+    }
+}
+
 pub async fn list_notifications(
     State(state): State<AppState>,
     auth: AuthSession,
@@ -179,8 +219,11 @@ pub async fn list_notifications(
     let owner = auth.user_id.0;
     let limit = query.limit.clamp(1, 500);
     let offset = query.offset.max(0);
-    let (notifications, total) =
-        list_notifications_for_owner(&state.db, owner, limit, offset).await?;
+    let (records, total) = list_notifications_for_owner(&state.db, owner, limit, offset).await?;
+    let notifications = records
+        .into_iter()
+        .map(|record| record.to_view())
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(ApiResponse::success(NotificationListResponse {
         notifications,
         total,
@@ -254,7 +297,9 @@ pub async fn create_notification(
     }
 
     Ok(Json(ApiResponse::success(
-        load_notification_for_owner(&state.db, &id, owner).await?,
+        load_notification_record_for_owner(&state.db, &id, owner)
+            .await?
+            .to_view()?,
     )))
 }
 
@@ -266,7 +311,7 @@ pub async fn update_notification(
 ) -> Result<Json<ApiResponse<NotificationView>>, AppError> {
     require_scope(&auth, "notification:write")?;
     let owner = auth.user_id.0;
-    let existing = load_notification_for_owner(&state.db, &id, owner).await?;
+    let existing = load_notification_record_for_owner(&state.db, &id, owner).await?;
     let input = build_update_notification_input(req, &existing).await?;
     let now = Utc::now();
     let affected = match &state.db {
@@ -324,7 +369,9 @@ pub async fn update_notification(
         return Err(AppError::NotFound("notification not found".into()));
     }
     Ok(Json(ApiResponse::success(
-        load_notification_for_owner(&state.db, &id, owner).await?,
+        load_notification_record_for_owner(&state.db, &id, owner)
+            .await?
+            .to_view()?,
     )))
 }
 
@@ -369,7 +416,7 @@ pub async fn test_notification(
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     require_scope(&auth, "notification:write")?;
-    let notification = load_notification_for_owner(&state.db, &id, auth.user_id.0).await?;
+    let notification = load_notification_record_for_owner(&state.db, &id, auth.user_id.0).await?;
     let channel = notification_to_channel(&notification)?;
     let mut metadata = HashMap::new();
     metadata.insert("notification_id".to_string(), notification.id.clone());
@@ -695,7 +742,7 @@ async fn build_create_notification_input(
 
 async fn build_update_notification_input(
     req: UpdateNotificationRequest,
-    existing: &NotificationView,
+    existing: &NotificationRecord,
 ) -> Result<NotificationInput, AppError> {
     let name = match req.name {
         Some(name) => require_name(name, "name")?,
@@ -745,7 +792,7 @@ async fn list_notifications_for_owner(
     owner: Uuid,
     limit: i64,
     offset: i64,
-) -> Result<(Vec<NotificationView>, i64), AppError> {
+) -> Result<(Vec<NotificationRecord>, i64), AppError> {
     match db {
         DatabaseBackend::Sqlite(pool) => {
             let rows = sqlx::query(
@@ -773,7 +820,7 @@ async fn list_notifications_for_owner(
                     .map_err(db_err)?;
             let notifications = rows
                 .into_iter()
-                .map(row_to_notification_sqlite)
+                .map(row_to_notification_record_sqlite)
                 .collect::<Result<Vec<_>, _>>()?;
             Ok((notifications, total.0))
         }
@@ -803,18 +850,18 @@ async fn list_notifications_for_owner(
                     .map_err(db_err)?;
             let notifications = rows
                 .into_iter()
-                .map(row_to_notification_postgres)
+                .map(row_to_notification_record_postgres)
                 .collect::<Result<Vec<_>, _>>()?;
             Ok((notifications, total.0))
         }
     }
 }
 
-async fn load_notification_for_owner(
+async fn load_notification_record_for_owner(
     db: &DatabaseBackend,
     id: &str,
     owner: Uuid,
-) -> Result<NotificationView, AppError> {
+) -> Result<NotificationRecord, AppError> {
     match db {
         DatabaseBackend::Sqlite(pool) => {
             let row = sqlx::query(
@@ -831,7 +878,7 @@ async fn load_notification_for_owner(
             .fetch_optional(pool)
             .await
             .map_err(db_err)?;
-            row.map(row_to_notification_sqlite)
+            row.map(row_to_notification_record_sqlite)
                 .transpose()?
                 .ok_or_else(|| AppError::NotFound("notification not found".into()))
         }
@@ -850,7 +897,7 @@ async fn load_notification_for_owner(
             .fetch_optional(pool)
             .await
             .map_err(db_err)?;
-            row.map(row_to_notification_postgres)
+            row.map(row_to_notification_record_postgres)
                 .transpose()?
                 .ok_or_else(|| AppError::NotFound("notification not found".into()))
         }
@@ -1130,10 +1177,11 @@ async fn ensure_notification_exists(
     }
 }
 
-fn row_to_notification_sqlite(row: sqlx::sqlite::SqliteRow) -> Result<NotificationView, AppError> {
+fn row_to_notification_record_sqlite(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<NotificationRecord, AppError> {
     let headers_json: Option<String> = row.try_get("headers_json").map_err(db_err)?;
-    let headers = parse_headers_json(headers_json.as_deref())?;
-    Ok(NotificationView {
+    Ok(NotificationRecord {
         id: row.try_get("id").map_err(db_err)?,
         owner_user_id: row.try_get("owner_user_id").map_err(db_err)?,
         name: row.try_get("name").map_err(db_err)?,
@@ -1141,7 +1189,6 @@ fn row_to_notification_sqlite(row: sqlx::sqlite::SqliteRow) -> Result<Notificati
         request_method: row.try_get("request_method").map_err(db_err)?,
         request_type: row.try_get("request_type").map_err(db_err)?,
         headers_json,
-        headers,
         body_template: row
             .try_get::<Option<String>, _>("body_template")
             .map_err(db_err)?
@@ -1153,13 +1200,14 @@ fn row_to_notification_sqlite(row: sqlx::sqlite::SqliteRow) -> Result<Notificati
     })
 }
 
-fn row_to_notification_postgres(row: sqlx::postgres::PgRow) -> Result<NotificationView, AppError> {
+fn row_to_notification_record_postgres(
+    row: sqlx::postgres::PgRow,
+) -> Result<NotificationRecord, AppError> {
     let headers_json: Option<String> = row.try_get("headers_json").map_err(db_err)?;
-    let headers = parse_headers_json(headers_json.as_deref())?;
     let owner: Uuid = row.try_get("owner_user_id").map_err(db_err)?;
     let created_at: DateTime<Utc> = row.try_get("created_at").map_err(db_err)?;
     let updated_at: DateTime<Utc> = row.try_get("updated_at").map_err(db_err)?;
-    Ok(NotificationView {
+    Ok(NotificationRecord {
         id: row.try_get("id").map_err(db_err)?,
         owner_user_id: owner.to_string(),
         name: row.try_get("name").map_err(db_err)?,
@@ -1167,7 +1215,6 @@ fn row_to_notification_postgres(row: sqlx::postgres::PgRow) -> Result<Notificati
         request_method: row.try_get("request_method").map_err(db_err)?,
         request_type: row.try_get("request_type").map_err(db_err)?,
         headers_json,
-        headers,
         body_template: row
             .try_get::<Option<String>, _>("body_template")
             .map_err(db_err)?
@@ -1210,24 +1257,25 @@ where
     String: for<'a> sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
     for<'a> &'a str: sqlx::ColumnIndex<R>,
 {
+    let url: String = row.try_get("url").map_err(db_err)?;
     Ok(NotificationGroupMemberView {
         id: row.try_get("id").map_err(db_err)?,
         name: row.try_get("name").map_err(db_err)?,
         request_type: row.try_get("request_type").map_err(db_err)?,
-        url: row.try_get("url").map_err(db_err)?,
+        url: redact_notification_url(&url),
     })
 }
 
-fn notification_to_channel(view: &NotificationView) -> Result<NotificationChannel, AppError> {
+fn notification_to_channel(record: &NotificationRecord) -> Result<NotificationChannel, AppError> {
     Ok(NotificationChannel {
-        id: view.id.clone(),
-        name: view.name.clone(),
-        url: view.url.clone(),
-        request_method: view.request_method.clone(),
-        request_type: view.request_type.clone(),
-        headers: parse_headers_json(view.headers_json.as_deref())?,
-        body_template: view.body_template.clone(),
-        verify_tls: view.verify_tls,
+        id: record.id.clone(),
+        name: record.name.clone(),
+        url: record.url.clone(),
+        request_method: record.request_method.clone(),
+        request_type: record.request_type.clone(),
+        headers: parse_headers_json(record.headers_json.as_deref())?,
+        body_template: record.body_template.clone(),
+        verify_tls: record.verify_tls,
     })
 }
 
@@ -1366,6 +1414,54 @@ fn parse_headers_json(value: Option<&str>) -> Result<HashMap<String, String>, Ap
         .map_err(|e| AppError::BadRequest(format!("headers_json must be a string map: {e}")))
 }
 
+fn redacted_headers_json(value: Option<&str>) -> Result<Option<String>, AppError> {
+    let headers = parse_headers_json(value)?;
+    if headers.is_empty() {
+        return Ok(None);
+    }
+    let redacted = headers
+        .into_keys()
+        .map(|key| (key, REDACTED_NOTIFICATION_SECRET.to_string()))
+        .collect::<HashMap<_, _>>();
+    serde_json::to_string(&redacted)
+        .map(Some)
+        .map_err(|e| AppError::BadRequest(format!("invalid headers: {e}")))
+}
+
+fn redact_body_template(value: &str) -> String {
+    if value.trim().is_empty() {
+        String::new()
+    } else {
+        REDACTED_NOTIFICATION_SECRET.to_string()
+    }
+}
+
+fn redact_notification_url(value: &str) -> String {
+    let Ok(parsed) = reqwest::Url::parse(value) else {
+        return REDACTED_NOTIFICATION_SECRET.to_string();
+    };
+    let Some(host) = parsed.host_str() else {
+        return REDACTED_NOTIFICATION_SECRET.to_string();
+    };
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let authority = match parsed.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    };
+    if parsed.path() == "/" && parsed.query().is_none() && parsed.fragment().is_none() {
+        format!("{}://{authority}/", parsed.scheme())
+    } else {
+        format!(
+            "{}://{authority}/{REDACTED_NOTIFICATION_SECRET}",
+            parsed.scheme()
+        )
+    }
+}
+
 fn replace_template_markers(input: &str) -> String {
     let mut rest = input;
     let mut out = String::with_capacity(input.len());
@@ -1416,6 +1512,58 @@ mod tests {
         assert_eq!(
             replace_template_markers("https://example.com/{{title}}/{{metadata.host}}"),
             "https://example.com/test/test"
+        );
+    }
+
+    #[test]
+    fn notification_api_view_redacts_secret_bearing_fields() {
+        let record = NotificationRecord {
+            id: "notification-1".to_string(),
+            owner_user_id: "user-1".to_string(),
+            name: "webhook".to_string(),
+            url: "https://hooks.example.com/services/token/path?secret=value".to_string(),
+            request_method: "POST".to_string(),
+            request_type: "json".to_string(),
+            headers_json: Some(
+                r#"{"Authorization":"Bearer secret-token","X-Webhook-Secret":"secret"}"#
+                    .to_string(),
+            ),
+            body_template: r#"{"token":"secret","message":"{{message}}"}"#.to_string(),
+            verify_tls: true,
+            format_metric_units: true,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+
+        let view = record.to_view().unwrap();
+
+        assert_eq!(
+            view.url,
+            format!("https://hooks.example.com/{REDACTED_NOTIFICATION_SECRET}")
+        );
+        assert_eq!(
+            view.headers.get("Authorization").map(String::as_str),
+            Some(REDACTED_NOTIFICATION_SECRET)
+        );
+        assert_eq!(
+            view.headers.get("X-Webhook-Secret").map(String::as_str),
+            Some(REDACTED_NOTIFICATION_SECRET)
+        );
+        assert_eq!(view.body_template, REDACTED_NOTIFICATION_SECRET);
+        assert!(!serde_json::to_string(&view)
+            .unwrap()
+            .contains("secret-token"));
+    }
+
+    #[test]
+    fn notification_url_redaction_preserves_origin_only() {
+        assert_eq!(
+            redact_notification_url("https://example.com/webhook/token?secret=value"),
+            format!("https://example.com/{REDACTED_NOTIFICATION_SECRET}")
+        );
+        assert_eq!(
+            redact_notification_url("https://example.com/"),
+            "https://example.com/"
         );
     }
 }
