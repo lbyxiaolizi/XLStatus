@@ -406,10 +406,204 @@ impl AlertEventRepository {
         }
         Ok(out)
     }
+
+    pub async fn list_recent_for_server_ids(
+        &self,
+        server_ids: &[String],
+        limit: i64,
+    ) -> Result<Vec<AlertEventRow>> {
+        if server_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        match &self.db {
+            DatabaseBackend::Sqlite(pool) => {
+                let placeholders = sqlite_placeholders(server_ids.len());
+                let sql = format!(
+                    r#"
+                    SELECT id, rule_id, agent_id, service_id, kind, payload_json, fired_at
+                    FROM alert_events
+                    WHERE agent_id IN ({placeholders})
+                    ORDER BY fired_at DESC
+                    LIMIT ?
+                    "#,
+                );
+                let mut query = sqlx::query_as::<
+                    _,
+                    (
+                        String,
+                        String,
+                        Option<String>,
+                        Option<String>,
+                        String,
+                        String,
+                        String,
+                    ),
+                >(&sql);
+                for server_id in server_ids {
+                    query = query.bind(server_id);
+                }
+                let rows = query.bind(limit).fetch_all(pool).await?;
+                for (id, rule_id, agent_id, service_id, kind, payload_json, fired_at) in rows {
+                    out.push(AlertEventRow {
+                        id,
+                        rule_id,
+                        agent_id,
+                        service_id,
+                        kind,
+                        payload_json,
+                        fired_at: parse_dt(&fired_at)?,
+                    });
+                }
+            }
+            DatabaseBackend::Postgres(pool) => {
+                let parsed = parse_uuid_ids(server_ids)?;
+                let rows: Vec<(
+                    String,
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    String,
+                    String,
+                    String,
+                )> = sqlx::query_as(
+                    r#"
+                    SELECT id::text, rule_id::text, agent_id::text, service_id::text,
+                           kind, payload_json, fired_at::text
+                    FROM alert_events
+                    WHERE agent_id = ANY($1::uuid[])
+                    ORDER BY fired_at DESC
+                    LIMIT $2
+                    "#,
+                )
+                .bind(&parsed)
+                .bind(limit)
+                .fetch_all(pool)
+                .await?;
+                for (id, rule_id, agent_id, service_id, kind, payload_json, fired_at) in rows {
+                    out.push(AlertEventRow {
+                        id,
+                        rule_id,
+                        agent_id,
+                        service_id,
+                        kind,
+                        payload_json,
+                        fired_at: parse_dt(&fired_at)?,
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn list_recent_for_owner_server_ids(
+        &self,
+        owner_user_id: &str,
+        server_ids: &[String],
+        limit: i64,
+    ) -> Result<Vec<AlertEventRow>> {
+        if server_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        match &self.db {
+            DatabaseBackend::Sqlite(pool) => {
+                let placeholders = sqlite_placeholders(server_ids.len());
+                let sql = format!(
+                    r#"
+                    SELECT e.id, e.rule_id, e.agent_id, e.service_id, e.kind, e.payload_json, e.fired_at
+                    FROM alert_events e
+                    JOIN alert_rules r ON r.id = e.rule_id
+                    WHERE r.owner_user_id = ? AND e.agent_id IN ({placeholders})
+                    ORDER BY e.fired_at DESC
+                    LIMIT ?
+                    "#,
+                );
+                let mut query = sqlx::query_as::<
+                    _,
+                    (
+                        String,
+                        String,
+                        Option<String>,
+                        Option<String>,
+                        String,
+                        String,
+                        String,
+                    ),
+                >(&sql)
+                .bind(owner_user_id);
+                for server_id in server_ids {
+                    query = query.bind(server_id);
+                }
+                let rows = query.bind(limit).fetch_all(pool).await?;
+                for (id, rule_id, agent_id, service_id, kind, payload_json, fired_at) in rows {
+                    out.push(AlertEventRow {
+                        id,
+                        rule_id,
+                        agent_id,
+                        service_id,
+                        kind,
+                        payload_json,
+                        fired_at: parse_dt(&fired_at)?,
+                    });
+                }
+            }
+            DatabaseBackend::Postgres(pool) => {
+                let owner = Uuid::parse_str(owner_user_id)?;
+                let parsed = parse_uuid_ids(server_ids)?;
+                let rows: Vec<(
+                    String,
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    String,
+                    String,
+                    String,
+                )> = sqlx::query_as(
+                    r#"
+                    SELECT e.id::text, e.rule_id::text, e.agent_id::text, e.service_id::text,
+                           e.kind, e.payload_json, e.fired_at::text
+                    FROM alert_events e
+                    JOIN alert_rules r ON r.id = e.rule_id
+                    WHERE r.owner_user_id = $1 AND e.agent_id = ANY($2::uuid[])
+                    ORDER BY e.fired_at DESC
+                    LIMIT $3
+                    "#,
+                )
+                .bind(owner)
+                .bind(&parsed)
+                .bind(limit)
+                .fetch_all(pool)
+                .await?;
+                for (id, rule_id, agent_id, service_id, kind, payload_json, fired_at) in rows {
+                    out.push(AlertEventRow {
+                        id,
+                        rule_id,
+                        agent_id,
+                        service_id,
+                        kind,
+                        payload_json,
+                        fired_at: parse_dt(&fired_at)?,
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 fn parse_dt(s: &str) -> Result<DateTime<Utc>> {
     Ok(DateTime::parse_from_rfc3339(s)?.with_timezone(&Utc))
+}
+
+fn sqlite_placeholders(len: usize) -> String {
+    std::iter::repeat_n("?", len).collect::<Vec<_>>().join(", ")
+}
+
+fn parse_uuid_ids(ids: &[String]) -> Result<Vec<Uuid>> {
+    ids.iter()
+        .map(|id| Uuid::parse_str(id).with_context(|| format!("invalid server id: {id}")))
+        .collect()
 }
 
 fn parse_task_ids_json(value: Option<String>) -> Vec<String> {

@@ -188,21 +188,30 @@ pub async fn list_alert_events(
     }
     let repo = AlertEventRepository::new(state.db.clone());
     let limit = q.limit.clamp(1, 500);
+    let owner = auth.user_id.0.to_string();
     let events: Vec<crate::db::repository::alerts::AlertEventRow> = if auth.role.is_admin() {
-        repo.list_recent(limit)
-            .await
-            .map_err(AppError::Database)?
-            .into_iter()
-            .filter(|event| alert_event_visible_to_auth(&auth, event))
-            .collect()
+        if let Some(server_ids) = auth.server_ids.as_ref() {
+            repo.list_recent_for_server_ids(server_ids, limit)
+                .await
+                .map_err(AppError::Database)?
+        } else {
+            repo.list_recent(limit).await.map_err(AppError::Database)?
+        }
     } else {
-        repo.list_recent_for_owner(&auth.user_id.0.to_string(), limit)
-            .await
-            .map_err(AppError::Database)?
-            .into_iter()
-            .filter(|event| alert_event_visible_to_auth(&auth, event))
-            .collect()
+        if let Some(server_ids) = auth.server_ids.as_ref() {
+            repo.list_recent_for_owner_server_ids(&owner, server_ids, limit)
+                .await
+                .map_err(AppError::Database)?
+        } else {
+            repo.list_recent_for_owner(&owner, limit)
+                .await
+                .map_err(AppError::Database)?
+        }
     };
+    let events: Vec<_> = events
+        .into_iter()
+        .filter(|event| alert_event_visible_to_auth(&auth, event))
+        .collect();
     let view: Vec<serde_json::Value> = events
         .iter()
         .map(|e| {
@@ -463,6 +472,7 @@ mod tests {
     use super::*;
     use crate::auth::middleware::AuthKind;
     use crate::db::DatabaseBackend;
+    use std::sync::Arc;
     use xlstatus_shared::{UserId, UserRole};
 
     #[tokio::test]
@@ -575,6 +585,118 @@ mod tests {
         assert_eq!(events[0].rule_id, owner_rule);
     }
 
+    #[tokio::test]
+    async fn admin_pat_alert_events_filter_allowlist_before_limit() {
+        let db = test_db().await;
+        let owner = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let other = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let allowed_rule = "00000000-0000-0000-0000-000000000511";
+        let other_rule = "00000000-0000-0000-0000-000000000512";
+        let allowed_server = "00000000-0000-0000-0000-000000000111";
+        let other_server = "00000000-0000-0000-0000-000000000222";
+
+        seed_user(&db, owner, "owner", "member").await;
+        seed_user(&db, other, "other", "member").await;
+        seed_alert_rule(&db, allowed_rule, owner, "allowed-rule").await;
+        seed_alert_rule(&db, other_rule, other, "other-rule").await;
+        seed_alert_event(
+            &db,
+            "00000000-0000-0000-0000-000000000611",
+            allowed_rule,
+            allowed_server,
+            "2026-01-02T00:00:00Z",
+        )
+        .await;
+        seed_alert_event(
+            &db,
+            "00000000-0000-0000-0000-000000000612",
+            other_rule,
+            other_server,
+            "2026-01-03T00:00:00Z",
+        )
+        .await;
+
+        let response = list_alert_events(
+            State(test_state(db.clone())),
+            pat_alert_session(owner, UserRole::Admin, &[allowed_server]),
+            Query(ListQuery {
+                limit: 1,
+                offset: 0,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let data = response.data.unwrap();
+        let events = data["events"].as_array().unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["rule_id"], allowed_rule);
+        assert_eq!(events[0]["agent_id"], allowed_server);
+        assert_eq!(data["total"], 1);
+    }
+
+    #[tokio::test]
+    async fn member_pat_alert_events_filter_owner_and_allowlist_before_limit() {
+        let db = test_db().await;
+        let owner = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let other = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let owner_allowed_rule = "00000000-0000-0000-0000-000000000521";
+        let owner_other_rule = "00000000-0000-0000-0000-000000000522";
+        let other_allowed_rule = "00000000-0000-0000-0000-000000000523";
+        let allowed_server = "00000000-0000-0000-0000-000000000121";
+        let owner_other_server = "00000000-0000-0000-0000-000000000122";
+
+        seed_user(&db, owner, "owner", "member").await;
+        seed_user(&db, other, "other", "member").await;
+        seed_alert_rule(&db, owner_allowed_rule, owner, "owner-allowed-rule").await;
+        seed_alert_rule(&db, owner_other_rule, owner, "owner-other-rule").await;
+        seed_alert_rule(&db, other_allowed_rule, other, "other-allowed-rule").await;
+        seed_alert_event(
+            &db,
+            "00000000-0000-0000-0000-000000000621",
+            owner_allowed_rule,
+            allowed_server,
+            "2026-01-02T00:00:00Z",
+        )
+        .await;
+        seed_alert_event(
+            &db,
+            "00000000-0000-0000-0000-000000000622",
+            owner_other_rule,
+            owner_other_server,
+            "2026-01-03T00:00:00Z",
+        )
+        .await;
+        seed_alert_event(
+            &db,
+            "00000000-0000-0000-0000-000000000623",
+            other_allowed_rule,
+            allowed_server,
+            "2026-01-04T00:00:00Z",
+        )
+        .await;
+
+        let response = list_alert_events(
+            State(test_state(db.clone())),
+            pat_alert_session(owner, UserRole::Member, &[allowed_server]),
+            Query(ListQuery {
+                limit: 1,
+                offset: 0,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let data = response.data.unwrap();
+        let events = data["events"].as_array().unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["rule_id"], owner_allowed_rule);
+        assert_eq!(events[0]["agent_id"], allowed_server);
+        assert_eq!(data["total"], 1);
+    }
+
     #[test]
     fn alert_rule_resource_limits_are_explicit() {
         assert_eq!(ALERT_API_MAX_BODY_BYTES, 64 * 1024);
@@ -629,6 +751,21 @@ mod tests {
         db
     }
 
+    fn test_state(db: DatabaseBackend) -> AppState {
+        AppState {
+            db,
+            config: Arc::new(crate::config::Config::default()),
+            agent_jwt_challenges: Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            metrics: xlstatus_tsdb::MetricStore::in_memory(),
+            realtime: crate::realtime::BroadcastHub::new(),
+            session_registry: crate::grpc::SessionRegistry::new(),
+            terminal_sessions: crate::api::v1::terminal::TerminalSessionRegistry::new(),
+            io_registry: crate::grpc::IoRegistry::new(),
+        }
+    }
+
     fn member_alert_session(user_id: uuid::Uuid) -> AuthSession {
         AuthSession {
             session_id: "sess".into(),
@@ -640,6 +777,20 @@ mod tests {
             scopes: vec!["alert:read".into(), "alert:write".into()],
             server_ids: None,
             pat_id: None,
+        }
+    }
+
+    fn pat_alert_session(user_id: uuid::Uuid, role: UserRole, server_ids: &[&str]) -> AuthSession {
+        AuthSession {
+            session_id: "pat-session".into(),
+            user_id: UserId(user_id),
+            username: "pat".into(),
+            role,
+            csrf_token: "csrf".into(),
+            auth_kind: AuthKind::PersonalAccessToken,
+            scopes: vec!["alert:read".into()],
+            server_ids: Some(server_ids.iter().map(|id| id.to_string()).collect()),
+            pat_id: Some("00000000-0000-0000-0000-000000000701".into()),
         }
     }
 
