@@ -24,7 +24,7 @@ const DDNS_API_MAX_BODY_BYTES: usize = 64 * 1024;
 const DDNS_MAX_NAME_BYTES: usize = 128;
 const DDNS_MAX_PROVIDER_BYTES: usize = 64;
 const DDNS_MAX_DOMAIN_BYTES: usize = 253;
-const DDNS_MAX_AGENT_ID_BYTES: usize = 64;
+const DDNS_UUID_TEXT_LEN: usize = 36;
 const DDNS_MAX_RECORD_ID_BYTES: usize = 128;
 const DDNS_MAX_ZONE_ID_BYTES: usize = 128;
 const DDNS_MAX_SECRET_BYTES: usize = 4096;
@@ -317,20 +317,29 @@ fn normalize_ddns_provider(value: &str) -> Result<String, String> {
 }
 
 fn normalize_ddns_agent_id(value: Option<String>) -> Result<Option<String>, String> {
-    let Some(value) = value.map(|value| value.trim().to_string()) else {
+    let Some(value) = value else {
         return Ok(None);
     };
     if value.is_empty() {
         return Ok(None);
     }
-    if value.len() > DDNS_MAX_AGENT_ID_BYTES {
-        return Err(format!(
-            "agent_id must be at most {DDNS_MAX_AGENT_ID_BYTES} bytes"
-        ));
+    normalize_ddns_resource_uuid(value, "agent_id").map(Some)
+}
+
+fn normalize_ddns_resource_uuid(value: String, field: &str) -> Result<String, String> {
+    if value.is_empty() {
+        return Err(format!("{field} is required"));
     }
-    uuid::Uuid::parse_str(&value)
-        .map(|value| Some(value.to_string()))
-        .map_err(|_| "agent_id must be a UUID".to_string())
+    if value.len() != DDNS_UUID_TEXT_LEN {
+        return Err(format!("{field} must be a canonical UUID"));
+    }
+    let parsed =
+        uuid::Uuid::parse_str(&value).map_err(|_| format!("{field} must be a canonical UUID"))?;
+    let canonical = parsed.to_string();
+    if canonical != value {
+        return Err(format!("{field} must be a canonical UUID"));
+    }
+    Ok(canonical)
 }
 
 pub async fn delete_ddns_config(
@@ -340,6 +349,8 @@ pub async fn delete_ddns_config(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<serde_json::Value>>)>
 {
     require_ddns_scope_json(&auth_user, "ddns:delete")?;
+    let id = normalize_ddns_resource_uuid(id, "config_id")
+        .map_err(|message| api_error::<serde_json::Value>(StatusCode::BAD_REQUEST, message))?;
     let Some(config) = DdnsConfigRepository::get_by_id(&state.db, &id)
         .await
         .map_err(|e| {
@@ -397,6 +408,9 @@ pub async fn list_ddns_history(
     (StatusCode, Json<ApiResponse<DdnsHistoryListResponse>>),
 > {
     require_ddns_scope(&auth_user, "ddns:read")?;
+    let config_id = normalize_ddns_resource_uuid(config_id, "config_id").map_err(|message| {
+        api_error::<DdnsHistoryListResponse>(StatusCode::BAD_REQUEST, message)
+    })?;
     let Some(config) = DdnsConfigRepository::get_by_id(&state.db, &config_id)
         .await
         .map_err(|e| {
@@ -742,7 +756,7 @@ mod tests {
         assert_eq!(DDNS_MAX_NAME_BYTES, 128);
         assert_eq!(DDNS_MAX_PROVIDER_BYTES, 64);
         assert_eq!(DDNS_MAX_DOMAIN_BYTES, 253);
-        assert_eq!(DDNS_MAX_AGENT_ID_BYTES, 64);
+        assert_eq!(DDNS_UUID_TEXT_LEN, 36);
         assert_eq!(DDNS_MAX_RECORD_ID_BYTES, 128);
         assert_eq!(DDNS_MAX_ZONE_ID_BYTES, 128);
         assert_eq!(DDNS_MAX_SECRET_BYTES, 4096);
@@ -761,16 +775,23 @@ mod tests {
     }
 
     #[test]
-    fn ddns_agent_id_is_uuid_canonicalized() {
-        let id = uuid::Uuid::from_bytes([3; 16]);
+    fn ddns_agent_and_config_ids_require_canonical_uuid_text() {
+        let id = uuid::Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
 
         assert_eq!(
-            normalize_ddns_agent_id(Some(id.simple().to_string())).unwrap(),
+            normalize_ddns_agent_id(Some(id.to_string())).unwrap(),
             Some(id.to_string())
         );
-        assert_eq!(normalize_ddns_agent_id(Some(" ".into())).unwrap(), None);
+        assert_eq!(
+            normalize_ddns_resource_uuid(id.to_string(), "config_id").unwrap(),
+            id.to_string()
+        );
         assert!(normalize_ddns_agent_id(Some("server-a".into())).is_err());
-        assert!(normalize_ddns_agent_id(Some("a".repeat(DDNS_MAX_AGENT_ID_BYTES + 1))).is_err());
+        assert!(normalize_ddns_agent_id(Some(format!(" {} ", id))).is_err());
+        assert!(normalize_ddns_agent_id(Some(id.simple().to_string())).is_err());
+        assert!(normalize_ddns_agent_id(Some(id.to_string().to_uppercase())).is_err());
+        assert!(normalize_ddns_agent_id(Some("a".repeat(DDNS_UUID_TEXT_LEN + 1))).is_err());
+        assert!(normalize_ddns_resource_uuid(id.simple().to_string(), "config_id").is_err());
     }
 
     #[test]
@@ -831,8 +852,8 @@ mod tests {
     #[test]
     fn ddns_config_normalization_trims_and_defaults_enabled() {
         let mut req = ddns_create_request();
-        let agent_id = uuid::Uuid::from_bytes([4; 16]);
-        req.agent_id = Some(format!(" {} ", agent_id.simple()));
+        let agent_id = uuid::Uuid::parse_str("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb").unwrap();
+        req.agent_id = Some(agent_id.to_string());
         req.name = " cfg ".into();
         req.provider = " cloudflare ".into();
         req.domain = " example.com ".into();
