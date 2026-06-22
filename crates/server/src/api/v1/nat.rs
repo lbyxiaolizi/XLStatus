@@ -275,7 +275,7 @@ pub async fn list_nat_mappings(
     }))
 }
 
-/// List all enabled NAT mappings
+/// List enabled NAT mappings that can currently be loaded by the NAT runtime.
 pub async fn list_all_nat_mappings(
     State(state): State<AppState>,
     auth_user: AuthUser,
@@ -284,16 +284,7 @@ pub async fn list_all_nat_mappings(
 
     require_scope_or_403(&auth_user, "nat:read")?;
     require_admin_cookie_session_or_403(&auth_user)?;
-    let mappings = NatMappingRepository::list_enabled(&db).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse {
-                success: false,
-                data: None,
-                error: Some(format!("Failed to list NAT mappings: {}", e)),
-            }),
-        )
-    })?;
+    let mappings = list_runtime_nat_mappings(&db).await?;
 
     let total = mappings.len();
 
@@ -302,6 +293,23 @@ pub async fn list_all_nat_mappings(
         data: Some(NatMappingListResponse { mappings, total }),
         error: None,
     }))
+}
+
+async fn list_runtime_nat_mappings(
+    db: &Db,
+) -> Result<Vec<NatMapping>, (StatusCode, Json<ApiResponse<()>>)> {
+    NatMappingRepository::list_enabled_for_active_agents(db)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse {
+                    success: false,
+                    data: None,
+                    error: Some(format!("Failed to list NAT mappings: {}", e)),
+                }),
+            )
+        })
 }
 
 /// Update a NAT mapping
@@ -1181,6 +1189,25 @@ mod tests {
         assert_eq!(err.0, StatusCode::FORBIDDEN);
     }
 
+    #[tokio::test]
+    async fn nat_global_runtime_list_ignores_revoked_agent_mappings() {
+        let db = test_db().await;
+        let active_mapping = create_nat_mapping_record(&db, 18080, false).await;
+        let revoked_mapping = create_nat_mapping_record(&db, 18081, true).await;
+
+        let mappings = match list_runtime_nat_mappings(&db).await {
+            Ok(mappings) => mappings,
+            Err((status, _)) => panic!("runtime NAT list failed with {status}"),
+        };
+        let ids = mappings
+            .iter()
+            .map(|mapping| mapping.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(ids.contains(&active_mapping.id.as_str()));
+        assert!(!ids.contains(&revoked_mapping.id.as_str()));
+    }
+
     #[test]
     fn nat_mapping_tunnel_limit_rejects_zero() {
         assert!(normalize_bounded_u32(
@@ -1316,6 +1343,61 @@ mod tests {
         let db = DatabaseBackend::connect(&url, true).await.unwrap();
         db.run_migrations().await.unwrap();
         db
+    }
+
+    async fn create_nat_mapping_record(
+        db: &DatabaseBackend,
+        public_port: u16,
+        revoke_agent: bool,
+    ) -> NatMapping {
+        let user = UserRepository::new(db.clone())
+            .create(CreateUserInput {
+                username: format!("nat-runtime-owner-{}", uuid::Uuid::now_v7()),
+                password: "password123".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        let agent_id = AgentId(uuid::Uuid::now_v7());
+        let agent_repo = AgentRepository::new(db.clone());
+        agent_repo
+            .create_with_id(
+                agent_id,
+                CreateAgentInput {
+                    name: "nat-runtime-agent".into(),
+                    public_key: "pk".into(),
+                    owner_user_id: user.id,
+                },
+            )
+            .await
+            .unwrap();
+        if revoke_agent {
+            agent_repo.revoke(agent_id).await.unwrap();
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let mapping = NatMapping {
+            id: uuid::Uuid::now_v7().to_string(),
+            agent_id: agent_id.0.to_string(),
+            local_host: "127.0.0.1".into(),
+            local_port: 8080,
+            public_port,
+            protocol: Protocol::Tcp,
+            enabled: true,
+            description: None,
+            allowed_sources: None,
+            max_active_tunnels: None,
+            idle_timeout_seconds: None,
+            max_bytes_per_tunnel: None,
+            max_bandwidth_bytes_per_second: None,
+            rate_limit_window_seconds: None,
+            max_connections_per_window: None,
+            max_bytes_per_window: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        NatMappingRepository::create(db, &mapping).await.unwrap();
+        mapping
     }
 
     fn create_nat_request(agent_id: uuid::Uuid) -> CreateNatMappingRequest {

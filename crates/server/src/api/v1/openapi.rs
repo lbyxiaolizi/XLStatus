@@ -713,7 +713,7 @@ const ROUTES: &[RouteSpec] = &[
     RouteSpec {
         method: "get",
         path: "/api/v1/nat/mappings/all",
-        summary: "List all NAT mappings",
+        summary: "List runtime NAT mappings",
         protected: true,
     },
     RouteSpec {
