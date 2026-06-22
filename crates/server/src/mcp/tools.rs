@@ -138,76 +138,8 @@ pub fn get_available_tools() -> Vec<McpTool> {
             }),
         },
         McpTool {
-            name: "fs.write".to_string(),
-            description: "Write content to a file on a server".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "server_id": {
-                        "type": "string",
-                        "description": "Server ID"
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "File path"
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "File content"
-                    },
-                    "mode": {
-                        "type": "string",
-                        "description": "Write mode: 'overwrite' or 'append'",
-                        "default": "overwrite"
-                    }
-                },
-                "required": ["server_id", "path", "content"]
-            }),
-        },
-        McpTool {
-            name: "fs.delete".to_string(),
-            description: "Delete a file from a server".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "server_id": {
-                        "type": "string",
-                        "description": "Server ID"
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "File path"
-                    }
-                },
-                "required": ["server_id", "path"]
-            }),
-        },
-        McpTool {
             name: "fs.download_url".to_string(),
             description: "Generate a temporary download URL for a file".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "server_id": {
-                        "type": "string",
-                        "description": "Server ID"
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "File path"
-                    },
-                    "expires_in": {
-                        "type": "integer",
-                        "description": "URL expiration time in seconds",
-                        "default": 3600
-                    }
-                },
-                "required": ["server_id", "path"]
-            }),
-        },
-        McpTool {
-            name: "fs.upload_url".to_string(),
-            description: "Generate a temporary upload URL for a file".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -238,11 +170,15 @@ mod tests {
     #[test]
     fn test_get_available_tools() {
         let tools = get_available_tools();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 7);
 
         let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(tool_names.contains(&"meta.whoami"));
         assert!(tool_names.contains(&"server.list"));
         assert!(tool_names.contains(&"fs.read"));
+        assert!(tool_names.contains(&"fs.download_url"));
+        assert!(!tool_names.contains(&"fs.write"));
+        assert!(!tool_names.contains(&"fs.delete"));
+        assert!(!tool_names.contains(&"fs.upload_url"));
     }
 }

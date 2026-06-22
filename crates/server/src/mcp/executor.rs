@@ -5,8 +5,7 @@ use hmac::{Hmac, Mac};
 use serde_json::json;
 use sha2::Sha256;
 use xlstatus_proto_gen::xlstatus::v1::{
-    server_task::Spec, FileDeleteTask, FileListTask, FileReadTask, FileWriteTask, ServerTask,
-    TaskOutcome, TaskType,
+    server_task::Spec, FileListTask, FileReadTask, ServerTask, TaskOutcome, TaskType,
 };
 use xlstatus_shared::{AgentId, UserId};
 
@@ -61,10 +60,9 @@ impl McpExecutor {
             "server.exec" => self.exec_server_exec(auth, &request.arguments).await,
             "fs.list" => self.exec_fs_list(auth, &request.arguments).await,
             "fs.read" => self.exec_fs_read(auth, &request.arguments).await,
-            "fs.write" => self.exec_fs_write(auth, &request.arguments).await,
-            "fs.delete" => self.exec_fs_delete(auth, &request.arguments).await,
+            "fs.write" | "fs.delete" => reject_mcp_file_write_tool(),
             "fs.download_url" => self.exec_fs_download_url(auth, &request.arguments).await,
-            "fs.upload_url" => self.exec_fs_upload_url(auth, &request.arguments).await,
+            "fs.upload_url" => reject_mcp_file_write_tool(),
             _ => Err(anyhow::anyhow!("Unknown tool: {}", request.tool)),
         };
 
@@ -309,83 +307,6 @@ impl McpExecutor {
         }))
     }
 
-    /// Execute fs.write
-    async fn exec_fs_write(
-        &self,
-        auth: &AuthSession,
-        args: &serde_json::Value,
-    ) -> Result<serde_json::Value> {
-        let server_id = args["server_id"].as_str().context("Missing server_id")?;
-        let agent = self.ensure_agent_active(auth, server_id).await?;
-        let server_id = agent.id.0.to_string();
-        let path = validate_abs_path(args["path"].as_str().context("Missing path")?)?;
-        let content = args["content"].as_str().context("Missing content")?;
-        let mode = args["mode"].as_str().unwrap_or("overwrite");
-        if mode != "overwrite" {
-            anyhow::bail!("unsupported write mode: {mode}");
-        }
-        let result = self
-            .dispatch_file_task(
-                &server_id,
-                ServerTask {
-                    task_id: String::new(),
-                    task_type: TaskType::FileWrite as i32,
-                    spec: Some(Spec::FileWrite(FileWriteTask {
-                        path: path.clone(),
-                        data: content.as_bytes().to_vec(),
-                        mode: 0,
-                        create_dirs: true,
-                    })),
-                },
-                MCP_FILE_OP_TIMEOUT_SECS,
-            )
-            .await?;
-        ensure_mcp_file_result_text(&result, MCP_SMALL_RESULT_MAX_BYTES, "fs.write result")?;
-        ensure_task_success(&result)?;
-        Ok(json!({
-            "server_id": server_id,
-            "path": path,
-            "mode": mode,
-            "bytes_written": result.stdout.trim().parse::<u64>().unwrap_or(content.len() as u64),
-        }))
-    }
-
-    /// Execute fs.delete
-    async fn exec_fs_delete(
-        &self,
-        auth: &AuthSession,
-        args: &serde_json::Value,
-    ) -> Result<serde_json::Value> {
-        let server_id = args["server_id"].as_str().context("Missing server_id")?;
-        let agent = self.ensure_agent_active(auth, server_id).await?;
-        let server_id = agent.id.0.to_string();
-        let path = validate_abs_path(args["path"].as_str().context("Missing path")?)?;
-        if path == "/" {
-            anyhow::bail!("refusing to delete filesystem root");
-        }
-        let result = self
-            .dispatch_file_task(
-                &server_id,
-                ServerTask {
-                    task_id: String::new(),
-                    task_type: TaskType::FileDelete as i32,
-                    spec: Some(Spec::FileDelete(FileDeleteTask {
-                        path: path.clone(),
-                        recursive: false,
-                    })),
-                },
-                MCP_FILE_OP_TIMEOUT_SECS,
-            )
-            .await?;
-        ensure_mcp_file_result_text(&result, MCP_SMALL_RESULT_MAX_BYTES, "fs.delete result")?;
-        ensure_task_success(&result)?;
-        Ok(json!({
-            "server_id": server_id,
-            "path": path,
-            "deleted": true,
-        }))
-    }
-
     /// Execute fs.download_url
     async fn exec_fs_download_url(
         &self,
@@ -425,48 +346,6 @@ impl McpExecutor {
             "expires_in": expires_in,
             "expires_at": expires_at,
             "method": "GET",
-        }))
-    }
-
-    /// Execute fs.upload_url
-    async fn exec_fs_upload_url(
-        &self,
-        auth: &AuthSession,
-        args: &serde_json::Value,
-    ) -> Result<serde_json::Value> {
-        let server_id = args["server_id"].as_str().context("Missing server_id")?;
-        let agent = self.ensure_agent_active(auth, server_id).await?;
-        let server_id = agent.id.0.to_string();
-        let path = validate_abs_path(args["path"].as_str().context("Missing path")?)?;
-        let expires_in = temporary_url_expires_in(
-            args["expires_in"]
-                .as_i64()
-                .unwrap_or(TEMP_URL_DEFAULT_EXPIRES_SECS),
-        );
-
-        let expires_at = temporary_url_expires_at(expires_in);
-        let token = self
-            .create_temporary_transfer_token(
-                auth,
-                &server_id,
-                &path,
-                "upload",
-                "transfer:write",
-                expires_at,
-            )
-            .await?;
-        let url = format!(
-            "/api/v1/transfers/temp/upload?token={}",
-            percent_encode(&token)
-        );
-
-        Ok(json!({
-            "server_id": server_id,
-            "path": path,
-            "url": url,
-            "expires_in": expires_in,
-            "expires_at": expires_at,
-            "method": "PUT",
         }))
     }
 
@@ -899,6 +778,10 @@ fn agent_visible_to_auth(auth: &AuthSession, agent: &crate::db::Agent) -> bool {
     allowed_by_pat && (auth.role.is_admin() || agent.owner_user_id == auth.user_id)
 }
 
+fn reject_mcp_file_write_tool() -> Result<serde_json::Value> {
+    anyhow::bail!("file write operations require a cookie session")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1098,6 +981,71 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("agent has been revoked"));
+        let (_, total) = TemporaryTransferTokenRepository::new(db)
+            .list(10, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 0);
+    }
+
+    #[tokio::test]
+    async fn mcp_file_write_tools_are_disabled_for_pat_mcp() {
+        let db = test_db().await;
+        let owner = UserId(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap());
+        seed_user(&db, owner, "owner", "admin").await;
+        let agent = AgentRepository::new(db.clone())
+            .create(CreateAgentInput {
+                name: "file-write-disabled-agent".into(),
+                public_key: "pk".into(),
+                owner_user_id: owner,
+            })
+            .await
+            .unwrap();
+        let executor = test_executor(db.clone());
+        let auth = pat_auth(owner, UserRole::Admin, vec![agent.id.0.to_string()]);
+
+        for (tool, arguments) in [
+            (
+                "fs.write",
+                json!({
+                    "server_id": agent.id.0.to_string(),
+                    "path": "/tmp/file.txt",
+                    "content": "owned"
+                }),
+            ),
+            (
+                "fs.delete",
+                json!({
+                    "server_id": agent.id.0.to_string(),
+                    "path": "/tmp/file.txt"
+                }),
+            ),
+            (
+                "fs.upload_url",
+                json!({
+                    "server_id": agent.id.0.to_string(),
+                    "path": "/tmp/file.txt"
+                }),
+            ),
+        ] {
+            let response = executor
+                .execute(
+                    &auth,
+                    McpToolRequest {
+                        tool: tool.into(),
+                        arguments,
+                    },
+                )
+                .await;
+
+            assert!(!response.success, "{tool} unexpectedly succeeded");
+            assert!(response
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cookie session"));
+        }
+
         let (_, total) = TemporaryTransferTokenRepository::new(db)
             .list(10, 0)
             .await
