@@ -17,6 +17,12 @@ pub const NOTIFICATION_MAX_HEADERS_JSON_BYTES: usize = 16 * 1024;
 pub const NOTIFICATION_MAX_BODY_TEMPLATE_BYTES: usize = 64 * 1024;
 pub const NOTIFICATION_MAX_RENDERED_BODY_BYTES: usize = 128 * 1024;
 pub const NOTIFICATION_MAX_GROUP_CHANNELS: usize = 32;
+pub const NOTIFICATION_MAX_MESSAGE_TITLE_BYTES: usize = 512;
+pub const NOTIFICATION_MAX_MESSAGE_TEXT_BYTES: usize = 4096;
+pub const NOTIFICATION_MAX_MESSAGE_TIMESTAMP_BYTES: usize = 128;
+pub const NOTIFICATION_MAX_MESSAGE_METADATA: usize = 32;
+pub const NOTIFICATION_MAX_MESSAGE_METADATA_KEY_BYTES: usize = 128;
+pub const NOTIFICATION_MAX_MESSAGE_METADATA_VALUE_BYTES: usize = 4096;
 
 /// Notification channel type
 #[derive(Debug, Clone)]
@@ -82,6 +88,7 @@ impl NotificationSender {
         message: &NotificationMessage,
     ) -> Result<()> {
         validate_notification_channel(channel)?;
+        validate_notification_message(message)?;
         info!(
             "Sending notification via channel {} ({})",
             channel.id, channel.name
@@ -311,6 +318,49 @@ pub fn validate_notification_channel(channel: &NotificationChannel) -> Result<()
     Ok(())
 }
 
+pub fn validate_notification_message(message: &NotificationMessage) -> Result<()> {
+    ensure_text_size(
+        &message.title,
+        0,
+        NOTIFICATION_MAX_MESSAGE_TITLE_BYTES,
+        "notification message title",
+    )?;
+    ensure_text_size(
+        &message.message,
+        0,
+        NOTIFICATION_MAX_MESSAGE_TEXT_BYTES,
+        "notification message text",
+    )?;
+    ensure_text_size(
+        &message.timestamp,
+        0,
+        NOTIFICATION_MAX_MESSAGE_TIMESTAMP_BYTES,
+        "notification message timestamp",
+    )?;
+    if message.metadata.len() > NOTIFICATION_MAX_MESSAGE_METADATA {
+        anyhow::bail!("notification message metadata contains too many entries");
+    }
+    for (key, value) in &message.metadata {
+        ensure_text_size(
+            key.trim(),
+            1,
+            NOTIFICATION_MAX_MESSAGE_METADATA_KEY_BYTES,
+            "notification message metadata key",
+        )?;
+        ensure_text_size(
+            value,
+            0,
+            NOTIFICATION_MAX_MESSAGE_METADATA_VALUE_BYTES,
+            "notification message metadata value",
+        )?;
+        if key.contains('\n') || key.contains('\r') || value.contains('\n') || value.contains('\r')
+        {
+            anyhow::bail!("notification message metadata must not contain newline characters");
+        }
+    }
+    Ok(())
+}
+
 pub fn ensure_headers_allowed(headers: &HashMap<String, String>) -> Result<()> {
     if headers.len() > NOTIFICATION_MAX_HEADERS {
         anyhow::bail!("notification headers contain too many entries");
@@ -414,6 +464,50 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("too many entries"));
+    }
+
+    #[test]
+    fn notification_message_runtime_fields_are_bounded() {
+        let valid = NotificationMessage {
+            title: "title".into(),
+            message: "message".into(),
+            severity: NotificationSeverity::Info,
+            timestamp: "2026-06-22T00:00:00Z".into(),
+            metadata: HashMap::from([("server".into(), "edge-1".into())]),
+        };
+        validate_notification_message(&valid).unwrap();
+
+        let mut oversized = valid.clone();
+        oversized.title = "x".repeat(NOTIFICATION_MAX_MESSAGE_TITLE_BYTES + 1);
+        assert!(validate_notification_message(&oversized)
+            .unwrap_err()
+            .to_string()
+            .contains("title"));
+
+        let mut oversized = valid.clone();
+        oversized.message = "x".repeat(NOTIFICATION_MAX_MESSAGE_TEXT_BYTES + 1);
+        assert!(validate_notification_message(&oversized)
+            .unwrap_err()
+            .to_string()
+            .contains("message text"));
+
+        let mut oversized = valid.clone();
+        oversized.metadata = (0..=NOTIFICATION_MAX_MESSAGE_METADATA)
+            .map(|idx| (format!("key-{idx}"), "value".to_string()))
+            .collect();
+        assert!(validate_notification_message(&oversized)
+            .unwrap_err()
+            .to_string()
+            .contains("too many entries"));
+
+        let mut oversized = valid;
+        oversized
+            .metadata
+            .insert("key\nwith-newline".into(), "value".into());
+        assert!(validate_notification_message(&oversized)
+            .unwrap_err()
+            .to_string()
+            .contains("metadata"));
     }
 
     #[test]
