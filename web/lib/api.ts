@@ -1360,6 +1360,7 @@ class ApiClient {
     agentId: string,
     cols: number,
     rows: number,
+    totpCode?: string,
   ): Promise<ApiResponse<TerminalSessionResponse>> {
     return this.requestWithFallback<TerminalSessionResponse>(
       "/api/v1/terminal/sessions",
@@ -1369,6 +1370,7 @@ class ApiClient {
         rows,
       },
       ["POST"],
+      { headers: this.sensitiveHeaders(totpCode) },
     );
   }
 

@@ -17,7 +17,7 @@ import {
   responseError,
   selectClass,
 } from "@/app/components/M7Primitives";
-import { apiClient, buildWebSocketUrl } from "@/lib/api";
+import { apiClient, buildWebSocketUrl, type TotpStatusResponse } from "@/lib/api";
 
 interface Server {
   id: string;
@@ -44,6 +44,7 @@ export default function TerminalPage() {
   const [loading, setLoading] = useState(true);
   const [opening, setOpening] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [totpStatus, setTotpStatus] = useState<TotpStatusResponse | null>(null);
   const [lines, setLines] = useState<TerminalLine[]>([
     { id: 1, direction: "system", text: "请选择 Agent 并打开终端会话。" },
   ]);
@@ -98,11 +99,13 @@ export default function TerminalPage() {
 
     closeSocket();
     setError(null);
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
     setOpening(true);
     setStatus("connecting");
     setLines([{ id: lineIdRef.current++, direction: "system", text: `正在打开 ${selectedAgent?.name || compactId(agentId)} (${cols}x${rows})...` }]);
 
-    const response = await apiClient.createTerminalSession(agentId, cols, rows);
+    const response = await apiClient.createTerminalSession(agentId, cols, rows, totpCode);
     if (!response.success) {
       setOpening(false);
       setStatus("error");
@@ -121,6 +124,28 @@ export default function TerminalPage() {
 
     setSessionId(nextSessionId);
     connectTerminal(nextSessionId);
+  }
+
+  async function sensitiveTotpCode(): Promise<string | undefined | null> {
+    let enabled = totpStatus?.enabled;
+    if (totpStatus === null) {
+      const response = await apiClient.getTotpStatus();
+      if (!response.success || !response.data) {
+        setError(responseError(response));
+        return null;
+      }
+      setTotpStatus(response.data);
+      enabled = response.data.enabled;
+    }
+    if (!enabled) return undefined;
+    const code = window.prompt("请输入 6 位 TOTP 验证码");
+    if (code === null) return null;
+    const trimmed = code.trim();
+    if (!/^\d{6}$/.test(trimmed)) {
+      setError("请输入 6 位 TOTP 验证码。");
+      return null;
+    }
+    return trimmed;
   }
 
   function connectTerminal(nextSessionId: string) {

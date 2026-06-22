@@ -19,7 +19,7 @@ use xlstatus_shared::{
 };
 
 use crate::api::types::ApiResponse;
-use crate::api::v1::auth::{AppError, AppState};
+use crate::api::v1::auth::{require_sensitive_totp, AppError, AppState};
 use crate::api::v1::servers::{ensure_agent_visible, server_visible};
 use crate::auth::middleware::{AuthKind, AuthSession};
 use crate::auth::rbac::has_scope;
@@ -76,11 +76,10 @@ pub fn terminal_body_limit() -> DefaultBodyLimit {
 pub async fn create_terminal_session(
     State(state): State<AppState>,
     auth: AuthSession,
+    headers: HeaderMap,
     Json(req): Json<CreateTerminalSessionRequest>,
 ) -> Result<Json<ApiResponse<CreateTerminalSessionResponse>>, AppError> {
-    if !has_scope(&auth, "server:exec") {
-        return Err(AppError::Forbidden("missing scope: server:exec".into()));
-    }
+    require_terminal_session_scope(&state.db, &auth, &headers).await?;
     let agent_id = parse_agent_id(&req.agent_id)?;
     if !server_visible(&auth, &agent_id) {
         return Err(AppError::Forbidden("agent not in scope".into()));
@@ -111,6 +110,22 @@ pub async fn create_terminal_session(
         rows: session.rows,
         created_at: session.created_at.to_rfc3339(),
     })))
+}
+
+async fn require_terminal_session_scope(
+    db: &crate::db::DatabaseBackend,
+    auth: &AuthSession,
+    headers: &HeaderMap,
+) -> Result<(), AppError> {
+    if !has_scope(auth, "server:exec") {
+        return Err(AppError::Forbidden("missing scope: server:exec".into()));
+    }
+    if matches!(auth.auth_kind, AuthKind::PersonalAccessToken) {
+        return Err(AppError::Forbidden(
+            "terminal sessions require a cookie session".into(),
+        ));
+    }
+    require_sensitive_totp(db, auth.user_id, headers).await
 }
 
 pub async fn ws_terminal(
@@ -685,6 +700,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_session_creation_rejects_pat_session() {
+        let db = test_db().await;
+        let auth = test_pat_auth("pat-id");
+
+        let err = require_terminal_session_scope(&db, &auth, &HeaderMap::new())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(message) if message.contains("cookie session")));
+    }
+
+    #[tokio::test]
+    async fn terminal_session_creation_requires_sensitive_totp_when_enabled() {
+        let db = test_db().await;
+        let auth = test_auth_session("sess-1");
+        seed_user_with_id(&db, auth.user_id).await;
+        seed_totp_enabled_user(&db, auth.user_id).await;
+
+        let err = require_terminal_session_scope(&db, &auth, &HeaderMap::new())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(message) if message.contains("TOTP")));
+    }
+
+    #[tokio::test]
+    async fn terminal_session_creation_allows_cookie_session_without_totp() {
+        let db = test_db().await;
+        let auth = test_auth_session("sess-1");
+        seed_user_with_id(&db, auth.user_id).await;
+
+        assert!(
+            require_terminal_session_scope(&db, &auth, &HeaderMap::new())
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
     async fn terminal_session_take_is_bound_to_creator_and_one_time() {
         let registry = TerminalSessionRegistry::new();
         let creator = test_auth_session("creator-session");
@@ -721,6 +775,8 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_session_pat_binding_uses_pat_id() {
+        // Registry-level compatibility for legacy in-memory entries; the HTTP
+        // terminal session creation entrypoint rejects PAT before this layer.
         let registry = TerminalSessionRegistry::new();
         let creator = test_pat_auth("pat-1");
         let same_session_different_pat = test_pat_auth("pat-2");
@@ -918,5 +974,31 @@ mod tests {
             .await
             .unwrap()
             .id
+    }
+
+    async fn seed_user_with_id(db: &DatabaseBackend, user_id: UserId) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, role, created_at, updated_at) VALUES (?, ?, 'x', 'admin', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(user_id.0.to_string())
+        .bind(format!("terminal-user-{}", user_id.0))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_totp_enabled_user(db: &DatabaseBackend, user_id: UserId) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query("UPDATE users SET totp_secret = ?, totp_enabled = 1 WHERE id = ?")
+            .bind("totp-secret")
+            .bind(user_id.0.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
     }
 }
