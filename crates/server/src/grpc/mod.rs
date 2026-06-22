@@ -21,6 +21,7 @@ use xlstatus_shared::AgentId;
 const AGENT_TELEMETRY_MAX_ITEMS: usize = 64;
 const AGENT_TELEMETRY_MAX_STRING_BYTES: usize = 128;
 const AGENT_TELEMETRY_MAX_JSON_BYTES: usize = 256 * 1024;
+const AGENT_GEO_IP_MAX_TEXT_BYTES: usize = 64;
 
 pub struct AgentServiceImpl {
     db: DatabaseBackend,
@@ -159,26 +160,19 @@ impl AgentService for AgentServiceImpl {
                         }
                     }
                     Some(agent_message::Payload::GeoIpReport(report)) => {
+                        let (ipv4, ipv6) = normalized_geo_ip_report(&report);
                         tracing::debug!(
                             "GeoIP report from agent {}: ipv4={}, ipv6={}",
                             agent_id,
-                            report.ipv4,
-                            report.ipv6
+                            ipv4.as_deref().unwrap_or(""),
+                            ipv6.as_deref().unwrap_or("")
                         );
                         if let Some(manager) = crate::current_ddns_manager() {
                             if let Err(e) = manager
                                 .check_agent_ip_report(
                                     &agent_id.0.to_string(),
-                                    if report.ipv4.trim().is_empty() {
-                                        None
-                                    } else {
-                                        Some(report.ipv4.as_str())
-                                    },
-                                    if report.ipv6.trim().is_empty() {
-                                        None
-                                    } else {
-                                        Some(report.ipv6.as_str())
-                                    },
+                                    ipv4.as_deref(),
+                                    ipv6.as_deref(),
                                 )
                                 .await
                             {
@@ -188,29 +182,23 @@ impl AgentService for AgentServiceImpl {
                         if let Err(e) = crate::api::v1::geoip::handle_agent_ip_report(
                             &db,
                             agent_id,
-                            if report.ipv4.trim().is_empty() {
-                                None
-                            } else {
-                                Some(report.ipv4.as_str())
-                            },
-                            if report.ipv6.trim().is_empty() {
-                                None
-                            } else {
-                                Some(report.ipv6.as_str())
-                            },
+                            ipv4.as_deref(),
+                            ipv6.as_deref(),
                         )
                         .await
                         {
                             tracing::warn!("Agent IP change handling failed: {}", e);
                         }
-                        realtime.publish(RealtimeEvent::new(
-                            "geo_ip",
-                            agent_id.0,
-                            serde_json::json!({
-                                "ipv4": report.ipv4,
-                                "ipv6": report.ipv6,
-                            }),
-                        ));
+                        if ipv4.is_some() || ipv6.is_some() {
+                            realtime.publish(RealtimeEvent::new(
+                                "geo_ip",
+                                agent_id.0,
+                                serde_json::json!({
+                                    "ipv4": ipv4.unwrap_or_default(),
+                                    "ipv6": ipv6.unwrap_or_default(),
+                                }),
+                            ));
+                        }
                     }
                     None => {}
                 }
@@ -368,6 +356,26 @@ fn grpc_metadata_value<T>(request: &Request<T>, name: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
+}
+
+fn normalized_geo_ip_report(
+    report: &xlstatus_proto_gen::xlstatus::v1::GeoIpReport,
+) -> (Option<String>, Option<String>) {
+    (
+        normalized_geo_ip_report_value(&report.ipv4),
+        normalized_geo_ip_report_value(&report.ipv6),
+    )
+}
+
+fn normalized_geo_ip_report_value(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > AGENT_GEO_IP_MAX_TEXT_BYTES {
+        return None;
+    }
+    value
+        .parse::<std::net::IpAddr>()
+        .ok()
+        .map(|ip| ip.to_string())
 }
 
 /// M3: hand-rolled JSON serializer for the gRPC HostState message.
@@ -540,7 +548,8 @@ where
 mod tests {
     use super::*;
     use xlstatus_proto_gen::xlstatus::v1::{
-        DiskInfo, DiskState, GpuState, HostInfo, HostInfoUpdate, HostState, NetStat, TempSensor,
+        DiskInfo, DiskState, GeoIpReport, GpuState, HostInfo, HostInfoUpdate, HostState, NetStat,
+        TempSensor,
     };
 
     fn parse_json(value: &str) -> serde_json::Value {
@@ -672,5 +681,24 @@ mod tests {
     #[test]
     fn host_info_without_payload_remains_empty() {
         assert_eq!(info_to_json(&HostInfoUpdate { host_info: None }), "");
+    }
+
+    #[test]
+    fn geo_ip_report_values_are_validated_and_canonicalized() {
+        let report = GeoIpReport {
+            ipv4: " 203.0.113.10 ".into(),
+            ipv6: "2001:0db8::0001".into(),
+        };
+        let (ipv4, ipv6) = normalized_geo_ip_report(&report);
+        assert_eq!(ipv4.as_deref(), Some("203.0.113.10"));
+        assert_eq!(ipv6.as_deref(), Some("2001:db8::1"));
+
+        let report = GeoIpReport {
+            ipv4: "not-an-ip".repeat(64),
+            ipv6: "also-not-an-ip".into(),
+        };
+        let (ipv4, ipv6) = normalized_geo_ip_report(&report);
+        assert!(ipv4.is_none());
+        assert!(ipv6.is_none());
     }
 }

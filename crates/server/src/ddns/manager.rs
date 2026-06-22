@@ -164,9 +164,9 @@ impl DdnsManager {
             // Try to extract an IP from the host state. The agent
             // does not always report IP; we use the first network
             // interface's address when available.
-            let new_ip = parsed["primary_ip"].as_str().map(|s| s.to_string());
+            let new_ip = parsed["primary_ip"].as_str().and_then(normalize_ddns_ip);
             let new_ip = match new_ip {
-                Some(s) if !s.is_empty() => s,
+                Some(s) => s,
                 _ => continue,
             };
             if cfg.last_applied_ip.as_deref() == Some(new_ip.as_str()) {
@@ -350,8 +350,8 @@ impl DdnsManager {
             return Ok(());
         };
         let new_ip = ipv4
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| ipv6.filter(|value| !value.trim().is_empty()));
+            .and_then(normalize_ddns_ip)
+            .or_else(|| ipv6.and_then(normalize_ddns_ip));
         let Some(new_ip) = new_ip else {
             return Ok(());
         };
@@ -371,10 +371,10 @@ impl DdnsManager {
             {
                 continue;
             }
-            if cfg.last_applied_ip.as_deref() == Some(new_ip) {
+            if cfg.last_applied_ip.as_deref() == Some(new_ip.as_str()) {
                 continue;
             }
-            self.apply_update(&cfg, new_ip).await;
+            self.apply_update(&cfg, &new_ip).await;
         }
 
         Ok(())
@@ -442,6 +442,17 @@ impl DdnsManager {
             last_check: chrono::Utc::now().to_rfc3339(),
         }
     }
+}
+
+fn normalize_ddns_ip(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 64 {
+        return None;
+    }
+    value
+        .parse::<std::net::IpAddr>()
+        .ok()
+        .map(|ip| ip.to_string())
 }
 
 async fn resolver_contains_ip(resolver_url: &str, domain: &str, ip: &str) -> Result<bool> {
@@ -626,6 +637,74 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(config.last_applied_ip.as_deref(), Some("203.0.113.40"));
+    }
+
+    #[tokio::test]
+    async fn ddns_agent_ip_report_rejects_invalid_ip_text() {
+        let db = test_db().await;
+        let fixture = create_fixture(&db).await;
+        let config_id = create_ddns_config(
+            &db,
+            fixture.owner.id.0.to_string(),
+            Some(fixture.agent.id.0.to_string()),
+            "invalid-ip-report.example.com",
+        )
+        .await;
+
+        let manager = DdnsManager::new(db.clone());
+        manager.reload_providers().await.unwrap();
+        manager
+            .check_agent_ip_report(
+                &fixture.agent.id.0.to_string(),
+                Some(&"not-an-ip".repeat(128)),
+                Some("still-not-an-ip"),
+            )
+            .await
+            .unwrap();
+
+        let config = DdnsConfigRepository::get_by_id(&db, &config_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.last_applied_ip, None);
+        assert!(DdnsHistoryRepository::list_for_config(&db, &config_id, 10)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn ddns_check_now_rejects_invalid_primary_ip() {
+        let db = test_db().await;
+        let fixture = create_fixture(&db).await;
+        let config_id = create_ddns_config(
+            &db,
+            fixture.owner.id.0.to_string(),
+            Some(fixture.agent.id.0.to_string()),
+            "invalid-primary-ip.example.com",
+        )
+        .await;
+        AgentRepository::new(db.clone())
+            .update_last_state(
+                fixture.agent.id,
+                &serde_json::json!({ "primary_ip": "not-an-ip".repeat(128) }).to_string(),
+            )
+            .await
+            .unwrap();
+
+        let manager = DdnsManager::new(db.clone());
+        manager.reload_providers().await.unwrap();
+        manager.check_now().await.unwrap();
+
+        let config = DdnsConfigRepository::get_by_id(&db, &config_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.last_applied_ip, None);
+        assert!(DdnsHistoryRepository::list_for_config(&db, &config_id, 10)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     async fn test_db() -> DatabaseBackend {
