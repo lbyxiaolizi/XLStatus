@@ -137,20 +137,19 @@ impl AlertRepository {
                     updated_at,
                 ) in rows
                 {
-                    out.push(AlertRuleRow {
+                    out.push(build_alert_rule_row(
                         id,
                         owner_user_id,
                         name,
-                        enabled: enabled != 0,
-                        trigger_mode: TriggerMode::from_db(&trigger_mode),
-                        conditions: serde_json::from_str(&rules_json)
-                            .context("invalid rules_json")?,
+                        enabled != 0,
+                        trigger_mode,
+                        rules_json,
                         notification_group_id,
-                        failure_task_ids: parse_task_ids_json(fail_task_ids_json),
-                        recovery_task_ids: parse_task_ids_json(recover_task_ids_json),
-                        created_at: parse_dt(&created_at)?,
-                        updated_at: parse_dt(&updated_at)?,
-                    });
+                        fail_task_ids_json,
+                        recover_task_ids_json,
+                        created_at,
+                        updated_at,
+                    )?);
                 }
             }
             DatabaseBackend::Postgres(pool) => {
@@ -185,20 +184,19 @@ impl AlertRepository {
                     updated_at,
                 ) in rows
                 {
-                    out.push(AlertRuleRow {
+                    out.push(build_alert_rule_row(
                         id,
                         owner_user_id,
                         name,
                         enabled,
-                        trigger_mode: TriggerMode::from_db(&trigger_mode),
-                        conditions: serde_json::from_str(&rules_json)
-                            .context("invalid rules_json")?,
+                        trigger_mode,
+                        rules_json,
                         notification_group_id,
-                        failure_task_ids: parse_task_ids_json(fail_task_ids_json),
-                        recovery_task_ids: parse_task_ids_json(recover_task_ids_json),
-                        created_at: parse_dt(&created_at)?,
-                        updated_at: parse_dt(&updated_at)?,
-                    });
+                        fail_task_ids_json,
+                        recover_task_ids_json,
+                        created_at,
+                        updated_at,
+                    )?);
                 }
             }
         }
@@ -206,25 +204,478 @@ impl AlertRepository {
     }
 
     pub async fn list_by_owner(&self, owner_user_id: &str) -> Result<Vec<AlertRuleRow>> {
-        let mut rows = self.list().await?;
-        rows.retain(|row| row.owner_user_id == owner_user_id);
-        Ok(rows)
+        let mut out = Vec::new();
+        match &self.db {
+            DatabaseBackend::Sqlite(pool) => {
+                let rows: Vec<(
+                    String,
+                    String,
+                    String,
+                    i64,
+                    String,
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    String,
+                    String,
+                )> = sqlx::query_as(
+                    "SELECT id, owner_user_id, name, enabled, trigger_mode, rules_json, notification_group_id, fail_task_ids_json, recover_task_ids_json, created_at, updated_at FROM alert_rules WHERE owner_user_id = ? ORDER BY created_at DESC",
+                )
+                .bind(owner_user_id)
+                .fetch_all(pool)
+                .await?;
+                for (
+                    id,
+                    owner_user_id,
+                    name,
+                    enabled,
+                    trigger_mode,
+                    rules_json,
+                    notification_group_id,
+                    fail_task_ids_json,
+                    recover_task_ids_json,
+                    created_at,
+                    updated_at,
+                ) in rows
+                {
+                    out.push(build_alert_rule_row(
+                        id,
+                        owner_user_id,
+                        name,
+                        enabled != 0,
+                        trigger_mode,
+                        rules_json,
+                        notification_group_id,
+                        fail_task_ids_json,
+                        recover_task_ids_json,
+                        created_at,
+                        updated_at,
+                    )?);
+                }
+            }
+            DatabaseBackend::Postgres(pool) => {
+                let rows: Vec<(
+                    String,
+                    String,
+                    String,
+                    bool,
+                    String,
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    String,
+                    String,
+                )> = sqlx::query_as(
+                    "SELECT id::text, owner_user_id::text, name, enabled, trigger_mode, rules_json, notification_group_id::text, fail_task_ids_json, recover_task_ids_json, created_at::text, updated_at::text FROM alert_rules WHERE owner_user_id::text = $1 ORDER BY created_at DESC",
+                )
+                .bind(owner_user_id)
+                .fetch_all(pool)
+                .await?;
+                for (
+                    id,
+                    owner_user_id,
+                    name,
+                    enabled,
+                    trigger_mode,
+                    rules_json,
+                    notification_group_id,
+                    fail_task_ids_json,
+                    recover_task_ids_json,
+                    created_at,
+                    updated_at,
+                ) in rows
+                {
+                    out.push(build_alert_rule_row(
+                        id,
+                        owner_user_id,
+                        name,
+                        enabled,
+                        trigger_mode,
+                        rules_json,
+                        notification_group_id,
+                        fail_task_ids_json,
+                        recover_task_ids_json,
+                        created_at,
+                        updated_at,
+                    )?);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn list_page(&self, limit: i64, offset: i64) -> Result<Vec<AlertRuleRow>> {
+        let limit = limit.max(0);
+        let offset = offset.max(0);
+        let mut out = Vec::new();
+        match &self.db {
+            DatabaseBackend::Sqlite(pool) => {
+                let rows: Vec<(
+                    String,
+                    String,
+                    String,
+                    i64,
+                    String,
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    String,
+                    String,
+                )> = sqlx::query_as(
+                    "SELECT id, owner_user_id, name, enabled, trigger_mode, rules_json, notification_group_id, fail_task_ids_json, recover_task_ids_json, created_at, updated_at FROM alert_rules ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                )
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(pool)
+                .await?;
+                for (
+                    id,
+                    owner_user_id,
+                    name,
+                    enabled,
+                    trigger_mode,
+                    rules_json,
+                    notification_group_id,
+                    fail_task_ids_json,
+                    recover_task_ids_json,
+                    created_at,
+                    updated_at,
+                ) in rows
+                {
+                    out.push(build_alert_rule_row(
+                        id,
+                        owner_user_id,
+                        name,
+                        enabled != 0,
+                        trigger_mode,
+                        rules_json,
+                        notification_group_id,
+                        fail_task_ids_json,
+                        recover_task_ids_json,
+                        created_at,
+                        updated_at,
+                    )?);
+                }
+            }
+            DatabaseBackend::Postgres(pool) => {
+                let rows: Vec<(
+                    String,
+                    String,
+                    String,
+                    bool,
+                    String,
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    String,
+                    String,
+                )> = sqlx::query_as(
+                    "SELECT id::text, owner_user_id::text, name, enabled, trigger_mode, rules_json, notification_group_id::text, fail_task_ids_json, recover_task_ids_json, created_at::text, updated_at::text FROM alert_rules ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+                )
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(pool)
+                .await?;
+                for (
+                    id,
+                    owner_user_id,
+                    name,
+                    enabled,
+                    trigger_mode,
+                    rules_json,
+                    notification_group_id,
+                    fail_task_ids_json,
+                    recover_task_ids_json,
+                    created_at,
+                    updated_at,
+                ) in rows
+                {
+                    out.push(build_alert_rule_row(
+                        id,
+                        owner_user_id,
+                        name,
+                        enabled,
+                        trigger_mode,
+                        rules_json,
+                        notification_group_id,
+                        fail_task_ids_json,
+                        recover_task_ids_json,
+                        created_at,
+                        updated_at,
+                    )?);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn list_by_owner_page(
+        &self,
+        owner_user_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AlertRuleRow>> {
+        let limit = limit.max(0);
+        let offset = offset.max(0);
+        let mut out = Vec::new();
+        match &self.db {
+            DatabaseBackend::Sqlite(pool) => {
+                let rows: Vec<(
+                    String,
+                    String,
+                    String,
+                    i64,
+                    String,
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    String,
+                    String,
+                )> = sqlx::query_as(
+                    "SELECT id, owner_user_id, name, enabled, trigger_mode, rules_json, notification_group_id, fail_task_ids_json, recover_task_ids_json, created_at, updated_at FROM alert_rules WHERE owner_user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                )
+                .bind(owner_user_id)
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(pool)
+                .await?;
+                for (
+                    id,
+                    owner_user_id,
+                    name,
+                    enabled,
+                    trigger_mode,
+                    rules_json,
+                    notification_group_id,
+                    fail_task_ids_json,
+                    recover_task_ids_json,
+                    created_at,
+                    updated_at,
+                ) in rows
+                {
+                    out.push(build_alert_rule_row(
+                        id,
+                        owner_user_id,
+                        name,
+                        enabled != 0,
+                        trigger_mode,
+                        rules_json,
+                        notification_group_id,
+                        fail_task_ids_json,
+                        recover_task_ids_json,
+                        created_at,
+                        updated_at,
+                    )?);
+                }
+            }
+            DatabaseBackend::Postgres(pool) => {
+                let rows: Vec<(
+                    String,
+                    String,
+                    String,
+                    bool,
+                    String,
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    String,
+                    String,
+                )> = sqlx::query_as(
+                    "SELECT id::text, owner_user_id::text, name, enabled, trigger_mode, rules_json, notification_group_id::text, fail_task_ids_json, recover_task_ids_json, created_at::text, updated_at::text FROM alert_rules WHERE owner_user_id::text = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+                )
+                .bind(owner_user_id)
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(pool)
+                .await?;
+                for (
+                    id,
+                    owner_user_id,
+                    name,
+                    enabled,
+                    trigger_mode,
+                    rules_json,
+                    notification_group_id,
+                    fail_task_ids_json,
+                    recover_task_ids_json,
+                    created_at,
+                    updated_at,
+                ) in rows
+                {
+                    out.push(build_alert_rule_row(
+                        id,
+                        owner_user_id,
+                        name,
+                        enabled,
+                        trigger_mode,
+                        rules_json,
+                        notification_group_id,
+                        fail_task_ids_json,
+                        recover_task_ids_json,
+                        created_at,
+                        updated_at,
+                    )?);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn count(&self) -> Result<i64> {
+        let (count,): (i64,) = match &self.db {
+            DatabaseBackend::Sqlite(pool) => {
+                sqlx::query_as("SELECT COUNT(*) FROM alert_rules")
+                    .fetch_one(pool)
+                    .await?
+            }
+            DatabaseBackend::Postgres(pool) => {
+                sqlx::query_as("SELECT COUNT(*) FROM alert_rules")
+                    .fetch_one(pool)
+                    .await?
+            }
+        };
+        Ok(count)
+    }
+
+    pub async fn count_by_owner(&self, owner_user_id: &str) -> Result<i64> {
+        let (count,): (i64,) = match &self.db {
+            DatabaseBackend::Sqlite(pool) => {
+                sqlx::query_as("SELECT COUNT(*) FROM alert_rules WHERE owner_user_id = ?")
+                    .bind(owner_user_id)
+                    .fetch_one(pool)
+                    .await?
+            }
+            DatabaseBackend::Postgres(pool) => {
+                sqlx::query_as("SELECT COUNT(*) FROM alert_rules WHERE owner_user_id::text = $1")
+                    .bind(owner_user_id)
+                    .fetch_one(pool)
+                    .await?
+            }
+        };
+        Ok(count)
     }
 
     pub async fn find_by_id(&self, id: &str) -> Result<Option<AlertRuleRow>> {
-        let rows = self.list().await?;
-        Ok(rows.into_iter().find(|row| row.id == id))
+        match &self.db {
+            DatabaseBackend::Sqlite(pool) => {
+                let row: Option<(
+                    String,
+                    String,
+                    String,
+                    i64,
+                    String,
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    String,
+                    String,
+                )> = sqlx::query_as(
+                    "SELECT id, owner_user_id, name, enabled, trigger_mode, rules_json, notification_group_id, fail_task_ids_json, recover_task_ids_json, created_at, updated_at FROM alert_rules WHERE id = ?",
+                )
+                .bind(id)
+                .fetch_optional(pool)
+                .await?;
+                row.map(
+                    |(
+                        id,
+                        owner_user_id,
+                        name,
+                        enabled,
+                        trigger_mode,
+                        rules_json,
+                        notification_group_id,
+                        fail_task_ids_json,
+                        recover_task_ids_json,
+                        created_at,
+                        updated_at,
+                    )| {
+                        build_alert_rule_row(
+                            id,
+                            owner_user_id,
+                            name,
+                            enabled != 0,
+                            trigger_mode,
+                            rules_json,
+                            notification_group_id,
+                            fail_task_ids_json,
+                            recover_task_ids_json,
+                            created_at,
+                            updated_at,
+                        )
+                    },
+                )
+                .transpose()
+            }
+            DatabaseBackend::Postgres(pool) => {
+                let row: Option<(
+                    String,
+                    String,
+                    String,
+                    bool,
+                    String,
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    String,
+                    String,
+                )> = sqlx::query_as(
+                    "SELECT id::text, owner_user_id::text, name, enabled, trigger_mode, rules_json, notification_group_id::text, fail_task_ids_json, recover_task_ids_json, created_at::text, updated_at::text FROM alert_rules WHERE id::text = $1",
+                )
+                .bind(id)
+                .fetch_optional(pool)
+                .await?;
+                row.map(
+                    |(
+                        id,
+                        owner_user_id,
+                        name,
+                        enabled,
+                        trigger_mode,
+                        rules_json,
+                        notification_group_id,
+                        fail_task_ids_json,
+                        recover_task_ids_json,
+                        created_at,
+                        updated_at,
+                    )| {
+                        build_alert_rule_row(
+                            id,
+                            owner_user_id,
+                            name,
+                            enabled,
+                            trigger_mode,
+                            rules_json,
+                            notification_group_id,
+                            fail_task_ids_json,
+                            recover_task_ids_json,
+                            created_at,
+                            updated_at,
+                        )
+                    },
+                )
+                .transpose()
+            }
+        }
     }
 
     pub async fn delete(&self, id: &str) -> Result<bool> {
-        let q = "DELETE FROM alert_rules WHERE id = $1";
         let affected = match &self.db {
-            DatabaseBackend::Sqlite(pool) => {
-                sqlx::query(q).bind(id).execute(pool).await?.rows_affected()
-            }
+            DatabaseBackend::Sqlite(pool) => sqlx::query("DELETE FROM alert_rules WHERE id = ?")
+                .bind(id)
+                .execute(pool)
+                .await?
+                .rows_affected(),
             DatabaseBackend::Postgres(pool) => {
                 let pid = Uuid::parse_str(id)?;
-                sqlx::query(q)
+                sqlx::query("DELETE FROM alert_rules WHERE id = $1")
                     .bind(pid)
                     .execute(pool)
                     .await?
@@ -257,6 +708,34 @@ impl AlertRepository {
         };
         Ok(affected > 0)
     }
+}
+
+fn build_alert_rule_row(
+    id: String,
+    owner_user_id: String,
+    name: String,
+    enabled: bool,
+    trigger_mode: String,
+    rules_json: String,
+    notification_group_id: Option<String>,
+    fail_task_ids_json: Option<String>,
+    recover_task_ids_json: Option<String>,
+    created_at: String,
+    updated_at: String,
+) -> Result<AlertRuleRow> {
+    Ok(AlertRuleRow {
+        id,
+        owner_user_id,
+        name,
+        enabled,
+        trigger_mode: TriggerMode::from_db(&trigger_mode),
+        conditions: serde_json::from_str(&rules_json).context("invalid rules_json")?,
+        notification_group_id,
+        failure_task_ids: parse_task_ids_json(fail_task_ids_json),
+        recovery_task_ids: parse_task_ids_json(recover_task_ids_json),
+        created_at: parse_dt(&created_at)?,
+        updated_at: parse_dt(&updated_at)?,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -617,6 +1096,7 @@ fn parse_task_ids_json(value: Option<String>) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::alerts::engine::{Operator, ResourceType};
+    use crate::db::DatabaseBackend;
 
     #[test]
     fn alert_condition_serde() {
@@ -642,5 +1122,85 @@ mod tests {
         let j = serde_json::to_string(&rule.conditions).unwrap();
         let back: Vec<AlertCondition> = serde_json::from_str(&j).unwrap();
         assert_eq!(back.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn find_by_id_ignores_unrelated_invalid_rules_json() {
+        let db = DatabaseBackend::connect("sqlite::memory:", true)
+            .await
+            .unwrap();
+        db.run_migrations().await.unwrap();
+        let owner = "00000000-0000-0000-0000-000000000001";
+        let other = "00000000-0000-0000-0000-000000000002";
+        let wanted = "00000000-0000-0000-0000-000000000701";
+        let dirty = "00000000-0000-0000-0000-000000000702";
+
+        seed_user(&db, owner, "owner").await;
+        seed_user(&db, other, "other").await;
+        seed_alert_rule_json(
+            &db,
+            wanted,
+            owner,
+            "wanted",
+            &serde_json::to_string(&[AlertCondition::ServerOffline {
+                agent_id: "00000000-0000-0000-0000-000000000101".into(),
+                offline_seconds: 60,
+            }])
+            .unwrap(),
+            "2026-01-02T00:00:00Z",
+        )
+        .await;
+        seed_alert_rule_json(
+            &db,
+            dirty,
+            other,
+            "dirty",
+            "not-json",
+            "2026-01-03T00:00:00Z",
+        )
+        .await;
+
+        let found = AlertRepository::new(db).find_by_id(wanted).await.unwrap();
+
+        assert_eq!(found.unwrap().id, wanted);
+    }
+
+    async fn seed_user(db: &DatabaseBackend, id: &str, username: &str) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, role, created_at, updated_at) VALUES (?, ?, 'x', 'member', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(username)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_alert_rule_json(
+        db: &DatabaseBackend,
+        id: &str,
+        owner: &str,
+        name: &str,
+        rules_json: &str,
+        created_at: &str,
+    ) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO alert_rules (id, owner_user_id, name, enabled, trigger_mode, rules_json, created_at, updated_at) VALUES (?, ?, ?, 1, 'once', ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(owner)
+        .bind(name)
+        .bind(rules_json)
+        .bind(created_at)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 }

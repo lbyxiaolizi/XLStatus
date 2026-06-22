@@ -24,6 +24,7 @@ const ALERT_MAX_NAME_BYTES: usize = 128;
 const ALERT_MAX_CONDITIONS: usize = 32;
 const ALERT_MAX_CONDITION_BYTES: usize = 4 * 1024;
 const ALERT_MAX_TASK_IDS: usize = 32;
+const ALERT_RULE_LIST_SCAN_BATCH: i64 = 500;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateAlertRuleRequest {
@@ -119,31 +120,82 @@ pub async fn list_alert_rules(
         return Err(AppError::Forbidden("missing scope: alert:read".into()));
     }
     let repo = AlertRepository::new(state.db.clone());
+    let limit = q.limit.clamp(1, 500);
+    let offset = q.offset.max(0);
     let owner = auth.user_id.0.to_string();
-    let rows = if auth.role.is_admin() {
-        repo.list().await.map_err(AppError::Database)?
-    } else {
-        repo.list_by_owner(&owner)
-            .await
-            .map_err(AppError::Database)?
-    };
-    let mut visible_rows = Vec::new();
-    for row in rows {
-        if alert_rule_visible_to_auth(&state.db, &auth, &row).await? {
-            visible_rows.push(row);
+    let (rows, total) = if auth.server_ids.is_none() {
+        if auth.role.is_admin() {
+            (
+                repo.list_page(limit, offset)
+                    .await
+                    .map_err(AppError::Database)?,
+                repo.count().await.map_err(AppError::Database)?,
+            )
+        } else {
+            (
+                repo.list_by_owner_page(&owner, limit, offset)
+                    .await
+                    .map_err(AppError::Database)?,
+                repo.count_by_owner(&owner)
+                    .await
+                    .map_err(AppError::Database)?,
+            )
         }
-    }
-    let total = visible_rows.len() as i64;
-    let start = q.offset.max(0) as usize;
-    let end = (start + q.limit.clamp(1, 500) as usize).min(visible_rows.len());
-    let view: Vec<AlertRuleView> = visible_rows[start..end]
-        .iter()
-        .map(|r| row_to_view(r))
-        .collect();
+    } else {
+        list_alert_rules_visible_page(&state.db, &repo, &auth, &owner, limit, offset).await?
+    };
+    let view: Vec<AlertRuleView> = rows.iter().map(row_to_view).collect();
     Ok(Json(ApiResponse::success(serde_json::json!({
         "rules": view,
         "total": total,
     }))))
+}
+
+async fn list_alert_rules_visible_page(
+    db: &crate::db::Db,
+    repo: &AlertRepository,
+    auth: &AuthSession,
+    owner: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<crate::db::repository::alerts::AlertRuleRow>, i64), AppError> {
+    let mut rows = Vec::new();
+    let mut total = 0_i64;
+    let mut skipped = 0_i64;
+    let mut scan_offset = 0_i64;
+    loop {
+        let batch = if auth.role.is_admin() {
+            repo.list_page(ALERT_RULE_LIST_SCAN_BATCH, scan_offset)
+                .await
+                .map_err(AppError::Database)?
+        } else {
+            repo.list_by_owner_page(owner, ALERT_RULE_LIST_SCAN_BATCH, scan_offset)
+                .await
+                .map_err(AppError::Database)?
+        };
+        if batch.is_empty() {
+            break;
+        }
+        let batch_len = batch.len();
+        for row in batch {
+            if !alert_rule_visible_to_auth(db, auth, &row).await? {
+                continue;
+            }
+            total += 1;
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            if rows.len() < limit as usize {
+                rows.push(row);
+            }
+        }
+        if batch_len < ALERT_RULE_LIST_SCAN_BATCH as usize {
+            break;
+        }
+        scan_offset += ALERT_RULE_LIST_SCAN_BATCH;
+    }
+    Ok((rows, total))
 }
 
 pub async fn delete_alert_rule(
@@ -691,6 +743,101 @@ mod tests {
         assert_eq!(data["total"], 1);
     }
 
+    #[tokio::test]
+    async fn admin_pat_alert_rules_filter_allowlist_before_pagination() {
+        let db = test_db().await;
+        let owner = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let other = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let allowed_server = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000131").unwrap();
+        let blocked_server = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000232").unwrap();
+        let blocked_rule = "00000000-0000-0000-0000-000000000531";
+        let allowed_rule = "00000000-0000-0000-0000-000000000532";
+
+        seed_user(&db, owner, "owner", "admin").await;
+        seed_user(&db, other, "other", "member").await;
+        seed_agent(&db, allowed_server, owner, "allowed").await;
+        seed_agent(&db, blocked_server, other, "blocked").await;
+        seed_alert_rule_with_condition(
+            &db,
+            blocked_rule,
+            other,
+            "blocked-rule",
+            server_offline_condition(blocked_server),
+            "2026-01-03T00:00:00Z",
+        )
+        .await;
+        seed_alert_rule_with_condition(
+            &db,
+            allowed_rule,
+            owner,
+            "allowed-rule",
+            server_offline_condition(allowed_server),
+            "2026-01-02T00:00:00Z",
+        )
+        .await;
+
+        let response = list_alert_rules(
+            State(test_state(db.clone())),
+            pat_alert_session(owner, UserRole::Admin, &[&allowed_server.to_string()]),
+            Query(ListQuery {
+                limit: 1,
+                offset: 0,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let data = response.data.unwrap();
+        let rules = data["rules"].as_array().unwrap();
+
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["id"], allowed_rule);
+        assert_eq!(data["total"], 1);
+    }
+
+    #[tokio::test]
+    async fn member_alert_rules_ignore_other_owner_invalid_json() {
+        let db = test_db().await;
+        let owner = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let other = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let owner_server = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000141").unwrap();
+        let owner_rule = "00000000-0000-0000-0000-000000000541";
+        let dirty_rule = "00000000-0000-0000-0000-000000000542";
+
+        seed_user(&db, owner, "owner", "member").await;
+        seed_user(&db, other, "other", "member").await;
+        seed_agent(&db, owner_server, owner, "owner-server").await;
+        seed_alert_rule_with_condition(
+            &db,
+            owner_rule,
+            owner,
+            "owner-rule",
+            server_offline_condition(owner_server),
+            "2026-01-02T00:00:00Z",
+        )
+        .await;
+        seed_invalid_alert_rule_json(&db, dirty_rule, other, "dirty-rule", "2026-01-03T00:00:00Z")
+            .await;
+
+        let response = list_alert_rules(
+            State(test_state(db.clone())),
+            member_alert_session(owner),
+            Query(ListQuery {
+                limit: 10,
+                offset: 0,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let data = response.data.unwrap();
+        let rules = data["rules"].as_array().unwrap();
+
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["id"], owner_rule);
+        assert_eq!(data["total"], 1);
+    }
+
     #[test]
     fn alert_rule_resource_limits_are_explicit() {
         assert_eq!(ALERT_API_MAX_BODY_BYTES, 64 * 1024);
@@ -861,21 +1008,70 @@ mod tests {
     }
 
     async fn seed_alert_rule(db: &DatabaseBackend, id: &str, owner: uuid::Uuid, name: &str) {
+        seed_alert_rule_with_condition(
+            db,
+            id,
+            owner,
+            name,
+            server_offline_condition(
+                uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000101").unwrap(),
+            ),
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+    }
+
+    fn server_offline_condition(agent_id: uuid::Uuid) -> AlertCondition {
+        AlertCondition::ServerOffline {
+            agent_id: agent_id.to_string(),
+            offline_seconds: 60,
+        }
+    }
+
+    async fn seed_alert_rule_with_condition(
+        db: &DatabaseBackend,
+        id: &str,
+        owner: uuid::Uuid,
+        name: &str,
+        condition: AlertCondition,
+        created_at: &str,
+    ) {
         let DatabaseBackend::Sqlite(pool) = db else {
             unreachable!();
         };
-        let rules_json = serde_json::to_string(&[AlertCondition::ServerOffline {
-            agent_id: "00000000-0000-0000-0000-000000000101".into(),
-            offline_seconds: 60,
-        }])
-        .unwrap();
+        let rules_json = serde_json::to_string(&[condition]).unwrap();
         sqlx::query(
-            "INSERT INTO alert_rules (id, owner_user_id, name, enabled, trigger_mode, rules_json, created_at, updated_at) VALUES (?, ?, ?, 1, 'once', ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            "INSERT INTO alert_rules (id, owner_user_id, name, enabled, trigger_mode, rules_json, created_at, updated_at) VALUES (?, ?, ?, 1, 'once', ?, ?, ?)",
         )
         .bind(id)
         .bind(owner.to_string())
         .bind(name)
         .bind(rules_json)
+        .bind(created_at)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_invalid_alert_rule_json(
+        db: &DatabaseBackend,
+        id: &str,
+        owner: uuid::Uuid,
+        name: &str,
+        created_at: &str,
+    ) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO alert_rules (id, owner_user_id, name, enabled, trigger_mode, rules_json, created_at, updated_at) VALUES (?, ?, ?, 1, 'once', 'not-json', ?, ?)",
+        )
+        .bind(id)
+        .bind(owner.to_string())
+        .bind(name)
+        .bind(created_at)
+        .bind(created_at)
         .execute(pool)
         .await
         .unwrap();
