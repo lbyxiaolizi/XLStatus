@@ -19,6 +19,7 @@ use xlstatus_shared::AgentId;
 const DEFAULT_ENROLLMENT_TOKEN_TTL_HOURS: i64 = 1;
 const MAX_ENROLLMENT_TOKEN_TTL_HOURS: i64 = 24;
 pub(crate) const AGENT_AUTH_API_MAX_BODY_BYTES: usize = 4 * 1024;
+const AGENT_RESOURCE_UUID_TEXT_LEN: usize = 36;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateEnrollmentTokenRequest {
@@ -162,8 +163,7 @@ pub async fn revoke_agent(
     Path(agent_id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     require_admin_cookie_session(&auth_user)?;
-    let agent_id = uuid::Uuid::parse_str(&agent_id)
-        .map_err(|_| AppError::BadRequest(format!("invalid agent id: {agent_id}")))?;
+    let agent_id = parse_agent_resource_id(&agent_id)?;
     let agent_repo = AgentRepository::new(state.db.clone());
     let revoked = agent_repo.revoke(AgentId(agent_id)).await?;
     if !revoked {
@@ -220,6 +220,22 @@ pub fn set_revoke_registry(session: Arc<SessionRegistry>, io: Arc<IoRegistry>) {
 
 fn revoke_registry() -> Option<RevokeRegistry> {
     REVOKE_REGISTRY.read().clone()
+}
+
+fn parse_agent_resource_id(agent_id: &str) -> Result<uuid::Uuid, AppError> {
+    if agent_id.len() != AGENT_RESOURCE_UUID_TEXT_LEN {
+        return Err(AppError::BadRequest(
+            "agent_id must be a canonical UUID".into(),
+        ));
+    }
+    let parsed = uuid::Uuid::parse_str(agent_id)
+        .map_err(|_| AppError::BadRequest("agent_id must be a canonical UUID".into()))?;
+    if parsed.to_string() != agent_id {
+        return Err(AppError::BadRequest(
+            "agent_id must be a canonical UUID".into(),
+        ));
+    }
+    Ok(parsed)
 }
 
 fn normalize_enrollment_token_ttl(expires_in_hours: Option<i64>) -> Result<i64, AppError> {
@@ -286,6 +302,7 @@ mod tests {
     fn enrollment_token_ttl_is_bounded() {
         let _ = agent_auth_body_limit();
         assert_eq!(AGENT_AUTH_API_MAX_BODY_BYTES, 4 * 1024);
+        assert_eq!(AGENT_RESOURCE_UUID_TEXT_LEN, 36);
         assert_eq!(normalize_enrollment_token_ttl(None).unwrap(), 1);
         assert_eq!(normalize_enrollment_token_ttl(Some(24)).unwrap(), 24);
         assert!(matches!(
@@ -296,6 +313,21 @@ mod tests {
             normalize_enrollment_token_ttl(Some(25)),
             Err(AppError::BadRequest(_))
         ));
+    }
+
+    #[test]
+    fn agent_resource_ids_require_canonical_uuid_text() {
+        let agent_id = uuid::Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
+
+        assert_eq!(
+            parse_agent_resource_id(&agent_id.to_string()).unwrap(),
+            agent_id
+        );
+        assert!(parse_agent_resource_id("agent-a").is_err());
+        assert!(parse_agent_resource_id(&format!(" {} ", agent_id)).is_err());
+        assert!(parse_agent_resource_id(&agent_id.simple().to_string()).is_err());
+        assert!(parse_agent_resource_id(&agent_id.to_string().to_uppercase()).is_err());
+        assert!(parse_agent_resource_id(&"a".repeat(AGENT_RESOURCE_UUID_TEXT_LEN + 1)).is_err());
     }
 
     #[test]
