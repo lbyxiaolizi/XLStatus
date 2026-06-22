@@ -18,6 +18,10 @@ const SELECTED_DASHBOARD_THEME_KEY: &str = "theme_selected_dashboard";
 const THEME_API_MAX_BODY_BYTES: usize = 64 * 1024;
 const THEME_MAX_CUSTOM_THEMES: usize = 32;
 const THEME_MAX_CUSTOM_CATALOG_BYTES: usize = 256 * 1024;
+const THEME_MAX_ID_BYTES: usize = 64;
+const THEME_MAX_NAME_BYTES: usize = 120;
+const THEME_MAX_DESCRIPTION_BYTES: usize = 500;
+const THEME_MAX_TIMESTAMP_BYTES: usize = 64;
 const THEME_ALLOWED_VARIABLES: &[&str] = &[
     "--bg-page",
     "--bg-card",
@@ -129,6 +133,7 @@ pub async fn update_theme(
     Json(req): Json<UpdateThemeRequest>,
 ) -> Result<Json<ApiResponse<ThemeDefinition>>, AppError> {
     require_admin_cookie_session(&auth)?;
+    let id = require_theme_slug(&id, "theme id")?;
     if builtin_theme(&id).is_some() {
         return Err(AppError::BadRequest(
             "builtin themes cannot be edited; import a custom copy instead".into(),
@@ -178,6 +183,7 @@ pub async fn select_theme(
     Json(req): Json<SelectThemeRequest>,
 ) -> Result<Json<ApiResponse<ThemeListResponse>>, AppError> {
     require_admin_cookie_session(&auth)?;
+    let id = require_theme_slug(&id, "theme id")?;
     let target = normalize_select_target(&req.target)?;
     let all = all_themes(&state.db).await?;
     let theme = all
@@ -213,6 +219,7 @@ pub async fn delete_theme(
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     require_admin_cookie_session(&auth)?;
+    let id = require_theme_slug(&id, "theme id")?;
     if builtin_theme(&id).is_some() {
         return Err(AppError::BadRequest(
             "builtin themes cannot be deleted".into(),
@@ -435,22 +442,27 @@ fn normalize_theme_input(
 
 fn normalize_theme_id(value: &str) -> Result<String, AppError> {
     let value = value.trim().to_ascii_lowercase();
-    let valid = !value.is_empty()
-        && value.len() <= 64
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '_');
-    if !valid {
-        return Err(AppError::BadRequest(
-            "theme id must use lowercase letters, numbers, dashes, or underscores".into(),
-        ));
-    }
+    require_theme_slug(&value, "theme id")?;
     if builtin_theme(&value).is_some() {
         return Err(AppError::BadRequest(
             "custom theme id conflicts with a builtin theme".into(),
         ));
     }
     Ok(value)
+}
+
+fn require_theme_slug(value: &str, field: &str) -> Result<String, AppError> {
+    let valid = !value.is_empty()
+        && value.len() <= THEME_MAX_ID_BYTES
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '_');
+    if !valid {
+        return Err(AppError::BadRequest(format!(
+            "{field} must use lowercase letters, numbers, dashes, or underscores"
+        )));
+    }
+    Ok(value.to_string())
 }
 
 fn normalize_target(value: &str) -> Result<String, AppError> {
@@ -473,7 +485,7 @@ fn normalize_name(value: &str, field: &str) -> Result<String, AppError> {
     if value.is_empty() {
         return Err(AppError::BadRequest(format!("{field} is required")));
     }
-    if value.len() > 120 {
+    if value.len() > THEME_MAX_NAME_BYTES {
         return Err(AppError::BadRequest(format!("{field} is too long")));
     }
     Ok(value.to_string())
@@ -560,12 +572,29 @@ async fn custom_themes(db: &DatabaseBackend) -> Result<Vec<ThemeDefinition>, App
     let Some(raw) = get_string_setting(db, CUSTOM_THEMES_KEY).await? else {
         return Ok(Vec::new());
     };
-    let mut themes = serde_json::from_str::<Vec<ThemeDefinition>>(&raw)
-        .map_err(|e| AppError::BadRequest(format!("stored theme catalog is invalid: {e}")))?;
-    for theme in &mut themes {
-        sanitize_stored_theme(theme);
+    if raw.len() > THEME_MAX_CUSTOM_CATALOG_BYTES {
+        return Ok(Vec::new());
     }
-    Ok(themes)
+    let Ok(themes) = serde_json::from_str::<Vec<ThemeDefinition>>(&raw) else {
+        return Ok(Vec::new());
+    };
+    let mut sanitized = Vec::new();
+    for mut theme in themes {
+        if sanitized.len() >= THEME_MAX_CUSTOM_THEMES {
+            break;
+        }
+        if !sanitize_stored_theme(&mut theme) {
+            continue;
+        }
+        if sanitized
+            .iter()
+            .any(|existing: &ThemeDefinition| existing.id == theme.id)
+        {
+            continue;
+        }
+        sanitized.push(theme);
+    }
+    Ok(sanitized)
 }
 
 async fn upsert_custom_theme(db: &DatabaseBackend, theme: ThemeDefinition) -> Result<(), AppError> {
@@ -590,13 +619,54 @@ fn clear_custom_theme_css(theme: &mut ThemeDefinition) {
     theme.dark_custom_css = None;
 }
 
-fn sanitize_stored_theme(theme: &mut ThemeDefinition) {
+fn sanitize_stored_theme(theme: &mut ThemeDefinition) -> bool {
+    let Ok(id) = require_theme_slug(&theme.id, "theme id") else {
+        return false;
+    };
+    if builtin_theme(&id).is_some() {
+        return false;
+    }
+    let Ok(name) = normalize_name(&theme.name, "name") else {
+        return false;
+    };
+    let Ok(description) = normalize_optional_text(
+        theme.description.take(),
+        THEME_MAX_DESCRIPTION_BYTES,
+        "description",
+    ) else {
+        return false;
+    };
+    let Ok(target) = normalize_target(&theme.target) else {
+        return false;
+    };
+    let Ok(created_at) = normalize_optional_text(
+        theme.created_at.take(),
+        THEME_MAX_TIMESTAMP_BYTES,
+        "created_at",
+    ) else {
+        return false;
+    };
+    let Ok(updated_at) = normalize_optional_text(
+        theme.updated_at.take(),
+        THEME_MAX_TIMESTAMP_BYTES,
+        "updated_at",
+    ) else {
+        return false;
+    };
+    theme.id = id;
+    theme.name = name;
+    theme.description = description;
+    theme.target = target;
+    theme.created_at = created_at;
+    theme.updated_at = updated_at;
+    theme.builtin = false;
     clear_custom_theme_css(theme);
     theme.variables = sanitize_stored_theme_variables(std::mem::take(&mut theme.variables));
     theme.light_variables =
         sanitize_stored_theme_variables(std::mem::take(&mut theme.light_variables));
     theme.dark_variables =
         sanitize_stored_theme_variables(std::mem::take(&mut theme.dark_variables));
+    true
 }
 
 fn sanitize_stored_theme_variables(variables: HashMap<String, String>) -> HashMap<String, String> {
@@ -630,14 +700,35 @@ fn custom_theme_catalog_json(themes: &[ThemeDefinition]) -> Result<String, AppEr
 }
 
 async fn selected_public_theme_id(db: &DatabaseBackend) -> Result<Option<String>, AppError> {
-    get_string_setting(db, SELECTED_PUBLIC_THEME_KEY).await
+    selected_theme_id(db, SELECTED_PUBLIC_THEME_KEY).await
 }
 
 async fn selected_dashboard_theme_id(db: &DatabaseBackend) -> Result<Option<String>, AppError> {
-    get_string_setting(db, SELECTED_DASHBOARD_THEME_KEY).await
+    selected_theme_id(db, SELECTED_DASHBOARD_THEME_KEY).await
+}
+
+async fn selected_theme_id(db: &DatabaseBackend, key: &str) -> Result<Option<String>, AppError> {
+    Ok(normalize_selected_theme_id(
+        get_raw_string_setting(db, key).await?,
+    ))
+}
+
+fn normalize_selected_theme_id(value: Option<String>) -> Option<String> {
+    value.and_then(|value| require_theme_slug(&value, "theme id").ok())
 }
 
 async fn get_string_setting(db: &DatabaseBackend, key: &str) -> Result<Option<String>, AppError> {
+    get_raw_string_setting(db, key).await.map(|value| {
+        value
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())
+    })
+}
+
+async fn get_raw_string_setting(
+    db: &DatabaseBackend,
+    key: &str,
+) -> Result<Option<String>, AppError> {
     let raw = match db {
         DatabaseBackend::Sqlite(pool) => {
             let row: Option<(String,)> =
@@ -658,11 +749,6 @@ async fn get_string_setting(db: &DatabaseBackend, key: &str) -> Result<Option<St
     };
     raw.map(|value| serde_json::from_str::<String>(&value))
         .transpose()
-        .map(|value| {
-            value
-                .map(|item| item.trim().to_string())
-                .filter(|item| !item.is_empty())
-        })
         .map_err(|e| AppError::BadRequest(format!("invalid setting value for {key}: {e}")))
 }
 
@@ -781,7 +867,7 @@ mod tests {
             updated_at: None,
         };
 
-        sanitize_stored_theme(&mut theme);
+        assert!(sanitize_stored_theme(&mut theme));
 
         assert_eq!(theme.variables.len(), 1);
         assert_eq!(theme.variables["--accent-color"], "#16a34a");
@@ -793,11 +879,112 @@ mod tests {
     }
 
     #[test]
+    fn theme_path_ids_require_canonical_slug_text() {
+        assert_eq!(
+            require_theme_slug("custom-theme_1", "theme id").unwrap(),
+            "custom-theme_1"
+        );
+        for value in [
+            "",
+            " Custom",
+            "custom ",
+            "Custom",
+            "custom/theme",
+            "custom.theme",
+            "a".repeat(THEME_MAX_ID_BYTES + 1).as_str(),
+        ] {
+            assert!(
+                require_theme_slug(value, "theme id").is_err(),
+                "{value:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_theme_ids_ignore_historical_dirty_values() {
+        assert_eq!(
+            normalize_selected_theme_id(Some("clear-blue".into())).as_deref(),
+            Some("clear-blue")
+        );
+        for value in [
+            " Clear-blue",
+            "clear-blue ",
+            "Clear-Blue",
+            "clear/blue",
+            "a".repeat(THEME_MAX_ID_BYTES + 1).as_str(),
+        ] {
+            assert!(
+                normalize_selected_theme_id(Some(value.to_string())).is_none(),
+                "{value:?} should be ignored"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn historical_custom_theme_catalog_drops_invalid_entries() {
+        let db = test_db().await;
+        let mut valid = sample_custom_theme("custom-good");
+        valid.variables.insert("--bg-page".into(), "#ffffff".into());
+        valid.variables.insert(
+            "--accent-color".into(),
+            "url(https://example.com/pixel)".into(),
+        );
+        valid.custom_css = Some("body{background:url(https://example.com/x)}".into());
+
+        let mut invalid_id = sample_custom_theme("Custom-Bad");
+        invalid_id.name = "Invalid ID".into();
+
+        let mut builtin_conflict = sample_custom_theme("bold-pink");
+        builtin_conflict.name = "Builtin conflict".into();
+
+        let mut duplicate = sample_custom_theme("custom-good");
+        duplicate.name = "Duplicate".into();
+
+        let mut invalid_name = sample_custom_theme("custom-empty-name");
+        invalid_name.name = "   ".into();
+
+        seed_string_setting(
+            &db,
+            CUSTOM_THEMES_KEY,
+            &serde_json::to_string(&vec![
+                valid,
+                invalid_id,
+                builtin_conflict,
+                duplicate,
+                invalid_name,
+            ])
+            .unwrap(),
+        )
+        .await;
+
+        let themes = custom_themes(&db).await.unwrap();
+
+        assert_eq!(themes.len(), 1);
+        assert_eq!(themes[0].id, "custom-good");
+        assert_eq!(themes[0].name, "custom-good");
+        assert!(!themes[0].builtin);
+        assert!(themes[0].custom_css.is_none());
+        assert!(themes[0].variables.contains_key("--bg-page"));
+        assert!(!themes[0].variables.contains_key("--accent-color"));
+    }
+
+    #[tokio::test]
+    async fn malformed_historical_custom_theme_catalog_degrades_to_empty() {
+        let db = test_db().await;
+        seed_string_setting(&db, CUSTOM_THEMES_KEY, "{not json").await;
+
+        let themes = custom_themes(&db).await.unwrap();
+
+        assert!(themes.is_empty());
+    }
+
+    #[test]
     fn theme_resource_limits_are_explicit() {
         let _ = theme_body_limit();
         assert_eq!(THEME_API_MAX_BODY_BYTES, 64 * 1024);
         assert_eq!(THEME_MAX_CUSTOM_THEMES, 32);
         assert_eq!(THEME_MAX_CUSTOM_CATALOG_BYTES, 256 * 1024);
+        assert_eq!(THEME_MAX_ID_BYTES, 64);
     }
 
     #[test]
@@ -878,6 +1065,29 @@ mod tests {
             created_at: None,
             updated_at: None,
         }
+    }
+
+    async fn test_db() -> DatabaseBackend {
+        let db = DatabaseBackend::connect("sqlite::memory:", true)
+            .await
+            .unwrap();
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    async fn seed_string_setting(db: &DatabaseBackend, key: &str, value: &str) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        let value_json = serde_json::to_string(value).unwrap();
+        sqlx::query(
+            "INSERT INTO system_settings (key, value_json, updated_at) VALUES (?, ?, '2026-06-22T00:00:00Z')",
+        )
+        .bind(key)
+        .bind(value_json)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     fn auth_session(auth_kind: AuthKind) -> AuthSession {

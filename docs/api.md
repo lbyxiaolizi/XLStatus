@@ -78,7 +78,7 @@ PAT 创建请求体上限为 16KiB。PAT 名称最长 128 字节，scopes 最多
 
 系统设置写入口请求体上限为 64KiB。公开站点名称最长 80 字节，公开 logo/favicon/background URL 各最长 500 字节且必须是无 credentials/fragment 的 HTTP(S) URL；公开背景 URL 还会拒绝会破坏 CSS `url()` 的引号、括号、反斜杠和控制字符。停用的自定义 head/body 字段最多只接受 1024 字节空白值。GeoIP ipinfo token 最长 4096 字节，GeoIP IP 变化服务器列表最多 64 个 UUID，通知组 ID 必须是 UUID，DDNS resolver URL 最长 2048 字节且必须是无 credentials/fragment 的 HTTP(S) URL。Cloudflared token 保存请求体上限为 16KiB，token 最长 8192 字节。
 
-主题导入、更新、删除和选择写入口请求体上限为 64KiB，且只允许管理员 Cookie session 修改或选择主题。自定义主题最多保存 32 个，序列化后的自定义主题目录最多 256KiB。主题 id 最长 64 字节且只允许小写字母、数字、`-`、`_`，名称最长 120 字节，描述最长 500 字节；每组 CSS 变量最多 60 项，只允许既定颜色变量名（如 `--bg-page`、`--accent-color`、`--btn-bg` 等）和安全颜色值（hex、`rgb(a)`、`hsl(a)`），会拒绝 `url()`、`var()`、自定义 CSS 片段和未知变量名。历史自定义主题读取时也会清空 custom CSS 并丢弃不安全变量。
+主题导入、更新、删除和选择写入口请求体上限为 64KiB，且只允许管理员 Cookie session 修改或选择主题。主题 path `:id` 必须是已规范化 slug：最长 64 字节且只允许小写字母、数字、`-`、`_`；导入 body 中的主题 id 会 trim 并转小写后保存为同一 slug 形态。自定义主题最多保存 32 个，序列化后的自定义主题目录最多 256KiB。主题名称最长 120 字节，描述最长 500 字节；每组 CSS 变量最多 60 项，只允许既定颜色变量名（如 `--bg-page`、`--accent-color`、`--btn-bg` 等）和安全颜色值（hex、`rgb(a)`、`hsl(a)`），会拒绝 `url()`、`var()`、自定义 CSS 片段和未知变量名。历史自定义主题读取时会清空 custom CSS、丢弃不安全变量，并过滤非法 id、内置主题冲突、重复 id、非法 target/name/description/timestamp 和超预算目录；历史 selected theme id 必须已经是规范 slug，否则会被忽略。
 
 ### Agent 和服务器
 
