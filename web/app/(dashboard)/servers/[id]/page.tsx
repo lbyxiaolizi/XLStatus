@@ -454,13 +454,15 @@ export default function ServerDetailPage({ params }: PageProps) {
       setError("请填写写入路径。");
       return;
     }
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
     setSaving(true);
     const response = await apiClient.writeServerFile(serverId, {
       path: writePath.trim(),
       content: writeContent,
       encoding: "utf8",
       create_dirs: true,
-    });
+    }, totpCode);
     setSaving(false);
     if (response.success) {
       setNotice(`已写入 ${writePath.trim()}。`);
@@ -472,7 +474,9 @@ export default function ServerDetailPage({ params }: PageProps) {
 
   async function deleteEntry(entryPath: string, recursive: boolean) {
     if (!confirm(`确定删除 ${entryPath}？`)) return;
-    const response = await apiClient.deleteServerFile(serverId, { path: entryPath, recursive });
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
+    const response = await apiClient.deleteServerFile(serverId, { path: entryPath, recursive }, totpCode);
     if (response.success) {
       setNotice(`已删除 ${entryPath}。`);
       await loadFiles(path);
@@ -487,10 +491,12 @@ export default function ServerDetailPage({ params }: PageProps) {
       setError("请先选择或输入文件路径。");
       return;
     }
+    const totpCode = kind === "upload" ? await sensitiveTotpCode() : undefined;
+    if (totpCode === null) return;
     const response =
       kind === "download"
         ? await apiClient.getServerDownloadUrl(serverId, target.trim())
-        : await apiClient.getServerUploadUrl(serverId, target.trim());
+        : await apiClient.getServerUploadUrl(serverId, target.trim(), totpCode);
     if (response.success && response.data) {
       setNotice(`${response.data.method} ${response.data.url}`);
     } else {

@@ -995,11 +995,13 @@ class ApiClient {
   async writeServerFile(
     id: string,
     payload: JsonObject,
+    totpCode?: string,
   ): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
       `/api/v1/servers/${encodeURIComponent(id)}/files/write`,
       {
         method: "POST",
+        headers: this.sensitiveHeaders(totpCode),
         body: JSON.stringify(payload),
       },
     );
@@ -1008,11 +1010,13 @@ class ApiClient {
   async deleteServerFile(
     id: string,
     payload: JsonObject,
+    totpCode?: string,
   ): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
       `/api/v1/servers/${encodeURIComponent(id)}/files/delete`,
       {
         method: "POST",
+        headers: this.sensitiveHeaders(totpCode),
         body: JSON.stringify(payload),
       },
     );
@@ -1034,11 +1038,13 @@ class ApiClient {
   async getServerUploadUrl(
     id: string,
     path: string,
+    totpCode?: string,
   ): Promise<ApiResponse<TempUrlResponse>> {
     return this.request<TempUrlResponse>(
       `/api/v1/servers/${encodeURIComponent(id)}/files/upload-url`,
       {
         method: "POST",
+        headers: this.sensitiveHeaders(totpCode),
         body: JSON.stringify({ path }),
       },
     );

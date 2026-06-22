@@ -267,10 +267,11 @@ pub async fn read_file(
 pub async fn write_file(
     State(state): State<AppState>,
     auth: AuthSession,
+    headers: HeaderMap,
     Path(server_id): Path<String>,
     Json(req): Json<FileWriteRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
-    require_transfer_scope(&auth, "transfer:write")?;
+    require_transfer_write_sensitive_auth(&state.db, &auth, &headers).await?;
     let agent_id = ensure_server_online(&state, &auth, &server_id).await?;
     let path = validate_abs_path(&req.path)?;
     let encoding = normalize_encoding(&req.encoding)?;
@@ -314,10 +315,11 @@ pub async fn write_file(
 pub async fn delete_file(
     State(state): State<AppState>,
     auth: AuthSession,
+    headers: HeaderMap,
     Path(server_id): Path<String>,
     Json(req): Json<FileDeleteRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
-    require_transfer_scope(&auth, "transfer:write")?;
+    require_transfer_write_sensitive_auth(&state.db, &auth, &headers).await?;
     let agent_id = ensure_server_online(&state, &auth, &server_id).await?;
     let path = validate_abs_path(&req.path)?;
     if path == "/" {
@@ -364,9 +366,11 @@ pub async fn download_url(
 pub async fn upload_url(
     State(state): State<AppState>,
     auth: AuthSession,
+    headers: HeaderMap,
     Path(server_id): Path<String>,
     Json(req): Json<TempUrlRequest>,
 ) -> Result<Json<ApiResponse<TempUrlResponse>>, AppError> {
+    require_transfer_write_sensitive_auth(&state.db, &auth, &headers).await?;
     build_temp_url(state, auth, server_id, req, "upload", "PUT").await
 }
 
@@ -648,6 +652,20 @@ fn require_transfer_scope(auth: &AuthSession, scope: &str) -> Result<(), AppErro
     } else {
         Err(AppError::Forbidden(format!("missing scope: {scope}")))
     }
+}
+
+async fn require_transfer_write_sensitive_auth(
+    db: &crate::db::Db,
+    auth: &AuthSession,
+    headers: &HeaderMap,
+) -> Result<(), AppError> {
+    require_transfer_scope(auth, "transfer:write")?;
+    if matches!(auth.auth_kind, AuthKind::PersonalAccessToken) {
+        return Err(AppError::Forbidden(
+            "file write operations require a cookie session".into(),
+        ));
+    }
+    require_sensitive_totp(db, auth.user_id, headers).await
 }
 
 fn validate_abs_path(path: &str) -> Result<String, AppError> {
@@ -1076,6 +1094,81 @@ mod tests {
         assert_eq!(CONFIG_PATCH_MAX_BYTES, 128 * 1024);
         assert_eq!(FILE_LIST_RESULT_MAX_BYTES, 2 * 1024 * 1024);
         assert_eq!(FILE_SMALL_RESULT_MAX_BYTES, 4096);
+    }
+
+    #[tokio::test]
+    async fn transfer_write_operations_reject_pat() {
+        let state = test_state().await;
+        let auth = auth_session(
+            AuthKind::PersonalAccessToken,
+            xlstatus_shared::UserRole::Admin,
+            vec!["transfer:write"],
+        );
+
+        let err = require_transfer_write_sensitive_auth(&state.db, &auth, &HeaderMap::new())
+            .await
+            .unwrap_err();
+
+        assert!(app_error_message(&err).contains("cookie session"));
+    }
+
+    #[tokio::test]
+    async fn transfer_write_operations_require_totp_when_enabled() {
+        let state = test_state().await;
+        let user = UserRepository::new(state.db.clone())
+            .create(CreateUserInput {
+                username: "transfer-admin".into(),
+                password: "secret-password".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        seed_totp_enabled_user(&state.db, user.id.0).await;
+        let auth = AuthSession {
+            session_id: "sess".into(),
+            user_id: user.id,
+            username: user.username,
+            role: user.role,
+            csrf_token: "csrf".into(),
+            auth_kind: AuthKind::Session,
+            scopes: Vec::new(),
+            server_ids: None,
+            pat_id: None,
+        };
+
+        let err = require_transfer_write_sensitive_auth(&state.db, &auth, &HeaderMap::new())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn transfer_write_operations_allow_cookie_without_totp() {
+        let state = test_state().await;
+        let user = UserRepository::new(state.db.clone())
+            .create(CreateUserInput {
+                username: "transfer-admin".into(),
+                password: "secret-password".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        let auth = AuthSession {
+            session_id: "sess".into(),
+            user_id: user.id,
+            username: user.username,
+            role: user.role,
+            csrf_token: "csrf".into(),
+            auth_kind: AuthKind::Session,
+            scopes: Vec::new(),
+            server_ids: None,
+            pat_id: None,
+        };
+
+        require_transfer_write_sensitive_auth(&state.db, &auth, &HeaderMap::new())
+            .await
+            .unwrap();
     }
 
     #[test]
