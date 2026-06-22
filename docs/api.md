@@ -227,7 +227,7 @@ Agent gRPC 服务定义在 `proto/xlstatus/v1/agent.proto`，生成代码在 `cr
 
 `GET /api/v1/agents/install.sh` 接收查询参数并返回一个很小的 bootstrap shell 脚本。真正的 `install-agent.sh` 放在 GitHub Release 资产中，bootstrap 只负责导出参数并下载执行 GitHub 脚本。bootstrap 响应会发送 `Cache-Control: no-store`、`Pragma: no-cache` 和 `Expires: 0`，避免包含 enrollment token 或控制面参数的脚本被缓存。
 
-安全约束：公开 bootstrap 的原始 query 最长 16KiB，请求 `Host` 必须是最长 512 字节的纯 authority，不能包含 userinfo、path、query、fragment、反斜杠或控制字符。`server_url` 与 `grpc_server` 最长 2048 字节，只能是 `http` / `https` origin URL，不能包含 path、query、fragment 或 userinfo；若显式传入，host 必须与本次请求的 `Host` 相同，端口可以不同。未传 `server_url` 时使用当前请求 Host；未传 `grpc_server` 时在同 Host 上推导 `:50051`。会回显到 shell 脚本的参数会 trim 后校验长度并拒绝控制字符。
+安全约束：公开 bootstrap 的原始 query 最长 16KiB，请求 `Host` 必须是最长 512 字节的纯 authority，不能包含 userinfo、path、query、fragment、反斜杠或控制字符。`server_url` 与 `grpc_server` 最长 2048 字节，只能是 `http` / `https` origin URL，不能包含 path、query、fragment 或 userinfo；若显式传入，host 必须与本次请求的 `Host` 相同，端口可以不同。未传 `server_url` 时使用当前请求 Host；如果启用 `XLSTATUS_TRUST_PROXY_HEADERS` 且请求来源命中 `XLSTATUS_TRUSTED_PROXIES`，默认 scheme 会采信可信代理的 `X-Forwarded-Proto` / `Forwarded: proto=`，否则直连默认使用 `http`。未传 `grpc_server` 时在同 Host 上推导 `:50051` 并沿用 `server_url` scheme。会回显到 shell 脚本的参数会 trim 后校验长度并拒绝控制字符。
 
 支持的参数：
 

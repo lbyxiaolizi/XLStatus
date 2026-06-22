@@ -1,5 +1,6 @@
 use anyhow::Context;
 use axum::{
+    extract::connect_info::ConnectInfo,
     extract::Query,
     extract::Request,
     http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
@@ -885,10 +886,17 @@ struct AgentInstallQuery {
     version: Option<String>,
 }
 
-async fn install_agent_script(headers: HeaderMap, uri: Uri) -> Response {
+async fn install_agent_script(
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    let request_scheme =
+        crate::security::forwarded_proto_from_headers_and_peer(&headers, Some(peer_addr))
+            .unwrap_or("http");
     install_agent_script_response(
         parse_agent_install_query(&uri)
-            .and_then(|query| build_install_agent_script(&headers, query)),
+            .and_then(|query| build_install_agent_script(&headers, request_scheme, query)),
     )
 }
 
@@ -942,6 +950,7 @@ fn parse_agent_install_query(uri: &Uri) -> Result<AgentInstallQuery, String> {
 
 fn build_install_agent_script(
     headers: &HeaderMap,
+    request_scheme: &str,
     query: AgentInstallQuery,
 ) -> Result<String, String> {
     let requested_version = query
@@ -963,6 +972,7 @@ fn build_install_agent_script(
         query.server_url.as_deref(),
         request_host.as_deref(),
         request_authority.as_deref(),
+        request_scheme,
         "server_url",
     )?;
     let grpc_server = normalize_install_grpc_url(
@@ -1108,6 +1118,7 @@ fn normalize_install_control_url(
     value: Option<&str>,
     request_host: Option<&str>,
     request_authority: Option<&str>,
+    request_scheme: &str,
     field: &str,
 ) -> Result<String, String> {
     if request_host.is_none()
@@ -1122,7 +1133,7 @@ fn normalize_install_control_url(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-        .or_else(|| request_authority.map(|authority| format!("http://{authority}")))
+        .or_else(|| request_authority.map(|authority| format!("{request_scheme}://{authority}")))
         .unwrap_or_else(|| "http://localhost:8080".to_string());
     ensure_install_text_size(&raw, 1, INSTALL_BOOTSTRAP_MAX_URL_BYTES, field)?;
     let url = parse_install_endpoint_url(&raw, field)?;
@@ -1492,6 +1503,7 @@ mod tests {
 
         let err = build_install_agent_script(
             &headers,
+            "http",
             install_query(Some("https://evil.example.com"), None),
         )
         .unwrap_err();
@@ -1499,6 +1511,7 @@ mod tests {
 
         let err = build_install_agent_script(
             &headers,
+            "http",
             install_query(
                 Some("https://status.example.com"),
                 Some("https://evil.example.com:50051"),
@@ -1513,6 +1526,7 @@ mod tests {
         let headers = HeaderMap::new();
         let err = build_install_agent_script(
             &headers,
+            "http",
             install_query(Some("https://evil.example.com"), None),
         )
         .unwrap_err();
@@ -1522,7 +1536,7 @@ mod tests {
     #[test]
     fn install_bootstrap_defaults_to_request_host() {
         let headers = headers_with_host("status.example.com");
-        let body = build_install_agent_script(&headers, install_query(None, None)).unwrap();
+        let body = build_install_agent_script(&headers, "http", install_query(None, None)).unwrap();
 
         assert!(body.contains("export SERVER_URL='http://status.example.com'"));
         assert!(body.contains("export GRPC_SERVER='http://status.example.com:50051'"));
@@ -1531,10 +1545,20 @@ mod tests {
     #[test]
     fn install_bootstrap_default_server_url_preserves_request_host_port() {
         let headers = headers_with_host("status.example.com:8080");
-        let body = build_install_agent_script(&headers, install_query(None, None)).unwrap();
+        let body = build_install_agent_script(&headers, "http", install_query(None, None)).unwrap();
 
         assert!(body.contains("export SERVER_URL='http://status.example.com:8080'"));
         assert!(body.contains("export GRPC_SERVER='http://status.example.com:50051'"));
+    }
+
+    #[test]
+    fn install_bootstrap_defaults_to_forwarded_https_request_scheme() {
+        let headers = headers_with_host("status.example.com");
+        let body =
+            build_install_agent_script(&headers, "https", install_query(None, None)).unwrap();
+
+        assert!(body.contains("export SERVER_URL='https://status.example.com'"));
+        assert!(body.contains("export GRPC_SERVER='https://status.example.com:50051'"));
     }
 
     #[test]
@@ -1547,7 +1571,8 @@ mod tests {
             "status.example.com\\@evil.example",
         ] {
             let headers = headers_with_host(host);
-            let err = build_install_agent_script(&headers, install_query(None, None)).unwrap_err();
+            let err = build_install_agent_script(&headers, "http", install_query(None, None))
+                .unwrap_err();
             assert!(
                 err.contains("Host header"),
                 "{host} should be rejected as invalid Host authority"
@@ -1560,6 +1585,7 @@ mod tests {
         let headers = headers_with_host("status.example.com");
         let body = build_install_agent_script(
             &headers,
+            "http",
             install_query(
                 Some("https://status.example.com:8443"),
                 Some("https://status.example.com:50051"),
@@ -1577,6 +1603,7 @@ mod tests {
 
         let err = build_install_agent_script(
             &headers,
+            "http",
             install_query(Some("https://status.example.com/path"), None),
         )
         .unwrap_err();
@@ -1584,6 +1611,7 @@ mod tests {
 
         let err = build_install_agent_script(
             &headers,
+            "http",
             install_query(Some("https://user:pass@status.example.com"), None),
         )
         .unwrap_err();
@@ -1596,22 +1624,22 @@ mod tests {
 
         let mut query = install_query(None, None);
         query.enrollment_token = Some("x".repeat(INSTALL_BOOTSTRAP_MAX_ENROLLMENT_TOKEN_BYTES + 1));
-        let err = build_install_agent_script(&headers, query).unwrap_err();
+        let err = build_install_agent_script(&headers, "http", query).unwrap_err();
         assert!(err.contains("enrollment_token must be between"));
 
         let mut query = install_query(None, None);
         query.agent_name = Some("a".repeat(INSTALL_BOOTSTRAP_MAX_AGENT_NAME_BYTES + 1));
-        let err = build_install_agent_script(&headers, query).unwrap_err();
+        let err = build_install_agent_script(&headers, "http", query).unwrap_err();
         assert!(err.contains("agent_name must be between"));
 
         let mut query = install_query(None, None);
         query.grpc_tls_ca_path = Some("a".repeat(INSTALL_BOOTSTRAP_MAX_TLS_PATH_BYTES + 1));
-        let err = build_install_agent_script(&headers, query).unwrap_err();
+        let err = build_install_agent_script(&headers, "http", query).unwrap_err();
         assert!(err.contains("grpc_tls_ca_path must be between"));
 
         let mut query = install_query(None, None);
         query.grpc_tls_domain_name = Some("a".repeat(INSTALL_BOOTSTRAP_MAX_TLS_DOMAIN_BYTES + 1));
-        let err = build_install_agent_script(&headers, query).unwrap_err();
+        let err = build_install_agent_script(&headers, "http", query).unwrap_err();
         assert!(err.contains("grpc_tls_domain_name must be between"));
     }
 
@@ -1621,7 +1649,7 @@ mod tests {
         let mut query = install_query(None, None);
         query.agent_name = Some("agent\nname".into());
 
-        let err = build_install_agent_script(&headers, query).unwrap_err();
+        let err = build_install_agent_script(&headers, "http", query).unwrap_err();
         assert!(err.contains("agent_name must not contain control characters"));
     }
 
@@ -1633,8 +1661,9 @@ mod tests {
             "a".repeat(INSTALL_BOOTSTRAP_MAX_URL_BYTES)
         );
 
-        let err = build_install_agent_script(&headers, install_query(Some(&long_host), None))
-            .unwrap_err();
+        let err =
+            build_install_agent_script(&headers, "http", install_query(Some(&long_host), None))
+                .unwrap_err();
         assert!(err.contains("server_url must be between"));
     }
 
@@ -1645,7 +1674,8 @@ mod tests {
             "a".repeat(INSTALL_BOOTSTRAP_MAX_HOST_BYTES)
         ));
 
-        let err = build_install_agent_script(&headers, install_query(None, None)).unwrap_err();
+        let err =
+            build_install_agent_script(&headers, "http", install_query(None, None)).unwrap_err();
         assert!(err.contains("Host header must be between"));
     }
 

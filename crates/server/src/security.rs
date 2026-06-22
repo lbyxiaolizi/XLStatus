@@ -170,6 +170,20 @@ pub fn client_ip_from_headers_and_peer(
     )
 }
 
+pub fn forwarded_proto_from_headers_and_peer(
+    headers: &HeaderMap,
+    peer_addr: Option<SocketAddr>,
+) -> Option<&'static str> {
+    if !trust_proxy_headers() {
+        return None;
+    }
+    let peer_ip = peer_addr.map(|addr| addr.ip())?;
+    if !trusted_proxy_ip(peer_ip) {
+        return None;
+    }
+    forwarded_proto_header_value(headers).and_then(normalize_forwarded_proto)
+}
+
 pub fn forwarded_client_ip_with_peer<F>(
     mut get_header: F,
     fallback: Option<String>,
@@ -210,6 +224,36 @@ fn bounded_http_forwarded_header_value(value: &HeaderValue) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+fn forwarded_proto_header_value(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(bounded_http_forwarded_header_value)
+        .and_then(|value| value.split(',').next().map(str::trim).map(str::to_string))
+        .or_else(|| {
+            headers
+                .get(header::FORWARDED)
+                .and_then(bounded_http_forwarded_header_value)
+                .and_then(|value| forwarded_header_param(&value, "proto"))
+        })
+}
+
+fn normalize_forwarded_proto(value: String) -> Option<&'static str> {
+    match value.trim().trim_matches('"').to_ascii_lowercase().as_str() {
+        "https" => Some("https"),
+        "http" => Some("http"),
+        _ => None,
+    }
+}
+
+fn forwarded_header_param(value: &str, name: &str) -> Option<String> {
+    value.split(',').next()?.split(';').find_map(|part| {
+        let (key, value) = part.trim().split_once('=')?;
+        key.trim()
+            .eq_ignore_ascii_case(name)
+            .then(|| value.trim().trim_matches('"').to_string())
+    })
 }
 
 fn origin_matches_allowed_origin(origin: &str, allowed: &str) -> bool {
@@ -541,6 +585,62 @@ mod tests {
         assert_eq!(
             client_ip_from_headers_and_peer(&headers, Some(peer_addr)),
             "10.0.0.5"
+        );
+    }
+
+    #[test]
+    fn forwarded_proto_requires_trusted_proxy_peer() {
+        let _env = TrustedProxyEnvGuard::set();
+        let trusted_peer: SocketAddr = "10.0.0.5:443".parse().unwrap();
+        let untrusted_peer: SocketAddr = "198.51.100.8:443".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+
+        assert_eq!(
+            forwarded_proto_from_headers_and_peer(&headers, Some(trusted_peer)),
+            Some("https")
+        );
+        assert_eq!(
+            forwarded_proto_from_headers_and_peer(&headers, Some(untrusted_peer)),
+            None
+        );
+        assert_eq!(forwarded_proto_from_headers_and_peer(&headers, None), None);
+    }
+
+    #[test]
+    fn forwarded_proto_accepts_rfc_forwarded_header() {
+        let _env = TrustedProxyEnvGuard::set();
+        let peer_addr: SocketAddr = "10.0.0.5:443".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::FORWARDED,
+            "for=203.0.113.10;proto=\"https\";host=status.example.com"
+                .parse()
+                .unwrap(),
+        );
+
+        assert_eq!(
+            forwarded_proto_from_headers_and_peer(&headers, Some(peer_addr)),
+            Some("https")
+        );
+    }
+
+    #[test]
+    fn forwarded_proto_ignores_oversized_or_unknown_values() {
+        let _env = TrustedProxyEnvGuard::set();
+        let peer_addr: SocketAddr = "10.0.0.5:443".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", "ftp".parse().unwrap());
+        assert_eq!(
+            forwarded_proto_from_headers_and_peer(&headers, Some(peer_addr)),
+            None
+        );
+
+        let oversized = format!("https{}", " ".repeat(HTTP_FORWARDED_HEADER_MAX_BYTES));
+        headers.insert("x-forwarded-proto", oversized.parse().unwrap());
+        assert_eq!(
+            forwarded_proto_from_headers_and_peer(&headers, Some(peer_addr)),
+            None
         );
     }
 
