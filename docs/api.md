@@ -124,7 +124,7 @@ Enrollment token 创建请求体上限为 4KiB，`expires_in_hours` 必须在 1 
 
 告警规则创建请求体上限为 64KiB。规则名称最长 128 字节，单条规则最多 32 个条件、单个条件 JSON 最长 4KiB，失败/恢复触发任务各最多 32 个 UUID。
 
-通知创建、更新、通知组创建/更新和通知组加成员请求体上限为 128KiB。通知名称最长 128 字节，Webhook URL 最长 2048 字节，headers JSON 最长 16KiB、最多 32 个 header、单个 header name 最长 128 字节、value 最长 4096 字节，body template 最长 64KiB，渲染后的 URL 最长 4096 字节、请求体最长 128KiB。单个通知组最多 32 个渠道；告警、任务和 GeoIP IP 变更后台通知单次最多发送 32 个 Webhook。
+通知创建、更新、通知组创建/更新和通知组加成员请求体上限为 128KiB。通知名称最长 128 字节，Webhook URL 最长 2048 字节，headers JSON 最长 16KiB、最多 32 个 header、单个 header name 最长 128 字节、value 最长 4096 字节，body template 最长 64KiB，渲染后的 URL 最长 4096 字节、请求体最长 128KiB。单个通知组最多 32 个渠道；告警、任务和 GeoIP IP 变更后台通知单次最多发送 32 个 Webhook。手动测试通知按用户和通知渠道设置 30 秒冷却。
 
 ### 任务
 

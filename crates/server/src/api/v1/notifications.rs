@@ -19,7 +19,14 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use std::collections::HashMap;
+use std::time::{Duration as StdDuration, Instant};
 use uuid::Uuid;
+
+const NOTIFICATION_TEST_COOLDOWN_SECS: u64 = 30;
+
+static NOTIFICATION_TEST_RATE_STATE: once_cell::sync::Lazy<
+    std::sync::Mutex<HashMap<String, Instant>>,
+> = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
 
 #[derive(Debug, Deserialize)]
 pub struct ListQuery {
@@ -420,6 +427,7 @@ pub async fn test_notification(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     require_scope(&auth, "notification:write")?;
     let notification = load_notification_record_for_owner(&state.db, &id, auth.user_id.0).await?;
+    check_notification_test_rate_limit(auth.user_id.0, &notification.id)?;
     let channel = notification_to_channel(&notification)?;
     let mut metadata = HashMap::new();
     metadata.insert("notification_id".to_string(), notification.id.clone());
@@ -444,6 +452,38 @@ pub async fn test_notification(
 
 pub fn notification_body_limit() -> DefaultBodyLimit {
     DefaultBodyLimit::max(NOTIFICATION_API_MAX_BODY_BYTES)
+}
+
+fn check_notification_test_rate_limit(
+    user_id: Uuid,
+    notification_id: &str,
+) -> Result<(), AppError> {
+    let key = format!("{user_id}:{notification_id}");
+    check_notification_test_rate_limit_in(&NOTIFICATION_TEST_RATE_STATE, key, Instant::now())
+}
+
+fn check_notification_test_rate_limit_in(
+    state: &std::sync::Mutex<HashMap<String, Instant>>,
+    key: String,
+    now: Instant,
+) -> Result<(), AppError> {
+    let mut state = state
+        .lock()
+        .map_err(|_| AppError::Database(anyhow::anyhow!("notification test limiter poisoned")))?;
+    state.retain(|_, last| now.duration_since(*last) < notification_test_cooldown());
+    if let Some(last) = state.get(&key) {
+        if now.duration_since(*last) < notification_test_cooldown() {
+            return Err(AppError::TooManyRequests(format!(
+                "notification test can be sent once every {NOTIFICATION_TEST_COOLDOWN_SECS} seconds"
+            )));
+        }
+    }
+    state.insert(key, now);
+    Ok(())
+}
+
+fn notification_test_cooldown() -> StdDuration {
+    StdDuration::from_secs(NOTIFICATION_TEST_COOLDOWN_SECS)
 }
 
 pub async fn list_notification_groups(
@@ -1805,6 +1845,36 @@ mod tests {
         )
         .await
         .unwrap());
+    }
+
+    #[test]
+    fn notification_test_rate_limit_is_per_user_and_notification() {
+        assert_eq!(NOTIFICATION_TEST_COOLDOWN_SECS, 30);
+        let state = std::sync::Mutex::new(HashMap::new());
+        let now = Instant::now();
+        let key = "user-1:notification-1".to_string();
+
+        assert!(check_notification_test_rate_limit_in(&state, key.clone(), now).is_ok());
+        assert!(matches!(
+            check_notification_test_rate_limit_in(
+                &state,
+                key.clone(),
+                now + StdDuration::from_secs(1)
+            ),
+            Err(AppError::TooManyRequests(_))
+        ));
+        assert!(check_notification_test_rate_limit_in(
+            &state,
+            "user-1:notification-2".to_string(),
+            now + StdDuration::from_secs(1)
+        )
+        .is_ok());
+        assert!(check_notification_test_rate_limit_in(
+            &state,
+            key,
+            now + notification_test_cooldown()
+        )
+        .is_ok());
     }
 
     async fn test_db() -> DatabaseBackend {
