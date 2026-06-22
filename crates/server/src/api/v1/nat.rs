@@ -22,7 +22,7 @@ use std::net::IpAddr;
 use xlstatus_shared::nat::*;
 
 const NAT_API_MAX_BODY_BYTES: usize = 64 * 1024;
-const NAT_MAX_AGENT_ID_BYTES: usize = 64;
+const NAT_UUID_TEXT_LEN: usize = 36;
 const NAT_MAX_LOCAL_HOST_BYTES: usize = 253;
 const NAT_MAX_PROTOCOL_BYTES: usize = 16;
 const NAT_MAX_DESCRIPTION_BYTES: usize = 1024;
@@ -211,6 +211,8 @@ pub async fn get_nat_mapping(
     let db = state.db.clone();
 
     require_scope_or_403(&auth_user, "nat:read")?;
+    let mapping_id =
+        normalize_nat_resource_uuid(mapping_id, "mapping_id").map_err(bad_request_with)?;
     let mapping = NatMappingRepository::get_by_id(&db, &mapping_id)
         .await
         .map_err(|e| {
@@ -322,6 +324,8 @@ pub async fn update_nat_mapping(
     let db = state.db.clone();
 
     require_scope_or_403(&auth_user, "nat:write")?;
+    let mapping_id =
+        normalize_nat_resource_uuid(mapping_id, "mapping_id").map_err(bad_request_with)?;
     let req = normalize_update_nat_mapping_request(req).map_err(bad_request_with)?;
     let mut mapping = NatMappingRepository::get_by_id(&db, &mapping_id)
         .await
@@ -448,6 +452,8 @@ pub async fn delete_nat_mapping(
     let db = state.db.clone();
 
     require_scope_or_403(&auth_user, "nat:delete")?;
+    let mapping_id =
+        normalize_nat_resource_uuid(mapping_id, "mapping_id").map_err(bad_request_with)?;
     // Check if mapping exists
     let mapping = NatMappingRepository::get_by_id(&db, &mapping_id)
         .await
@@ -748,11 +754,23 @@ fn normalize_update_nat_mapping_request(
 }
 
 fn normalize_nat_agent_id(value: String) -> Result<String, String> {
-    normalize_required_nat_text(value, NAT_MAX_AGENT_ID_BYTES, "agent_id").and_then(|value| {
-        uuid::Uuid::parse_str(&value)
-            .map(|value| value.to_string())
-            .map_err(|_| "agent_id must be a UUID".to_string())
-    })
+    normalize_nat_resource_uuid(value, "agent_id")
+}
+
+fn normalize_nat_resource_uuid(value: String, field: &str) -> Result<String, String> {
+    if value.is_empty() {
+        return Err(format!("{field} is required"));
+    }
+    if value.len() != NAT_UUID_TEXT_LEN {
+        return Err(format!("{field} must be a canonical UUID"));
+    }
+    let parsed =
+        uuid::Uuid::parse_str(&value).map_err(|_| format!("{field} must be a canonical UUID"))?;
+    let canonical = parsed.to_string();
+    if canonical != value {
+        return Err(format!("{field} must be a canonical UUID"));
+    }
+    Ok(canonical)
 }
 
 fn normalize_nat_protocol(value: &str) -> Result<Protocol, String> {
@@ -971,7 +989,7 @@ mod tests {
     #[test]
     fn nat_mapping_resource_limits_are_explicit() {
         assert_eq!(NAT_API_MAX_BODY_BYTES, 64 * 1024);
-        assert_eq!(NAT_MAX_AGENT_ID_BYTES, 64);
+        assert_eq!(NAT_UUID_TEXT_LEN, 36);
         assert_eq!(NAT_MAX_LOCAL_HOST_BYTES, 253);
         assert_eq!(NAT_MAX_PROTOCOL_BYTES, 16);
         assert_eq!(NAT_MAX_DESCRIPTION_BYTES, 1024);
@@ -989,14 +1007,22 @@ mod tests {
 
     #[test]
     fn nat_agent_id_and_protocol_are_normalized() {
-        let agent_id = uuid::Uuid::from_bytes([4; 16]);
+        let agent_id = uuid::Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
 
         assert_eq!(
-            normalize_nat_agent_id(format!(" {} ", agent_id.simple())).unwrap(),
+            normalize_nat_agent_id(agent_id.to_string()).unwrap(),
             agent_id.to_string()
         );
         assert!(normalize_nat_agent_id("server-a".into()).is_err());
-        assert!(normalize_nat_agent_id("a".repeat(NAT_MAX_AGENT_ID_BYTES + 1)).is_err());
+        assert!(normalize_nat_agent_id(format!(" {} ", agent_id)).is_err());
+        assert!(normalize_nat_agent_id(agent_id.simple().to_string()).is_err());
+        assert!(normalize_nat_agent_id(agent_id.to_string().to_uppercase()).is_err());
+        assert!(normalize_nat_agent_id("a".repeat(NAT_UUID_TEXT_LEN + 1)).is_err());
+        assert_eq!(
+            normalize_nat_resource_uuid(agent_id.to_string(), "mapping_id").unwrap(),
+            agent_id.to_string()
+        );
+        assert!(normalize_nat_resource_uuid(agent_id.simple().to_string(), "mapping_id").is_err());
 
         assert!(matches!(
             normalize_nat_protocol(" TCP ").unwrap(),
@@ -1083,9 +1109,8 @@ mod tests {
 
     #[test]
     fn nat_create_request_normalizes_inputs() {
-        let agent_id = uuid::Uuid::from_bytes([5; 16]);
+        let agent_id = uuid::Uuid::parse_str("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb").unwrap();
         let mut req = create_nat_request(agent_id);
-        req.agent_id = format!(" {} ", agent_id.simple());
         req.local_host = " 127.0.0.1 ".into();
         req.protocol = " TCP ".into();
         req.description = Some(" demo ".into());
