@@ -33,7 +33,9 @@ services:
       - SESSION_SECRET=${SESSION_SECRET:?set SESSION_SECRET to a long random value}
       - SECRET_ENCRYPTION_KEY=${SECRET_ENCRYPTION_KEY:-}
       - XLSTATUS_SEED_ADMIN_USERNAME=${XLSTATUS_SEED_ADMIN_USERNAME:-admin}
-      - XLSTATUS_SEED_ADMIN_PASSWORD=${XLSTATUS_SEED_ADMIN_PASSWORD:?set XLSTATUS_SEED_ADMIN_PASSWORD}
+      - XLSTATUS_SEED_ADMIN_PASSWORD_FILE=/run/secrets/xlstatus_seed_admin_password
+    secrets:
+      - xlstatus_seed_admin_password
     depends_on:
       postgres:
         condition: service_healthy
@@ -83,3 +85,7 @@ services:
 volumes:
   postgres_data:
     driver: local
+
+secrets:
+  xlstatus_seed_admin_password:
+    file: ./.secrets/xlstatus_seed_admin_password

@@ -30,6 +30,8 @@ SESSION_TTL_HOURS=24
 SECURITY_COOKIE_SECURE=true
 XLSTATUS_SEED_ADMIN_USERNAME=admin
 XLSTATUS_SEED_ADMIN_PASSWORD=replace-with-a-strong-initial-password
+# Prefer this for container deployments:
+XLSTATUS_SEED_ADMIN_PASSWORD_FILE=/run/secrets/xlstatus_seed_admin_password
 ```
 
 | 变量 | 说明 |
@@ -48,7 +50,8 @@ XLSTATUS_SEED_ADMIN_PASSWORD=replace-with-a-strong-initial-password
 | `SESSION_TTL_HOURS` | Cookie 会话有效期，默认 `24` 小时。 |
 | `SECURITY_COOKIE_SECURE` | 是否为 session/CSRF Cookie 添加 `Secure`。环境变量和 TOML 部署默认开启，本地无配置开发默认关闭。 |
 | `XLSTATUS_SEED_ADMIN_USERNAME` | 可选的首个管理员用户名。 |
-| `XLSTATUS_SEED_ADMIN_PASSWORD` | 可选的首个管理员密码。只在用户不存在时创建。 |
+| `XLSTATUS_SEED_ADMIN_PASSWORD_FILE` | 可选的首个管理员密码文件路径。设置后优先于明文密码变量，Compose 默认使用 Docker secret 挂载到 `/run/secrets/xlstatus_seed_admin_password`。 |
+| `XLSTATUS_SEED_ADMIN_PASSWORD` | 可选的首个管理员密码。只在用户不存在时创建；容器部署优先使用 `XLSTATUS_SEED_ADMIN_PASSWORD_FILE`，避免把密码持久保存在容器环境里。 |
 
 ## config.toml
 
@@ -215,4 +218,11 @@ XLSTATUS_SEED_ADMIN_USERNAME=admin
 XLSTATUS_SEED_ADMIN_PASSWORD=replace-with-a-strong-initial-password
 ```
 
-如果该用户名已存在，不会覆盖密码。生产环境必须使用强随机初始密码，并在首次登录后移除明文 seed 变量。
+也可以使用文件路径，适合 Docker secret、systemd 临时 env file 或其它 secret manager：
+
+```env
+XLSTATUS_SEED_ADMIN_USERNAME=admin
+XLSTATUS_SEED_ADMIN_PASSWORD_FILE=/run/secrets/xlstatus_seed_admin_password
+```
+
+如果该用户名已存在，不会覆盖密码。生产环境必须使用强随机初始密码；容器部署不要把密码写进 `.env` 或 Compose 环境变量，首次登录后应轮换初始化密码或清理一次性 secret 文件。

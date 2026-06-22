@@ -7,6 +7,10 @@
 SQLite 版本：
 
 ```bash
+mkdir -p .secrets
+printf '%s\n' 'replace-with-a-strong-initial-password' > .secrets/xlstatus_seed_admin_password
+chmod 700 .secrets
+chmod 600 .secrets/xlstatus_seed_admin_password
 docker compose up -d
 curl -fsS http://localhost:8080/healthz
 docker compose ps
@@ -26,7 +30,7 @@ docker compose -f docker-compose.pg.yml ps
 - API: `http://localhost:8080`
 - 公开状态页: `http://localhost:3000/status`
 
-本地管理员账号使用你在 `XLSTATUS_SEED_ADMIN_PASSWORD` 中设置的初始密码。
+本地管理员账号使用你写入 `.secrets/xlstatus_seed_admin_password` 的初始密码。
 
 Compose 已设置：
 
@@ -36,6 +40,7 @@ CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
 
 因此默认 Web UI 可以访问 API。SQLite Compose 会创建 `./data/xlstatus.db`；PostgreSQL Compose 会在空 volume 上创建数据库用户和库，然后由 XLStatus 执行应用迁移。
 PostgreSQL Compose 的数据库端口只绑定宿主 `127.0.0.1:5432`，不要改成公网监听；远程维护请使用 SSH tunnel、VPN 或受控防火墙。
+Compose 会把 `.secrets/xlstatus_seed_admin_password` 挂载为 Docker secret，并通过 `XLSTATUS_SEED_ADMIN_PASSWORD_FILE` 让 Server 读取；不要把首次管理员密码写进 `.env` 或 Compose 环境变量。
 
 远端服务器上运行 Docker Compose 时，先设置浏览器可访问的地址：
 

@@ -22,6 +22,10 @@ The current pre-release is `v0.1.0-alpha.3`. Start from the documentation index 
 ```bash
 git clone https://github.com/lbyxiaolizi/XLStatus.git
 cd XLStatus
+mkdir -p .secrets
+printf '%s\n' 'replace-with-a-strong-initial-password' > .secrets/xlstatus_seed_admin_password
+chmod 700 .secrets
+chmod 600 .secrets/xlstatus_seed_admin_password
 docker compose up -d
 curl -fsS http://localhost:8080/healthz
 ```
@@ -32,7 +36,7 @@ Open:
 - API: `http://localhost:8080`
 - Public status: `http://localhost:3000/status`
 
-Set `XLSTATUS_SEED_ADMIN_PASSWORD` to a strong initial password before first start.
+Set a strong initial password in `.secrets/xlstatus_seed_admin_password` before first start.
 
 For PostgreSQL:
 

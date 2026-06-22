@@ -13,6 +13,15 @@
 
 ## Docker Compose
 
+首次启动前先创建本地管理员初始化密码文件：
+
+```bash
+mkdir -p .secrets
+printf '%s\n' 'replace-with-a-strong-initial-password' > .secrets/xlstatus_seed_admin_password
+chmod 700 .secrets
+chmod 600 .secrets/xlstatus_seed_admin_password
+```
+
 ```bash
 docker compose up -d
 curl -fsS http://localhost:8080/healthz
@@ -26,6 +35,7 @@ curl -fsS http://localhost:8080/healthz
 ```
 
 PostgreSQL Compose 默认只把数据库端口发布到宿主 `127.0.0.1:5432`，供本机调试和备份使用；不要把 `5432` 直接发布到公网。需要远端维护数据库时，优先通过 SSH tunnel、VPN 或受控防火墙访问。
+Compose 会把 `.secrets/xlstatus_seed_admin_password` 挂载为 Docker secret，并通过 `XLSTATUS_SEED_ADMIN_PASSWORD_FILE` 让 Server 读取；不要把首次管理员密码写进 `.env` 或 Compose 环境变量。
 
 本地访问：
 

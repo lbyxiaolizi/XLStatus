@@ -35,6 +35,7 @@ next-env.d.ts
 .env
 .env.local
 .env.*.local
+.secrets/
 
 # Build artifacts
 /data/

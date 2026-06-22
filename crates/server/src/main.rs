@@ -1349,10 +1349,9 @@ fn server_task_result(
 async fn seed_admin_user(db: &DatabaseBackend) -> anyhow::Result<()> {
     let username =
         std::env::var("XLSTATUS_SEED_ADMIN_USERNAME").or_else(|_| std::env::var("ADMIN_USERNAME"));
-    let password =
-        std::env::var("XLSTATUS_SEED_ADMIN_PASSWORD").or_else(|_| std::env::var("ADMIN_PASSWORD"));
+    let password = seed_admin_password_from_environment()?;
 
-    let (Ok(username), Ok(password)) = (username, password) else {
+    let (Ok(username), Some(password)) = (username, password) else {
         return Ok(());
     };
 
@@ -1369,6 +1368,40 @@ async fn seed_admin_user(db: &DatabaseBackend) -> anyhow::Result<()> {
     .await?;
     tracing::info!("Seeded admin user '{}'", username);
     Ok(())
+}
+
+fn seed_admin_password_from_environment() -> anyhow::Result<Option<String>> {
+    match std::env::var("XLSTATUS_SEED_ADMIN_PASSWORD_FILE")
+        .or_else(|_| std::env::var("ADMIN_PASSWORD_FILE"))
+    {
+        Ok(path) if !path.trim().is_empty() => {
+            return read_seed_admin_password_file(path.trim()).map(Some);
+        }
+        Ok(_) | Err(std::env::VarError::NotPresent) => {}
+        Err(err) => return Err(anyhow::anyhow!(err)),
+    }
+
+    match std::env::var("XLSTATUS_SEED_ADMIN_PASSWORD").or_else(|_| std::env::var("ADMIN_PASSWORD"))
+    {
+        Ok(password) => Ok(Some(password)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(err) => Err(anyhow::anyhow!(err)),
+    }
+}
+
+fn read_seed_admin_password_file(path: &str) -> anyhow::Result<String> {
+    let mut password = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read seed admin password file {path}"))?;
+
+    while matches!(password.as_bytes().last(), Some(b'\n' | b'\r')) {
+        password.pop();
+    }
+
+    if password.is_empty() {
+        anyhow::bail!("seed admin password file is empty");
+    }
+
+    Ok(password)
 }
 
 #[cfg(test)]
@@ -1629,6 +1662,82 @@ mod tests {
         assert!(script.contains("systemctl restart xlstatus"));
         assert!(!script.contains("Environment=\"XLSTATUS_SEED_ADMIN_PASSWORD="));
         assert!(!script.contains("ADMIN_PASSWORD_SYSTEMD"));
+    }
+
+    #[test]
+    fn seed_admin_password_file_trims_trailing_newlines() {
+        let path = std::env::temp_dir().join(format!(
+            "xlstatus-seed-admin-password-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        std::fs::write(&path, "  strong password  \r\n").unwrap();
+        let password = read_seed_admin_password_file(path.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(password, "  strong password  ");
+    }
+
+    #[test]
+    fn seed_admin_password_file_rejects_empty_secret() {
+        let path = std::env::temp_dir().join(format!(
+            "xlstatus-empty-seed-admin-password-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        std::fs::write(&path, "\n").unwrap();
+        let err = read_seed_admin_password_file(path.to_str().unwrap()).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(err.to_string().contains("password file is empty"));
+    }
+
+    #[test]
+    fn compose_seed_admin_password_uses_secret_file() {
+        for (name, compose) in [
+            (
+                "docker-compose.yml",
+                include_str!("../../../docker-compose.yml"),
+            ),
+            (
+                "docker-compose.pg.yml",
+                include_str!("../../../docker-compose.pg.yml"),
+            ),
+            (
+                "docker-compose.simple.yml",
+                include_str!("../../../docker-compose.simple.yml"),
+            ),
+        ] {
+            assert!(
+                compose.contains(
+                    "XLSTATUS_SEED_ADMIN_PASSWORD_FILE=/run/secrets/xlstatus_seed_admin_password"
+                ),
+                "{name} must point the server at the mounted seed admin password secret"
+            );
+            assert!(
+                !compose.contains("XLSTATUS_SEED_ADMIN_PASSWORD=${"),
+                "{name} must not persist the seed admin password in the container environment"
+            );
+            assert!(
+                compose.contains("xlstatus_seed_admin_password:"),
+                "{name} must define the seed admin password secret"
+            );
+            assert!(
+                compose.contains("file: ./.secrets/xlstatus_seed_admin_password"),
+                "{name} must load the seed admin password from the local secrets directory"
+            );
+        }
+
+        let gitignore = include_str!("../../../.gitignore");
+        assert!(gitignore.contains(".secrets/"));
     }
 
     #[test]
