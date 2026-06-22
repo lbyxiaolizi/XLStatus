@@ -908,9 +908,10 @@ class ApiClient {
     return this.request<ServerGroupListResponse>("/api/v1/server-groups");
   }
 
-  async createServerGroup(group: JsonObject): Promise<ApiResponse<ServerGroup>> {
+  async createServerGroup(group: JsonObject, totpCode?: string): Promise<ApiResponse<ServerGroup>> {
     return this.request<ServerGroup>("/api/v1/server-groups", {
       method: "POST",
+      headers: this.sensitiveHeaders(totpCode),
       body: JSON.stringify(group),
     });
   }
@@ -918,29 +919,33 @@ class ApiClient {
   async updateServerGroup(
     id: string,
     group: JsonObject,
+    totpCode?: string,
   ): Promise<ApiResponse<ServerGroup>> {
     return this.requestWithFallback<ServerGroup>(
       `/api/v1/server-groups/${encodeURIComponent(id)}`,
       group,
       ["PATCH", "POST", "PUT"],
+      { headers: this.sensitiveHeaders(totpCode) },
     );
   }
 
-  async deleteServerGroup(id: string): Promise<ApiResponse<JsonObject>> {
+  async deleteServerGroup(id: string, totpCode?: string): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
       `/api/v1/server-groups/${encodeURIComponent(id)}`,
-      { method: "DELETE" },
+      { method: "DELETE", headers: this.sensitiveHeaders(totpCode) },
     );
   }
 
   async addServerGroupMembers(
     id: string,
     serverIds: string[],
+    totpCode?: string,
   ): Promise<ApiResponse<ServerGroup>> {
     return this.request<ServerGroup>(
       `/api/v1/server-groups/${encodeURIComponent(id)}/members`,
       {
         method: "POST",
+        headers: this.sensitiveHeaders(totpCode),
         body: JSON.stringify({ server_ids: serverIds }),
       },
     );
@@ -949,10 +954,11 @@ class ApiClient {
   async deleteServerGroupMember(
     id: string,
     serverId: string,
+    totpCode?: string,
   ): Promise<ApiResponse<ServerGroup>> {
     return this.request<ServerGroup>(
       `/api/v1/server-groups/${encodeURIComponent(id)}/members/${encodeURIComponent(serverId)}`,
-      { method: "DELETE" },
+      { method: "DELETE", headers: this.sensitiveHeaders(totpCode) },
     );
   }
 

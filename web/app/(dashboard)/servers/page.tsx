@@ -432,7 +432,7 @@ export default function ServersPage() {
     setError(null);
     setBatchNotice(null);
     const totpCode = await sensitiveTotpCodeForAction(
-      action === "delete" || action === "transfer_owner" || action === "set_dashboard_visible",
+      action === "delete" || action === "transfer_owner" || action === "set_dashboard_visible" || action === "move_group",
     );
     if (totpCode === null) return false;
     const payload: JsonObject = {
@@ -478,7 +478,9 @@ export default function ServersPage() {
       setError("请填写服务器分组名称。");
       return;
     }
-    const response = await apiClient.createServerGroup({ name });
+    const totpCode = await sensitiveTotpCodeForAction(true);
+    if (totpCode === null) return;
+    const response = await apiClient.createServerGroup({ name }, totpCode);
     if (!response.success) {
       setError(responseError(response));
       return;
@@ -515,7 +517,9 @@ export default function ServersPage() {
       }
       payload.display_order = parsed;
     }
-    const response = await apiClient.updateServerGroup(selectedServerGroupId, payload);
+    const totpCode = await sensitiveTotpCodeForAction(true);
+    if (totpCode === null) return;
+    const response = await apiClient.updateServerGroup(selectedServerGroupId, payload, totpCode);
     if (!response.success) {
       setError(responseError(response));
       return;
@@ -533,7 +537,9 @@ export default function ServersPage() {
       setError("请先选择服务器。");
       return;
     }
-    const response = await apiClient.addServerGroupMembers(selectedServerGroupId, selectedIds);
+    const totpCode = await sensitiveTotpCodeForAction(true);
+    if (totpCode === null) return;
+    const response = await apiClient.addServerGroupMembers(selectedServerGroupId, selectedIds, totpCode);
     if (!response.success) {
       setError(responseError(response));
       return;
@@ -562,7 +568,9 @@ export default function ServersPage() {
     }
     const group = serverGroups.find((item) => item.id === selectedServerGroupId);
     if (!confirm(`确定删除服务器分组 ${group?.name ?? selectedServerGroupId}？`)) return;
-    const response = await apiClient.deleteServerGroup(selectedServerGroupId);
+    const totpCode = await sensitiveTotpCodeForAction(true);
+    if (totpCode === null) return;
+    const response = await apiClient.deleteServerGroup(selectedServerGroupId, totpCode);
     if (!response.success) {
       setError(responseError(response));
       return;

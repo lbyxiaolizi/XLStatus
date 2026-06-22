@@ -655,6 +655,9 @@ pub async fn batch_update_servers(
     ) {
         require_sensitive_totp(&state.db, auth.user_id, &headers).await?;
     }
+    if matches!(req.action, ServerBatchAction::MoveGroup) {
+        require_server_group_write_auth(&state.db, &auth, &headers).await?;
+    }
     if matches!(req.action, ServerBatchAction::SetDashboardVisible) {
         require_public_server_visibility_write_auth(&state.db, &auth, &headers).await?;
     }
@@ -935,11 +938,13 @@ pub async fn list_server_groups(
 pub async fn create_server_group(
     State(state): State<AppState>,
     auth: AuthSession,
+    headers: HeaderMap,
     Json(req): Json<CreateServerGroupRequest>,
 ) -> Result<Json<ApiResponse<ServerGroupView>>, AppError> {
     if !has_scope(&auth, "server:write") {
         return Err(AppError::Forbidden("missing scope: server:write".into()));
     }
+    require_server_group_write_auth(&state.db, &auth, &headers).await?;
     let name = normalize_group_name(&req.name)?;
     let color = normalize_optional_label(req.color, "color")?;
     let display_order = normalize_display_order(req.display_order, "display_order")?;
@@ -982,12 +987,14 @@ pub async fn create_server_group(
 pub async fn update_server_group(
     State(state): State<AppState>,
     auth: AuthSession,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(req): Json<UpdateServerGroupRequest>,
 ) -> Result<Json<ApiResponse<ServerGroupView>>, AppError> {
     if !has_scope(&auth, "server:write") {
         return Err(AppError::Forbidden("missing scope: server:write".into()));
     }
+    require_server_group_write_auth(&state.db, &auth, &headers).await?;
     let existing = load_server_group(&state.db, &auth, &id).await?;
     let name = match req.name {
         Some(value) => normalize_group_name(&value)?,
@@ -1035,11 +1042,13 @@ pub async fn update_server_group(
 pub async fn delete_server_group(
     State(state): State<AppState>,
     auth: AuthSession,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     if !has_scope(&auth, "server:write") {
         return Err(AppError::Forbidden("missing scope: server:write".into()));
     }
+    require_server_group_write_auth(&state.db, &auth, &headers).await?;
     load_server_group(&state.db, &auth, &id).await?;
     let affected = match &state.db {
         DatabaseBackend::Sqlite(pool) => {
@@ -1070,12 +1079,14 @@ pub async fn delete_server_group(
 pub async fn add_server_group_members(
     State(state): State<AppState>,
     auth: AuthSession,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(req): Json<AddServerGroupMembersRequest>,
 ) -> Result<Json<ApiResponse<ServerGroupView>>, AppError> {
     if !has_scope(&auth, "server:write") {
         return Err(AppError::Forbidden("missing scope: server:write".into()));
     }
+    require_server_group_write_auth(&state.db, &auth, &headers).await?;
     let server_ids = dedupe_ids(req.server_ids, SERVER_BATCH_MAX_SERVER_IDS, "server_ids")?;
     if server_ids.is_empty() {
         return Err(AppError::BadRequest("server_ids is required".into()));
@@ -1119,11 +1130,13 @@ pub async fn add_server_group_members(
 pub async fn delete_server_group_member(
     State(state): State<AppState>,
     auth: AuthSession,
+    headers: HeaderMap,
     Path((id, server_id)): Path<(String, String)>,
 ) -> Result<Json<ApiResponse<ServerGroupView>>, AppError> {
     if !has_scope(&auth, "server:write") {
         return Err(AppError::Forbidden("missing scope: server:write".into()));
     }
+    require_server_group_write_auth(&state.db, &auth, &headers).await?;
     load_server_group(&state.db, &auth, &id).await?;
     ensure_group_server_access(&state.db, &auth, &server_id).await?;
     match &state.db {
@@ -1772,6 +1785,19 @@ async fn require_public_server_visibility_write_auth(
     headers: &HeaderMap,
 ) -> Result<(), AppError> {
     require_admin_cookie_session(auth)?;
+    require_sensitive_totp(db, auth.user_id, headers).await
+}
+
+async fn require_server_group_write_auth(
+    db: &DatabaseBackend,
+    auth: &AuthSession,
+    headers: &HeaderMap,
+) -> Result<(), AppError> {
+    if matches!(auth.auth_kind, AuthKind::PersonalAccessToken) {
+        return Err(AppError::Forbidden(
+            "server group changes require a cookie session".into(),
+        ));
+    }
     require_sensitive_totp(db, auth.user_id, headers).await
 }
 
@@ -3566,6 +3592,7 @@ mod tests {
         let update_err = update_server_group(
             State(test_state(db.clone())),
             auth.clone(),
+            HeaderMap::new(),
             Path(blocked_group.to_string()),
             Json(UpdateServerGroupRequest {
                 name: Some("renamed".into()),
@@ -3577,10 +3604,14 @@ mod tests {
         .unwrap_err();
         assert!(matches!(update_err, AppError::Forbidden(_)));
 
-        let delete_err =
-            delete_server_group(State(test_state(db)), auth, Path(blocked_group.to_string()))
-                .await
-                .unwrap_err();
+        let delete_err = delete_server_group(
+            State(test_state(db)),
+            auth,
+            HeaderMap::new(),
+            Path(blocked_group.to_string()),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(delete_err, AppError::Forbidden(_)));
     }
 
@@ -3695,6 +3726,7 @@ mod tests {
         let Json(response) = add_server_group_members(
             State(test_state(db.clone())),
             auth.clone(),
+            HeaderMap::new(),
             Path(group_id.to_string()),
             Json(AddServerGroupMembersRequest {
                 server_ids: vec![active_server.to_string()],
@@ -3710,6 +3742,7 @@ mod tests {
         let add_err = add_server_group_members(
             State(test_state(db.clone())),
             auth.clone(),
+            HeaderMap::new(),
             Path(group_id.to_string()),
             Json(AddServerGroupMembersRequest {
                 server_ids: vec![revoked_server.to_string()],
@@ -3759,6 +3792,7 @@ mod tests {
         let Json(response) = delete_server_group_member(
             State(test_state(db)),
             auth,
+            HeaderMap::new(),
             Path((group_id.to_string(), revoked_server.to_string())),
         )
         .await
@@ -3767,6 +3801,47 @@ mod tests {
             response.data.unwrap().server_ids,
             vec![active_server.to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn server_group_changes_reject_pat_session() {
+        let db = test_db().await;
+        let auth = auth_session(AuthKind::PersonalAccessToken, UserRole::Admin);
+
+        let err = require_server_group_write_auth(&db, &auth, &HeaderMap::new())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+        assert!(error_message(err).contains("cookie session"));
+    }
+
+    #[tokio::test]
+    async fn server_group_changes_require_sensitive_totp_when_enabled() {
+        let db = test_db().await;
+        let admin = Uuid::from_bytes([9; 16]);
+        seed_user(&db, admin, "admin", "admin").await;
+        seed_totp_enabled_user(&db, admin).await;
+        let auth = auth_session(AuthKind::Session, UserRole::Admin);
+
+        let err = require_server_group_write_auth(&db, &auth, &HeaderMap::new())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+        assert!(error_message(err).contains("TOTP"));
+    }
+
+    #[tokio::test]
+    async fn server_group_changes_allow_cookie_without_totp() {
+        let db = test_db().await;
+        let admin = Uuid::from_bytes([9; 16]);
+        seed_user(&db, admin, "admin", "admin").await;
+        let auth = auth_session(AuthKind::Session, UserRole::Admin);
+
+        require_server_group_write_auth(&db, &auth, &HeaderMap::new())
+            .await
+            .unwrap();
     }
 
     #[test]
