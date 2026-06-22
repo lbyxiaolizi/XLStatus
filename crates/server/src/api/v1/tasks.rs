@@ -89,7 +89,7 @@ pub async fn create_task(
     let db = state.db.clone();
 
     require_scope_or_403(&auth_user, "task:write")?;
-    validate_task_selector_or_403(&auth_user, &req.server_selector_json)?;
+    validate_task_selector_for_write_or_403(&db, &auth_user, &req.server_selector_json).await?;
     let notification_group_id = normalize_optional_id(req.notification_group_id);
     ensure_task_notification_group_owned(&db, &auth_user, notification_group_id.as_deref()).await?;
     // Validate schedule if present
@@ -306,7 +306,7 @@ pub async fn update_task(
     if let Some(enabled) = req.enabled {
         task.enabled = enabled;
     }
-    validate_task_selector_or_403(&auth_user, &task.server_selector_json)?;
+    validate_task_selector_for_write_or_403(&db, &auth_user, &task.server_selector_json).await?;
     ensure_task_notification_group_owned(&db, &auth_user, task.notification_group_id.as_deref())
         .await?;
 
@@ -666,19 +666,22 @@ fn validate_task_selector_or_403(
     validate_task_selector_for_session(&auth_user.auth_session(), selector_json)
 }
 
+async fn validate_task_selector_for_write_or_403(
+    db: &Db,
+    auth_user: &AuthUser,
+    selector_json: &str,
+) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
+    validate_task_selector_or_403(auth_user, selector_json)?;
+    let selector = parse_task_selector_or_403(selector_json)?;
+    let explicit_server_ids = explicit_selector_server_ids(&selector);
+    ensure_explicit_selector_servers_active(db, auth_user, &explicit_server_ids).await
+}
+
 fn validate_task_selector_for_session(
     session: &AuthSession,
     selector_json: &str,
 ) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
-    let selector: ServerSelector = match serde_json::from_str(selector_json) {
-        Ok(s) => s,
-        Err(_) => {
-            return Err(api_error(
-                StatusCode::BAD_REQUEST,
-                "server_selector_json is not valid JSON",
-            ));
-        }
-    };
+    let selector = parse_task_selector_or_403(selector_json)?;
 
     let mut scoped_server_ids = selector.server_ids.clone();
     scoped_server_ids.extend(selector.exclude_server_ids.clone());
@@ -707,6 +710,88 @@ fn validate_task_selector_for_session(
         ));
     }
 
+    Ok(())
+}
+
+fn parse_task_selector_or_403(
+    selector_json: &str,
+) -> Result<ServerSelector, (StatusCode, Json<ApiResponse<()>>)> {
+    serde_json::from_str(selector_json).map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "server_selector_json is not valid JSON",
+        )
+    })
+}
+
+fn explicit_selector_server_ids(selector: &ServerSelector) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for server_id in selector
+        .server_ids
+        .iter()
+        .chain(selector.exclude_server_ids.iter())
+    {
+        if seen.insert(server_id) {
+            out.push(server_id.clone());
+        }
+    }
+    out
+}
+
+async fn ensure_explicit_selector_servers_active(
+    db: &Db,
+    auth_user: &AuthUser,
+    server_ids: &[String],
+) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
+    if server_ids.is_empty() {
+        return Ok(());
+    }
+
+    for server_id in server_ids {
+        let parsed = uuid::Uuid::parse_str(server_id).map_err(|_| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                format!("server_selector_json contains invalid server_id: {server_id}"),
+            )
+        })?;
+        let exists = match db {
+            Db::Sqlite(pool) => {
+                let row: (i64,) = sqlx::query_as(
+                    "SELECT COUNT(*) FROM agents WHERE id = ? AND owner_user_id = ? AND revoked_at IS NULL",
+                )
+                .bind(parsed.to_string())
+                .bind(auth_user.user.id.0.to_string())
+                .fetch_one(pool)
+                .await
+                .map_err(|e| {
+                    tracing::error!("Failed to validate task selector server: {}", e);
+                    api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+                })?;
+                row.0 > 0
+            }
+            Db::Postgres(pool) => {
+                let row: (i64,) = sqlx::query_as(
+                    "SELECT COUNT(*) FROM agents WHERE id = $1 AND owner_user_id = $2 AND revoked_at IS NULL",
+                )
+                .bind(parsed)
+                .bind(auth_user.user.id.0)
+                .fetch_one(pool)
+                .await
+                .map_err(|e| {
+                    tracing::error!("Failed to validate task selector server: {}", e);
+                    api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+                })?;
+                row.0 > 0
+            }
+        };
+        if !exists {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                format!("server_selector_json contains unknown or revoked server: {server_id}"),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -931,6 +1016,73 @@ mod tests {
             .contains("too many entries"));
     }
 
+    #[tokio::test]
+    async fn task_write_selector_requires_explicit_active_servers() {
+        let db = test_db().await;
+        let auth = cookie_admin();
+        let owner = auth.user.id.0.to_string();
+        let active_server = uuid::Uuid::from_bytes([2; 16]).to_string();
+        let revoked_server = uuid::Uuid::from_bytes([3; 16]).to_string();
+        let other_owner_server = uuid::Uuid::from_bytes([4; 16]).to_string();
+        let other_owner = uuid::Uuid::from_bytes([5; 16]).to_string();
+        seed_user(&db, &owner).await;
+        seed_user(&db, &other_owner).await;
+        seed_agent(&db, &active_server, &owner, None).await;
+        seed_agent(&db, &revoked_server, &owner, Some("2026-01-02T00:00:00Z")).await;
+        seed_agent(&db, &other_owner_server, &other_owner, None).await;
+
+        let active_selector = json!({ "server_ids": [active_server] }).to_string();
+        assert!(
+            validate_task_selector_for_write_or_403(&db, &auth, &active_selector)
+                .await
+                .is_ok()
+        );
+
+        let revoked_selector = json!({ "server_ids": [revoked_server] }).to_string();
+        let err = validate_task_selector_for_write_or_403(&db, &auth, &revoked_selector)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err
+            .1
+             .0
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("unknown or revoked server"));
+
+        let other_owner_selector =
+            json!({ "exclude_server_ids": [other_owner_server] }).to_string();
+        let err = validate_task_selector_for_write_or_403(&db, &auth, &other_owner_selector)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn scoped_pat_task_write_rejects_revoked_allowlist_server() {
+        let db = test_db().await;
+        let owner = uuid::Uuid::from_bytes([1; 16]).to_string();
+        let revoked_server = uuid::Uuid::from_bytes([6; 16]).to_string();
+        seed_user(&db, &owner).await;
+        seed_agent(&db, &revoked_server, &owner, Some("2026-01-02T00:00:00Z")).await;
+        let auth = pat_with_servers(vec![&revoked_server]);
+        let selector = json!({ "server_ids": [revoked_server] }).to_string();
+
+        let err = validate_task_selector_for_write_or_403(&db, &auth, &selector)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err
+            .1
+             .0
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("unknown or revoked server"));
+    }
+
     fn pat_with_servers(server_ids: Vec<&str>) -> AuthUser {
         let now = Utc::now();
         AuthUser {
@@ -949,6 +1101,27 @@ mod tests {
             scopes: vec!["task:read".into(), "task:write".into(), "task:exec".into()],
             server_ids: Some(server_ids.into_iter().map(str::to_string).collect()),
             pat_id: Some("pat".into()),
+        }
+    }
+
+    fn cookie_admin() -> AuthUser {
+        let now = Utc::now();
+        AuthUser {
+            user: User {
+                id: UserId(uuid::Uuid::from_bytes([1; 16])),
+                username: "owner".into(),
+                password_hash: "x".into(),
+                role: UserRole::Admin,
+                token_version: 0,
+                created_at: now,
+                updated_at: now,
+            },
+            session_id: "session".into(),
+            csrf_token: "csrf".into(),
+            auth_kind: AuthKind::Session,
+            scopes: Vec::new(),
+            server_ids: None,
+            pat_id: None,
         }
     }
 
@@ -1008,6 +1181,27 @@ mod tests {
         )
         .bind(id)
         .bind(owner_user_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_agent(
+        db: &DatabaseBackend,
+        id: &str,
+        owner_user_id: &str,
+        revoked_at: Option<&str>,
+    ) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO agents (id, name, public_key, owner_user_id, revoked_at, created_at, updated_at) VALUES (?, ?, 'pk', ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(format!("agent-{id}"))
+        .bind(owner_user_id)
+        .bind(revoked_at)
         .execute(pool)
         .await
         .unwrap();
