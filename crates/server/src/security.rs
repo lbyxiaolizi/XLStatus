@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
-use axum::http::{header, HeaderMap};
+use axum::http::{header, HeaderMap, HeaderValue};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::net::lookup_host;
+
+const HTTP_FORWARDED_HEADER_MAX_BYTES: usize = 1024;
 
 pub async fn validate_outbound_url(url: &str, purpose: &str) -> Result<reqwest::Url> {
     validate_outbound_url_resolved(url, purpose)
@@ -161,8 +163,7 @@ pub fn client_ip_from_headers_and_peer(
         |name| {
             headers
                 .get(name)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string)
+                .and_then(bounded_http_forwarded_header_value)
         },
         peer_ip.map(|ip| ip.to_string()),
         peer_ip,
@@ -197,6 +198,18 @@ fn trust_proxy_headers() -> bool {
     std::env::var("XLSTATUS_TRUST_PROXY_HEADERS")
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false)
+}
+
+fn bounded_http_forwarded_header_value(value: &HeaderValue) -> Option<String> {
+    if value.as_bytes().len() > HTTP_FORWARDED_HEADER_MAX_BYTES {
+        return None;
+    }
+    value
+        .to_str()
+        .ok()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn origin_matches_allowed_origin(origin: &str, allowed: &str) -> bool {
@@ -400,6 +413,9 @@ fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    static PROXY_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn blocks_private_ip_ranges() {
@@ -469,6 +485,97 @@ mod tests {
             ),
             "198.51.100.9"
         );
+    }
+
+    #[test]
+    fn http_forwarded_headers_are_bounded_before_trusting_proxy_values() {
+        let _env = TrustedProxyEnvGuard::set();
+        let peer_addr: SocketAddr = "10.0.0.5:443".parse().unwrap();
+        let oversized = format!(
+            "203.0.113.10{}",
+            " ".repeat(HTTP_FORWARDED_HEADER_MAX_BYTES)
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.10, 10.0.0.5".parse().unwrap());
+        assert_eq!(
+            client_ip_from_headers_and_peer(&headers, Some(peer_addr)),
+            "203.0.113.10"
+        );
+
+        headers.insert("x-forwarded-for", oversized.parse().unwrap());
+        assert_eq!(
+            client_ip_from_headers_and_peer(&headers, Some(peer_addr)),
+            "10.0.0.5"
+        );
+    }
+
+    #[test]
+    fn oversized_http_forwarded_fallback_headers_are_ignored() {
+        let _env = TrustedProxyEnvGuard::set();
+        let peer_addr: SocketAddr = "10.0.0.5:443".parse().unwrap();
+        let oversized = format!(
+            "203.0.113.10{}",
+            " ".repeat(HTTP_FORWARDED_HEADER_MAX_BYTES)
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", "198.51.100.8".parse().unwrap());
+        headers.insert("cf-connecting-ip", "198.51.100.9".parse().unwrap());
+        assert_eq!(
+            client_ip_from_headers_and_peer(&headers, Some(peer_addr)),
+            "198.51.100.8"
+        );
+
+        headers.insert("x-real-ip", oversized.parse().unwrap());
+        assert_eq!(
+            client_ip_from_headers_and_peer(&headers, Some(peer_addr)),
+            "198.51.100.9"
+        );
+
+        let oversized = format!(
+            "203.0.113.10{}",
+            " ".repeat(HTTP_FORWARDED_HEADER_MAX_BYTES)
+        );
+        headers.insert("cf-connecting-ip", oversized.parse().unwrap());
+        assert_eq!(
+            client_ip_from_headers_and_peer(&headers, Some(peer_addr)),
+            "10.0.0.5"
+        );
+    }
+
+    struct TrustedProxyEnvGuard {
+        trust_proxy_headers: Option<String>,
+        trusted_proxies: Option<String>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl TrustedProxyEnvGuard {
+        fn set() -> Self {
+            let lock = PROXY_ENV_LOCK.lock().unwrap();
+            let trust_proxy_headers = std::env::var("XLSTATUS_TRUST_PROXY_HEADERS").ok();
+            let trusted_proxies = std::env::var("XLSTATUS_TRUSTED_PROXIES").ok();
+            std::env::set_var("XLSTATUS_TRUST_PROXY_HEADERS", "1");
+            std::env::set_var("XLSTATUS_TRUSTED_PROXIES", "10.0.0.0/8");
+            Self {
+                trust_proxy_headers,
+                trusted_proxies,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for TrustedProxyEnvGuard {
+        fn drop(&mut self) {
+            match &self.trust_proxy_headers {
+                Some(value) => std::env::set_var("XLSTATUS_TRUST_PROXY_HEADERS", value),
+                None => std::env::remove_var("XLSTATUS_TRUST_PROXY_HEADERS"),
+            }
+            match &self.trusted_proxies {
+                Some(value) => std::env::set_var("XLSTATUS_TRUSTED_PROXIES", value),
+                None => std::env::remove_var("XLSTATUS_TRUSTED_PROXIES"),
+            }
+        }
     }
 
     #[test]

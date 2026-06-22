@@ -9,6 +9,7 @@
 - 健康检查：`GET /healthz`
 - 认证方式：Dashboard 使用 Cookie 会话和 CSRF；Agent 使用注册后的密钥和 JWT 流程。
 - 所有 HTTP 请求的原始 path 在进入路由 extractor 前最多 4096 字节，原始 query string 最多 16KiB；具体接口可定义更小的业务上限。
+- 启用 `XLSTATUS_TRUST_PROXY_HEADERS=1` 且请求来源命中 `XLSTATUS_TRUSTED_PROXIES` 时，HTTP 审计 IP 会按 `x-forwarded-for`、`x-real-ip`、`cf-connecting-ip` 解析；这些 forwarded header 单项最多 1024 字节，超限或非法值会被忽略并回退 socket peer IP。
 
 ## 公共接口
 
