@@ -11,6 +11,10 @@
 //! `server:read` and a matching `server_id` in the PAT allowlist.
 
 use crate::api::types::ApiResponse;
+use crate::api::v1::agent_json::{
+    parse_agent_telemetry_json, parse_dashboard_metadata_json,
+    AGENT_DASHBOARD_METADATA_JSON_MAX_BYTES,
+};
 use crate::api::v1::auth::{require_sensitive_totp, AppError, AppState};
 use crate::api::v1::geoip::{lookup_agent_geo_location, AgentGeoLocation};
 use crate::auth::middleware::{AuthKind, AuthSession};
@@ -38,7 +42,7 @@ const ONLINE_THRESHOLD_SECS: i64 = 30;
 const SERVER_MANAGEMENT_API_MAX_BODY_BYTES: usize = 64 * 1024;
 const SERVER_NAME_MAX_BYTES: usize = 128;
 const SERVER_LABEL_MAX_BYTES: usize = 512;
-const SERVER_DASHBOARD_METADATA_MAX_BYTES: usize = 16 * 1024;
+const SERVER_DASHBOARD_METADATA_MAX_BYTES: usize = AGENT_DASHBOARD_METADATA_JSON_MAX_BYTES;
 const SERVER_TAG_INPUT_MAX_ITEMS: usize = 64;
 const SERVER_TAG_INPUT_MAX_BYTES: usize = 128;
 const SERVER_BATCH_MAX_SERVER_IDS: usize = 200;
@@ -160,14 +164,8 @@ pub async fn list_servers(
         } else {
             "offline"
         };
-        let parsed = row
-            .last_state_json
-            .as_deref()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
-        let parsed_info = row
-            .last_info_json
-            .as_deref()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+        let parsed = parse_agent_telemetry_json(row.last_state_json.as_deref());
+        let parsed_info = parse_agent_telemetry_json(row.last_info_json.as_deref());
         let dashboard = dashboard_metadata(
             row.dashboard_metadata_json.as_deref(),
             &[parsed_info.as_ref(), parsed.as_ref()],
@@ -324,14 +322,8 @@ pub async fn get_server(
     } else {
         "offline"
     };
-    let last_state = row
-        .last_state_json
-        .as_deref()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
-    let last_info = row
-        .last_info_json
-        .as_deref()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+    let last_state = parse_agent_telemetry_json(row.last_state_json.as_deref());
+    let last_info = parse_agent_telemetry_json(row.last_info_json.as_deref());
     let dashboard = dashboard_metadata(
         row.dashboard_metadata_json.as_deref(),
         &[last_info.as_ref(), last_state.as_ref()],
@@ -1674,14 +1666,8 @@ async fn apply_batch_action(
         | ServerBatchAction::AddTags
         | ServerBatchAction::RemoveTags
         | ServerBatchAction::SetDashboardVisible => {
-            let parsed_info = row
-                .last_info_json
-                .as_deref()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
-            let parsed_state = row
-                .last_state_json
-                .as_deref()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+            let parsed_info = parse_agent_telemetry_json(row.last_info_json.as_deref());
+            let parsed_state = parse_agent_telemetry_json(row.last_state_json.as_deref());
             let mut metadata = dashboard_metadata(
                 row.dashboard_metadata_json.as_deref(),
                 &[parsed_info.as_ref(), parsed_state.as_ref()],
@@ -3067,9 +3053,7 @@ fn dashboard_metadata(
     stored: Option<&str>,
     fallback_sources: &[Option<&serde_json::Value>],
 ) -> DashboardMetadata {
-    let mut out = stored
-        .and_then(|value| serde_json::from_str::<DashboardMetadata>(value).ok())
-        .unwrap_or_default();
+    let mut out = parse_dashboard_metadata_json::<DashboardMetadata>(stored).unwrap_or_default();
 
     if out.public_note.is_none() {
         out.public_note = metadata_string(fallback_sources, &["public_note", "public_description"]);
@@ -4285,6 +4269,31 @@ mod tests {
         };
         let err = dashboard_metadata_json(&metadata).unwrap_err();
         assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn historical_dashboard_metadata_is_bounded_at_read_time() {
+        let oversized = format!(
+            r#"{{"tags":["prod"],"dashboard_visible":true,"public_note":"{}"}}"#,
+            "x".repeat(SERVER_DASHBOARD_METADATA_MAX_BYTES)
+        );
+        let metadata = dashboard_metadata(Some(&oversized), &[]);
+
+        assert!(metadata.tags.is_empty());
+        assert_eq!(metadata.dashboard_visible, None);
+        assert_eq!(metadata.public_note, None);
+    }
+
+    #[test]
+    fn historical_agent_telemetry_is_bounded_at_read_time() {
+        let oversized = format!(
+            r#"{{"cpu_percent":42,"padding":"{}"}}"#,
+            "x".repeat(crate::api::v1::agent_json::AGENT_TELEMETRY_JSON_MAX_BYTES)
+        );
+
+        let parsed = parse_agent_telemetry_json::<serde_json::Value>(Some(&oversized));
+
+        assert!(parsed.is_none());
     }
 
     #[test]

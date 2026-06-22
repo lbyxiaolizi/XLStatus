@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod agent_json;
 pub mod agent_jwt;
 pub mod alerts;
 pub mod auth;

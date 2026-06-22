@@ -9,6 +9,10 @@ use std::sync::Arc;
 use tracing::{info, warn};
 use xlstatus_shared::tasks::*;
 
+use crate::api::v1::agent_json::{
+    parse_agent_telemetry_json, parse_dashboard_metadata_json,
+    AGENT_DASHBOARD_METADATA_JSON_MAX_BYTES, AGENT_TELEMETRY_JSON_MAX_BYTES,
+};
 use crate::db::repository::tasks::{TaskRepository, TaskRunRepository};
 use crate::db::Db;
 use crate::grpc::{truncate_task_result_text, SessionRegistry, TaskResponseRegistry};
@@ -569,11 +573,22 @@ async fn list_owned_agent_records(
     match db {
         crate::db::DatabaseBackend::Sqlite(pool) => {
             let rows = sqlx::query(
-                "SELECT id, name, dashboard_metadata_json, last_info_json, last_state_json FROM agents WHERE owner_user_id = ? AND revoked_at IS NULL ORDER BY created_at ASC",
+                r#"
+                SELECT id, name,
+                       CASE WHEN dashboard_metadata_json IS NOT NULL AND length(CAST(dashboard_metadata_json AS BLOB)) <= ? THEN dashboard_metadata_json ELSE NULL END AS dashboard_metadata_json,
+                       CASE WHEN last_info_json IS NOT NULL AND length(CAST(last_info_json AS BLOB)) <= ? THEN last_info_json ELSE NULL END AS last_info_json,
+                       CASE WHEN last_state_json IS NOT NULL AND length(CAST(last_state_json AS BLOB)) <= ? THEN last_state_json ELSE NULL END AS last_state_json
+                FROM agents
+                WHERE owner_user_id = ? AND revoked_at IS NULL
+                ORDER BY created_at ASC
+                "#,
             )
+            .bind(AGENT_DASHBOARD_METADATA_JSON_MAX_BYTES as i64)
+            .bind(AGENT_TELEMETRY_JSON_MAX_BYTES as i64)
+            .bind(AGENT_TELEMETRY_JSON_MAX_BYTES as i64)
             .bind(owner_user_id)
-                .fetch_all(pool)
-                .await?;
+            .fetch_all(pool)
+            .await?;
             Ok(rows
                 .into_iter()
                 .map(|row| AgentSelectorRecord {
@@ -588,11 +603,21 @@ async fn list_owned_agent_records(
         crate::db::DatabaseBackend::Postgres(pool) => {
             let owner_id = uuid::Uuid::parse_str(owner_user_id)?;
             let rows = sqlx::query(
-                "SELECT id::text AS id, name, dashboard_metadata_json, last_info_json, last_state_json FROM agents WHERE owner_user_id = $1 AND revoked_at IS NULL ORDER BY created_at ASC",
+                r#"
+                SELECT id::text AS id, name,
+                       CASE WHEN dashboard_metadata_json IS NOT NULL AND octet_length(dashboard_metadata_json) <= $2 THEN dashboard_metadata_json ELSE NULL END AS dashboard_metadata_json,
+                       CASE WHEN last_info_json IS NOT NULL AND octet_length(last_info_json) <= $3 THEN last_info_json ELSE NULL END AS last_info_json,
+                       CASE WHEN last_state_json IS NOT NULL AND octet_length(last_state_json) <= $3 THEN last_state_json ELSE NULL END AS last_state_json
+                FROM agents
+                WHERE owner_user_id = $1 AND revoked_at IS NULL
+                ORDER BY created_at ASC
+                "#,
             )
             .bind(owner_id)
-                .fetch_all(pool)
-                .await?;
+            .bind(AGENT_DASHBOARD_METADATA_JSON_MAX_BYTES as i64)
+            .bind(AGENT_TELEMETRY_JSON_MAX_BYTES as i64)
+            .fetch_all(pool)
+            .await?;
             Ok(rows
                 .into_iter()
                 .map(|row| AgentSelectorRecord {
@@ -720,14 +745,17 @@ fn agent_matches_tag_filters(record: &AgentSelectorRecord, filters: &[String]) -
 
 fn agent_tags(record: &AgentSelectorRecord) -> HashSet<String> {
     let mut out = HashSet::new();
-    for tag in record
-        .dashboard_metadata_json
-        .as_deref()
-        .into_iter()
-        .chain(record.last_info_json.as_deref())
-        .chain(record.last_state_json.as_deref())
-        .filter_map(|value| serde_json::from_str::<serde_json::Value>(value).ok())
-        .flat_map(|value| tags_from_json_source(&value))
+    let sources = [
+        parse_dashboard_metadata_json::<serde_json::Value>(
+            record.dashboard_metadata_json.as_deref(),
+        ),
+        parse_agent_telemetry_json::<serde_json::Value>(record.last_info_json.as_deref()),
+        parse_agent_telemetry_json::<serde_json::Value>(record.last_state_json.as_deref()),
+    ];
+    for tag in sources
+        .iter()
+        .flatten()
+        .flat_map(|value| tags_from_json_source(value))
     {
         if let Some(tag) = normalize_tag_filter(&tag) {
             out.insert(tag);
@@ -1087,6 +1115,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_tag_selector_ignores_oversized_historical_agent_metadata() {
+        let db = test_db().await;
+        let owner = "00000000-0000-0000-0000-000000000001";
+        let valid_agent = "00000000-0000-0000-0000-000000000201";
+        let dirty_agent = "00000000-0000-0000-0000-000000000202";
+        seed_user(&db, owner, "owner").await;
+        seed_agent(&db, valid_agent, owner, None).await;
+        seed_agent(&db, dirty_agent, owner, None).await;
+        set_agent_dashboard_metadata(&db, valid_agent, r#"{"tags":["prod"]}"#).await;
+        let oversized = format!(
+            r#"{{"tags":["prod"],"padding":"{}"}}"#,
+            "x".repeat(AGENT_DASHBOARD_METADATA_JSON_MAX_BYTES)
+        );
+        set_agent_dashboard_metadata(&db, dirty_agent, &oversized).await;
+        let selector = ServerSelector {
+            tag_names: vec!["prod".into()],
+            ..Default::default()
+        };
+
+        let resolved = resolve_server_ids(&db, &selector, CoverMode::All, owner, None)
+            .await
+            .unwrap();
+
+        assert_eq!(resolved, vec![valid_agent.to_string()]);
+    }
+
+    #[tokio::test]
     async fn notification_channels_skip_invalid_historical_rows() {
         let db = test_db().await;
         let owner = "00000000-0000-0000-0000-000000000001";
@@ -1205,6 +1260,18 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    async fn set_agent_dashboard_metadata(db: &Db, agent_id: &str, metadata: &str) {
+        let Db::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query("UPDATE agents SET dashboard_metadata_json = ? WHERE id = ?")
+            .bind(metadata)
+            .bind(agent_id)
+            .execute(pool)
+            .await
+            .unwrap();
     }
 
     async fn seed_notification_group(db: &Db, id: &str, owner: &str) {

@@ -1,4 +1,8 @@
 use crate::api::types::ApiResponse;
+use crate::api::v1::agent_json::{
+    parse_agent_telemetry_json, parse_dashboard_metadata_json,
+    AGENT_DASHBOARD_METADATA_JSON_MAX_BYTES,
+};
 use crate::api::v1::auth::{AppError, AppState};
 use crate::api::v1::services::SERVICE_MAX_SERVER_IDS;
 use crate::api::v1::settings::{
@@ -181,10 +185,7 @@ pub async fn public_server_detail(
 
     let agent = row.agent;
     let public_note = public_note_from_metadata(&dashboard);
-    let parsed = row
-        .last_state_json
-        .as_deref()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+    let parsed = parse_agent_telemetry_json(row.last_state_json.as_deref());
     let network_rates = network_rates_from_store(&state.metrics, agent.id.0);
     Ok(Json(ApiResponse::success(PublicServerDetailView {
         id: agent.id.0.to_string(),
@@ -359,10 +360,7 @@ async fn public_servers_with_metric_option(
             continue;
         }
         let public_note = public_note_from_metadata(&dashboard);
-        let parsed = row
-            .last_state_json
-            .as_deref()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+        let parsed = parse_agent_telemetry_json(row.last_state_json.as_deref());
         let network_rates = network_rates_from_store(&state.metrics, agent.id.0);
 
         servers.push(PublicServerView {
@@ -410,9 +408,9 @@ async fn public_services(state: &AppState) -> Result<Vec<PublicServiceView>, App
                       JOIN agents a ON a.id = ss.server_id
                       WHERE ss.service_id = s.id
                         AND a.revoked_at IS NULL
-                        AND json_valid(a.dashboard_metadata_json)
-                        AND json_extract(a.dashboard_metadata_json, '$.dashboard_visible') = 1
-                        AND COALESCE(json_extract(a.dashboard_metadata_json, '$.hide_for_guest'), 0) != 1
+                        AND json_valid(CASE WHEN length(CAST(a.dashboard_metadata_json AS BLOB)) <= ? THEN a.dashboard_metadata_json END)
+                        AND json_extract(CASE WHEN length(CAST(a.dashboard_metadata_json AS BLOB)) <= ? THEN a.dashboard_metadata_json END, '$.dashboard_visible') = 1
+                        AND COALESCE(json_extract(CASE WHEN length(CAST(a.dashboard_metadata_json AS BLOB)) <= ? THEN a.dashboard_metadata_json END, '$.hide_for_guest'), 0) != 1
                     )
                     OR (
                       NOT EXISTS (SELECT 1 FROM service_servers ss WHERE ss.service_id = s.id)
@@ -421,9 +419,9 @@ async fn public_services(state: &AppState) -> Result<Vec<PublicServiceView>, App
                         FROM agents a
                         WHERE a.id = s.server_id
                           AND a.revoked_at IS NULL
-                          AND json_valid(a.dashboard_metadata_json)
-                          AND json_extract(a.dashboard_metadata_json, '$.dashboard_visible') = 1
-                          AND COALESCE(json_extract(a.dashboard_metadata_json, '$.hide_for_guest'), 0) != 1
+                          AND json_valid(CASE WHEN length(CAST(a.dashboard_metadata_json AS BLOB)) <= ? THEN a.dashboard_metadata_json END)
+                          AND json_extract(CASE WHEN length(CAST(a.dashboard_metadata_json AS BLOB)) <= ? THEN a.dashboard_metadata_json END, '$.dashboard_visible') = 1
+                          AND COALESCE(json_extract(CASE WHEN length(CAST(a.dashboard_metadata_json AS BLOB)) <= ? THEN a.dashboard_metadata_json END, '$.hide_for_guest'), 0) != 1
                       )
                     )
                   )
@@ -431,6 +429,12 @@ async fn public_services(state: &AppState) -> Result<Vec<PublicServiceView>, App
                 LIMIT ?
                 "#,
             )
+            .bind(AGENT_DASHBOARD_METADATA_JSON_MAX_BYTES as i64)
+            .bind(AGENT_DASHBOARD_METADATA_JSON_MAX_BYTES as i64)
+            .bind(AGENT_DASHBOARD_METADATA_JSON_MAX_BYTES as i64)
+            .bind(AGENT_DASHBOARD_METADATA_JSON_MAX_BYTES as i64)
+            .bind(AGENT_DASHBOARD_METADATA_JSON_MAX_BYTES as i64)
+            .bind(AGENT_DASHBOARD_METADATA_JSON_MAX_BYTES as i64)
             .bind(PUBLIC_STATUS_SERVICE_LIMIT)
             .fetch_all(pool)
             .await
@@ -565,13 +569,16 @@ async fn public_agent_rows(state: &AppState, limit: i64) -> Result<Vec<AgentWith
                        last_info_json, last_info_at
                 FROM agents
                 WHERE revoked_at IS NULL
-                  AND json_valid(dashboard_metadata_json)
-                  AND json_extract(dashboard_metadata_json, '$.dashboard_visible') = 1
-                  AND COALESCE(json_extract(dashboard_metadata_json, '$.hide_for_guest'), 0) != 1
+                  AND json_valid(CASE WHEN length(CAST(dashboard_metadata_json AS BLOB)) <= ? THEN dashboard_metadata_json END)
+                  AND json_extract(CASE WHEN length(CAST(dashboard_metadata_json AS BLOB)) <= ? THEN dashboard_metadata_json END, '$.dashboard_visible') = 1
+                  AND COALESCE(json_extract(CASE WHEN length(CAST(dashboard_metadata_json AS BLOB)) <= ? THEN dashboard_metadata_json END, '$.hide_for_guest'), 0) != 1
                 ORDER BY created_at DESC
                 LIMIT ?
                 "#,
             )
+            .bind(AGENT_DASHBOARD_METADATA_JSON_MAX_BYTES as i64)
+            .bind(AGENT_DASHBOARD_METADATA_JSON_MAX_BYTES as i64)
+            .bind(AGENT_DASHBOARD_METADATA_JSON_MAX_BYTES as i64)
             .bind(limit)
             .fetch_all(pool)
             .await
@@ -603,12 +610,14 @@ async fn public_agent_rows_postgres(
                    last_state_json, last_state_at::text, last_info_json, last_info_at::text
             FROM agents
             WHERE revoked_at IS NULL
+              AND octet_length(dashboard_metadata_json) <= $3
             ORDER BY created_at DESC
             LIMIT $1 OFFSET $2
             "#,
         )
         .bind(PUBLIC_POSTGRES_SCAN_BATCH)
         .bind(offset)
+        .bind(AGENT_DASHBOARD_METADATA_JSON_MAX_BYTES as i64)
         .fetch_all(pool)
         .await
         .map_err(|e| AppError::Database(e.into()))?;
@@ -1596,9 +1605,7 @@ fn json_f64(value: &serde_json::Value) -> Option<f64> {
 }
 
 fn dashboard_metadata(stored: Option<&str>) -> DashboardMetadata {
-    let mut out = stored
-        .and_then(|value| serde_json::from_str::<DashboardMetadata>(value).ok())
-        .unwrap_or_default();
+    let mut out = parse_dashboard_metadata_json::<DashboardMetadata>(stored).unwrap_or_default();
 
     out.public_note = out
         .public_note
@@ -1696,6 +1703,30 @@ mod tests {
                 "{hidden_field} must not be serialized in public server view"
             );
         }
+    }
+
+    #[test]
+    fn public_dashboard_metadata_is_bounded_at_read_time() {
+        let oversized = format!(
+            r#"{{"dashboard_visible":true,"public_note":"{}"}}"#,
+            "x".repeat(AGENT_DASHBOARD_METADATA_JSON_MAX_BYTES)
+        );
+        let metadata = dashboard_metadata(Some(&oversized));
+
+        assert!(!visible_to_public(&metadata));
+        assert!(metadata.public_note.is_none());
+    }
+
+    #[test]
+    fn public_resources_ignore_oversized_historical_telemetry() {
+        let oversized = format!(
+            r#"{{"cpu_percent":42,"padding":"{}"}}"#,
+            "x".repeat(crate::api::v1::agent_json::AGENT_TELEMETRY_JSON_MAX_BYTES)
+        );
+        let parsed = parse_agent_telemetry_json::<serde_json::Value>(Some(&oversized));
+
+        assert!(parsed.is_none());
+        assert!(public_resources_from_state(parsed.as_ref(), (None, None)).is_none());
     }
 
     #[test]
@@ -1913,6 +1944,45 @@ mod tests {
             )
             .await;
         }
+
+        let servers = public_servers(&state).await.unwrap();
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].id, public_server);
+    }
+
+    #[tokio::test]
+    async fn public_servers_skip_oversized_historical_dashboard_metadata_in_sql() {
+        let state = test_state_with_public_site(true).await;
+        let DatabaseBackend::Sqlite(pool) = &state.db else {
+            unreachable!();
+        };
+        let owner = Uuid::now_v7().to_string();
+        seed_public_user(pool, &owner).await;
+        let public_server = Uuid::now_v7().to_string();
+        seed_public_agent(
+            pool,
+            &public_server,
+            &owner,
+            "public-server",
+            true,
+            false,
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+        let oversized = format!(
+            r#"{{"dashboard_visible":true,"hide_for_guest":false,"public_note":"{}"}}"#,
+            "x".repeat(AGENT_DASHBOARD_METADATA_JSON_MAX_BYTES)
+        );
+        seed_public_agent_with_metadata(
+            pool,
+            &Uuid::now_v7().to_string(),
+            &owner,
+            "oversized-public-server",
+            &oversized,
+            "2026-01-02T00:00:00Z",
+        )
+        .await;
 
         let servers = public_servers(&state).await.unwrap();
 
@@ -2379,6 +2449,28 @@ mod tests {
         .bind(created_at)
         .bind(created_at)
         .bind(metadata)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_public_agent_with_metadata(
+        pool: &sqlx::SqlitePool,
+        agent_id: &str,
+        owner_id: &str,
+        name: &str,
+        dashboard_metadata_json: &str,
+        created_at: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO agents (id, name, public_key, owner_user_id, created_at, updated_at, dashboard_metadata_json) VALUES (?, ?, 'pk', ?, ?, ?, ?)",
+        )
+        .bind(agent_id)
+        .bind(name)
+        .bind(owner_id)
+        .bind(created_at)
+        .bind(created_at)
+        .bind(dashboard_metadata_json)
         .execute(pool)
         .await
         .unwrap();
