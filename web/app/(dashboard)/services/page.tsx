@@ -20,7 +20,7 @@ import {
   tdClass,
   thClass,
 } from "@/app/components/M7Primitives";
-import { apiClient, type JsonObject } from "@/lib/api";
+import { apiClient, type JsonObject, type TotpStatusResponse } from "@/lib/api";
 
 type ServiceKind = "http" | "tcp" | "icmp";
 type ServiceCoverMode = "local" | "all" | "specific" | "exclude";
@@ -91,6 +91,7 @@ export default function ServicesPage() {
   const [modal, setModal] = useState<"create" | "edit" | null>(null);
   const [editing, setEditing] = useState<Service | null>(null);
   const [form, setForm] = useState<ServiceForm>(blankForm);
+  const [totpStatus, setTotpStatus] = useState<TotpStatusResponse | null>(null);
   const [probeResult, setProbeResult] = useState<string | null>(null);
   const [query, setQuery] = useState("");
 
@@ -183,13 +184,37 @@ export default function ServicesPage() {
     }
   }
 
+  async function sensitiveTotpCode(): Promise<string | undefined | null> {
+    let enabled = totpStatus?.enabled;
+    if (totpStatus === null) {
+      const response = await apiClient.getTotpStatus();
+      if (!response.success || !response.data) {
+        setError(responseError(response));
+        return null;
+      }
+      setTotpStatus(response.data);
+      enabled = response.data.enabled;
+    }
+    if (!enabled) return undefined;
+    const code = window.prompt("请输入 6 位 TOTP 验证码");
+    if (code === null) return null;
+    const trimmed = code.trim();
+    if (!/^\d{6}$/.test(trimmed)) {
+      setError("请输入 6 位 TOTP 验证码。");
+      return null;
+    }
+    return trimmed;
+  }
+
   async function testProbe() {
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
     setTesting(true);
     const response = await apiClient.testProbe({
       service_type: form.service_type,
       target: form.target.trim(),
       timeout_seconds: Number(form.timeout_seconds),
-    });
+    }, totpCode);
     setTesting(false);
     if (response.success && response.data) {
       const status = response.data.success ? "成功" : "失败";

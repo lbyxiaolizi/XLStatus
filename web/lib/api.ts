@@ -1133,9 +1133,13 @@ class ApiClient {
     });
   }
 
-  async testProbe(probe: JsonObject): Promise<ApiResponse<ProbeTestResponse>> {
+  async testProbe(
+    probe: JsonObject,
+    totpCode?: string,
+  ): Promise<ApiResponse<ProbeTestResponse>> {
     return this.request<ProbeTestResponse>("/api/v1/services/test-probe", {
       method: "POST",
+      headers: this.sensitiveHeaders(totpCode),
       body: JSON.stringify(probe),
     });
   }

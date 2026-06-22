@@ -1,15 +1,16 @@
 use crate::api::types::*;
-use crate::api::v1::auth::{AppError, AppState};
+use crate::api::v1::auth::{require_sensitive_totp, AppError, AppState};
 use crate::api::v1::notifications::ensure_notification_group_owned_by;
 use crate::api::v1::servers::agent_visible;
 use crate::api::v1::tasks::{ensure_task_ids_visible_to_auth_session, require_task_uuid_text};
-use crate::auth::middleware::AuthSession;
+use crate::auth::middleware::{AuthKind, AuthSession};
 use crate::auth::rbac::has_scope;
-use crate::db::AgentRepository;
+use crate::db::{AgentRepository, DatabaseBackend};
 use crate::security::{validate_outbound_host, validate_outbound_url};
 use crate::services::{probe_http, probe_icmp, probe_tcp, ProbeType};
 use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
+    http::HeaderMap,
     Json,
 };
 use chrono::Utc;
@@ -519,11 +520,12 @@ pub async fn delete_service(
 }
 
 pub async fn test_probe(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     auth: AuthSession,
+    headers: HeaderMap,
     Json(req): Json<ProbeTestRequest>,
 ) -> Result<Json<ApiResponse<ProbeTestResponse>>, AppError> {
-    require_probe_test_scope(&auth)?;
+    require_probe_test_scope(&state.db, &auth, &headers).await?;
 
     let timeout = normalize_probe_timeout(req.timeout_seconds)? as u64;
 
@@ -1587,8 +1589,18 @@ fn require_scope(auth: &AuthSession, scope: &str) -> Result<(), AppError> {
     }
 }
 
-fn require_probe_test_scope(auth: &AuthSession) -> Result<(), AppError> {
-    require_scope(auth, "service:write")
+async fn require_probe_test_scope(
+    db: &DatabaseBackend,
+    auth: &AuthSession,
+    headers: &HeaderMap,
+) -> Result<(), AppError> {
+    require_scope(auth, "service:write")?;
+    if matches!(auth.auth_kind, AuthKind::PersonalAccessToken) {
+        return Err(AppError::Forbidden(
+            "service test probe requires a cookie session".into(),
+        ));
+    }
+    require_sensitive_totp(db, auth.user_id, headers).await
 }
 
 fn db_err(err: sqlx::Error) -> AppError {
@@ -1928,15 +1940,44 @@ mod tests {
         assert!(matches!(err, AppError::Forbidden(_)));
     }
 
-    #[test]
-    fn probe_test_requires_service_write_scope() {
+    #[tokio::test]
+    async fn probe_test_rejects_pat_session() {
+        let db = test_db().await;
         let admin = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
-        let read_only = admin_pat_session_with_scopes(admin, vec!["service:read".into()]);
-        let writer = admin_pat_session_with_scopes(admin, vec!["service:write".into()]);
+        let auth = admin_pat_session_with_scopes(admin, vec!["service:write".into()]);
 
-        let err = require_probe_test_scope(&read_only).unwrap_err();
+        let err = require_probe_test_scope(&db, &auth, &HeaderMap::new())
+            .await
+            .unwrap_err();
+
         assert!(matches!(err, AppError::Forbidden(_)));
-        assert!(require_probe_test_scope(&writer).is_ok());
+    }
+
+    #[tokio::test]
+    async fn probe_test_requires_sensitive_totp_when_enabled() {
+        let db = test_db().await;
+        let admin = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        seed_user(&db, admin, "admin", "admin").await;
+        seed_totp_enabled_user(&db, admin).await;
+        let auth = admin_cookie_session(admin);
+
+        let err = require_probe_test_scope(&db, &auth, &HeaderMap::new())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn probe_test_allows_cookie_session_without_totp() {
+        let db = test_db().await;
+        let admin = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        seed_user(&db, admin, "admin", "admin").await;
+        let auth = admin_cookie_session(admin);
+
+        require_probe_test_scope(&db, &auth, &HeaderMap::new())
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -2139,6 +2180,20 @@ mod tests {
         }
     }
 
+    fn admin_cookie_session(user_id: Uuid) -> AuthSession {
+        AuthSession {
+            session_id: "sess".into(),
+            user_id: UserId(user_id),
+            username: "admin".into(),
+            role: UserRole::Admin,
+            csrf_token: "csrf".into(),
+            auth_kind: AuthKind::Session,
+            scopes: vec!["service:write".into()],
+            server_ids: None,
+            pat_id: None,
+        }
+    }
+
     fn valid_service_input() -> ValidServiceInput {
         ValidServiceInput {
             name: "svc".into(),
@@ -2170,6 +2225,18 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    async fn seed_totp_enabled_user(db: &DatabaseBackend, id: Uuid) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query("UPDATE users SET totp_secret = ?, totp_enabled = 1 WHERE id = ?")
+            .bind("totp-secret")
+            .bind(id.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
     }
 
     async fn seed_agent(db: &DatabaseBackend, id: Uuid, owner: Uuid, name: &str) {
