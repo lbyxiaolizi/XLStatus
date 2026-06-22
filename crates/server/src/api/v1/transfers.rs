@@ -28,6 +28,7 @@ use crate::grpc::{base64_encoded_len, ensure_task_result_text_within};
 
 const TEMP_TRANSFER_MAX_BYTES: usize = 100 * 1024 * 1024;
 const TEMP_TRANSFER_MAX_QUERY_BYTES: usize = 512;
+const TEMP_TRANSFER_UUID_TEXT_LEN: usize = 36;
 const DOWNLOAD_TIMEOUT_SECS: u64 = 60;
 const UPLOAD_TIMEOUT_SECS: u64 = 120;
 const TEMP_TRANSFER_RATE_LIMIT: u32 = 10;
@@ -123,6 +124,7 @@ pub async fn revoke_temporary_transfer(
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<RevokeTemporaryTransferResponse>>, crate::api::v1::auth::AppError> {
     require_transfer_scope_app(&auth, "transfer:write")?;
+    let id = require_temporary_transfer_uuid_text(&id, "temporary_transfer_token_id")?;
     let repo = TemporaryTransferTokenRepository::new(state.db.clone());
     let record = repo
         .find_by_id(&id)
@@ -212,6 +214,31 @@ fn require_transfer_scope_app(
             "missing scope: {scope}"
         )))
     }
+}
+
+fn require_temporary_transfer_uuid_text(
+    value: &str,
+    field: &str,
+) -> Result<String, crate::api::v1::auth::AppError> {
+    if value.is_empty() {
+        return Err(crate::api::v1::auth::AppError::BadRequest(format!(
+            "{field} is required"
+        )));
+    }
+    if value.len() != TEMP_TRANSFER_UUID_TEXT_LEN {
+        return Err(crate::api::v1::auth::AppError::BadRequest(format!(
+            "{field} must be a canonical UUID"
+        )));
+    }
+    let parsed = uuid::Uuid::parse_str(value).map_err(|_| {
+        crate::api::v1::auth::AppError::BadRequest(format!("{field} must be a canonical UUID"))
+    })?;
+    if parsed.to_string() != value {
+        return Err(crate::api::v1::auth::AppError::BadRequest(format!(
+            "{field} must be a canonical UUID"
+        )));
+    }
+    Ok(value.to_string())
 }
 
 pub async fn temp_upload(
@@ -1081,6 +1108,30 @@ mod tests {
     }
 
     #[test]
+    fn temporary_transfer_management_ids_require_canonical_uuid_text() {
+        let canonical = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        assert_eq!(
+            require_temporary_transfer_uuid_text(canonical, "temporary_transfer_token_id").unwrap(),
+            canonical
+        );
+
+        for token_id in [
+            "token-a",
+            " aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa ",
+            "aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaaaaaa",
+            "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaax",
+        ] {
+            assert!(
+                require_temporary_transfer_uuid_text(token_id, "temporary_transfer_token_id")
+                    .is_err(),
+                "{token_id:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn temporary_transfer_responses_are_not_cacheable() {
         let headers = temporary_download_headers(42, "secret.txt").unwrap();
         assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
@@ -1198,6 +1249,76 @@ mod tests {
         assert!(stored.used_at.is_none());
         assert!(stored.used_ip.is_none());
         assert!(stored.used_status.is_none());
+    }
+
+    #[tokio::test]
+    async fn revoke_temporary_transfer_rejects_historical_text_ids_before_sql() {
+        let state = test_state().await;
+        let user = UserRepository::new(state.db.clone())
+            .create(CreateUserInput {
+                username: "owner".into(),
+                password: "secret-password".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        let agent = AgentRepository::new(state.db.clone())
+            .create(CreateAgentInput {
+                name: "agent".into(),
+                public_key: "public".into(),
+                owner_user_id: user.id,
+            })
+            .await
+            .unwrap();
+        let pool = state.db.sqlite_pool().unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO temporary_transfer_tokens
+            (id, token_hash, server_id, path, op, issued_by_user_id, auth_kind,
+             scope, expires_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("dirty-token-id")
+        .bind(hash_token("xlt_dirty"))
+        .bind(agent.id.0.to_string())
+        .bind("/tmp/file.txt")
+        .bind("download")
+        .bind(user.id.0.to_string())
+        .bind("session")
+        .bind("transfer:read")
+        .bind((Utc::now() + Duration::minutes(5)).to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let err = revoke_temporary_transfer(
+            State(state.clone()),
+            AuthSession {
+                session_id: "session".into(),
+                user_id: user.id,
+                username: "owner".into(),
+                role: UserRole::Admin,
+                csrf_token: "csrf".into(),
+                auth_kind: AuthKind::Session,
+                scopes: Vec::new(),
+                server_ids: None,
+                pat_id: None,
+            },
+            Path("dirty-token-id".into()),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, crate::api::v1::auth::AppError::BadRequest(_)));
+
+        let revoked_at: Option<String> =
+            sqlx::query_scalar("SELECT revoked_at FROM temporary_transfer_tokens WHERE id = ?")
+                .bind("dirty-token-id")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert!(revoked_at.is_none());
     }
 
     async fn test_state() -> AppState {
