@@ -23,6 +23,7 @@ use tokio::sync::Mutex;
 static CLOUDFLARED: Lazy<Mutex<CloudflaredProcess>> =
     Lazy::new(|| Mutex::new(CloudflaredProcess::default()));
 const CLOUDFLARED_TOKEN_MAX_BODY_BYTES: usize = 16 * 1024;
+const CLOUDFLARED_TOKEN_ENV: &str = "TUNNEL_TOKEN";
 
 #[derive(Default)]
 struct CloudflaredProcess {
@@ -111,14 +112,7 @@ pub async fn start_cloudflared(
         })));
     }
 
-    let mut child = Command::new("cloudflared")
-        .arg("tunnel")
-        .arg("--no-autoupdate")
-        .arg("run")
-        .arg("--token")
-        .arg(token)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+    let mut child = cloudflared_run_command(&token)
         .spawn()
         .map_err(|e| AppError::BadRequest(format!("failed to start cloudflared: {e}")))?;
 
@@ -198,6 +192,18 @@ fn refresh_process(process: &mut CloudflaredProcess) {
     }
 }
 
+fn cloudflared_run_command(token: &str) -> Command {
+    let mut command = Command::new("cloudflared");
+    command
+        .arg("tunnel")
+        .arg("--no-autoupdate")
+        .arg("run")
+        .env(CLOUDFLARED_TOKEN_ENV, token)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
 async fn read_cloudflared_logs<R>(stream_name: &'static str, stream: R)
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -245,14 +251,35 @@ fn require_admin_cookie_session(auth: &AuthSession) -> Result<(), AppError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cloudflared_token_body_limit, require_admin_cookie_session, AppError};
+    use super::{
+        cloudflared_run_command, cloudflared_token_body_limit, require_admin_cookie_session,
+        AppError,
+    };
     use crate::auth::middleware::{AuthKind, AuthSession};
+    use std::ffi::OsStr;
     use xlstatus_shared::{UserId, UserRole};
 
     #[test]
     fn cloudflared_token_body_budget_is_explicit() {
         let _ = cloudflared_token_body_limit();
         assert_eq!(super::CLOUDFLARED_TOKEN_MAX_BODY_BYTES, 16 * 1024);
+    }
+
+    #[test]
+    fn cloudflared_start_keeps_token_out_of_process_arguments() {
+        let token = "secret-cloudflare-tunnel-token";
+        let command = cloudflared_run_command(token);
+        let std_command = command.as_std();
+        let args: Vec<String> = std_command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(args, vec!["tunnel", "--no-autoupdate", "run"]);
+        assert!(!args.iter().any(|arg| arg.contains(token)));
+        assert!(std_command.get_envs().any(|(key, value)| {
+            key == OsStr::new(super::CLOUDFLARED_TOKEN_ENV) && value == Some(OsStr::new(token))
+        }));
     }
 
     #[test]
