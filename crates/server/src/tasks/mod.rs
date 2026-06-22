@@ -620,9 +620,20 @@ async fn list_group_agent_ids(
         crate::db::DatabaseBackend::Sqlite(pool) => {
             for group_id in group_ids {
                 let rows = sqlx::query(
-                    "SELECT sgm.agent_id FROM server_group_members sgm JOIN server_groups sg ON sg.id = sgm.group_id WHERE sg.id = ? AND sg.owner_user_id = ? ORDER BY sgm.created_at ASC",
+                    r#"
+                    SELECT sgm.agent_id
+                    FROM server_group_members sgm
+                    JOIN server_groups sg ON sg.id = sgm.group_id
+                    JOIN agents a ON a.id = sgm.agent_id
+                    WHERE sg.id = ?
+                      AND sg.owner_user_id = ?
+                      AND a.owner_user_id = ?
+                      AND a.revoked_at IS NULL
+                    ORDER BY sgm.created_at ASC
+                    "#,
                 )
                 .bind(group_id)
+                .bind(owner_user_id)
                 .bind(owner_user_id)
                 .fetch_all(pool)
                 .await?;
@@ -639,7 +650,17 @@ async fn list_group_agent_ids(
                     continue;
                 };
                 let rows = sqlx::query(
-                    "SELECT sgm.agent_id::text AS agent_id FROM server_group_members sgm JOIN server_groups sg ON sg.id = sgm.group_id WHERE sg.id = $1 AND sg.owner_user_id = $2 ORDER BY sgm.created_at ASC",
+                    r#"
+                    SELECT sgm.agent_id::text AS agent_id
+                    FROM server_group_members sgm
+                    JOIN server_groups sg ON sg.id = sgm.group_id
+                    JOIN agents a ON a.id = sgm.agent_id
+                    WHERE sg.id = $1
+                      AND sg.owner_user_id = $2
+                      AND a.owner_user_id = $2
+                      AND a.revoked_at IS NULL
+                    ORDER BY sgm.created_at ASC
+                    "#,
                 )
                 .bind(group_uuid)
                 .bind(owner_id)
@@ -1047,6 +1068,33 @@ mod tests {
         assert_eq!(result.error.len(), TASK_RESULT_ERROR_MAX_BYTES);
     }
 
+    #[tokio::test]
+    async fn task_group_selector_ignores_cross_owner_and_revoked_dirty_members() {
+        let db = test_db().await;
+        let owner = "00000000-0000-0000-0000-000000000001";
+        let other = "00000000-0000-0000-0000-000000000002";
+        let group_id = "00000000-0000-0000-0000-000000000101";
+        let owner_agent = "00000000-0000-0000-0000-000000000201";
+        let other_agent = "00000000-0000-0000-0000-000000000202";
+        let revoked_agent = "00000000-0000-0000-0000-000000000203";
+
+        seed_user(&db, owner, "owner").await;
+        seed_user(&db, other, "other").await;
+        seed_agent(&db, owner_agent, owner, None).await;
+        seed_agent(&db, other_agent, other, None).await;
+        seed_agent(&db, revoked_agent, owner, Some("2026-01-02T00:00:00Z")).await;
+        seed_server_group(&db, group_id, owner).await;
+        seed_server_group_member(&db, group_id, owner_agent).await;
+        seed_server_group_member(&db, group_id, other_agent).await;
+        seed_server_group_member(&db, group_id, revoked_agent).await;
+
+        let resolved = list_group_agent_ids(&db, owner, &[group_id.to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(resolved, vec![owner_agent.to_string()]);
+    }
+
     async fn test_db() -> Db {
         let db = Db::connect("sqlite::memory:", true).await.unwrap();
         db.run_migrations().await.unwrap();
@@ -1062,6 +1110,50 @@ mod tests {
         )
         .bind(id)
         .bind(username)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_agent(db: &Db, id: &str, owner: &str, revoked_at: Option<&str>) {
+        let Db::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO agents (id, name, public_key, owner_user_id, revoked_at, created_at, updated_at) VALUES (?, ?, 'pk', ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(format!("agent-{id}"))
+        .bind(owner)
+        .bind(revoked_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_server_group(db: &Db, id: &str, owner: &str) {
+        let Db::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO server_groups (id, owner_user_id, name, created_at, updated_at) VALUES (?, ?, 'group', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(owner)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_server_group_member(db: &Db, group_id: &str, agent_id: &str) {
+        let Db::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO server_group_members (group_id, agent_id, created_at) VALUES (?, ?, '2026-01-01T00:00:00Z')",
+        )
+        .bind(group_id)
+        .bind(agent_id)
         .execute(pool)
         .await
         .unwrap();
