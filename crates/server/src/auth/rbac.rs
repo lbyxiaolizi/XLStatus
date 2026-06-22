@@ -59,6 +59,13 @@ pub const NON_ADMIN_PAT_DENIED_SCOPES: &[&str] = &[
 pub const SERVER_SCOPED_PAT_NAMESPACES: &[&str] =
     &["server", "service", "alert", "task", "nat", "transfer"];
 
+pub const PAT_RUNTIME_MAX_SCOPES: usize = 64;
+pub const PAT_RUNTIME_MAX_SCOPE_BYTES: usize = 128;
+pub const PAT_RUNTIME_MAX_SERVER_IDS: usize = 64;
+pub const PAT_RUNTIME_MAX_SERVER_ID_BYTES: usize = 64;
+pub const PAT_RUNTIME_SCOPES_JSON_MAX_BYTES: usize = 16 * 1024;
+pub const PAT_RUNTIME_SERVER_IDS_JSON_MAX_BYTES: usize = 8 * 1024;
+
 fn known_scope_namespace(namespace: &str) -> bool {
     KNOWN_SCOPES.iter().any(|scope| {
         scope
@@ -80,9 +87,7 @@ fn namespace_contains_non_admin_denied_scope(namespace: &str) -> bool {
 /// Validate that a list of PAT scopes only contains known scope names and is
 /// well-formed. `admin:*` is only usable by Admin users.
 pub fn validate_pat_scopes(scopes: &[String], is_admin: bool) -> Result<(), String> {
-    if scopes.is_empty() {
-        return Err("scopes must not be empty".to_string());
-    }
+    validate_pat_scope_resource_limits(scopes)?;
 
     for scope in scopes {
         if scope == "*" {
@@ -128,6 +133,35 @@ pub fn validate_pat_scopes(scopes: &[String], is_admin: bool) -> Result<(), Stri
     }
 
     Ok(())
+}
+
+fn validate_pat_scope_resource_limits(scopes: &[String]) -> Result<(), String> {
+    if scopes.is_empty() {
+        return Err("scopes must not be empty".to_string());
+    }
+    if scopes.len() > PAT_RUNTIME_MAX_SCOPES {
+        return Err(format!(
+            "scopes must contain at most {PAT_RUNTIME_MAX_SCOPES} items"
+        ));
+    }
+
+    for scope in scopes {
+        if scope.len() > PAT_RUNTIME_MAX_SCOPE_BYTES {
+            return Err(format!(
+                "scope must be at most {PAT_RUNTIME_MAX_SCOPE_BYTES} bytes"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+pub fn validate_pat_policy_resource_limits(
+    scopes: &[String],
+    server_ids: Option<&[String]>,
+) -> Result<(), String> {
+    validate_pat_scope_resource_limits(scopes)?;
+    validate_server_ids(server_ids)
 }
 
 fn pat_scope_grants(stored_scope: &str, required_scope: &str, is_admin: bool) -> bool {
@@ -203,7 +237,18 @@ pub fn validate_server_ids(server_ids: Option<&[String]>) -> Result<(), String> 
         return Ok(());
     };
 
+    if ids.len() > PAT_RUNTIME_MAX_SERVER_IDS {
+        return Err(format!(
+            "server allowlist must contain at most {PAT_RUNTIME_MAX_SERVER_IDS} items"
+        ));
+    }
+
     for id in ids {
+        if id.len() > PAT_RUNTIME_MAX_SERVER_ID_BYTES {
+            return Err(format!(
+                "server id in allowlist must be at most {PAT_RUNTIME_MAX_SERVER_ID_BYTES} bytes"
+            ));
+        }
         uuid::Uuid::parse_str(id).map_err(|_| format!("invalid server id in allowlist: {}", id))?;
     }
 
@@ -344,6 +389,32 @@ mod tests {
     }
 
     #[test]
+    fn validate_pat_runtime_resource_limits_are_explicit() {
+        assert_eq!(PAT_RUNTIME_MAX_SCOPES, 64);
+        assert_eq!(PAT_RUNTIME_MAX_SCOPE_BYTES, 128);
+        assert_eq!(PAT_RUNTIME_MAX_SERVER_IDS, 64);
+        assert_eq!(PAT_RUNTIME_MAX_SERVER_ID_BYTES, 64);
+        assert_eq!(PAT_RUNTIME_SCOPES_JSON_MAX_BYTES, 16 * 1024);
+        assert_eq!(PAT_RUNTIME_SERVER_IDS_JSON_MAX_BYTES, 8 * 1024);
+    }
+
+    #[test]
+    fn validate_pat_runtime_rejects_oversized_scope_lists() {
+        let scopes = (0..=PAT_RUNTIME_MAX_SCOPES)
+            .map(|_| "notification:read".to_string())
+            .collect::<Vec<_>>();
+
+        assert!(validate_pat_runtime(&scopes, true, None).is_err());
+    }
+
+    #[test]
+    fn validate_pat_runtime_rejects_oversized_scope_values() {
+        let scopes = vec!["x".repeat(PAT_RUNTIME_MAX_SCOPE_BYTES + 1)];
+
+        assert!(validate_pat_runtime(&scopes, true, None).is_err());
+    }
+
+    #[test]
     fn validate_pat_scopes_rejects_bare_wildcard() {
         let s = vec!["*".to_string()];
         assert!(validate_pat_scopes(&s, true).is_err());
@@ -444,6 +515,16 @@ mod tests {
         assert!(validate_pat_runtime(&scopes, false, None).is_err());
     }
 
+    #[test]
+    fn validate_pat_runtime_rejects_oversized_server_allowlists() {
+        let scopes = vec!["notification:read".to_string()];
+        let server_ids = (0..=PAT_RUNTIME_MAX_SERVER_IDS)
+            .map(|idx| uuid::Uuid::from_u128(idx as u128 + 1).to_string())
+            .collect::<Vec<_>>();
+
+        assert!(validate_pat_runtime(&scopes, true, Some(&server_ids)).is_err());
+    }
+
     // ---- validate_server_ids ----
 
     #[test]
@@ -466,6 +547,12 @@ mod tests {
     #[test]
     fn validate_server_ids_rejects_non_uuid() {
         let v = vec!["not-a-uuid".to_string()];
+        assert!(validate_server_ids(Some(&v)).is_err());
+    }
+
+    #[test]
+    fn validate_server_ids_rejects_oversized_id_text() {
+        let v = vec!["a".repeat(PAT_RUNTIME_MAX_SERVER_ID_BYTES + 1)];
         assert!(validate_server_ids(Some(&v)).is_err());
     }
 

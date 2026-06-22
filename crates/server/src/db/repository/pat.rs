@@ -1,6 +1,11 @@
 #![allow(dead_code)]
 #![allow(unused)]
 
+use crate::auth::rbac::{
+    validate_pat_policy_resource_limits, PAT_RUNTIME_MAX_SCOPES, PAT_RUNTIME_MAX_SCOPE_BYTES,
+    PAT_RUNTIME_MAX_SERVER_IDS, PAT_RUNTIME_MAX_SERVER_ID_BYTES, PAT_RUNTIME_SCOPES_JSON_MAX_BYTES,
+    PAT_RUNTIME_SERVER_IDS_JSON_MAX_BYTES,
+};
 use crate::db::{CreatePATInput, DatabaseBackend, PersonalAccessToken};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -542,9 +547,15 @@ fn row_to_pat_sqlite(
     revoked_at: Option<String>,
 ) -> Result<PersonalAccessToken> {
     let user_id = UserId(parse_pat_uuid(&user_id_str, "user_id")?);
-    let scopes = serde_json::from_str(&scopes_json)
+    let scopes = parse_string_array_json(&scopes_json, "scopes", PAT_RUNTIME_SCOPES_JSON_MAX_BYTES)
         .with_context(|| format!("invalid PAT scopes JSON for {id}"))?;
-    let server_ids = parse_optional_string_array_json(server_ids_json.as_deref(), "server_ids")?;
+    let server_ids = parse_optional_string_array_json(
+        server_ids_json.as_deref(),
+        "server_ids",
+        PAT_RUNTIME_SERVER_IDS_JSON_MAX_BYTES,
+    )?;
+    validate_pat_policy_resource_limits(&scopes, server_ids.as_deref())
+        .map_err(|msg| anyhow::anyhow!("invalid PAT runtime policy for {id}: {msg}"))?;
     Ok(PersonalAccessToken {
         id,
         user_id,
@@ -573,14 +584,26 @@ fn row_to_pat_postgres(
     created_at: DateTime<Utc>,
     revoked_at: Option<DateTime<Utc>>,
 ) -> Result<PersonalAccessToken> {
-    let scopes = serde_json::from_value(scopes_json)
-        .with_context(|| format!("invalid PAT scopes JSON for {id}"))?;
+    let scopes = parse_string_array_value(
+        scopes_json,
+        "scopes",
+        PAT_RUNTIME_SCOPES_JSON_MAX_BYTES,
+        PAT_RUNTIME_MAX_SCOPES,
+        PAT_RUNTIME_MAX_SCOPE_BYTES,
+    )
+    .with_context(|| format!("invalid PAT scopes JSON for {id}"))?;
     let server_ids = match server_ids_json {
-        Some(value) => {
-            Some(serde_json::from_value(value).with_context(|| "invalid PAT server_ids JSON")?)
-        }
+        Some(value) => Some(parse_string_array_value(
+            value,
+            "server_ids",
+            PAT_RUNTIME_SERVER_IDS_JSON_MAX_BYTES,
+            PAT_RUNTIME_MAX_SERVER_IDS,
+            PAT_RUNTIME_MAX_SERVER_ID_BYTES,
+        )?),
         None => None,
     };
+    validate_pat_policy_resource_limits(&scopes, server_ids.as_deref())
+        .map_err(|msg| anyhow::anyhow!("invalid PAT runtime policy for {id}: {msg}"))?;
     Ok(PersonalAccessToken {
         id,
         user_id,
@@ -599,13 +622,52 @@ fn row_to_pat_postgres(
 fn parse_optional_string_array_json(
     value: Option<&str>,
     field: &str,
+    max_bytes: usize,
 ) -> Result<Option<Vec<String>>> {
     match value {
-        Some(value) => serde_json::from_str(value)
-            .map(Some)
-            .with_context(|| format!("invalid PAT {field} JSON")),
+        Some(value) => parse_string_array_json(value, field, max_bytes).map(Some),
         None => Ok(None),
     }
+}
+
+fn parse_string_array_json(value: &str, field: &str, max_bytes: usize) -> Result<Vec<String>> {
+    if value.len() > max_bytes {
+        anyhow::bail!("PAT {field} JSON exceeds {max_bytes} bytes");
+    }
+    serde_json::from_str(value).with_context(|| format!("invalid PAT {field} JSON"))
+}
+
+fn parse_string_array_value(
+    value: serde_json::Value,
+    field: &str,
+    max_bytes: usize,
+    max_items: usize,
+    max_item_bytes: usize,
+) -> Result<Vec<String>> {
+    let serde_json::Value::Array(values) = value else {
+        anyhow::bail!("invalid PAT {field} JSON");
+    };
+    if values.len() > max_items {
+        anyhow::bail!("PAT {field} JSON contains more than {max_items} items");
+    }
+
+    let mut total_bytes = 2usize;
+    let mut strings = Vec::new();
+    for value in values {
+        let serde_json::Value::String(value) = value else {
+            anyhow::bail!("invalid PAT {field} JSON");
+        };
+        if value.len() > max_item_bytes {
+            anyhow::bail!("PAT {field} JSON item exceeds {max_item_bytes} bytes");
+        }
+        total_bytes = total_bytes.saturating_add(value.len()).saturating_add(3);
+        if total_bytes > max_bytes {
+            anyhow::bail!("PAT {field} JSON exceeds {max_bytes} bytes");
+        }
+        strings.push(value);
+    }
+
+    Ok(strings)
 }
 
 fn parse_required_rfc3339(value: &str, field: &str) -> Result<DateTime<Utc>> {
@@ -672,6 +734,72 @@ mod tests {
         let repo = PATRepository::new(db.clone());
         let token_hash = hash_token("xlp_dirty_scopes");
         insert_raw_pat(&db, user.id, "dirty-scopes", &token_hash, "not-json", None).await;
+
+        assert!(repo
+            .find_by_token_hash(&token_hash)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo.list_by_user(user.id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn oversized_historical_pat_scopes_are_not_returned() {
+        let db = test_db().await;
+        let user = UserRepository::new(db.clone())
+            .create(CreateUserInput {
+                username: "owner".into(),
+                password: "secret".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        let repo = PATRepository::new(db.clone());
+        let token_hash = hash_token("xlp_oversized_scopes");
+        let scopes = serde_json::to_string(
+            &(0..=crate::auth::rbac::PAT_RUNTIME_MAX_SCOPES)
+                .map(|_| "notification:read".to_string())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        insert_raw_pat(&db, user.id, "oversized-scopes", &token_hash, &scopes, None).await;
+
+        assert!(repo
+            .find_by_token_hash(&token_hash)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo.list_by_user(user.id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn oversized_historical_pat_server_ids_are_not_returned() {
+        let db = test_db().await;
+        let user = UserRepository::new(db.clone())
+            .create(CreateUserInput {
+                username: "owner".into(),
+                password: "secret".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        let repo = PATRepository::new(db.clone());
+        let token_hash = hash_token("xlp_oversized_server_ids");
+        let server_ids = serde_json::to_string(
+            &(0..=crate::auth::rbac::PAT_RUNTIME_MAX_SERVER_IDS)
+                .map(|idx| uuid::Uuid::from_u128(idx as u128 + 1).to_string())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        insert_raw_pat(
+            &db,
+            user.id,
+            "oversized-server-ids",
+            &token_hash,
+            r#"["notification:read"]"#,
+            Some(&server_ids),
+        )
+        .await;
 
         assert!(repo
             .find_by_token_hash(&token_hash)
