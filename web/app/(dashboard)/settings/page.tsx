@@ -758,8 +758,10 @@ export default function SettingsPage() {
   }
 
   async function testGeoIp() {
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
     setGeoIpLoading(true);
-    const response = await apiClient.testGeoIp(geoIp.ip.trim(), geoIp.provider, geoIp.token);
+    const response = await apiClient.testGeoIp(geoIp.ip.trim(), geoIp.provider, geoIp.token, totpCode);
     setGeoIpLoading(false);
     if (response.success && response.data) {
       setGeoIpResult(response.data);

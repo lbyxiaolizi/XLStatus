@@ -1566,9 +1566,11 @@ class ApiClient {
     ip: string,
     provider = "empty",
     token = "",
+    totpCode?: string,
   ): Promise<ApiResponse<GeoIpLookupResponse>> {
     return this.request<GeoIpLookupResponse>("/api/v1/geoip/test", {
       method: "POST",
+      headers: this.sensitiveHeaders(totpCode),
       body: JSON.stringify({
         ip,
         provider,

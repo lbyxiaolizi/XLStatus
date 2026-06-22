@@ -209,7 +209,7 @@ DDNS 配置创建、删除、provider reload 和手动 check-now 属于敏感 DD
 
 MCP POST 入口请求体上限为 1MiB。`/mcp` JSON-RPC batch 最多 16 项，空 batch 或超过上限会返回 `Invalid Request`。`server.list` 会先按 owner/admin 与 PAT server allowlist 过滤后再应用 `limit` / `offset`；管理员 PAT 可列出 allowlist 命中的跨 owner 服务器，非管理员 PAT 仍只列出自己拥有且 allowlist 命中的服务器。`server.get`、`server.exec`、`fs.*` 和 `fs.download_url` / `fs.upload_url` 的 `server_id` 必须是 36 字节 canonical UUID 文本；非法、simple、大写或带空格 UUID 会在 Agent 查询、任务派发或临时 token 写入前返回错误。`server.exec` 命令最长 8192 字节，timeout 被限制在 1 到 60 秒，默认 30 秒；Agent 返回的 exec stdout/stderr 各最多 64KiB、error 最多 4KiB。MCP `server.exec`、`fs.*` 文件任务和 `fs.download_url` / `fs.upload_url` 签发临时 URL 都要求目标 Agent 当前未撤销；`fs.read` 单次最多读取 1MiB，返回 base64 文本按该预算校验；`fs.list` Agent 返回 JSON 最长 1MiB，`fs.write/delete` 小结果最长 4KiB。
 
-GeoIP 测试接口请求体上限为 4KiB。GeoIP MMDB update/upload 属于敏感维护写操作，只允许管理员 Cookie session；若管理员已启用 TOTP，请求必须携带有效 `x-totp-code`。GeoIP MMDB update 请求体上限为 16KiB，`source_url` 最长 2048 字节，`source_path` 最长 4096 字节；本地 `source_path` 必须是普通文件，读取前会按 128MiB 上限检查文件大小。GeoIP JSON provider 响应最多读取 16KiB，返回的 `raw` JSON 会限制字符串长度、数组项数、对象字段数和嵌套深度；MMDB 下载和上传文件上限均为 128MiB，下载路径会在读取过程中按上限中止。
+GeoIP 测试接口请求体上限为 4KiB，只允许管理员 Cookie session；若管理员已启用 TOTP，请求必须携带有效 `x-totp-code`。GeoIP MMDB update/upload 属于敏感维护写操作，只允许管理员 Cookie session；若管理员已启用 TOTP，请求必须携带有效 `x-totp-code`。GeoIP MMDB update 请求体上限为 16KiB，`source_url` 最长 2048 字节，`source_path` 最长 4096 字节；本地 `source_path` 必须是普通文件，读取前会按 128MiB 上限检查文件大小。GeoIP JSON provider 响应最多读取 16KiB，返回的 `raw` JSON 会限制字符串长度、数组项数、对象字段数和嵌套深度；MMDB 下载和上传文件上限均为 128MiB，下载路径会在读取过程中按上限中止。
 
 ## gRPC
 

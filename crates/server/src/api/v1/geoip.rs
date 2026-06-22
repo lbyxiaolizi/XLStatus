@@ -112,9 +112,11 @@ struct AgentIpSnapshot {
 pub async fn test_geoip(
     State(state): State<AppState>,
     auth: AuthSession,
+    headers: HeaderMap,
     Json(req): Json<GeoIpTestRequest>,
 ) -> Result<Json<ApiResponse<GeoIpLookupResponse>>, AppError> {
-    require_admin(&auth)?;
+    require_admin_cookie_session(&auth)?;
+    require_sensitive_totp(&state.db, auth.user_id, &headers).await?;
     let ip = req.ip.trim();
     if ip.is_empty() {
         return Err(AppError::BadRequest("ip is required".into()));
@@ -1311,6 +1313,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn geoip_test_rejects_admin_pat_session() {
+        let state = test_state(test_db().await);
+
+        let err = test_geoip(
+            State(state),
+            auth_session(AuthKind::PersonalAccessToken),
+            HeaderMap::new(),
+            Json(GeoIpTestRequest {
+                ip: "1.1.1.1".into(),
+                provider: Some("empty".into()),
+                token: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[tokio::test]
     async fn geoip_mmdb_writes_require_sensitive_totp_when_enabled() {
         let db = test_db().await;
         let user_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
@@ -1321,6 +1343,53 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn geoip_test_requires_sensitive_totp_when_enabled() {
+        let db = test_db().await;
+        let user_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        seed_user(&db, user_id, "owner").await;
+        seed_totp_enabled_user(&db, user_id).await;
+
+        let err = test_geoip(
+            State(test_state(db)),
+            auth_session_for(UserId(user_id), AuthKind::Session),
+            HeaderMap::new(),
+            Json(GeoIpTestRequest {
+                ip: "1.1.1.1".into(),
+                provider: Some("empty".into()),
+                token: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn geoip_test_allows_cookie_session_without_totp() {
+        let db = test_db().await;
+        let user_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        seed_user(&db, user_id, "owner").await;
+
+        let response = test_geoip(
+            State(test_state(db)),
+            auth_session_for(UserId(user_id), AuthKind::Session),
+            HeaderMap::new(),
+            Json(GeoIpTestRequest {
+                ip: "1.1.1.1".into(),
+                provider: Some("empty".into()),
+                token: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let data = response.0.data.expect("geoip result");
+        assert_eq!(data.provider, "empty");
+        assert_eq!(data.ip, "1.1.1.1");
     }
 
     #[tokio::test]
@@ -1350,9 +1419,13 @@ mod tests {
     }
 
     fn auth_session(auth_kind: AuthKind) -> AuthSession {
+        auth_session_for(UserId(uuid::Uuid::from_bytes([1; 16])), auth_kind)
+    }
+
+    fn auth_session_for(user_id: UserId, auth_kind: AuthKind) -> AuthSession {
         AuthSession {
             session_id: "sess".into(),
-            user_id: UserId(uuid::Uuid::from_bytes([1; 16])),
+            user_id,
             username: "admin".into(),
             role: UserRole::Admin,
             csrf_token: "csrf".into(),
@@ -1360,6 +1433,21 @@ mod tests {
             scopes: vec!["admin:*".into()],
             server_ids: None,
             pat_id: None,
+        }
+    }
+
+    fn test_state(db: DatabaseBackend) -> AppState {
+        AppState {
+            db,
+            config: std::sync::Arc::new(crate::config::Config::default()),
+            agent_jwt_challenges: std::sync::Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            metrics: xlstatus_tsdb::MetricStore::in_memory(),
+            realtime: crate::realtime::BroadcastHub::new(),
+            session_registry: crate::grpc::SessionRegistry::new(),
+            terminal_sessions: crate::api::v1::terminal::TerminalSessionRegistry::new(),
+            io_registry: crate::grpc::IoRegistry::new(),
         }
     }
 
