@@ -1334,24 +1334,31 @@ class ApiClient {
     return this.request<JsonObject>(`/api/v1/tasks/${encodeURIComponent(id)}`);
   }
 
-  async createTask(task: JsonObject): Promise<ApiResponse<JsonObject>> {
+  async createTask(task: JsonObject, totpCode?: string): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>("/api/v1/tasks", {
       method: "POST",
+      headers: this.sensitiveHeaders(totpCode),
       body: JSON.stringify(task),
     });
   }
 
-  async updateTask(id: string, task: JsonObject): Promise<ApiResponse<JsonObject>> {
+  async updateTask(
+    id: string,
+    task: JsonObject,
+    totpCode?: string,
+  ): Promise<ApiResponse<JsonObject>> {
     return this.requestWithFallback<JsonObject>(
       `/api/v1/tasks/${encodeURIComponent(id)}`,
       task,
       ["POST", "PATCH", "PUT"],
+      { headers: this.sensitiveHeaders(totpCode) },
     );
   }
 
-  async deleteTask(id: string): Promise<ApiResponse<JsonObject>> {
+  async deleteTask(id: string, totpCode?: string): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(`/api/v1/tasks/${encodeURIComponent(id)}`, {
       method: "DELETE",
+      headers: this.sensitiveHeaders(totpCode),
     });
   }
 

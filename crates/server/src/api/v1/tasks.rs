@@ -85,11 +85,12 @@ pub struct TaskRunsResponse {
 pub async fn create_task(
     State(state): State<AppState>,
     auth_user: AuthUser,
+    headers: HeaderMap,
     Json(req): Json<CreateTaskRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     let db = state.db.clone();
 
-    require_scope_or_403(&auth_user, "task:write")?;
+    require_task_mutation_sensitive_scope(&db, &auth_user, "task:write", &headers).await?;
     validate_task_selector_for_write_or_403(&db, &auth_user, &req.server_selector_json).await?;
     let notification_group_id = normalize_optional_id(req.notification_group_id);
     ensure_task_notification_group_owned(&db, &auth_user, notification_group_id.as_deref()).await?;
@@ -227,12 +228,13 @@ pub async fn get_task(
 pub async fn update_task(
     State(state): State<AppState>,
     auth_user: AuthUser,
+    headers: HeaderMap,
     Path(task_id): Path<String>,
     Json(req): Json<UpdateTaskRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     let db = state.db.clone();
 
-    require_scope_or_403(&auth_user, "task:write")?;
+    require_task_mutation_sensitive_scope(&db, &auth_user, "task:write", &headers).await?;
     let task_id = normalize_task_resource_id(task_id, "task_id")?;
     let mut task = TaskRepository::get_by_id(&db, &task_id)
         .await
@@ -338,11 +340,12 @@ pub async fn update_task(
 pub async fn delete_task(
     State(state): State<AppState>,
     auth_user: AuthUser,
+    headers: HeaderMap,
     Path(task_id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     let db = state.db.clone();
 
-    require_scope_or_403(&auth_user, "task:delete")?;
+    require_task_mutation_sensitive_scope(&db, &auth_user, "task:delete", &headers).await?;
     let task_id = normalize_task_resource_id(task_id, "task_id")?;
     let task = TaskRepository::get_by_id(&db, &task_id)
         .await
@@ -703,6 +706,24 @@ async fn require_task_run_sensitive_scope(
         return Err(api_error(
             StatusCode::FORBIDDEN,
             "manual task runs require a cookie session",
+        ));
+    }
+    require_sensitive_totp(db, auth_user.user.id, headers)
+        .await
+        .map_err(app_error_to_api)
+}
+
+async fn require_task_mutation_sensitive_scope(
+    db: &Db,
+    auth_user: &AuthUser,
+    required_scope: &str,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
+    require_scope_or_403(auth_user, required_scope)?;
+    if matches!(auth_user.auth_kind, AuthKind::PersonalAccessToken) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "task changes require a cookie session",
         ));
     }
     require_sensitive_totp(db, auth_user.user.id, headers)
@@ -1108,6 +1129,66 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn task_changes_reject_pat_session() {
+        let db = test_db().await;
+        let auth = pat_with_servers(vec!["server-a"]);
+
+        let err =
+            require_task_mutation_sensitive_scope(&db, &auth, "task:write", &HeaderMap::new())
+                .await
+                .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(err
+            .1
+             .0
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("cookie session"));
+    }
+
+    #[tokio::test]
+    async fn task_changes_require_sensitive_totp_when_enabled() {
+        let db = test_db().await;
+        let auth = cookie_admin();
+        let owner = auth.user.id.0.to_string();
+        seed_user(&db, &owner).await;
+        seed_totp_enabled_user(&db, &owner).await;
+
+        let err =
+            require_task_mutation_sensitive_scope(&db, &auth, "task:write", &HeaderMap::new())
+                .await
+                .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(err
+            .1
+             .0
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("TOTP"));
+    }
+
+    #[tokio::test]
+    async fn task_changes_allow_cookie_without_totp() {
+        let db = test_db().await;
+        let auth = cookie_admin();
+        let owner = auth.user.id.0.to_string();
+        seed_user(&db, &owner).await;
+
+        assert!(require_task_mutation_sensitive_scope(
+            &db,
+            &auth,
+            "task:delete",
+            &HeaderMap::new()
+        )
+        .await
+        .is_ok());
     }
 
     #[test]

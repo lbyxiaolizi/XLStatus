@@ -201,10 +201,15 @@ export default function TasksPage() {
     event.preventDefault();
     setSaving(true);
     const payload = formToPayload(form);
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) {
+      setSaving(false);
+      return;
+    }
     const response =
       modal === "edit" && editing
-        ? await apiClient.updateTask(editing.id, payload)
-        : await apiClient.createTask(payload);
+        ? await apiClient.updateTask(editing.id, payload, totpCode)
+        : await apiClient.createTask(payload, totpCode);
     setSaving(false);
     if (response.success) {
       setModal(null);
@@ -254,7 +259,9 @@ export default function TasksPage() {
 
   async function deleteTask(task: Task) {
     if (!confirm(`确定删除任务「${task.name}」？`)) return;
-    const response = await apiClient.deleteTask(task.id);
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
+    const response = await apiClient.deleteTask(task.id, totpCode);
     if (response.success) {
       setNotice("任务已删除。");
       await loadTasks();

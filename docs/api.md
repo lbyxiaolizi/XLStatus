@@ -156,7 +156,7 @@ Enrollment token 创建请求体上限为 4KiB，`expires_in_hours` 必须在 1 
 | `POST` | `/api/v1/tasks/:id/run` | 手动运行任务 |
 | `GET` | `/api/v1/tasks/:id/runs` | 任务运行记录 |
 
-任务创建/更新请求体上限为 256KiB。任务名称最长 128 字节，Shell 命令最长 8192 字节，`payload_json` 最长 64KiB，`server_selector_json` 最长 16KiB。手动运行任务会立即向 Agent 下发任务、Shell 类型可执行命令，只允许 Cookie session；若账号已启用 TOTP，请求必须携带有效 `x-totp-code`，PAT 不能触发手动运行。任务详情、更新、删除、手动运行和运行历史 path `:id` 必须是 36 字节 canonical UUID 文本；非法、simple、大写或带空格 UUID 会在 repository/调度前返回 400。选择器中每类显式 ID 最多 64 项、标签最多 32 项；显式 `server_ids` 和 `exclude_server_ids` 必须是任务 owner 名下未撤销服务器。一次任务执行最多解析并下发到 64 台服务器。任务执行时，group selector 只展开任务 owner 名下未撤销 Agent 成员，历史跨 owner、已删除或已撤销分组成员不会进入目标集合。任务列表和任务运行记录的 `limit` 会限制在 1 到 500；带 server allowlist 的 PAT 会先按任务选择器或运行记录 `server_id` 过滤，再应用 `offset` / `limit`。任务运行历史持久化前会把 Agent 返回的 stdout/stderr 分别截断到 64KiB、error 截断到 16KiB，并标记 `output_truncated`。
+任务创建/更新请求体上限为 256KiB。任务名称最长 128 字节，Shell 命令最长 8192 字节，`payload_json` 最长 64KiB，`server_selector_json` 最长 16KiB。任务创建、更新、删除和手动运行只允许 Cookie session；若账号已启用 TOTP，请求必须携带有效 `x-totp-code`，PAT 不能保存、删除或触发远程任务。任务详情、更新、删除、手动运行和运行历史 path `:id` 必须是 36 字节 canonical UUID 文本；非法、simple、大写或带空格 UUID 会在 repository/调度前返回 400。选择器中每类显式 ID 最多 64 项、标签最多 32 项；显式 `server_ids` 和 `exclude_server_ids` 必须是任务 owner 名下未撤销服务器。一次任务执行最多解析并下发到 64 台服务器。任务执行时，group selector 只展开任务 owner 名下未撤销 Agent 成员，历史跨 owner、已删除或已撤销分组成员不会进入目标集合。任务列表和任务运行记录的 `limit` 会限制在 1 到 500；带 server allowlist 的 PAT 会先按任务选择器或运行记录 `server_id` 过滤，再应用 `offset` / `limit`。任务运行历史持久化前会把 Agent 返回的 stdout/stderr 分别截断到 64KiB、error 截断到 16KiB，并标记 `output_truncated`。
 
 ### 文件、配置和终端
 
