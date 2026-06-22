@@ -29,6 +29,7 @@ const FILE_OP_TIMEOUT_SECS: u64 = 30;
 const FILE_READ_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const FILE_WRITE_MAX_BYTES: usize = 2 * 1024 * 1024;
 const SERVER_OPS_API_MAX_BODY_BYTES: usize = 3 * 1024 * 1024;
+const SERVER_OPS_UUID_TEXT_LEN: usize = 36;
 const SERVER_OPS_MAX_PATH_BYTES: usize = 4096;
 const CONFIG_PATCH_MAX_BYTES: usize = 128 * 1024;
 const FORCE_UPDATE_MAX_URL_BYTES: usize = 2048;
@@ -465,7 +466,7 @@ async fn build_temp_url(
         "transfer:write"
     };
     require_transfer_scope(&auth, scope)?;
-    ensure_server_active(&state, &auth, &server_id).await?;
+    let agent_id = ensure_server_active(&state, &auth, &server_id).await?;
     let path = validate_abs_path(&req.path)?;
     let expires_in = temporary_url_expires_in(req.expires_in);
     let expires_at = temporary_url_expires_at(expires_in);
@@ -480,10 +481,7 @@ async fn build_temp_url(
     TemporaryTransferTokenRepository::new(state.db.clone())
         .create(CreateTemporaryTransferTokenInput {
             token_hash,
-            server_id: AgentId(
-                uuid::Uuid::parse_str(&server_id)
-                    .map_err(|_| AppError::BadRequest(format!("invalid server id: {server_id}")))?,
-            ),
+            server_id: agent_id,
             path: path.clone(),
             op: op.to_string(),
             issued_by_user_id: auth.user_id,
@@ -516,8 +514,7 @@ async fn ensure_server_visible(
     auth: &AuthSession,
     server_id: &str,
 ) -> Result<AgentId, AppError> {
-    let parsed = uuid::Uuid::parse_str(server_id)
-        .map_err(|_| AppError::BadRequest(format!("invalid server id: {server_id}")))?;
+    let parsed = parse_server_ops_agent_id(server_id)?;
     let agent_id = AgentId(parsed);
     if !server_visible(auth, &agent_id) {
         return Err(AppError::Forbidden("agent not in scope".into()));
@@ -528,6 +525,22 @@ async fn ensure_server_visible(
         .ok_or(AppError::NotFound("agent not found".into()))?;
     ensure_agent_visible(auth, &agent)?;
     Ok(agent_id)
+}
+
+fn parse_server_ops_agent_id(server_id: &str) -> Result<uuid::Uuid, AppError> {
+    if server_id.len() != SERVER_OPS_UUID_TEXT_LEN {
+        return Err(AppError::BadRequest(
+            "server_id must be a canonical UUID".into(),
+        ));
+    }
+    let parsed = uuid::Uuid::parse_str(server_id)
+        .map_err(|_| AppError::BadRequest("server_id must be a canonical UUID".into()))?;
+    if parsed.to_string() != server_id {
+        return Err(AppError::BadRequest(
+            "server_id must be a canonical UUID".into(),
+        ));
+    }
+    Ok(parsed)
 }
 
 async fn ensure_server_online(
@@ -944,10 +957,26 @@ mod tests {
     #[test]
     fn server_ops_resource_limits_are_explicit() {
         assert_eq!(SERVER_OPS_API_MAX_BODY_BYTES, 3 * 1024 * 1024);
+        assert_eq!(SERVER_OPS_UUID_TEXT_LEN, 36);
         assert_eq!(FILE_WRITE_MAX_BYTES, 2 * 1024 * 1024);
         assert_eq!(CONFIG_PATCH_MAX_BYTES, 128 * 1024);
         assert_eq!(FILE_LIST_RESULT_MAX_BYTES, 2 * 1024 * 1024);
         assert_eq!(FILE_SMALL_RESULT_MAX_BYTES, 4096);
+    }
+
+    #[test]
+    fn server_ops_path_ids_require_canonical_uuid_text() {
+        let server_id = uuid::Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
+
+        assert_eq!(
+            parse_server_ops_agent_id(&server_id.to_string()).unwrap(),
+            server_id
+        );
+        assert!(parse_server_ops_agent_id("server-a").is_err());
+        assert!(parse_server_ops_agent_id(&format!(" {} ", server_id)).is_err());
+        assert!(parse_server_ops_agent_id(&server_id.simple().to_string()).is_err());
+        assert!(parse_server_ops_agent_id(&server_id.to_string().to_uppercase()).is_err());
+        assert!(parse_server_ops_agent_id(&"a".repeat(SERVER_OPS_UUID_TEXT_LEN + 1)).is_err());
     }
 
     #[test]
