@@ -12,6 +12,7 @@ use xlstatus_shared::AgentId;
 const CHALLENGE_TTL_SECONDS: i64 = 60;
 const MAX_PENDING_CHALLENGES: usize = 4096;
 const MAX_PENDING_CHALLENGES_PER_AGENT: usize = 16;
+const AGENT_ID_TEXT_LEN: usize = 36;
 const NONCE_HEX_LEN: usize = 64;
 const SIGNATURE_HEX_LEN: usize = 128;
 
@@ -134,9 +135,19 @@ pub async fn get_agent_jwt(
 }
 
 fn parse_agent_id(agent_id: &str) -> Result<AgentId, AppError> {
-    Ok(AgentId(uuid::Uuid::parse_str(agent_id).map_err(|e| {
-        AppError::BadRequest(format!("Invalid agent_id: {}", e))
-    })?))
+    if agent_id.len() != AGENT_ID_TEXT_LEN {
+        return Err(AppError::BadRequest(
+            "agent_id must be a canonical UUID".into(),
+        ));
+    }
+    let parsed = uuid::Uuid::parse_str(agent_id)
+        .map_err(|_| AppError::BadRequest("agent_id must be a canonical UUID".into()))?;
+    if parsed.to_string() != agent_id {
+        return Err(AppError::BadRequest(
+            "agent_id must be a canonical UUID".into(),
+        ));
+    }
+    Ok(AgentId(parsed))
 }
 
 fn challenge_key(agent_id: AgentId, nonce: &str) -> String {
@@ -261,6 +272,25 @@ mod tests {
         assert!(valid_signature_shape(&"A".repeat(SIGNATURE_HEX_LEN)));
         assert!(!valid_signature_shape(&"a".repeat(SIGNATURE_HEX_LEN - 1)));
         assert!(!valid_signature_shape(&"g".repeat(SIGNATURE_HEX_LEN)));
+    }
+
+    #[test]
+    fn agent_id_requires_canonical_uuid_text() {
+        let id = uuid::Uuid::now_v7();
+
+        assert_eq!(parse_agent_id(&id.to_string()).unwrap().0, id);
+        assert!(matches!(
+            parse_agent_id(&"a".repeat(AGENT_ID_TEXT_LEN + 1)),
+            Err(AppError::BadRequest(_))
+        ));
+        assert!(matches!(
+            parse_agent_id(&id.simple().to_string()),
+            Err(AppError::BadRequest(_))
+        ));
+        assert!(matches!(
+            parse_agent_id(&id.to_string().to_uppercase()),
+            Err(AppError::BadRequest(_))
+        ));
     }
 
     #[test]
