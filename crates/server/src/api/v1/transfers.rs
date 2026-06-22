@@ -745,6 +745,12 @@ async fn validate_transfer_issuer(
                 "temporary URL server is invalid".to_string(),
             )
         })?;
+    if agent.revoked_at.is_some() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "temporary URL server is revoked".to_string(),
+        ));
+    }
     if !crate::api::v1::servers::agent_visible(&auth, &agent) {
         return Err((
             StatusCode::FORBIDDEN,
@@ -1001,7 +1007,13 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
     use chrono::Duration;
-    use xlstatus_shared::UserId;
+    use std::sync::Arc;
+    use xlstatus_shared::{UserId, UserRole};
+
+    use crate::db::{
+        CreateAgentInput, CreateSessionInput, CreateTemporaryTransferTokenInput, CreateUserInput,
+        DatabaseBackend, UserRepository,
+    };
 
     #[test]
     fn temporary_transfer_view_does_not_expose_token_hash() {
@@ -1093,5 +1105,97 @@ mod tests {
             ensure_temporary_transfer_result_text(&result, 16, "temporary result").unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_GATEWAY);
         assert!(err.1.contains("error exceeds"));
+    }
+
+    #[tokio::test]
+    async fn temporary_transfer_rejects_revoked_server_before_consuming_token() {
+        let state = test_state().await;
+        let token = format!("xlt_{}", "a".repeat(64));
+        let token_hash = hash_token(&token);
+        let user = UserRepository::new(state.db.clone())
+            .create(CreateUserInput {
+                username: "owner".into(),
+                password: "secret-password".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        let agent_repo = AgentRepository::new(state.db.clone());
+        let agent = agent_repo
+            .create(CreateAgentInput {
+                name: "revoked-agent".into(),
+                public_key: "public".into(),
+                owner_user_id: user.id,
+            })
+            .await
+            .unwrap();
+        let session = SessionRepository::new(state.db.clone())
+            .create(
+                CreateSessionInput {
+                    user_id: user.id,
+                    ip: Some("127.0.0.1".into()),
+                    user_agent: Some("test".into()),
+                    expires_at: Utc::now() + Duration::minutes(30),
+                },
+                "session-token-hash".into(),
+            )
+            .await
+            .unwrap();
+        let record = TemporaryTransferTokenRepository::new(state.db.clone())
+            .create(CreateTemporaryTransferTokenInput {
+                token_hash: token_hash.clone(),
+                server_id: agent.id,
+                path: "/tmp/file.txt".into(),
+                op: "download".into(),
+                issued_by_user_id: user.id,
+                auth_kind: "session".into(),
+                session_id: Some(session.id),
+                api_token_id: None,
+                scope: "transfer:read".into(),
+                expires_at: Utc::now() + Duration::minutes(5),
+                created_ip: Some("127.0.0.1".into()),
+            })
+            .await
+            .unwrap();
+
+        assert!(agent_repo.revoke(agent.id).await.unwrap());
+
+        let err = validate_temporary_transfer(&state, &token, "download")
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(err.1, "temporary URL server is revoked");
+
+        let stored = TemporaryTransferTokenRepository::new(state.db.clone())
+            .find_by_id(&record.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.used_at.is_none());
+        assert!(stored.used_ip.is_none());
+        assert!(stored.used_status.is_none());
+    }
+
+    async fn test_state() -> AppState {
+        let path = std::env::temp_dir().join(format!(
+            "xlstatus-temp-transfer-api-test-{}.db",
+            uuid::Uuid::now_v7()
+        ));
+        let url = format!("sqlite://{}?mode=rwc", path.to_string_lossy());
+        let db = DatabaseBackend::connect(&url, true).await.unwrap();
+        db.run_migrations().await.unwrap();
+
+        AppState {
+            db,
+            config: Arc::new(crate::config::Config::default()),
+            agent_jwt_challenges: Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            metrics: xlstatus_tsdb::MetricStore::in_memory(),
+            realtime: crate::realtime::BroadcastHub::new(),
+            session_registry: crate::grpc::SessionRegistry::new(),
+            terminal_sessions: crate::api::v1::terminal::TerminalSessionRegistry::new(),
+            io_registry: crate::grpc::IoRegistry::new(),
+        }
     }
 }
