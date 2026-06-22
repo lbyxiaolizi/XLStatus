@@ -1,8 +1,10 @@
 use anyhow::Context;
 use axum::{
     extract::Query,
+    extract::Request,
     http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
     middleware,
+    middleware::Next,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
     Router,
@@ -104,6 +106,7 @@ use auth::middleware::session_middleware;
 use xlstatus_shared::UserRole;
 
 const GRPC_MESSAGE_LIMIT: usize = 256 * 1024 * 1024;
+const HTTP_MAX_QUERY_BYTES: usize = 16 * 1024;
 const DEFAULT_AGENT_INSTALL_VERSION: &str = "v0.1.0-alpha.3";
 const INSTALL_BOOTSTRAP_MAX_QUERY_BYTES: usize = 16 * 1024;
 const INSTALL_BOOTSTRAP_MAX_HOST_BYTES: usize = 512;
@@ -687,6 +690,7 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .merge(protected)
                 .with_state(state)
+                .layer(middleware::from_fn(limit_http_query_length))
                 .layer(cors);
 
             let addr: SocketAddr = bind.parse()?;
@@ -1260,6 +1264,28 @@ fn build_cors_layer(allowed_origins: &[String]) -> anyhow::Result<CorsLayer> {
         .allow_credentials(true))
 }
 
+async fn limit_http_query_length(request: Request, next: Next) -> Response {
+    match ensure_http_query_length(request.uri()) {
+        Ok(()) => next.run(request).await,
+        Err(message) => (
+            StatusCode::URI_TOO_LONG,
+            [(header::CONTENT_TYPE, "application/json")],
+            format!(r#"{{"success":false,"error":"{message}"}}"#),
+        )
+            .into_response(),
+    }
+}
+
+fn ensure_http_query_length(uri: &Uri) -> Result<(), String> {
+    let raw_query = uri.query().unwrap_or_default();
+    if raw_query.len() > HTTP_MAX_QUERY_BYTES {
+        return Err(format!(
+            "query string must be at most {HTTP_MAX_QUERY_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
+
 fn server_task_result(
     name: &str,
     result: Result<anyhow::Result<()>, tokio::task::JoinError>,
@@ -1335,6 +1361,20 @@ mod tests {
             .unwrap();
         let err = parse_agent_install_query(&uri).unwrap_err();
         assert!(err.contains("install query must be at most"));
+    }
+
+    #[test]
+    fn global_http_query_resource_budget_is_bounded() {
+        assert_eq!(HTTP_MAX_QUERY_BYTES, 16 * 1024);
+
+        let uri: Uri = "/api/v1/servers?limit=50&offset=0".parse().unwrap();
+        assert!(ensure_http_query_length(&uri).is_ok());
+
+        let uri: Uri = format!("/api/v1/servers?x={}", "a".repeat(HTTP_MAX_QUERY_BYTES))
+            .parse()
+            .unwrap();
+        let err = ensure_http_query_length(&uri).unwrap_err();
+        assert!(err.contains("query string must be at most"));
     }
 
     #[test]
