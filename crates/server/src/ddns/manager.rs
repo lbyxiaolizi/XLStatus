@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 
-use crate::api::v1::settings;
+use crate::api::v1::{agent_json::parse_agent_telemetry_json, settings};
 use crate::db::{AgentRepository, AgentWithState, Db};
 use crate::security::{secure_reqwest_client_builder, validate_outbound_url_resolved};
 use anyhow::{Context, Result};
@@ -157,9 +157,9 @@ impl DdnsManager {
                 Some(s) => s,
                 None => continue,
             };
-            let parsed: serde_json::Value = match serde_json::from_str(state_json) {
-                Ok(v) => v,
-                Err(_) => continue,
+            let Some(parsed) = parse_agent_telemetry_json::<serde_json::Value>(Some(state_json))
+            else {
+                continue;
             };
             // Try to extract an IP from the host state. The agent
             // does not always report IP; we use the first network
@@ -732,6 +732,41 @@ mod tests {
                 fixture.agent.id,
                 &serde_json::json!({ "primary_ip": "not-an-ip".repeat(128) }).to_string(),
             )
+            .await
+            .unwrap();
+
+        let manager = DdnsManager::new(db.clone());
+        manager.reload_providers().await.unwrap();
+        manager.check_now().await.unwrap();
+
+        let config = DdnsConfigRepository::get_by_id(&db, &config_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.last_applied_ip, None);
+        assert!(DdnsHistoryRepository::list_for_config(&db, &config_id, 10)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn ddns_check_now_ignores_oversized_historical_agent_state() {
+        let db = test_db().await;
+        let fixture = create_fixture(&db).await;
+        let config_id = create_ddns_config(
+            &db,
+            fixture.owner.id.0.to_string(),
+            Some(fixture.agent.id.0.to_string()),
+            "oversized-state.example.com",
+        )
+        .await;
+        let oversized = format!(
+            r#"{{"primary_ip":"203.0.113.70","padding":"{}"}}"#,
+            "x".repeat(crate::api::v1::agent_json::AGENT_TELEMETRY_JSON_MAX_BYTES)
+        );
+        AgentRepository::new(db.clone())
+            .update_last_state(fixture.agent.id, &oversized)
             .await
             .unwrap();
 

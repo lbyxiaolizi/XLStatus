@@ -12,6 +12,7 @@ use xlstatus_proto_gen::xlstatus::v1::{
 use xlstatus_shared::AgentId;
 
 use crate::api::types::ApiResponse;
+use crate::api::v1::agent_json::parse_agent_telemetry_json;
 use crate::api::v1::auth::{require_sensitive_totp, AppError, AppState};
 use crate::api::v1::servers::{ensure_agent_visible, server_visible};
 use crate::auth::generate_temporary_transfer_token;
@@ -387,10 +388,7 @@ pub async fn get_config(
         .find_by_id_with_state(agent_id)
         .await?
         .ok_or_else(|| AppError::NotFound("agent not found".into()))?;
-    let last_info = row
-        .last_info_json
-        .as_deref()
-        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok());
+    let last_info = parse_agent_telemetry_json::<serde_json::Value>(row.last_info_json.as_deref());
     Ok(Json(ApiResponse::success(serde_json::json!({
         "server_id": server_id,
         "agent_name": row.agent.name,
@@ -1548,6 +1546,54 @@ mod tests {
             .unwrap_err();
 
         assert!(app_error_message(&err).contains("agent has been revoked"));
+    }
+
+    #[tokio::test]
+    async fn get_config_ignores_oversized_historical_last_info() {
+        let state = test_state().await;
+        let user = UserRepository::new(state.db.clone())
+            .create(CreateUserInput {
+                username: "owner".into(),
+                password: "secret-password".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        let agent_repo = AgentRepository::new(state.db.clone());
+        let agent = agent_repo
+            .create(CreateAgentInput {
+                name: "config-agent".into(),
+                public_key: "public".into(),
+                owner_user_id: user.id,
+            })
+            .await
+            .unwrap();
+        let oversized = format!(
+            r#"{{"agent_version":"1.2.3","padding":"{}"}}"#,
+            "x".repeat(crate::api::v1::agent_json::AGENT_TELEMETRY_JSON_MAX_BYTES)
+        );
+        agent_repo
+            .update_last_info(agent.id, &oversized)
+            .await
+            .unwrap();
+        let auth = AuthSession {
+            session_id: "sess".into(),
+            user_id: user.id,
+            username: user.username,
+            role: user.role,
+            csrf_token: "csrf".into(),
+            auth_kind: AuthKind::Session,
+            scopes: Vec::new(),
+            server_ids: None,
+            pat_id: None,
+        };
+
+        let response = get_config(State(state), auth, Path(agent.id.0.to_string()))
+            .await
+            .unwrap();
+        let data = response.0.data.expect("config response data");
+
+        assert_eq!(data.get("last_info"), Some(&serde_json::Value::Null));
     }
 
     async fn test_state() -> AppState {

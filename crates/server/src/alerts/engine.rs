@@ -2,6 +2,7 @@
 //!
 //! See `docs/implementation-audit.md` for the full design notes.
 
+use crate::api::v1::agent_json::parse_dashboard_metadata_json;
 use crate::api::v1::alerts::{
     ALERT_MAX_CONDITIONS, ALERT_MAX_CONDITION_BYTES, ALERT_MAX_CONSECUTIVE_FAILURES,
     ALERT_MAX_DAYS_BEFORE, ALERT_MAX_LATENCY_MS, ALERT_MAX_NAME_BYTES, ALERT_MAX_OFFLINE_SECONDS,
@@ -1522,7 +1523,7 @@ fn traffic_quota_percent(
 }
 
 fn metadata_traffic_quota_bytes(value: &str) -> Option<u64> {
-    let parsed = serde_json::from_str::<serde_json::Value>(value).ok()?;
+    let parsed = parse_dashboard_metadata_json::<serde_json::Value>(Some(value))?;
     metadata_u64_from_value(
         &parsed,
         &[
@@ -2052,6 +2053,45 @@ mod tests {
             traffic_quota_percent(&state, 1000, TrafficQuotaDirection::Out),
             Some(60.0)
         );
+    }
+
+    #[tokio::test]
+    async fn traffic_quota_condition_ignores_oversized_historical_metadata() {
+        let db = test_db().await;
+        let owner = "00000000-0000-0000-0000-000000000001";
+        let agent = "00000000-0000-0000-0000-000000000101";
+        seed_user(&db, owner, "owner").await;
+        seed_agent(&db, agent, owner, "agent").await;
+        let oversized = format!(
+            r#"{{"traffic_quota_bytes":1000,"padding":"{}"}}"#,
+            "x".repeat(crate::api::v1::agent_json::AGENT_DASHBOARD_METADATA_JSON_MAX_BYTES)
+        );
+        set_agent_dashboard_metadata(&db, agent, &oversized).await;
+
+        let engine = AlertEngine::new(
+            db,
+            crate::grpc::SessionRegistry::new(),
+            crate::current_task_response_registry(),
+        );
+        engine
+            .observe_agent_state(
+                agent,
+                serde_json::json!({
+                    "network_in_total": 800,
+                    "network_out_total": 300
+                }),
+            )
+            .await;
+        let matched = engine
+            .check_condition(&AlertCondition::ServerTrafficQuota {
+                agent_id: agent.into(),
+                percent: 80.0,
+                direction: TrafficQuotaDirection::Total,
+            })
+            .await
+            .unwrap();
+
+        assert!(!matched);
     }
 
     #[tokio::test]
@@ -2855,6 +2895,18 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    async fn set_agent_dashboard_metadata(db: &Db, id: &str, metadata: &str) {
+        let Db::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query("UPDATE agents SET dashboard_metadata_json = ? WHERE id = ?")
+            .bind(metadata)
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
     }
 
     async fn seed_service_with_servers(
