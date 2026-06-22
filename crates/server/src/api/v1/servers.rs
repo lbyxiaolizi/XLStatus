@@ -1069,7 +1069,7 @@ pub async fn add_server_group_members(
     }
     load_server_group(&state.db, &auth, &id).await?;
     for server_id in &server_ids {
-        ensure_group_server_access(&state.db, &auth, server_id).await?;
+        ensure_group_server_active(&state.db, &auth, server_id).await?;
     }
     let now = Utc::now();
     match &state.db {
@@ -1498,6 +1498,23 @@ async fn ensure_group_server_access(
     ensure_agent_visible(auth, &agent)
 }
 
+async fn ensure_group_server_active(
+    db: &DatabaseBackend,
+    auth: &AuthSession,
+    server_id: &str,
+) -> Result<(), AppError> {
+    let agent_id = parse_agent_id(server_id)?;
+    let agent = AgentRepository::new(db.clone())
+        .find_by_id(agent_id)
+        .await?
+        .ok_or(AppError::NotFound("agent not found".into()))?;
+    ensure_agent_visible(auth, &agent)?;
+    if agent.revoked_at.is_some() {
+        return Err(AppError::BadRequest("agent has been revoked".into()));
+    }
+    Ok(())
+}
+
 fn normalize_group_name(value: &str) -> Result<String, AppError> {
     let value = value.trim();
     if value.is_empty() {
@@ -1539,6 +1556,9 @@ async fn apply_batch_action(
         ServerBatchAction::MoveGroup => {
             if !auth.role.is_admin() && row.agent.owner_user_id != auth.user_id {
                 return Err("agent is owned by another user".into());
+            }
+            if row.agent.revoked_at.is_some() {
+                return Err("agent has been revoked".into());
             }
             let target_group_id =
                 target_group_id.ok_or_else(|| "group_id is required".to_string())?;
@@ -3204,6 +3224,17 @@ mod tests {
         .unwrap();
     }
 
+    async fn revoke_agent(db: &DatabaseBackend, id: Uuid) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query("UPDATE agents SET revoked_at = '2026-06-22T00:00:00Z' WHERE id = ?")
+            .bind(id.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
     async fn seed_server_group(db: &DatabaseBackend, id: Uuid, owner: Uuid, name: &str) {
         let DatabaseBackend::Sqlite(pool) = db else {
             unreachable!();
@@ -3436,6 +3467,114 @@ mod tests {
             .unwrap();
 
         assert_eq!(group.server_ids, vec![owner_server.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn server_group_write_rejects_revoked_members_but_allows_cleanup() {
+        let db = test_db().await;
+        let owner = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let active_server = Uuid::parse_str("00000000-0000-0000-0000-000000000111").unwrap();
+        let revoked_server = Uuid::parse_str("00000000-0000-0000-0000-000000000222").unwrap();
+        let group_id = Uuid::parse_str("00000000-0000-0000-0000-000000000333").unwrap();
+
+        seed_user(&db, owner, "owner", "member").await;
+        seed_agent(
+            &db,
+            active_server,
+            owner,
+            "active-server",
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+        seed_agent(
+            &db,
+            revoked_server,
+            owner,
+            "revoked-server",
+            "2026-01-02T00:00:00Z",
+        )
+        .await;
+        revoke_agent(&db, revoked_server).await;
+        seed_server_group(&db, group_id, owner, "owner-group").await;
+
+        let mut auth = auth_session(AuthKind::Session, UserRole::Admin);
+        auth.user_id = UserId(owner);
+
+        let Json(response) = add_server_group_members(
+            State(test_state(db.clone())),
+            auth.clone(),
+            Path(group_id.to_string()),
+            Json(AddServerGroupMembersRequest {
+                server_ids: vec![active_server.to_string()],
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response.data.unwrap().server_ids,
+            vec![active_server.to_string()]
+        );
+
+        let add_err = add_server_group_members(
+            State(test_state(db.clone())),
+            auth.clone(),
+            Path(group_id.to_string()),
+            Json(AddServerGroupMembersRequest {
+                server_ids: vec![revoked_server.to_string()],
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(add_err, AppError::BadRequest(_)));
+
+        let group = load_server_group(&db, &auth, &group_id.to_string())
+            .await
+            .unwrap();
+        assert_eq!(group.server_ids, vec![active_server.to_string()]);
+
+        let Json(batch_response) = batch_update_servers(
+            State(test_state(db.clone())),
+            auth.clone(),
+            ConnectInfo("127.0.0.1:12345".parse().unwrap()),
+            HeaderMap::new(),
+            Json(BatchUpdateServersRequest {
+                server_ids: vec![revoked_server.to_string()],
+                action: ServerBatchAction::MoveGroup,
+                tags: vec![],
+                dashboard_visible: None,
+                owner_user_id: None,
+                group_id: Some(group_id.to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        let data = batch_response.data.unwrap();
+        assert_eq!(data.updated, 0);
+        assert_eq!(data.failed, 1);
+        assert!(data.results[0]
+            .error
+            .as_deref()
+            .is_some_and(|message| message.contains("revoked")));
+
+        seed_server_group_member(&db, group_id, revoked_server).await;
+        let group = load_server_group(&db, &auth, &group_id.to_string())
+            .await
+            .unwrap();
+        assert_eq!(group.server_ids.len(), 2);
+        assert!(group.server_ids.contains(&active_server.to_string()));
+        assert!(group.server_ids.contains(&revoked_server.to_string()));
+
+        let Json(response) = delete_server_group_member(
+            State(test_state(db)),
+            auth,
+            Path((group_id.to_string(), revoked_server.to_string())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response.data.unwrap().server_ids,
+            vec![active_server.to_string()]
+        );
     }
 
     #[test]
