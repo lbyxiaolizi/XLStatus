@@ -25,6 +25,8 @@ docker compose -f docker-compose.pg.yml up -d
 curl -fsS http://localhost:8080/healthz
 ```
 
+PostgreSQL Compose 默认只把数据库端口发布到宿主 `127.0.0.1:5432`，供本机调试和备份使用；不要把 `5432` 直接发布到公网。需要远端维护数据库时，优先通过 SSH tunnel、VPN 或受控防火墙访问。
+
 本地访问：
 
 - Web UI: `http://localhost:3000`

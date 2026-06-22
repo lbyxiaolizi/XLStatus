@@ -1630,4 +1630,13 @@ mod tests {
         assert!(!script.contains("Environment=\"XLSTATUS_SEED_ADMIN_PASSWORD="));
         assert!(!script.contains("ADMIN_PASSWORD_SYSTEMD"));
     }
+
+    #[test]
+    fn postgres_compose_does_not_publish_database_publicly() {
+        let compose = include_str!("../../../docker-compose.pg.yml");
+
+        assert!(compose.contains("\"127.0.0.1:5432:5432\""));
+        assert!(!compose.contains("\"5432:5432\""));
+        assert!(!compose.contains("- 5432:5432"));
+    }
 }

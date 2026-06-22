@@ -35,6 +35,7 @@ CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
 ```
 
 因此默认 Web UI 可以访问 API。SQLite Compose 会创建 `./data/xlstatus.db`；PostgreSQL Compose 会在空 volume 上创建数据库用户和库，然后由 XLStatus 执行应用迁移。
+PostgreSQL Compose 的数据库端口只绑定宿主 `127.0.0.1:5432`，不要改成公网监听；远程维护请使用 SSH tunnel、VPN 或受控防火墙。
 
 远端服务器上运行 Docker Compose 时，先设置浏览器可访问的地址：
 
