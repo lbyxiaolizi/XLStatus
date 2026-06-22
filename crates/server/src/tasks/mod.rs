@@ -11,7 +11,7 @@ use xlstatus_shared::tasks::*;
 
 use crate::db::repository::tasks::{TaskRepository, TaskRunRepository};
 use crate::db::Db;
-use crate::grpc::{SessionRegistry, TaskResponseRegistry};
+use crate::grpc::{truncate_task_result_text, SessionRegistry, TaskResponseRegistry};
 use crate::notifications::sender::{
     ensure_notification_channel_count_allowed, NotificationChannel, NotificationMessage,
     NotificationSender, NotificationSeverity, NOTIFICATION_MAX_GROUP_CHANNELS,
@@ -27,6 +27,9 @@ pub(crate) const TASK_MAX_SELECTOR_IDS: usize = 64;
 pub(crate) const TASK_MAX_SELECTOR_TAGS: usize = 32;
 pub(crate) const TASK_MAX_SELECTOR_TOKEN_BYTES: usize = 128;
 pub(crate) const TASK_MAX_DISPATCH_TARGETS: usize = 64;
+pub(crate) const TASK_RESULT_STDOUT_MAX_BYTES: usize = 64 * 1024;
+pub(crate) const TASK_RESULT_STDERR_MAX_BYTES: usize = 64 * 1024;
+pub(crate) const TASK_RESULT_ERROR_MAX_BYTES: usize = 16 * 1024;
 
 pub(crate) fn parse_task_schedule(schedule: &str) -> Result<Schedule> {
     let trimmed = schedule.trim();
@@ -262,8 +265,14 @@ pub async fn dispatch_task_to_agents_with_source(
 
         let started = std::time::Instant::now();
         let final_run = match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
-            Ok(Ok(result)) => {
+            Ok(Ok(mut result)) => {
                 let elapsed = started.elapsed().as_millis() as i64;
+                let text_truncation = truncate_task_result_text(
+                    &mut result,
+                    TASK_RESULT_STDOUT_MAX_BYTES,
+                    TASK_RESULT_STDERR_MAX_BYTES,
+                    TASK_RESULT_ERROR_MAX_BYTES,
+                );
                 use xlstatus_proto_gen::xlstatus::v1::TaskOutcome as Outcome;
                 let mapped = match Outcome::try_from(result.status).unwrap_or(Outcome::Unspecified)
                 {
@@ -299,10 +308,7 @@ pub async fn dispatch_task_to_agents_with_source(
                 } else {
                     Some(result.stdout)
                 };
-                let output_truncated = output
-                    .as_ref()
-                    .map(|o| o.len() > 64 * 1024)
-                    .unwrap_or(false);
+                let output_truncated = text_truncation.any();
 
                 TaskRunRepository::update_result(
                     db,
@@ -1017,6 +1023,28 @@ mod tests {
         assert!(ensure_task_target_count_allowed(TASK_MAX_DISPATCH_TARGETS).is_ok());
         let err = ensure_task_target_count_allowed(TASK_MAX_DISPATCH_TARGETS + 1).unwrap_err();
         assert!(err.to_string().contains("maximum"));
+    }
+
+    #[test]
+    fn task_result_output_is_truncated_before_persistence() {
+        let mut result = xlstatus_proto_gen::xlstatus::v1::TaskResult {
+            stdout: "x".repeat(TASK_RESULT_STDOUT_MAX_BYTES + 1),
+            stderr: "y".repeat(TASK_RESULT_STDERR_MAX_BYTES + 1),
+            error: "z".repeat(TASK_RESULT_ERROR_MAX_BYTES + 1),
+            ..Default::default()
+        };
+
+        let truncated = truncate_task_result_text(
+            &mut result,
+            TASK_RESULT_STDOUT_MAX_BYTES,
+            TASK_RESULT_STDERR_MAX_BYTES,
+            TASK_RESULT_ERROR_MAX_BYTES,
+        );
+
+        assert!(truncated.any());
+        assert_eq!(result.stdout.len(), TASK_RESULT_STDOUT_MAX_BYTES);
+        assert_eq!(result.stderr.len(), TASK_RESULT_STDERR_MAX_BYTES);
+        assert_eq!(result.error.len(), TASK_RESULT_ERROR_MAX_BYTES);
     }
 
     async fn test_db() -> Db {

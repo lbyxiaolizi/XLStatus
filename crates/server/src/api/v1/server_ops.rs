@@ -19,6 +19,7 @@ use crate::auth::rbac::has_scope;
 use crate::db::{
     AgentRepository, CreateTemporaryTransferTokenInput, TemporaryTransferTokenRepository,
 };
+use crate::grpc::{base64_encoded_len, ensure_task_result_text_within};
 use crate::mcp::executor::{
     percent_encode, temporary_url_expires_at, temporary_url_expires_in,
     TEMP_URL_DEFAULT_EXPIRES_SECS,
@@ -31,6 +32,8 @@ const SERVER_OPS_API_MAX_BODY_BYTES: usize = 3 * 1024 * 1024;
 const SERVER_OPS_MAX_PATH_BYTES: usize = 4096;
 const CONFIG_PATCH_MAX_BYTES: usize = 128 * 1024;
 const FORCE_UPDATE_MAX_URL_BYTES: usize = 2048;
+const FILE_LIST_RESULT_MAX_BYTES: usize = 2 * 1024 * 1024;
+const FILE_SMALL_RESULT_MAX_BYTES: usize = 4096;
 const FORCE_UPDATE_REPO_HOST: &str = "github.com";
 const FORCE_UPDATE_REPO_PATH_PREFIX: &str = "/lbyxiaolizi/XLStatus/releases/download/";
 
@@ -160,6 +163,11 @@ pub async fn list_files(
         FILE_OP_TIMEOUT_SECS,
     )
     .await?;
+    ensure_file_task_result_text(
+        &result,
+        FILE_LIST_RESULT_MAX_BYTES,
+        "agent file list result",
+    )?;
     ensure_task_success(&result)?;
     let entries = serde_json::from_str::<Vec<FileEntryViewJson>>(&result.stdout)
         .map_err(|e| AppError::BadRequest(format!("agent returned invalid file list: {e}")))?;
@@ -205,9 +213,19 @@ pub async fn read_file(
         FILE_OP_TIMEOUT_SECS,
     )
     .await?;
+    ensure_file_task_result_text(
+        &result,
+        base64_encoded_len(length as usize),
+        "agent file read result",
+    )?;
     ensure_task_success(&result)?;
     let bytes = decode_base64(result.stdout.trim())
         .map_err(|e| AppError::BadRequest(format!("agent returned invalid base64: {e}")))?;
+    if bytes.len() > length as usize {
+        return Err(AppError::BadRequest(format!(
+            "agent returned more than {length} file bytes"
+        )));
+    }
     let encoding = normalize_encoding(&req.encoding)?;
     let content = if encoding == "base64" {
         result.stdout.trim().to_string()
@@ -258,6 +276,11 @@ pub async fn write_file(
         FILE_OP_TIMEOUT_SECS,
     )
     .await?;
+    ensure_file_task_result_text(
+        &result,
+        FILE_SMALL_RESULT_MAX_BYTES,
+        "agent file write result",
+    )?;
     ensure_task_success(&result)?;
     Ok(Json(ApiResponse::success(serde_json::json!({
         "server_id": server_id,
@@ -294,6 +317,11 @@ pub async fn delete_file(
         FILE_OP_TIMEOUT_SECS,
     )
     .await?;
+    ensure_file_task_result_text(
+        &result,
+        FILE_SMALL_RESULT_MAX_BYTES,
+        "agent file delete result",
+    )?;
     ensure_task_success(&result)?;
     Ok(Json(ApiResponse::success(serde_json::json!({
         "server_id": server_id,
@@ -594,6 +622,21 @@ fn ensure_file_write_size(data: &[u8]) -> Result<(), AppError> {
     Ok(())
 }
 
+fn ensure_file_task_result_text(
+    result: &xlstatus_proto_gen::xlstatus::v1::TaskResult,
+    stdout_max: usize,
+    context: &str,
+) -> Result<(), AppError> {
+    ensure_task_result_text_within(
+        result,
+        stdout_max,
+        FILE_SMALL_RESULT_MAX_BYTES,
+        FILE_SMALL_RESULT_MAX_BYTES,
+        context,
+    )
+    .map_err(AppError::BadRequest)
+}
+
 fn serialize_config_patch(config: &serde_json::Value) -> Result<Vec<u8>, AppError> {
     let payload = serde_json::to_vec(config)
         .map_err(|e| AppError::BadRequest(format!("invalid config patch: {e}")))?;
@@ -880,6 +923,8 @@ mod tests {
         assert_eq!(SERVER_OPS_API_MAX_BODY_BYTES, 3 * 1024 * 1024);
         assert_eq!(FILE_WRITE_MAX_BYTES, 2 * 1024 * 1024);
         assert_eq!(CONFIG_PATCH_MAX_BYTES, 128 * 1024);
+        assert_eq!(FILE_LIST_RESULT_MAX_BYTES, 2 * 1024 * 1024);
+        assert_eq!(FILE_SMALL_RESULT_MAX_BYTES, 4096);
     }
 
     #[test]
@@ -898,6 +943,26 @@ mod tests {
         let oversized = serde_json::json!({ "blob": "a".repeat(CONFIG_PATCH_MAX_BYTES) });
         let err = serialize_config_patch(&oversized).unwrap_err();
         assert!(app_error_message(&err).contains("config patch exceeds"));
+    }
+
+    #[test]
+    fn file_task_result_text_has_business_bounds() {
+        let mut result = xlstatus_proto_gen::xlstatus::v1::TaskResult {
+            stdout: "ok".into(),
+            stderr: String::new(),
+            error: String::new(),
+            ..Default::default()
+        };
+        assert!(ensure_file_task_result_text(&result, 2, "file op").is_ok());
+
+        result.stdout = "x".repeat(3);
+        let err = ensure_file_task_result_text(&result, 2, "file op").unwrap_err();
+        assert!(app_error_message(&err).contains("stdout exceeds 2 bytes"));
+
+        result.stdout = "ok".into();
+        result.stderr = "x".repeat(FILE_SMALL_RESULT_MAX_BYTES + 1);
+        let err = ensure_file_task_result_text(&result, 2, "file op").unwrap_err();
+        assert!(app_error_message(&err).contains("stderr exceeds"));
     }
 
     #[test]

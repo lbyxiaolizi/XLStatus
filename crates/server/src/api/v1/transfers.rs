@@ -24,6 +24,7 @@ use crate::db::{
     AgentRepository, PATRepository, TemporaryTransferToken, TemporaryTransferTokenRepository,
     UserRepository,
 };
+use crate::grpc::{base64_encoded_len, ensure_task_result_text_within};
 
 const TEMP_TRANSFER_MAX_BYTES: usize = 100 * 1024 * 1024;
 const TEMP_TRANSFER_MAX_QUERY_BYTES: usize = 512;
@@ -31,6 +32,7 @@ const DOWNLOAD_TIMEOUT_SECS: u64 = 60;
 const UPLOAD_TIMEOUT_SECS: u64 = 120;
 const TEMP_TRANSFER_RATE_LIMIT: u32 = 10;
 const TEMP_TRANSFER_RATE_WINDOW_SECS: u64 = 60;
+const TEMP_TRANSFER_SMALL_RESULT_MAX_BYTES: usize = 4096;
 
 static TEMP_TRANSFER_RATE_STATE: once_cell::sync::Lazy<
     std::sync::Mutex<HashMap<String, (std::time::Instant, u32)>>,
@@ -270,6 +272,21 @@ async fn run_temp_download(
             return Err(err.into_response_error());
         }
     };
+    if let Err(err) = ensure_temporary_transfer_result_text(
+        &dispatched.result,
+        base64_encoded_len(TEMP_TRANSFER_MAX_BYTES),
+        "temporary download agent result",
+    ) {
+        record_temporary_transfer_result(
+            &state,
+            &transfer.token_id,
+            "failed",
+            Some(&dispatched.run_id),
+            Some(&err.1),
+        )
+        .await;
+        return Err(err);
+    }
     if let Err(err) = ensure_task_success(&dispatched.result) {
         record_temporary_transfer_result(
             &state,
@@ -435,6 +452,21 @@ async fn run_temp_upload(
             return Err(err.into_response_error());
         }
     };
+    if let Err(err) = ensure_temporary_transfer_result_text(
+        &dispatched.result,
+        TEMP_TRANSFER_SMALL_RESULT_MAX_BYTES,
+        "temporary upload agent result",
+    ) {
+        record_temporary_transfer_result(
+            &state,
+            &transfer.token_id,
+            "failed",
+            Some(&dispatched.run_id),
+            Some(&err.1),
+        )
+        .await;
+        return Err(err);
+    }
     if let Err(err) = ensure_task_success(&dispatched.result) {
         record_temporary_transfer_result(
             &state,
@@ -890,6 +922,21 @@ fn ensure_task_success(result: &TaskResult) -> Result<(), (StatusCode, String)> 
     Err((StatusCode::BAD_GATEWAY, detail))
 }
 
+fn ensure_temporary_transfer_result_text(
+    result: &TaskResult,
+    stdout_max: usize,
+    context: &str,
+) -> Result<(), (StatusCode, String)> {
+    ensure_task_result_text_within(
+        result,
+        stdout_max,
+        TEMP_TRANSFER_SMALL_RESULT_MAX_BYTES,
+        TEMP_TRANSFER_SMALL_RESULT_MAX_BYTES,
+        context,
+    )
+    .map_err(|message| (StatusCode::BAD_GATEWAY, message))
+}
+
 fn sanitize_filename(filename: &str) -> String {
     filename
         .chars()
@@ -993,6 +1040,7 @@ mod tests {
     #[test]
     fn temporary_transfer_query_resource_budget_is_bounded_before_deserialize() {
         assert_eq!(TEMP_TRANSFER_MAX_QUERY_BYTES, 512);
+        assert_eq!(TEMP_TRANSFER_SMALL_RESULT_MAX_BYTES, 4096);
 
         let uri: Uri = format!(
             "/api/v1/transfers/temp/download?token={}",
@@ -1021,5 +1069,29 @@ mod tests {
         let err = read_limited_body(too_large, 16).await.unwrap_err();
         assert_eq!(err.0, StatusCode::PAYLOAD_TOO_LARGE);
         assert!(err.1.contains("upload is larger than"));
+    }
+
+    #[test]
+    fn temporary_transfer_agent_result_text_is_bounded() {
+        let mut result = TaskResult {
+            stdout: "x".repeat(16),
+            stderr: String::new(),
+            error: String::new(),
+            ..Default::default()
+        };
+        assert!(ensure_temporary_transfer_result_text(&result, 16, "temporary result").is_ok());
+
+        result.stdout.push('x');
+        let err =
+            ensure_temporary_transfer_result_text(&result, 16, "temporary result").unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_GATEWAY);
+        assert!(err.1.contains("stdout exceeds 16 bytes"));
+
+        result.stdout = String::new();
+        result.error = "x".repeat(TEMP_TRANSFER_SMALL_RESULT_MAX_BYTES + 1);
+        let err =
+            ensure_temporary_transfer_result_text(&result, 16, "temporary result").unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_GATEWAY);
+        assert!(err.1.contains("error exceeds"));
     }
 }

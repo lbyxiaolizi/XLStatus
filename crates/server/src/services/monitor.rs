@@ -8,7 +8,7 @@ use crate::api::v1::services::{
     SERVICE_MIN_INTERVAL_SECONDS, SERVICE_MIN_TIMEOUT_SECONDS,
 };
 use crate::db::Db;
-use crate::grpc::{SessionRegistry, TaskResponseRegistry};
+use crate::grpc::{ensure_task_result_text_within, SessionRegistry, TaskResponseRegistry};
 use crate::services::probe::{probe_http, probe_icmp, probe_tcp, ProbeType, ServiceProbe};
 use crate::tasks::spawn_triggered_tasks;
 use anyhow::{Context, Result};
@@ -24,6 +24,9 @@ use xlstatus_proto_gen::xlstatus::v1::{
     server_task::Spec, HttpGetTask, IcmpPingTask, ServerTask, TaskOutcome, TaskType, TcpPingTask,
 };
 use xlstatus_shared::AgentId;
+
+const SERVICE_AGENT_PROBE_STDOUT_MAX_BYTES: usize = 16 * 1024;
+const SERVICE_AGENT_PROBE_ERROR_MAX_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceConfig {
@@ -713,6 +716,15 @@ fn ensure_probe_target_count(count: usize) -> Result<()> {
 fn service_probe_from_task_result(
     result: xlstatus_proto_gen::xlstatus::v1::TaskResult,
 ) -> Result<ServiceProbe> {
+    if let Err(message) = ensure_task_result_text_within(
+        &result,
+        SERVICE_AGENT_PROBE_STDOUT_MAX_BYTES,
+        SERVICE_AGENT_PROBE_ERROR_MAX_BYTES,
+        SERVICE_AGENT_PROBE_ERROR_MAX_BYTES,
+        "agent probe result",
+    ) {
+        return Ok(failure_probe(message));
+    }
     let status = TaskOutcome::try_from(result.status).unwrap_or(TaskOutcome::Unspecified);
     if status != TaskOutcome::Success {
         let message = if !result.error.trim().is_empty() {
@@ -915,6 +927,26 @@ mod tests {
         );
         assert!(ensure_probe_target_count(SERVICE_MAX_TARGETS_PER_PROBE).is_ok());
         assert!(ensure_probe_target_count(SERVICE_MAX_TARGETS_PER_PROBE + 1).is_err());
+        assert_eq!(SERVICE_AGENT_PROBE_STDOUT_MAX_BYTES, 16 * 1024);
+        assert_eq!(SERVICE_AGENT_PROBE_ERROR_MAX_BYTES, 4096);
+    }
+
+    #[test]
+    fn service_agent_probe_rejects_oversized_task_result_text() {
+        let result = xlstatus_proto_gen::xlstatus::v1::TaskResult {
+            status: TaskOutcome::Success as i32,
+            exit_code: 0,
+            stdout: "x".repeat(SERVICE_AGENT_PROBE_STDOUT_MAX_BYTES + 1),
+            ..Default::default()
+        };
+
+        let probe = service_probe_from_task_result(result).unwrap();
+        assert!(!probe.success);
+        assert!(probe
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("stdout exceeds"));
     }
 
     #[test]

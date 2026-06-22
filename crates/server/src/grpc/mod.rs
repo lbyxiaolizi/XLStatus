@@ -1,6 +1,9 @@
 mod session;
 
-pub use session::{IoRegistry, SessionRegistry, TaskResponseRegistry};
+pub use session::{
+    base64_encoded_len, ensure_task_result_text_within, truncate_task_result_text, IoRegistry,
+    SessionRegistry, TaskResponseRegistry,
+};
 
 use crate::api::v1::auth::{active_waf_ban, record_waf_event, register_agent_auth_failure};
 use crate::auth::verify_agent_jwt;

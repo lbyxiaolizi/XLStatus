@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
-use xlstatus_proto_gen::xlstatus::v1::{IoFrame, ServerMessage, ServerTask};
+use xlstatus_proto_gen::xlstatus::v1::{IoFrame, ServerMessage, ServerTask, TaskResult};
 use xlstatus_shared::AgentId;
 
 pub type SessionSender = mpsc::Sender<Result<ServerMessage, tonic::Status>>;
@@ -135,6 +135,78 @@ impl Default for SessionRegistry {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TaskResultTextTruncation {
+    pub stdout: bool,
+    pub stderr: bool,
+    pub error: bool,
+}
+
+impl TaskResultTextTruncation {
+    pub fn any(self) -> bool {
+        self.stdout || self.stderr || self.error
+    }
+}
+
+pub const fn base64_encoded_len(decoded_len: usize) -> usize {
+    let full = decoded_len / 3;
+    let rem = decoded_len % 3;
+    full.saturating_mul(4)
+        .saturating_add(if rem == 0 { 0 } else { 4 })
+}
+
+pub fn ensure_task_result_text_within(
+    result: &TaskResult,
+    stdout_max: usize,
+    stderr_max: usize,
+    error_max: usize,
+    context: &str,
+) -> Result<(), String> {
+    if result.stdout.len() > stdout_max {
+        return Err(format!("{context} stdout exceeds {stdout_max} bytes"));
+    }
+    if result.stderr.len() > stderr_max {
+        return Err(format!("{context} stderr exceeds {stderr_max} bytes"));
+    }
+    if result.error.len() > error_max {
+        return Err(format!("{context} error exceeds {error_max} bytes"));
+    }
+    Ok(())
+}
+
+pub fn truncate_task_result_text(
+    result: &mut TaskResult,
+    stdout_max: usize,
+    stderr_max: usize,
+    error_max: usize,
+) -> TaskResultTextTruncation {
+    let (stdout, stdout_truncated) = truncate_utf8_to_bytes(&result.stdout, stdout_max);
+    let (stderr, stderr_truncated) = truncate_utf8_to_bytes(&result.stderr, stderr_max);
+    let (error, error_truncated) = truncate_utf8_to_bytes(&result.error, error_max);
+    result.stdout = stdout;
+    result.stderr = stderr;
+    result.error = error;
+    TaskResultTextTruncation {
+        stdout: stdout_truncated,
+        stderr: stderr_truncated,
+        error: error_truncated,
+    }
+}
+
+pub fn truncate_utf8_to_bytes(value: &str, max_bytes: usize) -> (String, bool) {
+    if value.len() <= max_bytes {
+        return (value.to_string(), false);
+    }
+    if max_bytes == 0 {
+        return (String::new(), true);
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    (value[..end].to_string(), true)
+}
+
 #[derive(Clone, Default)]
 pub struct IoRegistry {
     agent_streams: Arc<RwLock<HashMap<AgentId, IoSender>>>,
@@ -256,5 +328,52 @@ impl TaskResponseRegistry {
     pub async fn cancel(&self, task_id: &str) {
         let mut pending = self.pending.write().await;
         pending.remove(task_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_result_text_bounds_report_specific_field() {
+        let result = TaskResult {
+            stdout: "a".repeat(5),
+            stderr: "b".repeat(3),
+            error: String::new(),
+            ..TaskResult::default()
+        };
+
+        assert!(ensure_task_result_text_within(&result, 5, 3, 0, "agent result").is_ok());
+        let err = ensure_task_result_text_within(&result, 4, 3, 0, "agent result").unwrap_err();
+        assert!(err.contains("stdout exceeds 4 bytes"));
+    }
+
+    #[test]
+    fn task_result_text_truncation_preserves_utf8_boundaries() {
+        let mut result = TaskResult {
+            stdout: "a你b".to_string(),
+            stderr: "stderr".to_string(),
+            error: "error".to_string(),
+            ..TaskResult::default()
+        };
+
+        let truncated = truncate_task_result_text(&mut result, 2, 10, 0);
+
+        assert!(truncated.stdout);
+        assert!(!truncated.stderr);
+        assert!(truncated.error);
+        assert_eq!(result.stdout, "a");
+        assert_eq!(result.stderr, "stderr");
+        assert_eq!(result.error, "");
+    }
+
+    #[test]
+    fn base64_encoded_length_matches_padding_rules() {
+        assert_eq!(base64_encoded_len(0), 0);
+        assert_eq!(base64_encoded_len(1), 4);
+        assert_eq!(base64_encoded_len(2), 4);
+        assert_eq!(base64_encoded_len(3), 4);
+        assert_eq!(base64_encoded_len(4), 8);
     }
 }

@@ -15,12 +15,16 @@ use crate::auth::generate_temporary_transfer_token;
 use crate::auth::middleware::{AuthKind, AuthSession};
 use crate::db::repository::agent::AgentRepository;
 use crate::db::{CreateTemporaryTransferTokenInput, TemporaryTransferTokenRepository};
+use crate::grpc::{base64_encoded_len, ensure_task_result_text_within};
 
 const MCP_FILE_OP_TIMEOUT_SECS: u64 = 30;
 const MCP_FILE_READ_MAX_BYTES: u64 = 1024 * 1024;
+const MCP_FILE_LIST_RESULT_MAX_BYTES: usize = 1024 * 1024;
+const MCP_SMALL_RESULT_MAX_BYTES: usize = 4096;
 const MCP_EXEC_MAX_COMMAND_BYTES: usize = 8192;
 const MCP_EXEC_DEFAULT_TIMEOUT_SECS: u32 = 30;
 const MCP_EXEC_MAX_TIMEOUT_SECS: u32 = 60;
+const MCP_EXEC_RESULT_MAX_BYTES: usize = 64 * 1024;
 pub(crate) const TEMP_URL_DEFAULT_EXPIRES_SECS: i64 = 300;
 pub(crate) const TEMP_URL_MAX_EXPIRES_SECS: i64 = 600;
 
@@ -182,6 +186,13 @@ impl McpExecutor {
                     anyhow::bail!("task timeout")
                 }
             };
+        ensure_mcp_task_result_text(
+            &result,
+            MCP_EXEC_RESULT_MAX_BYTES,
+            MCP_EXEC_RESULT_MAX_BYTES,
+            MCP_SMALL_RESULT_MAX_BYTES,
+            "server.exec result",
+        )?;
         use xlstatus_proto_gen::xlstatus::v1::TaskOutcome;
         let status = match TaskOutcome::try_from(result.status).unwrap_or(TaskOutcome::Unspecified)
         {
@@ -222,6 +233,7 @@ impl McpExecutor {
                 MCP_FILE_OP_TIMEOUT_SECS,
             )
             .await?;
+        ensure_mcp_file_result_text(&result, MCP_FILE_LIST_RESULT_MAX_BYTES, "fs.list result")?;
         ensure_task_success(&result)?;
         let entries = serde_json::from_str::<serde_json::Value>(&result.stdout)
             .context("agent returned invalid file list JSON")?;
@@ -260,9 +272,17 @@ impl McpExecutor {
                 MCP_FILE_OP_TIMEOUT_SECS,
             )
             .await?;
+        ensure_mcp_file_result_text(
+            &result,
+            base64_encoded_len(max_size as usize),
+            "fs.read result",
+        )?;
         ensure_task_success(&result)?;
         let data = decode_base64(result.stdout.trim())
             .map_err(|e| anyhow::anyhow!("agent returned invalid base64: {e}"))?;
+        if data.len() > max_size as usize {
+            anyhow::bail!("agent returned more than {max_size} file bytes");
+        }
         let content = String::from_utf8(data.clone()).context("file is not valid UTF-8")?;
         Ok(json!({
             "server_id": server_id,
@@ -304,6 +324,7 @@ impl McpExecutor {
                 MCP_FILE_OP_TIMEOUT_SECS,
             )
             .await?;
+        ensure_mcp_file_result_text(&result, MCP_SMALL_RESULT_MAX_BYTES, "fs.write result")?;
         ensure_task_success(&result)?;
         Ok(json!({
             "server_id": server_id,
@@ -339,6 +360,7 @@ impl McpExecutor {
                 MCP_FILE_OP_TIMEOUT_SECS,
             )
             .await?;
+        ensure_mcp_file_result_text(&result, MCP_SMALL_RESULT_MAX_BYTES, "fs.delete result")?;
         ensure_task_success(&result)?;
         Ok(json!({
             "server_id": server_id,
@@ -522,6 +544,13 @@ impl McpExecutor {
                     anyhow::bail!("task timeout")
                 }
             };
+        ensure_mcp_task_result_text(
+            &result,
+            MCP_EXEC_RESULT_MAX_BYTES,
+            MCP_EXEC_RESULT_MAX_BYTES,
+            MCP_SMALL_RESULT_MAX_BYTES,
+            "server.exec result",
+        )?;
         use xlstatus_proto_gen::xlstatus::v1::TaskOutcome;
         let status = match TaskOutcome::try_from(result.status).unwrap_or(TaskOutcome::Unspecified)
         {
@@ -586,6 +615,31 @@ fn ensure_task_success(result: &xlstatus_proto_gen::xlstatus::v1::TaskResult) ->
         format!("agent operation failed with exit code {}", result.exit_code)
     };
     anyhow::bail!(detail)
+}
+
+fn ensure_mcp_file_result_text(
+    result: &xlstatus_proto_gen::xlstatus::v1::TaskResult,
+    stdout_max: usize,
+    context: &str,
+) -> Result<()> {
+    ensure_mcp_task_result_text(
+        result,
+        stdout_max,
+        MCP_SMALL_RESULT_MAX_BYTES,
+        MCP_SMALL_RESULT_MAX_BYTES,
+        context,
+    )
+}
+
+fn ensure_mcp_task_result_text(
+    result: &xlstatus_proto_gen::xlstatus::v1::TaskResult,
+    stdout_max: usize,
+    stderr_max: usize,
+    error_max: usize,
+    context: &str,
+) -> Result<()> {
+    ensure_task_result_text_within(result, stdout_max, stderr_max, error_max, context)
+        .map_err(anyhow::Error::msg)
 }
 
 pub(crate) fn temporary_url_expires_in(expires_in: i64) -> i64 {
@@ -909,6 +963,29 @@ mod tests {
         assert!(validate_exec_command("   ").is_err());
         let oversized = "x".repeat(MCP_EXEC_MAX_COMMAND_BYTES + 1);
         assert!(validate_exec_command(&oversized).is_err());
+    }
+
+    #[test]
+    fn mcp_agent_result_text_has_business_bounds() {
+        assert_eq!(MCP_FILE_LIST_RESULT_MAX_BYTES, 1024 * 1024);
+        assert_eq!(MCP_EXEC_RESULT_MAX_BYTES, 64 * 1024);
+
+        let mut result = xlstatus_proto_gen::xlstatus::v1::TaskResult {
+            stdout: "ok".into(),
+            stderr: String::new(),
+            error: String::new(),
+            ..Default::default()
+        };
+        assert!(ensure_mcp_file_result_text(&result, 2, "fs.read result").is_ok());
+
+        result.stdout = "x".repeat(3);
+        let err = ensure_mcp_file_result_text(&result, 2, "fs.read result").unwrap_err();
+        assert!(err.to_string().contains("stdout exceeds 2 bytes"));
+
+        result.stdout = String::new();
+        result.stderr = "x".repeat(MCP_SMALL_RESULT_MAX_BYTES + 1);
+        let err = ensure_mcp_file_result_text(&result, 2, "fs.read result").unwrap_err();
+        assert!(err.to_string().contains("stderr exceeds"));
     }
 
     #[test]
