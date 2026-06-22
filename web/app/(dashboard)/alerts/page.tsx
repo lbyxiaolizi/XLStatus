@@ -19,7 +19,7 @@ import {
   tdClass,
   thClass,
 } from "@/app/components/M7Primitives";
-import { apiClient, type JsonObject } from "@/lib/api";
+import { apiClient, type JsonObject, type TotpStatusResponse } from "@/lib/api";
 
 interface AlertRule {
   id: string;
@@ -45,6 +45,7 @@ export default function AlertsPage() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [modal, setModal] = useState(false);
+  const [totpStatus, setTotpStatus] = useState<TotpStatusResponse | null>(null);
   const [form, setForm] = useState({
     name: "",
     trigger: "once",
@@ -96,7 +97,9 @@ export default function AlertsPage() {
       failure_task_ids: splitIds(form.failure_task_ids),
       recovery_task_ids: splitIds(form.recovery_task_ids),
     };
-    const response = await apiClient.createAlertRule(payload);
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
+    const response = await apiClient.createAlertRule(payload, totpCode);
     if (response.success) {
       setNotice("告警规则已创建。");
       setModal(false);
@@ -108,13 +111,37 @@ export default function AlertsPage() {
 
   async function deleteRule(rule: AlertRule) {
     if (!confirm(`确定删除告警规则「${rule.name}」？`)) return;
-    const response = await apiClient.deleteAlertRule(rule.id);
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
+    const response = await apiClient.deleteAlertRule(rule.id, totpCode);
     if (response.success) {
       setNotice("告警规则已删除。");
       await load();
     } else {
       setError(responseError(response));
     }
+  }
+
+  async function sensitiveTotpCode(): Promise<string | undefined | null> {
+    let enabled = totpStatus?.enabled;
+    if (totpStatus === null) {
+      const response = await apiClient.getTotpStatus();
+      if (!response.success || !response.data) {
+        setError(responseError(response));
+        return null;
+      }
+      setTotpStatus(response.data);
+      enabled = response.data.enabled;
+    }
+    if (!enabled) return undefined;
+    const code = window.prompt("请输入 6 位 TOTP 验证码");
+    if (code === null) return null;
+    const trimmed = code.trim();
+    if (!/^\d{6}$/.test(trimmed)) {
+      setError("请输入 6 位 TOTP 验证码。");
+      return null;
+    }
+    return trimmed;
   }
 
   return (

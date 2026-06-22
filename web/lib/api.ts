@@ -1173,9 +1173,10 @@ class ApiClient {
     );
   }
 
-  async createAlertRule(rule: JsonObject): Promise<ApiResponse<JsonObject>> {
+  async createAlertRule(rule: JsonObject, totpCode?: string): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>("/api/v1/alert-rules", {
       method: "POST",
+      headers: this.sensitiveHeaders(totpCode),
       body: JSON.stringify(rule),
     });
   }
@@ -1183,18 +1184,20 @@ class ApiClient {
   async updateAlertRule(
     id: string,
     rule: JsonObject,
+    totpCode?: string,
   ): Promise<ApiResponse<JsonObject>> {
     return this.requestWithFallback<JsonObject>(
       `/api/v1/alert-rules/${encodeURIComponent(id)}`,
       rule,
       ["PATCH", "POST", "PUT"],
+      { headers: this.sensitiveHeaders(totpCode) },
     );
   }
 
-  async deleteAlertRule(id: string): Promise<ApiResponse<JsonObject>> {
+  async deleteAlertRule(id: string, totpCode?: string): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
       `/api/v1/alert-rules/${encodeURIComponent(id)}`,
-      { method: "DELETE" },
+      { method: "DELETE", headers: this.sensitiveHeaders(totpCode) },
     );
   }
 

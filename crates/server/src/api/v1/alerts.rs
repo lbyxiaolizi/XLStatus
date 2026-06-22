@@ -2,17 +2,18 @@
 
 use crate::alerts::engine::{AlertCondition, Operator, ResourceType, TriggerMode};
 use crate::api::types::ApiResponse;
-use crate::api::v1::auth::{AppError, AppState};
+use crate::api::v1::auth::{require_sensitive_totp, AppError, AppState};
 use crate::api::v1::notifications::ensure_notification_group_owned_by;
 use crate::api::v1::servers::server_visible;
 use crate::api::v1::services::ensure_service_id_visible_to_auth;
 use crate::api::v1::tasks::{ensure_task_ids_visible_to_auth_session, require_task_uuid_text};
-use crate::auth::middleware::AuthSession;
+use crate::auth::middleware::{AuthKind, AuthSession};
 use crate::auth::rbac::has_scope;
 use crate::db::repository::alerts::{AlertEventRepository, AlertRepository};
-use crate::db::AgentRepository;
+use crate::db::{AgentRepository, DatabaseBackend};
 use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
+    http::HeaderMap,
     Json,
 };
 use chrono::{DateTime, Utc};
@@ -62,11 +63,10 @@ pub fn alert_body_limit() -> DefaultBodyLimit {
 pub async fn create_alert_rule(
     State(state): State<AppState>,
     auth: AuthSession,
+    headers: HeaderMap,
     Json(req): Json<CreateAlertRuleRequest>,
 ) -> Result<Json<ApiResponse<AlertRuleView>>, AppError> {
-    if !has_scope(&auth, "alert:write") {
-        return Err(AppError::Forbidden("missing scope: alert:write".into()));
-    }
+    require_alert_mutation_scope(&state.db, &auth, "alert:write", &headers).await?;
     let name = normalize_alert_name(&req.name)?;
     let conditions = parse_conditions(&req.conditions)?;
     let trigger = match req.trigger.as_deref() {
@@ -202,11 +202,10 @@ async fn list_alert_rules_visible_page(
 pub async fn delete_alert_rule(
     State(state): State<AppState>,
     auth: AuthSession,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
-    if !has_scope(&auth, "alert:delete") {
-        return Err(AppError::Forbidden("missing scope: alert:delete".into()));
-    }
+    require_alert_mutation_scope(&state.db, &auth, "alert:delete", &headers).await?;
     let id = require_alert_uuid_text(&id, "alert_rule_id")?;
     let repo = AlertRepository::new(state.db.clone());
     let owner = auth.user_id.0.to_string();
@@ -375,6 +374,23 @@ fn alert_event_visible_to_auth(
         .as_ref()
         .map(|agent_id| server_ids.iter().any(|allowed| allowed == agent_id))
         .unwrap_or(false)
+}
+
+async fn require_alert_mutation_scope(
+    db: &DatabaseBackend,
+    auth: &AuthSession,
+    scope: &str,
+    headers: &HeaderMap,
+) -> Result<(), AppError> {
+    if !has_scope(auth, scope) {
+        return Err(AppError::Forbidden(format!("missing scope: {scope}")));
+    }
+    if matches!(auth.auth_kind, AuthKind::PersonalAccessToken) {
+        return Err(AppError::Forbidden(
+            "alert rule changes require a cookie session".into(),
+        ));
+    }
+    require_sensitive_totp(db, auth.user_id, headers).await
 }
 
 async fn alert_rule_visible_to_auth(
@@ -843,6 +859,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn alert_rule_changes_reject_pat_session() {
+        let db = test_db().await;
+        let admin = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let auth = pat_alert_session_with_scopes(admin, UserRole::Admin, &["alert:write"]);
+
+        let err = require_alert_mutation_scope(&db, &auth, "alert:write", &HeaderMap::new())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+        assert!(app_error_message(&err).contains("cookie session"));
+    }
+
+    #[tokio::test]
+    async fn alert_rule_changes_require_sensitive_totp_when_enabled() {
+        let db = test_db().await;
+        let admin = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        seed_user(&db, admin, "admin", "admin").await;
+        seed_totp_enabled_user(&db, admin).await;
+        let auth = admin_alert_session(admin);
+
+        let err = require_alert_mutation_scope(&db, &auth, "alert:write", &HeaderMap::new())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+        assert!(app_error_message(&err).contains("TOTP"));
+    }
+
+    #[tokio::test]
+    async fn alert_rule_changes_allow_cookie_without_totp() {
+        let db = test_db().await;
+        let admin = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        seed_user(&db, admin, "admin", "admin").await;
+        let auth = admin_alert_session(admin);
+
+        require_alert_mutation_scope(&db, &auth, "alert:delete", &HeaderMap::new())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn member_alert_rules_ignore_other_owner_invalid_json() {
         let db = test_db().await;
         let owner = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
@@ -1003,6 +1061,20 @@ mod tests {
         }
     }
 
+    fn admin_alert_session(user_id: uuid::Uuid) -> AuthSession {
+        AuthSession {
+            session_id: "sess".into(),
+            user_id: UserId(user_id),
+            username: "admin".into(),
+            role: UserRole::Admin,
+            csrf_token: "csrf".into(),
+            auth_kind: AuthKind::Session,
+            scopes: Vec::new(),
+            server_ids: None,
+            pat_id: None,
+        }
+    }
+
     fn pat_alert_session(user_id: uuid::Uuid, role: UserRole, server_ids: &[&str]) -> AuthSession {
         AuthSession {
             session_id: "pat-session".into(),
@@ -1013,6 +1085,24 @@ mod tests {
             auth_kind: AuthKind::PersonalAccessToken,
             scopes: vec!["alert:read".into()],
             server_ids: Some(server_ids.iter().map(|id| id.to_string()).collect()),
+            pat_id: Some("00000000-0000-0000-0000-000000000701".into()),
+        }
+    }
+
+    fn pat_alert_session_with_scopes(
+        user_id: uuid::Uuid,
+        role: UserRole,
+        scopes: &[&str],
+    ) -> AuthSession {
+        AuthSession {
+            session_id: "pat-session".into(),
+            user_id: UserId(user_id),
+            username: "pat".into(),
+            role,
+            csrf_token: "csrf".into(),
+            auth_kind: AuthKind::PersonalAccessToken,
+            scopes: scopes.iter().map(|scope| scope.to_string()).collect(),
+            server_ids: None,
             pat_id: Some("00000000-0000-0000-0000-000000000701".into()),
         }
     }
@@ -1030,6 +1120,18 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    async fn seed_totp_enabled_user(db: &DatabaseBackend, id: uuid::Uuid) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query("UPDATE users SET totp_secret = ?, totp_enabled = 1 WHERE id = ?")
+            .bind("totp-secret")
+            .bind(id.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
     }
 
     async fn seed_agent(db: &DatabaseBackend, id: uuid::Uuid, owner: uuid::Uuid, name: &str) {
