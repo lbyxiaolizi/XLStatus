@@ -22,6 +22,7 @@ const PAT_MAX_SCOPES: usize = 64;
 const PAT_MAX_SCOPE_BYTES: usize = 128;
 const PAT_MAX_SERVER_IDS: usize = 64;
 const PAT_MAX_EXPIRES_AT_BYTES: usize = 64;
+const PAT_RESOURCE_UUID_TEXT_LEN: usize = 36;
 
 #[derive(Debug, Deserialize)]
 pub struct CreatePATRequest {
@@ -231,6 +232,26 @@ fn normalize_expires_at(value: Option<String>) -> Result<Option<String>, AppErro
     Ok(Some(value))
 }
 
+fn normalize_pat_resource_uuid(value: String, field: &str) -> Result<String, AppError> {
+    if value.is_empty() {
+        return Err(AppError::BadRequest(format!("{field} is required")));
+    }
+    if value.len() != PAT_RESOURCE_UUID_TEXT_LEN {
+        return Err(AppError::BadRequest(format!(
+            "{field} must be a canonical UUID"
+        )));
+    }
+    let parsed = uuid::Uuid::parse_str(&value)
+        .map_err(|_| AppError::BadRequest(format!("{field} must be a canonical UUID")))?;
+    let canonical = parsed.to_string();
+    if canonical != value {
+        return Err(AppError::BadRequest(format!(
+            "{field} must be a canonical UUID"
+        )));
+    }
+    Ok(canonical)
+}
+
 fn resolve_pat_expires_at(
     input: Option<&str>,
     now: DateTime<Utc>,
@@ -351,6 +372,7 @@ pub async fn revoke_pat(
         .require_cookie_session()
         .map_err(|_| AppError::Forbidden("PAT cannot manage API tokens".to_string()))?;
     super::auth::require_sensitive_totp(&state.db, auth_user.user.id, &headers).await?;
+    let id = normalize_pat_resource_uuid(id, "token_id")?;
 
     let pat_repo = PATRepository::new(state.db.clone());
     let revoked = pat_repo.revoke(&id, auth_user.user.id).await?;
@@ -380,6 +402,28 @@ mod tests {
         assert_eq!(PAT_MAX_SCOPE_BYTES, 128);
         assert_eq!(PAT_MAX_SERVER_IDS, 64);
         assert_eq!(PAT_MAX_EXPIRES_AT_BYTES, 64);
+        assert_eq!(PAT_RESOURCE_UUID_TEXT_LEN, 36);
+    }
+
+    #[test]
+    fn pat_resource_ids_require_canonical_uuid_text() {
+        let token_id = uuid::Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
+
+        assert_eq!(
+            normalize_pat_resource_uuid(token_id.to_string(), "token_id").unwrap(),
+            token_id.to_string()
+        );
+        assert!(normalize_pat_resource_uuid("token-a".into(), "token_id").is_err());
+        assert!(normalize_pat_resource_uuid(format!(" {} ", token_id), "token_id").is_err());
+        assert!(normalize_pat_resource_uuid(token_id.simple().to_string(), "token_id").is_err());
+        assert!(
+            normalize_pat_resource_uuid(token_id.to_string().to_uppercase(), "token_id").is_err()
+        );
+        assert!(normalize_pat_resource_uuid(
+            "a".repeat(PAT_RESOURCE_UUID_TEXT_LEN + 1),
+            "token_id"
+        )
+        .is_err());
     }
 
     #[test]
