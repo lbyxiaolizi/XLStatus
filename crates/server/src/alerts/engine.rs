@@ -8,6 +8,7 @@ use crate::api::v1::alerts::{
     ALERT_MAX_RESOURCE_DURATION_SECONDS, ALERT_MAX_RESOURCE_THRESHOLD, ALERT_MAX_TASK_IDS,
     ALERT_MAX_TRAFFIC_PERCENT,
 };
+use crate::api::v1::services::SERVICE_MAX_SERVER_IDS;
 use crate::db::Db;
 use crate::grpc::{SessionRegistry, TaskResponseRegistry};
 use crate::notifications::sender::{
@@ -770,7 +771,9 @@ impl AlertEngine {
         };
         match cover_mode.as_str() {
             "specific" => {
-                let mut server_ids = self.load_service_server_ids(service_id).await?;
+                let Some(mut server_ids) = self.load_service_server_ids(service_id).await? else {
+                    return Ok(ServiceResultScope::Servers(Vec::new()));
+                };
                 if server_ids.is_empty() {
                     if let Some(server_id) = legacy_server_id {
                         server_ids.push(server_id);
@@ -905,28 +908,34 @@ impl AlertEngine {
         }
     }
 
-    async fn load_service_server_ids(&self, service_id: &str) -> Result<Vec<String>> {
+    async fn load_service_server_ids(&self, service_id: &str) -> Result<Option<Vec<String>>> {
         match &self.db {
             crate::db::DatabaseBackend::Sqlite(pool) => {
                 let rows: Vec<(String,)> = sqlx::query_as(
-                    "SELECT server_id FROM service_servers WHERE service_id = ? ORDER BY created_at ASC, server_id ASC",
+                    "SELECT server_id FROM service_servers WHERE service_id = ? ORDER BY created_at ASC, server_id ASC LIMIT ?",
                 )
                 .bind(service_id)
+                .bind((SERVICE_MAX_SERVER_IDS + 1) as i64)
                 .fetch_all(pool)
                 .await?;
-                Ok(normalize_id_list(
+                Ok(bound_alert_service_server_ids(
+                    service_id,
+                    rows.len(),
                     rows.into_iter().map(|(id,)| id).collect(),
                 ))
             }
             crate::db::DatabaseBackend::Postgres(pool) => {
                 let sid = uuid::Uuid::parse_str(service_id)?;
                 let rows: Vec<(String,)> = sqlx::query_as(
-                    "SELECT server_id::text FROM service_servers WHERE service_id = $1 ORDER BY created_at ASC, server_id ASC",
+                    "SELECT server_id::text FROM service_servers WHERE service_id = $1 ORDER BY created_at ASC, server_id ASC LIMIT $2",
                 )
                 .bind(sid)
+                .bind((SERVICE_MAX_SERVER_IDS + 1) as i64)
                 .fetch_all(pool)
                 .await?;
-                Ok(normalize_id_list(
+                Ok(bound_alert_service_server_ids(
+                    service_id,
+                    rows.len(),
                     rows.into_iter().map(|(id,)| id).collect(),
                 ))
             }
@@ -1770,6 +1779,23 @@ fn normalize_id_list(values: Vec<String>) -> Vec<String> {
         }
     }
     out
+}
+
+fn bound_alert_service_server_ids(
+    service_id: &str,
+    row_count: usize,
+    values: Vec<String>,
+) -> Option<Vec<String>> {
+    if row_count > SERVICE_MAX_SERVER_IDS {
+        warn!(
+            service_id = %service_id,
+            count = row_count,
+            max = SERVICE_MAX_SERVER_IDS,
+            "service alert result scope skipped: too many server assignments"
+        );
+        return None;
+    }
+    Some(normalize_id_list(values))
 }
 
 fn normalize_uuid_id_list(values: Vec<String>) -> Vec<String> {
@@ -2731,6 +2757,69 @@ mod tests {
             0
         );
         assert_eq!(engine.latest_service_latency_ms(service).await.unwrap(), -1);
+    }
+
+    #[tokio::test]
+    async fn service_alert_specific_scope_rejects_historical_server_assignments_over_budget() {
+        let db = test_db().await;
+        let owner = "00000000-0000-0000-0000-000000000001";
+        let first_server = "00000000-0000-0000-0000-000000000101";
+        let service = "00000000-0000-0000-0000-000000000307";
+
+        seed_user(&db, owner, "owner").await;
+        seed_agent(&db, first_server, owner, "server-0").await;
+        seed_service_with_servers(&db, service, owner, &[first_server], "specific").await;
+        seed_service_result(
+            &db,
+            "00000000-0000-0000-0000-000000000471",
+            service,
+            first_server,
+            "success",
+            Some(40),
+            None,
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+
+        let Db::Sqlite(pool) = &db else {
+            unreachable!();
+        };
+        for idx in 1..=SERVICE_MAX_SERVER_IDS {
+            let server_id = format!("00000000-0000-0000-0000-{idx:012}");
+            seed_agent(&db, &server_id, owner, &format!("server-{idx}")).await;
+            sqlx::query(
+                "INSERT INTO service_servers (service_id, server_id, created_at) VALUES (?, ?, '2026-01-01T00:00:00Z')",
+            )
+            .bind(service)
+            .bind(&server_id)
+            .execute(pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO service_results (id, service_id, server_id, status, delay_ms, created_at) VALUES (?, ?, ?, 'success', 25, '2026-01-02T00:00:00Z')",
+            )
+            .bind(format!("00000000-0000-0000-0000-9{idx:011}"))
+            .bind(service)
+            .bind(&server_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        let engine = AlertEngine::new(
+            db,
+            crate::grpc::SessionRegistry::new(),
+            crate::current_task_response_registry(),
+        );
+
+        assert_eq!(engine.latest_service_latency_ms(service).await.unwrap(), -1);
+        assert_eq!(
+            engine
+                .count_recent_service_failures(service, 1)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     async fn test_db() -> Db {
