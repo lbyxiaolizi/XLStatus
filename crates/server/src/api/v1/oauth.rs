@@ -42,6 +42,7 @@ const OAUTH_MAX_TOKEN_RESPONSE_BYTES: usize = 16 * 1024;
 const OAUTH_MAX_USERINFO_RESPONSE_BYTES: usize = 64 * 1024;
 const OAUTH_MAX_ACCESS_TOKEN_BYTES: usize = 8192;
 const OAUTH_MAX_CLAIM_BYTES: usize = 1024;
+const OAUTH_ALLOW_USERINFO_QUERY_TOKEN_ENV: &str = "XLSTATUS_ALLOW_OIDC_USERINFO_QUERY_TOKEN";
 
 #[derive(Debug, Serialize)]
 pub struct OAuthProviderView {
@@ -704,6 +705,7 @@ async fn fetch_userinfo(
     access_token: &str,
 ) -> Result<OidcUserInfo, AppError> {
     let userinfo_auth_method = parse_userinfo_auth_method(&provider.userinfo_auth_method)?;
+    ensure_userinfo_auth_method_allowed(userinfo_auth_method, allow_oidc_userinfo_query_token())?;
     let validated =
         validate_outbound_url_resolved(&provider.userinfo_url, "OIDC userinfo endpoint")
             .await
@@ -879,6 +881,34 @@ fn parse_userinfo_auth_method(value: &str) -> Result<UserinfoAuthMethod, AppErro
             "unsupported OIDC userinfo_auth_method: {value}"
         ))),
     }
+}
+
+fn ensure_userinfo_auth_method_allowed(
+    method: UserinfoAuthMethod,
+    allow_query_token: bool,
+) -> Result<(), AppError> {
+    if matches!(method, UserinfoAuthMethod::Query) && !allow_query_token {
+        return Err(AppError::BadRequest(
+            "OIDC userinfo query token auth is disabled".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn allow_oidc_userinfo_query_token() -> bool {
+    let value = std::env::var(OAUTH_ALLOW_USERINFO_QUERY_TOKEN_ENV).ok();
+    allow_oidc_userinfo_query_token_value(value.as_deref())
+}
+
+fn allow_oidc_userinfo_query_token_value(value: Option<&str>) -> bool {
+    value
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn normalize_method_name(value: &str) -> String {
@@ -1658,6 +1688,26 @@ mod tests {
             parse_userinfo_auth_method("access token query").unwrap(),
             UserinfoAuthMethod::Query
         );
+    }
+
+    #[test]
+    fn userinfo_query_token_auth_requires_explicit_escape_hatch() {
+        assert!(ensure_userinfo_auth_method_allowed(UserinfoAuthMethod::Bearer, false).is_ok());
+        assert!(ensure_userinfo_auth_method_allowed(UserinfoAuthMethod::None, false).is_ok());
+
+        let err =
+            ensure_userinfo_auth_method_allowed(UserinfoAuthMethod::Query, false).unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::BadRequest(message) if message.contains("query token auth is disabled")
+        ));
+        assert!(ensure_userinfo_auth_method_allowed(UserinfoAuthMethod::Query, true).is_ok());
+
+        assert!(!allow_oidc_userinfo_query_token_value(None));
+        assert!(!allow_oidc_userinfo_query_token_value(Some("false")));
+        assert!(allow_oidc_userinfo_query_token_value(Some("1")));
+        assert!(allow_oidc_userinfo_query_token_value(Some("true")));
+        assert!(allow_oidc_userinfo_query_token_value(Some("yes")));
     }
 
     #[tokio::test]
