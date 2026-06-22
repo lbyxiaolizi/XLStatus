@@ -111,7 +111,7 @@ impl PATRepository {
 
                 Ok(rows
                     .into_iter()
-                    .map(
+                    .filter_map(
                         |(
                             id,
                             user_id_str,
@@ -125,33 +125,28 @@ impl PATRepository {
                             created_at,
                             revoked_at,
                         )| {
-                            PersonalAccessToken {
+                            let pat_id = id.clone();
+                            match row_to_pat_sqlite(
                                 id,
-                                user_id: UserId(uuid::Uuid::parse_str(&user_id_str).unwrap()),
+                                user_id_str,
                                 name,
                                 token_hash,
-                                scopes: serde_json::from_str(&scopes_json).unwrap(),
-                                server_ids: server_ids_json
-                                    .and_then(|s| serde_json::from_str(&s).ok()),
-                                expires_at: expires_at.and_then(|s| {
-                                    DateTime::parse_from_rfc3339(&s)
-                                        .ok()
-                                        .map(|dt| dt.with_timezone(&Utc))
-                                }),
-                                last_used_at: last_used_at.and_then(|s| {
-                                    DateTime::parse_from_rfc3339(&s)
-                                        .ok()
-                                        .map(|dt| dt.with_timezone(&Utc))
-                                }),
+                                scopes_json,
+                                server_ids_json,
+                                expires_at,
+                                last_used_at,
                                 last_used_ip,
-                                created_at: DateTime::parse_from_rfc3339(&created_at)
-                                    .unwrap()
-                                    .with_timezone(&Utc),
-                                revoked_at: revoked_at.and_then(|s| {
-                                    DateTime::parse_from_rfc3339(&s)
-                                        .ok()
-                                        .map(|dt| dt.with_timezone(&Utc))
-                                }),
+                                created_at,
+                                revoked_at,
+                            ) {
+                                Ok(pat) => Some(pat),
+                                Err(err) => {
+                                    tracing::warn!(
+                                        pat_id = %pat_id,
+                                        "skipping invalid PAT row: {err}"
+                                    );
+                                    None
+                                }
                             }
                         },
                     )
@@ -172,7 +167,7 @@ impl PATRepository {
 
                 Ok(rows
                     .into_iter()
-                    .map(
+                    .filter_map(
                         |(
                             id,
                             user_id_uuid,
@@ -186,19 +181,28 @@ impl PATRepository {
                             created_at,
                             revoked_at,
                         )| {
-                            PersonalAccessToken {
-                                id: id.to_string(),
-                                user_id: UserId(user_id_uuid),
+                            let pat_id = id.to_string();
+                            match row_to_pat_postgres(
+                                pat_id.clone(),
+                                UserId(user_id_uuid),
                                 name,
                                 token_hash,
-                                scopes: serde_json::from_value(scopes_json).unwrap(),
-                                server_ids: server_ids_json
-                                    .and_then(|v| serde_json::from_value(v).ok()),
+                                scopes_json,
+                                server_ids_json,
                                 expires_at,
                                 last_used_at,
                                 last_used_ip,
                                 created_at,
                                 revoked_at,
+                            ) {
+                                Ok(pat) => Some(pat),
+                                Err(err) => {
+                                    tracing::warn!(
+                                        pat_id = %pat_id,
+                                        "skipping invalid PAT row: {err}"
+                                    );
+                                    None
+                                }
                             }
                         },
                     )
@@ -224,8 +228,8 @@ impl PATRepository {
                 .fetch_optional(pool)
                 .await?;
 
-                Ok(row.map(
-                    |(
+                match row {
+                    Some((
                         id,
                         user_id_str,
                         name,
@@ -237,34 +241,33 @@ impl PATRepository {
                         last_used_ip,
                         created_at,
                         revoked_at,
-                    )| PersonalAccessToken {
-                        id,
-                        user_id: UserId(uuid::Uuid::parse_str(&user_id_str).unwrap()),
-                        name,
-                        token_hash,
-                        scopes: serde_json::from_str(&scopes_json).unwrap(),
-                        server_ids: server_ids_json.and_then(|s| serde_json::from_str(&s).ok()),
-                        expires_at: expires_at.and_then(|s| {
-                            DateTime::parse_from_rfc3339(&s)
-                                .ok()
-                                .map(|dt| dt.with_timezone(&Utc))
-                        }),
-                        last_used_at: last_used_at.and_then(|s| {
-                            DateTime::parse_from_rfc3339(&s)
-                                .ok()
-                                .map(|dt| dt.with_timezone(&Utc))
-                        }),
-                        last_used_ip,
-                        created_at: DateTime::parse_from_rfc3339(&created_at)
-                            .unwrap()
-                            .with_timezone(&Utc),
-                        revoked_at: revoked_at.and_then(|s| {
-                            DateTime::parse_from_rfc3339(&s)
-                                .ok()
-                                .map(|dt| dt.with_timezone(&Utc))
-                        }),
-                    },
-                ))
+                    )) => {
+                        let pat_id = id.clone();
+                        match row_to_pat_sqlite(
+                            id,
+                            user_id_str,
+                            name,
+                            token_hash,
+                            scopes_json,
+                            server_ids_json,
+                            expires_at,
+                            last_used_at,
+                            last_used_ip,
+                            created_at,
+                            revoked_at,
+                        ) {
+                            Ok(pat) => Ok(Some(pat)),
+                            Err(err) => {
+                                tracing::warn!(
+                                    pat_id = %pat_id,
+                                    "treating invalid PAT row as not found: {err}"
+                                );
+                                Ok(None)
+                            }
+                        }
+                    }
+                    None => Ok(None),
+                }
             }
             DatabaseBackend::Postgres(pool) => {
                 let row = sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid, String, String, serde_json::Value, Option<serde_json::Value>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>, DateTime<Utc>, Option<DateTime<Utc>>)>(
@@ -278,8 +281,8 @@ impl PATRepository {
                 .fetch_optional(pool)
                 .await?;
 
-                Ok(row.map(
-                    |(
+                match row {
+                    Some((
                         id,
                         user_id_uuid,
                         name,
@@ -291,20 +294,33 @@ impl PATRepository {
                         last_used_ip,
                         created_at,
                         revoked_at,
-                    )| PersonalAccessToken {
-                        id: id.to_string(),
-                        user_id: UserId(user_id_uuid),
-                        name,
-                        token_hash,
-                        scopes: serde_json::from_value(scopes_json).unwrap(),
-                        server_ids: server_ids_json.and_then(|v| serde_json::from_value(v).ok()),
-                        expires_at,
-                        last_used_at,
-                        last_used_ip,
-                        created_at,
-                        revoked_at,
-                    },
-                ))
+                    )) => {
+                        let pat_id = id.to_string();
+                        match row_to_pat_postgres(
+                            pat_id.clone(),
+                            UserId(user_id_uuid),
+                            name,
+                            token_hash,
+                            scopes_json,
+                            server_ids_json,
+                            expires_at,
+                            last_used_at,
+                            last_used_ip,
+                            created_at,
+                            revoked_at,
+                        ) {
+                            Ok(pat) => Ok(Some(pat)),
+                            Err(err) => {
+                                tracing::warn!(
+                                    pat_id = %pat_id,
+                                    "treating invalid PAT row as not found: {err}"
+                                );
+                                Ok(None)
+                            }
+                        }
+                    }
+                    None => Ok(None),
+                }
             }
         }
     }
@@ -323,8 +339,8 @@ impl PATRepository {
                 .fetch_optional(pool)
                 .await?;
 
-                Ok(row.map(
-                    |(
+                match row {
+                    Some((
                         id,
                         user_id_str,
                         name,
@@ -336,34 +352,33 @@ impl PATRepository {
                         last_used_ip,
                         created_at,
                         revoked_at,
-                    )| PersonalAccessToken {
-                        id,
-                        user_id: UserId(uuid::Uuid::parse_str(&user_id_str).unwrap()),
-                        name,
-                        token_hash,
-                        scopes: serde_json::from_str(&scopes_json).unwrap(),
-                        server_ids: server_ids_json.and_then(|s| serde_json::from_str(&s).ok()),
-                        expires_at: expires_at.and_then(|s| {
-                            DateTime::parse_from_rfc3339(&s)
-                                .ok()
-                                .map(|dt| dt.with_timezone(&Utc))
-                        }),
-                        last_used_at: last_used_at.and_then(|s| {
-                            DateTime::parse_from_rfc3339(&s)
-                                .ok()
-                                .map(|dt| dt.with_timezone(&Utc))
-                        }),
-                        last_used_ip,
-                        created_at: DateTime::parse_from_rfc3339(&created_at)
-                            .unwrap()
-                            .with_timezone(&Utc),
-                        revoked_at: revoked_at.and_then(|s| {
-                            DateTime::parse_from_rfc3339(&s)
-                                .ok()
-                                .map(|dt| dt.with_timezone(&Utc))
-                        }),
-                    },
-                ))
+                    )) => {
+                        let pat_id = id.clone();
+                        match row_to_pat_sqlite(
+                            id,
+                            user_id_str,
+                            name,
+                            token_hash,
+                            scopes_json,
+                            server_ids_json,
+                            expires_at,
+                            last_used_at,
+                            last_used_ip,
+                            created_at,
+                            revoked_at,
+                        ) {
+                            Ok(pat) => Ok(Some(pat)),
+                            Err(err) => {
+                                tracing::warn!(
+                                    pat_id = %pat_id,
+                                    "treating invalid PAT row as not found: {err}"
+                                );
+                                Ok(None)
+                            }
+                        }
+                    }
+                    None => Ok(None),
+                }
             }
             DatabaseBackend::Postgres(pool) => {
                 let id = parse_pat_uuid(id, "id")?;
@@ -378,8 +393,8 @@ impl PATRepository {
                 .fetch_optional(pool)
                 .await?;
 
-                Ok(row.map(
-                    |(
+                match row {
+                    Some((
                         id,
                         user_id_uuid,
                         name,
@@ -391,20 +406,33 @@ impl PATRepository {
                         last_used_ip,
                         created_at,
                         revoked_at,
-                    )| PersonalAccessToken {
-                        id: id.to_string(),
-                        user_id: UserId(user_id_uuid),
-                        name,
-                        token_hash,
-                        scopes: serde_json::from_value(scopes_json).unwrap(),
-                        server_ids: server_ids_json.and_then(|v| serde_json::from_value(v).ok()),
-                        expires_at,
-                        last_used_at,
-                        last_used_ip,
-                        created_at,
-                        revoked_at,
-                    },
-                ))
+                    )) => {
+                        let pat_id = id.to_string();
+                        match row_to_pat_postgres(
+                            pat_id.clone(),
+                            UserId(user_id_uuid),
+                            name,
+                            token_hash,
+                            scopes_json,
+                            server_ids_json,
+                            expires_at,
+                            last_used_at,
+                            last_used_ip,
+                            created_at,
+                            revoked_at,
+                        ) {
+                            Ok(pat) => Ok(Some(pat)),
+                            Err(err) => {
+                                tracing::warn!(
+                                    pat_id = %pat_id,
+                                    "treating invalid PAT row as not found: {err}"
+                                );
+                                Ok(None)
+                            }
+                        }
+                    }
+                    None => Ok(None),
+                }
             }
         }
     }
@@ -498,4 +526,197 @@ impl PATRepository {
 
 fn parse_pat_uuid(value: &str, field: &str) -> Result<uuid::Uuid> {
     uuid::Uuid::parse_str(value).with_context(|| format!("invalid PAT {field} UUID"))
+}
+
+fn row_to_pat_sqlite(
+    id: String,
+    user_id_str: String,
+    name: String,
+    token_hash: String,
+    scopes_json: String,
+    server_ids_json: Option<String>,
+    expires_at: Option<String>,
+    last_used_at: Option<String>,
+    last_used_ip: Option<String>,
+    created_at: String,
+    revoked_at: Option<String>,
+) -> Result<PersonalAccessToken> {
+    let user_id = UserId(parse_pat_uuid(&user_id_str, "user_id")?);
+    let scopes = serde_json::from_str(&scopes_json)
+        .with_context(|| format!("invalid PAT scopes JSON for {id}"))?;
+    let server_ids = parse_optional_string_array_json(server_ids_json.as_deref(), "server_ids")?;
+    Ok(PersonalAccessToken {
+        id,
+        user_id,
+        name,
+        token_hash,
+        scopes,
+        server_ids,
+        expires_at: parse_optional_rfc3339(expires_at.as_deref(), "expires_at")?,
+        last_used_at: parse_optional_rfc3339(last_used_at.as_deref(), "last_used_at")?,
+        last_used_ip,
+        created_at: parse_required_rfc3339(&created_at, "created_at")?,
+        revoked_at: parse_optional_rfc3339(revoked_at.as_deref(), "revoked_at")?,
+    })
+}
+
+fn row_to_pat_postgres(
+    id: String,
+    user_id: UserId,
+    name: String,
+    token_hash: String,
+    scopes_json: serde_json::Value,
+    server_ids_json: Option<serde_json::Value>,
+    expires_at: Option<DateTime<Utc>>,
+    last_used_at: Option<DateTime<Utc>>,
+    last_used_ip: Option<String>,
+    created_at: DateTime<Utc>,
+    revoked_at: Option<DateTime<Utc>>,
+) -> Result<PersonalAccessToken> {
+    let scopes = serde_json::from_value(scopes_json)
+        .with_context(|| format!("invalid PAT scopes JSON for {id}"))?;
+    let server_ids = match server_ids_json {
+        Some(value) => {
+            Some(serde_json::from_value(value).with_context(|| "invalid PAT server_ids JSON")?)
+        }
+        None => None,
+    };
+    Ok(PersonalAccessToken {
+        id,
+        user_id,
+        name,
+        token_hash,
+        scopes,
+        server_ids,
+        expires_at,
+        last_used_at,
+        last_used_ip,
+        created_at,
+        revoked_at,
+    })
+}
+
+fn parse_optional_string_array_json(
+    value: Option<&str>,
+    field: &str,
+) -> Result<Option<Vec<String>>> {
+    match value {
+        Some(value) => serde_json::from_str(value)
+            .map(Some)
+            .with_context(|| format!("invalid PAT {field} JSON")),
+        None => Ok(None),
+    }
+}
+
+fn parse_required_rfc3339(value: &str, field: &str) -> Result<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .with_context(|| format!("invalid PAT {field} timestamp"))
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+fn parse_optional_rfc3339(value: Option<&str>, field: &str) -> Result<Option<DateTime<Utc>>> {
+    value
+        .map(|value| parse_required_rfc3339(value, field))
+        .transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::hash_token;
+    use crate::db::{CreateUserInput, UserRepository};
+    use xlstatus_shared::UserRole;
+
+    #[tokio::test]
+    async fn invalid_pat_server_ids_are_not_treated_as_global() {
+        let db = test_db().await;
+        let user = UserRepository::new(db.clone())
+            .create(CreateUserInput {
+                username: "owner".into(),
+                password: "secret".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        let repo = PATRepository::new(db.clone());
+        let token_hash = hash_token("xlp_dirty");
+        insert_raw_pat(
+            &db,
+            user.id,
+            "dirty-server-ids",
+            &token_hash,
+            r#"["server:read"]"#,
+            Some(r#"{"bad":"shape"}"#),
+        )
+        .await;
+
+        assert!(repo
+            .find_by_token_hash(&token_hash)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo.list_by_user(user.id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_pat_scopes_are_not_returned() {
+        let db = test_db().await;
+        let user = UserRepository::new(db.clone())
+            .create(CreateUserInput {
+                username: "owner".into(),
+                password: "secret".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        let repo = PATRepository::new(db.clone());
+        let token_hash = hash_token("xlp_dirty_scopes");
+        insert_raw_pat(&db, user.id, "dirty-scopes", &token_hash, "not-json", None).await;
+
+        assert!(repo
+            .find_by_token_hash(&token_hash)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo.list_by_user(user.id).await.unwrap().is_empty());
+    }
+
+    async fn insert_raw_pat(
+        db: &DatabaseBackend,
+        user_id: UserId,
+        name: &str,
+        token_hash: &str,
+        scopes: &str,
+        server_ids: Option<&str>,
+    ) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            r#"
+            INSERT INTO personal_access_tokens
+            (id, user_id, name, token_hash, scopes, server_ids, expires_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(uuid::Uuid::now_v7().to_string())
+        .bind(user_id.0.to_string())
+        .bind(name)
+        .bind(token_hash)
+        .bind(scopes)
+        .bind(server_ids)
+        .bind((Utc::now() + chrono::Duration::days(1)).to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn test_db() -> DatabaseBackend {
+        let db = DatabaseBackend::connect("sqlite::memory:", true)
+            .await
+            .unwrap();
+        db.run_migrations().await.unwrap();
+        db
+    }
 }
