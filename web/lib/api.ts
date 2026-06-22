@@ -1571,11 +1571,13 @@ class ApiClient {
 
   async updateSettings(
     settings: Partial<SystemSettingsResponse>,
+    totpCode?: string,
   ): Promise<ApiResponse<SystemSettingsResponse>> {
     return this.requestWithFallback<SystemSettingsResponse>(
       "/api/v1/settings",
       settings,
       ["PATCH", "POST"],
+      { headers: this.sensitiveHeaders(totpCode) },
     );
   }
 

@@ -1,13 +1,14 @@
 //! System settings API.
 
 use crate::api::types::ApiResponse;
-use crate::api::v1::auth::{AppError, AppState};
+use crate::api::v1::auth::{require_sensitive_totp, AppError, AppState};
 use crate::api::v1::notifications::ensure_notification_group_owned_by;
 use crate::auth::middleware::{AuthKind, AuthSession};
 use crate::db::{AgentRepository, DatabaseBackend};
 use crate::secrets::{decrypt_secret_if_needed, encrypt_secret, is_encrypted_secret};
 use axum::{
     extract::{DefaultBodyLimit, State},
+    http::HeaderMap,
     Json,
 };
 use chrono::Utc;
@@ -107,9 +108,11 @@ pub async fn get_settings(
 pub async fn update_settings(
     State(state): State<AppState>,
     auth: AuthSession,
+    headers: HeaderMap,
     Json(req): Json<UpdateSystemSettingsRequest>,
 ) -> Result<Json<ApiResponse<SystemSettingsResponse>>, AppError> {
     require_admin_cookie_session(&auth)?;
+    require_sensitive_totp(&state.db, auth.user_id, &headers).await?;
     if let Some(enabled) = req.public_site_enabled {
         set_bool_setting(&state.db, PUBLIC_SITE_ENABLED, enabled).await?;
     }
@@ -814,14 +817,15 @@ mod tests {
         normalize_geoip_ip_change_server_ids, normalize_optional_public_asset_url,
         normalize_optional_public_background_url, normalize_optional_secret_text,
         normalize_optional_url_setting, normalize_optional_uuid_text, public_site_branding,
-        require_admin_cookie_session, set_string_setting, settings_body_limit,
-        PUBLIC_BACKGROUND_URL, PUBLIC_FAVICON_URL, PUBLIC_LOGO_URL, SETTINGS_MAX_BODY_BYTES,
-        SETTINGS_MAX_CLOUDFLARED_TOKEN_BYTES, SETTINGS_MAX_DISABLED_CUSTOM_HTML_BYTES,
-        SETTINGS_MAX_GEOIP_IP_CHANGE_SERVERS, SETTINGS_MAX_GEOIP_TOKEN_BYTES,
-        SETTINGS_MAX_URL_BYTES,
+        public_site_enabled, require_admin_cookie_session, set_string_setting, settings_body_limit,
+        update_settings, PUBLIC_BACKGROUND_URL, PUBLIC_FAVICON_URL, PUBLIC_LOGO_URL,
+        SETTINGS_MAX_BODY_BYTES, SETTINGS_MAX_CLOUDFLARED_TOKEN_BYTES,
+        SETTINGS_MAX_DISABLED_CUSTOM_HTML_BYTES, SETTINGS_MAX_GEOIP_IP_CHANGE_SERVERS,
+        SETTINGS_MAX_GEOIP_TOKEN_BYTES, SETTINGS_MAX_URL_BYTES,
     };
     use crate::auth::middleware::{AuthKind, AuthSession};
     use crate::db::DatabaseBackend;
+    use axum::{extract::State, http::HeaderMap, Json};
     use xlstatus_shared::{UserId, UserRole};
 
     #[test]
@@ -1057,6 +1061,61 @@ mod tests {
         assert!(require_admin_cookie_session(&auth).is_ok());
     }
 
+    #[tokio::test]
+    async fn system_settings_updates_require_sensitive_totp_when_enabled() {
+        let db = DatabaseBackend::connect("sqlite::memory:", true)
+            .await
+            .unwrap();
+        db.run_migrations().await.unwrap();
+        let user_id = uuid::Uuid::from_bytes([1; 16]);
+        seed_user(&db, user_id).await;
+        seed_totp_enabled_user(&db, user_id).await;
+
+        let err = update_settings(
+            State(test_state(db.clone())),
+            auth_session(AuthKind::Session),
+            HeaderMap::new(),
+            Json(super::UpdateSystemSettingsRequest {
+                public_site_enabled: Some(false),
+                public_site_name: None,
+                public_logo_url: None,
+                public_favicon_url: None,
+                public_theme_color: None,
+                public_background_url: None,
+                public_custom_head: None,
+                public_custom_body: None,
+                public_server_details_enabled: None,
+                geoip_provider: None,
+                geoip_ipinfo_token: None,
+                geoip_ip_change_enabled: None,
+                geoip_ip_change_notification_group_id: None,
+                geoip_ip_change_server_ids: None,
+                geoip_ip_change_severity: None,
+                ddns_resolver_url: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, super::AppError::Forbidden(_)));
+        assert!(public_site_enabled(&db).await.unwrap());
+    }
+
+    fn test_state(db: DatabaseBackend) -> super::AppState {
+        super::AppState {
+            db,
+            config: std::sync::Arc::new(crate::config::Config::default()),
+            agent_jwt_challenges: std::sync::Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            metrics: xlstatus_tsdb::MetricStore::in_memory(),
+            realtime: crate::realtime::BroadcastHub::new(),
+            session_registry: crate::grpc::SessionRegistry::new(),
+            terminal_sessions: crate::api::v1::terminal::TerminalSessionRegistry::new(),
+            io_registry: crate::grpc::IoRegistry::new(),
+        }
+    }
+
     fn auth_session(auth_kind: AuthKind) -> AuthSession {
         AuthSession {
             session_id: "sess".into(),
@@ -1104,6 +1163,18 @@ mod tests {
             unreachable!();
         };
         sqlx::query("UPDATE agents SET revoked_at = '2026-06-22T00:00:00Z' WHERE id = ?")
+            .bind(id.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn seed_totp_enabled_user(db: &DatabaseBackend, id: uuid::Uuid) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query("UPDATE users SET totp_secret = ?, totp_enabled = 1 WHERE id = ?")
+            .bind("totp-secret")
             .bind(id.to_string())
             .execute(pool)
             .await

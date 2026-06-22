@@ -803,6 +803,8 @@ export default function SettingsPage() {
   }
 
   async function saveGeoIpSettings() {
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
     setSettingsLoading(true);
     const response = await apiClient.updateSettings({
       geoip_provider: geoIp.provider,
@@ -812,7 +814,7 @@ export default function SettingsPage() {
       geoip_ip_change_server_ids: splitSettingList(geoIpIpChange.server_ids),
       geoip_ip_change_severity: geoIpIpChange.severity,
       ddns_resolver_url: ddnsResolverUrl.trim(),
-    });
+    }, totpCode);
     setSettingsLoading(false);
     if (response.success && response.data) {
       const settings = response.data;
@@ -832,8 +834,10 @@ export default function SettingsPage() {
   }
 
   async function updatePublicSiteEnabled(enabled: boolean) {
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
     setSettingsLoading(true);
-    const response = await apiClient.updateSettings({ public_site_enabled: enabled });
+    const response = await apiClient.updateSettings({ public_site_enabled: enabled }, totpCode);
     setSettingsLoading(false);
     if (response.success && response.data) {
       setSystemSettings(response.data);
@@ -844,8 +848,10 @@ export default function SettingsPage() {
   }
 
   async function updatePublicServerDetailsEnabled(enabled: boolean) {
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
     setSettingsLoading(true);
-    const response = await apiClient.updateSettings({ public_server_details_enabled: enabled });
+    const response = await apiClient.updateSettings({ public_server_details_enabled: enabled }, totpCode);
     setSettingsLoading(false);
     if (response.success && response.data) {
       setSystemSettings(response.data);
@@ -861,6 +867,8 @@ export default function SettingsPage() {
       setError("请填写公开状态页名称。");
       return;
     }
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
     setSettingsLoading(true);
     const response = await apiClient.updateSettings({
       public_site_name: siteName,
@@ -870,7 +878,7 @@ export default function SettingsPage() {
       public_background_url: nullableText(publicBranding.backgroundUrl),
       public_custom_head: null,
       public_custom_body: null,
-    });
+    }, totpCode);
     setSettingsLoading(false);
     if (response.success && response.data) {
       setSystemSettings(response.data);
