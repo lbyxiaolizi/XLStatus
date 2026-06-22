@@ -869,6 +869,7 @@ pub async fn cancel_server_owner_transfer(
         return Err(AppError::Forbidden("missing scope: server:write".into()));
     }
     require_transfer_admin(&auth)?;
+    require_sensitive_totp(&state.db, auth.user_id, &headers).await?;
     let transfer = load_server_owner_transfer(&state.db, &id)
         .await?
         .ok_or(AppError::NotFound("server transfer not found".into()))?;
@@ -3223,6 +3224,18 @@ mod tests {
         .unwrap();
     }
 
+    async fn seed_totp_enabled_user(db: &DatabaseBackend, id: Uuid) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query("UPDATE users SET totp_secret = ?, totp_enabled = 1 WHERE id = ?")
+            .bind("totp-secret")
+            .bind(id.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
     async fn seed_agent(db: &DatabaseBackend, id: Uuid, owner: Uuid, name: &str, created_at: &str) {
         let DatabaseBackend::Sqlite(pool) = db else {
             unreachable!();
@@ -3301,6 +3314,36 @@ mod tests {
         .bind(id)
         .bind(server_id.to_string())
         .bind(to_user_id.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_server_owner_transfer(
+        db: &DatabaseBackend,
+        id: Uuid,
+        server_id: Uuid,
+        from_user_id: Uuid,
+        to_user_id: Uuid,
+        status: &str,
+    ) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            r#"
+            INSERT INTO server_owner_transfers (
+                id, agent_id, from_user_id, to_user_id, requested_by_user_id,
+                status, attempts, last_attempt_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+            "#,
+        )
+        .bind(id.to_string())
+        .bind(server_id.to_string())
+        .bind(from_user_id.to_string())
+        .bind(to_user_id.to_string())
+        .bind(from_user_id.to_string())
+        .bind(status)
         .execute(pool)
         .await
         .unwrap();
@@ -3680,6 +3723,41 @@ mod tests {
     fn ownership_transfer_allows_admin_cookie_session() {
         let auth = auth_session(AuthKind::Session, UserRole::Admin);
         assert!(require_transfer_admin(&auth).is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancel_ownership_transfer_requires_sensitive_totp_when_enabled() {
+        let db = test_db().await;
+        let admin = Uuid::from_bytes([9; 16]);
+        let owner = Uuid::parse_str("00000000-0000-0000-0000-000000000101").unwrap();
+        let target = Uuid::parse_str("00000000-0000-0000-0000-000000000202").unwrap();
+        let server = Uuid::parse_str("00000000-0000-0000-0000-000000000303").unwrap();
+        let transfer = Uuid::parse_str("00000000-0000-0000-0000-000000000404").unwrap();
+        seed_user(&db, admin, "admin", "admin").await;
+        seed_user(&db, owner, "owner", "member").await;
+        seed_user(&db, target, "target", "member").await;
+        seed_totp_enabled_user(&db, admin).await;
+        seed_agent(&db, server, owner, "server", "2026-01-01T00:00:00Z").await;
+        seed_server_owner_transfer(&db, transfer, server, owner, target, "failed").await;
+
+        let auth = auth_session(AuthKind::Session, UserRole::Admin);
+        let err = cancel_server_owner_transfer(
+            State(test_state(db.clone())),
+            auth,
+            ConnectInfo("127.0.0.1:8080".parse().unwrap()),
+            HeaderMap::new(),
+            Path(transfer.to_string()),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+        let still_failed = load_server_owner_transfer(&db, &transfer.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(still_failed.status, "failed");
+        assert!(still_failed.cancelled_at.is_none());
     }
 
     #[test]

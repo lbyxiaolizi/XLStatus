@@ -882,10 +882,14 @@ class ApiClient {
 
   async cancelServerOwnerTransfer(
     id: string,
+    totpCode?: string,
   ): Promise<ApiResponse<ServerOwnerTransfer>> {
     return this.request<ServerOwnerTransfer>(
       `/api/v1/server-transfers/${encodeURIComponent(id)}/cancel`,
-      { method: "POST" },
+      {
+        method: "POST",
+        headers: this.sensitiveHeaders(totpCode),
+      },
     );
   }
 

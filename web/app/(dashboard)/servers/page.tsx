@@ -630,7 +630,9 @@ export default function ServersPage() {
   async function cancelOwnerTransfer(transfer: ServerOwnerTransfer) {
     if (!confirm(`确定取消转移记录 ${compactId(transfer.id)}？`)) return;
     setTransferError(null);
-    const response = await apiClient.cancelServerOwnerTransfer(transfer.id);
+    const totpCode = await sensitiveTotpCodeForAction(true);
+    if (totpCode === null) return;
+    const response = await apiClient.cancelServerOwnerTransfer(transfer.id, totpCode);
     if (!response.success) {
       setTransferError(responseError(response));
       return;
