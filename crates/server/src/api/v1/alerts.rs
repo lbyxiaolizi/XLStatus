@@ -21,10 +21,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 const ALERT_API_MAX_BODY_BYTES: usize = 64 * 1024;
-const ALERT_MAX_NAME_BYTES: usize = 128;
-const ALERT_MAX_CONDITIONS: usize = 32;
-const ALERT_MAX_CONDITION_BYTES: usize = 4 * 1024;
-const ALERT_MAX_TASK_IDS: usize = 32;
+pub(crate) const ALERT_MAX_NAME_BYTES: usize = 128;
+pub(crate) const ALERT_MAX_CONDITIONS: usize = 32;
+pub(crate) const ALERT_MAX_CONDITION_BYTES: usize = 4 * 1024;
+pub(crate) const ALERT_MAX_TASK_IDS: usize = 32;
+pub(crate) const ALERT_MAX_CONSECUTIVE_FAILURES: u32 = 100;
+pub(crate) const ALERT_MAX_LATENCY_MS: i32 = 86_400_000;
+pub(crate) const ALERT_MAX_DAYS_BEFORE: i64 = 3650;
+pub(crate) const ALERT_MAX_OFFLINE_SECONDS: u64 = 31_536_000;
+pub(crate) const ALERT_MAX_RESOURCE_DURATION_SECONDS: u64 = 31_536_000;
+pub(crate) const ALERT_MAX_TRAFFIC_PERCENT: f64 = 1_000_000.0;
+pub(crate) const ALERT_MAX_RESOURCE_THRESHOLD: f64 = 1_000_000_000_000.0;
 const ALERT_RULE_LIST_SCAN_BATCH: i64 = 500;
 const ALERT_UUID_TEXT_LEN: usize = 36;
 
@@ -497,22 +504,64 @@ fn parse_conditions(items: &[JsonValue]) -> Result<Vec<AlertCondition>, AppError
 
 fn validate_condition(condition: &AlertCondition) -> Result<(), AppError> {
     match condition {
+        AlertCondition::ServiceDown {
+            consecutive_failures,
+            ..
+        } => {
+            if *consecutive_failures == 0 || *consecutive_failures > ALERT_MAX_CONSECUTIVE_FAILURES
+            {
+                return Err(AppError::BadRequest(format!(
+                    "consecutive_failures must be between 1 and {ALERT_MAX_CONSECUTIVE_FAILURES}"
+                )));
+            }
+        }
+        AlertCondition::ServiceLatency { max_latency_ms, .. } => {
+            if *max_latency_ms <= 0 || *max_latency_ms > ALERT_MAX_LATENCY_MS {
+                return Err(AppError::BadRequest(format!(
+                    "max_latency_ms must be between 1 and {ALERT_MAX_LATENCY_MS}"
+                )));
+            }
+        }
         AlertCondition::CertificateExpiry { days_before, .. }
         | AlertCondition::ServerExpiry { days_before, .. } => {
-            if *days_before < 0 {
-                return Err(AppError::BadRequest(
-                    "days_before must be greater than or equal to 0".into(),
-                ));
+            if *days_before < 0 || *days_before > ALERT_MAX_DAYS_BEFORE {
+                return Err(AppError::BadRequest(format!(
+                    "days_before must be between 0 and {ALERT_MAX_DAYS_BEFORE}"
+                )));
             }
         }
         AlertCondition::ServerTrafficQuota { percent, .. } => {
-            if !percent.is_finite() || *percent <= 0.0 {
-                return Err(AppError::BadRequest(
-                    "percent must be greater than 0".into(),
-                ));
+            if !percent.is_finite() || *percent <= 0.0 || *percent > ALERT_MAX_TRAFFIC_PERCENT {
+                return Err(AppError::BadRequest(format!(
+                    "percent must be greater than 0 and at most {ALERT_MAX_TRAFFIC_PERCENT}"
+                )));
             }
         }
-        _ => {}
+        AlertCondition::ServerOffline {
+            offline_seconds, ..
+        } => {
+            if *offline_seconds == 0 || *offline_seconds > ALERT_MAX_OFFLINE_SECONDS {
+                return Err(AppError::BadRequest(format!(
+                    "offline_seconds must be between 1 and {ALERT_MAX_OFFLINE_SECONDS}"
+                )));
+            }
+        }
+        AlertCondition::ServerResource {
+            threshold,
+            duration_seconds,
+            ..
+        } => {
+            if !threshold.is_finite() || threshold.abs() > ALERT_MAX_RESOURCE_THRESHOLD {
+                return Err(AppError::BadRequest(format!(
+                    "threshold must be finite and within +/-{ALERT_MAX_RESOURCE_THRESHOLD}"
+                )));
+            }
+            if *duration_seconds > ALERT_MAX_RESOURCE_DURATION_SECONDS {
+                return Err(AppError::BadRequest(format!(
+                    "duration_seconds must be at most {ALERT_MAX_RESOURCE_DURATION_SECONDS}"
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -949,6 +998,11 @@ mod tests {
         assert_eq!(ALERT_MAX_NAME_BYTES, 128);
         assert_eq!(ALERT_MAX_CONDITIONS, 32);
         assert_eq!(ALERT_MAX_TASK_IDS, 32);
+        assert_eq!(ALERT_MAX_CONSECUTIVE_FAILURES, 100);
+        assert_eq!(ALERT_MAX_LATENCY_MS, 86_400_000);
+        assert_eq!(ALERT_MAX_DAYS_BEFORE, 3650);
+        assert_eq!(ALERT_MAX_OFFLINE_SECONDS, 31_536_000);
+        assert_eq!(ALERT_MAX_RESOURCE_DURATION_SECONDS, 31_536_000);
         assert_eq!(ALERT_UUID_TEXT_LEN, 36);
     }
 
@@ -1022,6 +1076,30 @@ mod tests {
             "padding": "a".repeat(ALERT_MAX_CONDITION_BYTES)
         });
         assert!(parse_conditions(&[oversized]).is_err());
+
+        let zero_failures = serde_json::json!({
+            "type": "service_down",
+            "service_id": "00000000-0000-0000-0000-000000000301",
+            "consecutive_failures": 0
+        });
+        assert!(parse_conditions(&[zero_failures]).is_err());
+
+        let huge_offline = serde_json::json!({
+            "type": "server_offline",
+            "agent_id": "00000000-0000-0000-0000-000000000101",
+            "offline_seconds": ALERT_MAX_OFFLINE_SECONDS + 1
+        });
+        assert!(parse_conditions(&[huge_offline]).is_err());
+
+        let huge_duration = serde_json::json!({
+            "type": "server_resource",
+            "agent_id": "00000000-0000-0000-0000-000000000101",
+            "resource": "cpu",
+            "operator": "gt",
+            "threshold": 90,
+            "duration_seconds": ALERT_MAX_RESOURCE_DURATION_SECONDS + 1
+        });
+        assert!(parse_conditions(&[huge_duration]).is_err());
     }
 
     async fn test_db() -> DatabaseBackend {

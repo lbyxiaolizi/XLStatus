@@ -2,6 +2,12 @@
 //!
 //! See `docs/implementation-audit.md` for the full design notes.
 
+use crate::api::v1::alerts::{
+    ALERT_MAX_CONDITIONS, ALERT_MAX_CONDITION_BYTES, ALERT_MAX_CONSECUTIVE_FAILURES,
+    ALERT_MAX_DAYS_BEFORE, ALERT_MAX_LATENCY_MS, ALERT_MAX_NAME_BYTES, ALERT_MAX_OFFLINE_SECONDS,
+    ALERT_MAX_RESOURCE_DURATION_SECONDS, ALERT_MAX_RESOURCE_THRESHOLD, ALERT_MAX_TASK_IDS,
+    ALERT_MAX_TRAFFIC_PERCENT,
+};
 use crate::db::Db;
 use crate::grpc::{SessionRegistry, TaskResponseRegistry};
 use crate::notifications::sender::{
@@ -164,6 +170,18 @@ struct TrafficWindow {
 enum ServiceResultScope {
     Local,
     Servers(Vec<String>),
+}
+
+struct LoadedAlertRuleRow {
+    id: String,
+    owner_user_id: String,
+    name: String,
+    enabled: bool,
+    trigger_mode: String,
+    rules_json: String,
+    notification_group_id: Option<String>,
+    fail_task_ids_json: Option<String>,
+    recover_task_ids_json: Option<String>,
 }
 
 pub struct AlertEngine {
@@ -1274,18 +1292,21 @@ impl AlertEngine {
                     recover_task_ids_json,
                 ) in rows
                 {
-                    out.push(AlertRule {
+                    let row = LoadedAlertRuleRow {
                         id,
                         owner_user_id,
                         name,
                         enabled: enabled != 0,
-                        trigger_mode: TriggerMode::from_db(&trigger_mode),
-                        conditions: serde_json::from_str(&rules_json)
-                            .context("invalid rules_json")?,
+                        trigger_mode,
+                        rules_json,
                         notification_group_id,
-                        failure_task_ids: parse_task_ids_json(fail_task_ids_json),
-                        recovery_task_ids: parse_task_ids_json(recover_task_ids_json),
-                    });
+                        fail_task_ids_json,
+                        recover_task_ids_json,
+                    };
+                    match validate_loaded_alert_rule(row) {
+                        Ok(rule) => out.push(rule),
+                        Err(err) => warn!("historical alert rule row skipped: {err}"),
+                    }
                 }
             }
             crate::db::DatabaseBackend::Postgres(pool) => {
@@ -1316,18 +1337,21 @@ impl AlertEngine {
                     recover_task_ids_json,
                 ) in rows
                 {
-                    out.push(AlertRule {
+                    let row = LoadedAlertRuleRow {
                         id,
                         owner_user_id,
                         name,
                         enabled,
-                        trigger_mode: TriggerMode::from_db(&trigger_mode),
-                        conditions: serde_json::from_str(&rules_json)
-                            .context("invalid rules_json")?,
+                        trigger_mode,
+                        rules_json,
                         notification_group_id,
-                        failure_task_ids: parse_task_ids_json(fail_task_ids_json),
-                        recovery_task_ids: parse_task_ids_json(recover_task_ids_json),
-                    });
+                        fail_task_ids_json,
+                        recover_task_ids_json,
+                    };
+                    match validate_loaded_alert_rule(row) {
+                        Ok(rule) => out.push(rule),
+                        Err(err) => warn!("historical alert rule row skipped: {err}"),
+                    }
                 }
             }
         }
@@ -1536,11 +1560,197 @@ fn parse_server_expiry(value: &str) -> Option<DateTime<Utc>> {
     None
 }
 
-fn parse_task_ids_json(value: Option<String>) -> Vec<String> {
-    value
-        .as_deref()
-        .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
-        .unwrap_or_default()
+fn validate_loaded_alert_rule(row: LoadedAlertRuleRow) -> Result<AlertRule> {
+    let id = require_canonical_uuid(&row.id, "alert_rule_id")?;
+    let owner_user_id = require_canonical_uuid(&row.owner_user_id, "owner_user_id")?;
+    let name = row.name.trim().to_string();
+    ensure_bounded_nonempty_text(&name, ALERT_MAX_NAME_BYTES, "name")?;
+    let trigger_mode = parse_trigger_mode(&row.trigger_mode)?;
+    let conditions = parse_bounded_alert_conditions(&row.rules_json)?;
+    let notification_group_id = row
+        .notification_group_id
+        .map(|value| require_canonical_uuid(&value, "notification_group_id"))
+        .transpose()?;
+    let failure_task_ids =
+        parse_bounded_task_ids_json(row.fail_task_ids_json, "fail_task_ids_json")?;
+    let recovery_task_ids =
+        parse_bounded_task_ids_json(row.recover_task_ids_json, "recover_task_ids_json")?;
+
+    Ok(AlertRule {
+        id,
+        owner_user_id,
+        name,
+        enabled: row.enabled,
+        trigger_mode,
+        conditions,
+        notification_group_id,
+        failure_task_ids,
+        recovery_task_ids,
+    })
+}
+
+fn parse_trigger_mode(value: &str) -> Result<TriggerMode> {
+    match value.trim() {
+        "always" => Ok(TriggerMode::Always),
+        "once" => Ok(TriggerMode::Once),
+        _ => anyhow::bail!("trigger_mode must be always or once"),
+    }
+}
+
+fn parse_bounded_alert_conditions(value: &str) -> Result<Vec<AlertCondition>> {
+    if value.len() > ALERT_MAX_CONDITIONS * ALERT_MAX_CONDITION_BYTES {
+        anyhow::bail!("rules_json exceeds runtime budget");
+    }
+    let raw =
+        serde_json::from_str::<Vec<serde_json::Value>>(value).context("invalid rules_json")?;
+    if raw.is_empty() {
+        anyhow::bail!("at least one alert condition is required");
+    }
+    if raw.len() > ALERT_MAX_CONDITIONS {
+        anyhow::bail!("conditions exceeds {ALERT_MAX_CONDITIONS} items");
+    }
+    let mut conditions = Vec::new();
+    for condition in raw {
+        let bytes = serde_json::to_vec(&condition)?.len();
+        if bytes > ALERT_MAX_CONDITION_BYTES {
+            anyhow::bail!("condition exceeds {ALERT_MAX_CONDITION_BYTES} bytes");
+        }
+        let condition: AlertCondition =
+            serde_json::from_value(condition).context("invalid alert condition")?;
+        validate_runtime_condition(&condition)?;
+        conditions.push(condition);
+    }
+    Ok(conditions)
+}
+
+fn validate_runtime_condition(condition: &AlertCondition) -> Result<()> {
+    match condition {
+        AlertCondition::ServiceDown {
+            service_id,
+            consecutive_failures,
+        } => {
+            require_canonical_uuid(service_id, "service_id")?;
+            if *consecutive_failures == 0 || *consecutive_failures > ALERT_MAX_CONSECUTIVE_FAILURES
+            {
+                anyhow::bail!(
+                    "consecutive_failures must be between 1 and {ALERT_MAX_CONSECUTIVE_FAILURES}"
+                );
+            }
+        }
+        AlertCondition::ServiceLatency {
+            service_id,
+            max_latency_ms,
+        } => {
+            require_canonical_uuid(service_id, "service_id")?;
+            if *max_latency_ms <= 0 || *max_latency_ms > ALERT_MAX_LATENCY_MS {
+                anyhow::bail!("max_latency_ms must be between 1 and {ALERT_MAX_LATENCY_MS}");
+            }
+        }
+        AlertCondition::CertificateExpiry {
+            service_id,
+            days_before,
+        } => {
+            require_canonical_uuid(service_id, "service_id")?;
+            ensure_days_before(*days_before)?;
+        }
+        AlertCondition::ServerExpiry {
+            agent_id,
+            days_before,
+        } => {
+            require_canonical_uuid(agent_id, "agent_id")?;
+            ensure_days_before(*days_before)?;
+        }
+        AlertCondition::ServerTrafficQuota {
+            agent_id, percent, ..
+        } => {
+            require_canonical_uuid(agent_id, "agent_id")?;
+            if !percent.is_finite() || *percent <= 0.0 || *percent > ALERT_MAX_TRAFFIC_PERCENT {
+                anyhow::bail!(
+                    "percent must be greater than 0 and at most {ALERT_MAX_TRAFFIC_PERCENT}"
+                );
+            }
+        }
+        AlertCondition::ServerOffline {
+            agent_id,
+            offline_seconds,
+        } => {
+            require_canonical_uuid(agent_id, "agent_id")?;
+            if *offline_seconds == 0 || *offline_seconds > ALERT_MAX_OFFLINE_SECONDS {
+                anyhow::bail!("offline_seconds must be between 1 and {ALERT_MAX_OFFLINE_SECONDS}");
+            }
+        }
+        AlertCondition::ServerResource {
+            agent_id,
+            threshold,
+            duration_seconds,
+            ..
+        } => {
+            require_canonical_uuid(agent_id, "agent_id")?;
+            if !threshold.is_finite() || threshold.abs() > ALERT_MAX_RESOURCE_THRESHOLD {
+                anyhow::bail!(
+                    "threshold must be finite and within +/-{ALERT_MAX_RESOURCE_THRESHOLD}"
+                );
+            }
+            if *duration_seconds > ALERT_MAX_RESOURCE_DURATION_SECONDS {
+                anyhow::bail!(
+                    "duration_seconds must be at most {ALERT_MAX_RESOURCE_DURATION_SECONDS}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_days_before(value: i64) -> Result<()> {
+    if !(0..=ALERT_MAX_DAYS_BEFORE).contains(&value) {
+        anyhow::bail!("days_before must be between 0 and {ALERT_MAX_DAYS_BEFORE}");
+    }
+    Ok(())
+}
+
+fn parse_bounded_task_ids_json(value: Option<String>, field: &str) -> Result<Vec<String>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let values = serde_json::from_str::<Vec<String>>(&value)
+        .with_context(|| format!("{field} must be a JSON string array"))?;
+    if values.len() > ALERT_MAX_TASK_IDS {
+        anyhow::bail!("{field} exceeds {ALERT_MAX_TASK_IDS} items");
+    }
+    let mut out = Vec::new();
+    for value in values {
+        let id = require_canonical_uuid(&value, "task_id")?;
+        if !out.iter().any(|existing| existing == &id) {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
+fn ensure_bounded_nonempty_text(value: &str, max_bytes: usize, field: &str) -> Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("{field} is required");
+    }
+    if value.len() > max_bytes {
+        anyhow::bail!("{field} exceeds {max_bytes} bytes");
+    }
+    Ok(())
+}
+
+fn require_canonical_uuid(value: &str, field: &str) -> Result<String> {
+    let value = value.trim();
+    if value.len() != 36 {
+        anyhow::bail!("{field} must be a canonical UUID");
+    }
+    let parsed = uuid::Uuid::parse_str(value)
+        .with_context(|| format!("{field} must be a canonical UUID"))?;
+    if parsed.to_string() != value {
+        anyhow::bail!("{field} must be a canonical UUID");
+    }
+    Ok(value.to_string())
 }
 
 fn parse_id_list_json(value: Option<String>) -> Vec<String> {
@@ -1876,6 +2086,134 @@ mod tests {
 
         let channels = engine.channels_for_rule(&dirty_rule).await.unwrap();
         assert!(channels.is_empty());
+    }
+
+    #[test]
+    fn loaded_alert_rule_rejects_invalid_historical_fields() {
+        let valid = test_loaded_alert_rule_row();
+        let rule = validate_loaded_alert_rule(valid).unwrap();
+        assert_eq!(rule.trigger_mode, TriggerMode::Once);
+        assert_eq!(rule.failure_task_ids.len(), 1);
+
+        let mut malformed_tasks = test_loaded_alert_rule_row();
+        malformed_tasks.fail_task_ids_json = Some("not json".into());
+        assert!(validate_loaded_alert_rule(malformed_tasks).is_err());
+
+        let mut simple_task_id = test_loaded_alert_rule_row();
+        simple_task_id.fail_task_ids_json = Some(r#"["00000000000000000000000000000401"]"#.into());
+        assert!(validate_loaded_alert_rule(simple_task_id).is_err());
+
+        let mut unknown_trigger = test_loaded_alert_rule_row();
+        unknown_trigger.trigger_mode = "sometimes".into();
+        assert!(validate_loaded_alert_rule(unknown_trigger).is_err());
+
+        let mut oversized_offline = test_loaded_alert_rule_row();
+        oversized_offline.rules_json = serde_json::to_string(&[AlertCondition::ServerOffline {
+            agent_id: "00000000-0000-0000-0000-000000000101".into(),
+            offline_seconds: ALERT_MAX_OFFLINE_SECONDS + 1,
+        }])
+        .unwrap();
+        assert!(validate_loaded_alert_rule(oversized_offline).is_err());
+
+        let mut zero_failures = test_loaded_alert_rule_row();
+        zero_failures.rules_json = serde_json::to_string(&[AlertCondition::ServiceDown {
+            service_id: "00000000-0000-0000-0000-000000000301".into(),
+            consecutive_failures: 0,
+        }])
+        .unwrap();
+        assert!(validate_loaded_alert_rule(zero_failures).is_err());
+    }
+
+    #[tokio::test]
+    async fn invalid_historical_alert_rules_are_not_loaded() {
+        let db = test_db().await;
+        let owner = "00000000-0000-0000-0000-000000000001";
+        let valid_rule = "00000000-0000-0000-0000-000000000501";
+        let bad_json_rule = "00000000-0000-0000-0000-000000000502";
+        let bad_trigger_rule = "00000000-0000-0000-0000-000000000503";
+        let bad_tasks_rule = "00000000-0000-0000-0000-000000000504";
+        let bad_condition_rule = "00000000-0000-0000-0000-000000000505";
+        seed_user(&db, owner, "owner").await;
+        seed_raw_alert_rule(
+            &db,
+            valid_rule,
+            owner,
+            "valid",
+            "once",
+            &serde_json::to_string(&[AlertCondition::ServerOffline {
+                agent_id: "00000000-0000-0000-0000-000000000101".into(),
+                offline_seconds: 60,
+            }])
+            .unwrap(),
+            Some(r#"["00000000-0000-0000-0000-000000000401"]"#),
+        )
+        .await;
+        seed_raw_alert_rule(
+            &db,
+            bad_json_rule,
+            owner,
+            "bad-json",
+            "once",
+            "not json",
+            None,
+        )
+        .await;
+        seed_raw_alert_rule(
+            &db,
+            bad_trigger_rule,
+            owner,
+            "bad-trigger",
+            "sometimes",
+            &serde_json::to_string(&[AlertCondition::ServerOffline {
+                agent_id: "00000000-0000-0000-0000-000000000101".into(),
+                offline_seconds: 60,
+            }])
+            .unwrap(),
+            None,
+        )
+        .await;
+        seed_raw_alert_rule(
+            &db,
+            bad_tasks_rule,
+            owner,
+            "bad-tasks",
+            "once",
+            &serde_json::to_string(&[AlertCondition::ServerOffline {
+                agent_id: "00000000-0000-0000-0000-000000000101".into(),
+                offline_seconds: 60,
+            }])
+            .unwrap(),
+            Some("not json"),
+        )
+        .await;
+        seed_raw_alert_rule(
+            &db,
+            bad_condition_rule,
+            owner,
+            "bad-condition",
+            "once",
+            &serde_json::to_string(&[AlertCondition::ServerOffline {
+                agent_id: "00000000-0000-0000-0000-000000000101".into(),
+                offline_seconds: 0,
+            }])
+            .unwrap(),
+            None,
+        )
+        .await;
+
+        let engine = AlertEngine::new(
+            db,
+            crate::grpc::SessionRegistry::new(),
+            crate::current_task_response_registry(),
+        );
+        let rules = engine.load_alert_rules().await.unwrap();
+
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].id, valid_rule);
+        assert_eq!(
+            rules[0].failure_task_ids,
+            vec!["00000000-0000-0000-0000-000000000401".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -2535,6 +2873,32 @@ mod tests {
         .unwrap();
     }
 
+    async fn seed_raw_alert_rule(
+        db: &Db,
+        id: &str,
+        owner: &str,
+        name: &str,
+        trigger_mode: &str,
+        rules_json: &str,
+        fail_task_ids_json: Option<&str>,
+    ) {
+        let Db::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO alert_rules (id, owner_user_id, name, enabled, trigger_mode, rules_json, fail_task_ids_json, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(owner)
+        .bind(name)
+        .bind(trigger_mode)
+        .bind(rules_json)
+        .bind(fail_task_ids_json)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     async fn alert_events_for_rule(
         db: &Db,
         rule_id: &str,
@@ -2611,5 +2975,23 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    fn test_loaded_alert_rule_row() -> LoadedAlertRuleRow {
+        LoadedAlertRuleRow {
+            id: "00000000-0000-0000-0000-000000000501".into(),
+            owner_user_id: "00000000-0000-0000-0000-000000000001".into(),
+            name: "cpu-alert".into(),
+            enabled: true,
+            trigger_mode: "once".into(),
+            rules_json: serde_json::to_string(&[AlertCondition::ServerOffline {
+                agent_id: "00000000-0000-0000-0000-000000000101".into(),
+                offline_seconds: 60,
+            }])
+            .unwrap(),
+            notification_group_id: Some("00000000-0000-0000-0000-000000000301".into()),
+            fail_task_ids_json: Some(r#"["00000000-0000-0000-0000-000000000401"]"#.into()),
+            recover_task_ids_json: Some(r#"["00000000-0000-0000-0000-000000000402"]"#.into()),
+        }
     }
 }
