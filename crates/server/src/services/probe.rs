@@ -18,6 +18,9 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
+const SERVICE_PING_OUTPUT_MAX_BYTES: usize = 4096;
+const SERVICE_PING_PROCESS_TIMEOUT_GRACE_SECONDS: u64 = 2;
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct ServiceProbe {
@@ -164,23 +167,32 @@ pub async fn probe_icmp(host: &str, timeout_secs: u64) -> Result<ServiceProbe> {
         .ip()
         .to_string();
 
+    let ping_timeout = Duration::from_secs(
+        timeout_secs.saturating_add(SERVICE_PING_PROCESS_TIMEOUT_GRACE_SECONDS),
+    );
     let output = if cfg!(target_os = "windows") {
-        tokio::process::Command::new("ping")
-            .args(["-n", "4", "-w", &(timeout_secs * 1000).to_string(), &target])
-            .output()
-            .await?
+        let mut command = tokio::process::Command::new("ping");
+        command.kill_on_drop(true);
+        command.args(["-n", "4", "-w", &(timeout_secs * 1000).to_string(), &target]);
+        match tokio::time::timeout(ping_timeout, command.output()).await {
+            Ok(output) => output?,
+            Err(_) => return Ok(failed_ping_probe(start, "ping timeout")),
+        }
     } else {
-        tokio::process::Command::new("ping")
-            .args(["-c", "4", "-W", &timeout_secs.to_string(), &target])
-            .output()
-            .await?
+        let mut command = tokio::process::Command::new("ping");
+        command.kill_on_drop(true);
+        command.args(["-c", "4", "-W", &timeout_secs.to_string(), &target]);
+        match tokio::time::timeout(ping_timeout, command.output()).await {
+            Ok(output) => output?,
+            Err(_) => return Ok(failed_ping_probe(start, "ping timeout")),
+        }
     };
 
     let latency_ms = start.elapsed().as_millis() as i32;
 
     if output.status.success() {
         // Parse output for average latency
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = bounded_ping_output_text(&output.stdout);
         let avg_latency = parse_ping_latency(&stdout).unwrap_or(latency_ms);
 
         Ok(ServiceProbe {
@@ -195,19 +207,55 @@ pub async fn probe_icmp(host: &str, timeout_secs: u64) -> Result<ServiceProbe> {
             checked_at: Utc::now(),
         })
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Ok(ServiceProbe {
-            id: uuid::Uuid::now_v7().to_string(),
-            service_id: String::new(),
-            success: false,
-            latency_ms: Some(latency_ms),
-            status_code: None,
-            error: Some(format!("Ping failed: {}", stderr)),
-            cert_fingerprint: None,
-            cert_not_after: None,
-            checked_at: Utc::now(),
-        })
+        let message = ping_failure_message(&output.stderr, &output.stdout);
+        Ok(failed_ping_probe_with_latency(latency_ms, message))
     }
+}
+
+fn failed_ping_probe(start: Instant, error: impl Into<String>) -> ServiceProbe {
+    failed_ping_probe_with_latency(start.elapsed().as_millis() as i32, error)
+}
+
+fn failed_ping_probe_with_latency(latency_ms: i32, error: impl Into<String>) -> ServiceProbe {
+    ServiceProbe {
+        id: uuid::Uuid::now_v7().to_string(),
+        service_id: String::new(),
+        success: false,
+        latency_ms: Some(latency_ms),
+        status_code: None,
+        error: Some(error.into()),
+        cert_fingerprint: None,
+        cert_not_after: None,
+        checked_at: Utc::now(),
+    }
+}
+
+fn ping_failure_message(stderr: &[u8], stdout: &[u8]) -> String {
+    let stderr = bounded_ping_output_text(stderr);
+    let stdout = bounded_ping_output_text(stdout);
+    let detail = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
+    if detail.is_empty() {
+        "Ping failed".to_string()
+    } else {
+        format!("Ping failed: {detail}")
+    }
+}
+
+fn bounded_ping_output_text(bytes: &[u8]) -> String {
+    if bytes.len() <= SERVICE_PING_OUTPUT_MAX_BYTES {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let mut end = SERVICE_PING_OUTPUT_MAX_BYTES;
+    while end > 0 && std::str::from_utf8(&bytes[..end]).is_err() {
+        end -= 1;
+    }
+    let mut text = String::from_utf8_lossy(&bytes[..end]).into_owned();
+    text.push_str("... [truncated]");
+    text
 }
 
 #[derive(Debug, Clone)]
@@ -366,4 +414,45 @@ fn parse_ping_latency(output: &str) -> Option<i32> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ping_output_text_is_bounded_and_utf8_safe() {
+        assert_eq!(SERVICE_PING_OUTPUT_MAX_BYTES, 4096);
+        assert_eq!(SERVICE_PING_PROCESS_TIMEOUT_GRACE_SECONDS, 2);
+
+        let mut output = "a".repeat(SERVICE_PING_OUTPUT_MAX_BYTES - 1);
+        output.push('é');
+        output.push_str(&"b".repeat(32));
+
+        let bounded = bounded_ping_output_text(output.as_bytes());
+
+        assert!(bounded.ends_with("... [truncated]"));
+        assert!(bounded.is_char_boundary(bounded.len()));
+        assert!(bounded.len() <= SERVICE_PING_OUTPUT_MAX_BYTES + "... [truncated]".len());
+        assert!(!bounded.ends_with("�... [truncated]"));
+    }
+
+    #[test]
+    fn ping_failure_message_uses_bounded_stderr_or_stdout() {
+        let stderr = "error".repeat(SERVICE_PING_OUTPUT_MAX_BYTES);
+        let message = ping_failure_message(stderr.as_bytes(), b"stdout detail");
+
+        assert!(message.starts_with("Ping failed: error"));
+        assert!(message.ends_with("... [truncated]"));
+        assert!(
+            message.len()
+                <= "Ping failed: ".len() + SERVICE_PING_OUTPUT_MAX_BYTES + "... [truncated]".len()
+        );
+
+        let fallback = ping_failure_message(b"   ", b"stdout detail");
+        assert_eq!(fallback, "Ping failed: stdout detail");
+
+        let empty = ping_failure_message(b"", b"");
+        assert_eq!(empty, "Ping failed");
+    }
 }
