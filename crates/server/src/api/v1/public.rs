@@ -4,7 +4,7 @@ use crate::api::v1::settings::{
     public_server_details_enabled, public_site_branding, PublicSiteBranding,
 };
 use crate::api::v1::themes::{selected_public_theme, ThemeDefinition};
-use crate::db::{AgentRepository, DatabaseBackend};
+use crate::db::{Agent, AgentRepository, AgentWithState, DatabaseBackend};
 use axum::{
     body::{Body, Bytes},
     extract::State,
@@ -33,6 +33,8 @@ const PUBLIC_MJPEG_FRAME_CACHE_TTL: StdDuration = StdDuration::from_secs(1);
 const PUBLIC_METRIC_SAMPLE_LIMIT: usize = 240;
 const PUBLIC_SERVICE_HISTORY_LIMIT: i64 = 240;
 const PUBLIC_SERVER_ID_PATH_BYTES: usize = 36;
+const PUBLIC_STATUS_SERVER_LIMIT: i64 = 100;
+const PUBLIC_STATUS_SERVICE_LIMIT: i64 = 100;
 
 static PUBLIC_MJPEG_CONNECTIONS: once_cell::sync::Lazy<Arc<Semaphore>> =
     once_cell::sync::Lazy::new(|| Arc::new(Semaphore::new(PUBLIC_MJPEG_MAX_CONNECTIONS)));
@@ -331,8 +333,7 @@ async fn build_public_status_mjpeg_frame(state: &AppState) -> Result<Vec<u8>, Ap
 }
 
 async fn public_servers(state: &AppState) -> Result<Vec<PublicServerView>, AppError> {
-    let agent_repo = AgentRepository::new(state.db.clone());
-    let (rows, _) = agent_repo.list_with_state(100, 0).await?;
+    let rows = public_agent_rows(state, PUBLIC_STATUS_SERVER_LIMIT).await?;
     let include_server_details = public_server_details_enabled(&state.db).await?;
 
     let mut servers = Vec::new();
@@ -382,10 +383,35 @@ async fn public_services(state: &AppState) -> Result<Vec<PublicServiceView>, App
                 SELECT s.id, s.name, s.type, s.server_id
                 FROM services s
                 WHERE s.enabled = 1
+                  AND (
+                    EXISTS (
+                      SELECT 1
+                      FROM service_servers ss
+                      JOIN agents a ON a.id = ss.server_id
+                      WHERE ss.service_id = s.id
+                        AND a.revoked_at IS NULL
+                        AND json_valid(a.dashboard_metadata_json)
+                        AND json_extract(a.dashboard_metadata_json, '$.dashboard_visible') = 1
+                        AND COALESCE(json_extract(a.dashboard_metadata_json, '$.hide_for_guest'), 0) != 1
+                    )
+                    OR (
+                      NOT EXISTS (SELECT 1 FROM service_servers ss WHERE ss.service_id = s.id)
+                      AND EXISTS (
+                        SELECT 1
+                        FROM agents a
+                        WHERE a.id = s.server_id
+                          AND a.revoked_at IS NULL
+                          AND json_valid(a.dashboard_metadata_json)
+                          AND json_extract(a.dashboard_metadata_json, '$.dashboard_visible') = 1
+                          AND COALESCE(json_extract(a.dashboard_metadata_json, '$.hide_for_guest'), 0) != 1
+                      )
+                    )
+                  )
                 ORDER BY s.created_at DESC
-                LIMIT 100
+                LIMIT ?
                 "#,
             )
+            .bind(PUBLIC_STATUS_SERVICE_LIMIT)
             .fetch_all(pool)
             .await
             .map_err(|e| AppError::Database(e.into()))?;
@@ -428,10 +454,41 @@ async fn public_services(state: &AppState) -> Result<Vec<PublicServiceView>, App
                 SELECT s.id::text AS id, s.name, s.type, s.server_id::text AS server_id
                 FROM services s
                 WHERE s.enabled = true
+                  AND (
+                    EXISTS (
+                      SELECT 1
+                      FROM service_servers ss
+                      JOIN agents a ON a.id = ss.server_id
+                      WHERE ss.service_id = s.id
+                        AND a.revoked_at IS NULL
+                        AND (
+                          a.dashboard_metadata_json LIKE '%"dashboard_visible":true%'
+                          OR a.dashboard_metadata_json LIKE '%"dashboard_visible": true%'
+                        )
+                        AND a.dashboard_metadata_json NOT LIKE '%"hide_for_guest":true%'
+                        AND a.dashboard_metadata_json NOT LIKE '%"hide_for_guest": true%'
+                    )
+                    OR (
+                      NOT EXISTS (SELECT 1 FROM service_servers ss WHERE ss.service_id = s.id)
+                      AND EXISTS (
+                        SELECT 1
+                        FROM agents a
+                        WHERE a.id = s.server_id
+                          AND a.revoked_at IS NULL
+                          AND (
+                            a.dashboard_metadata_json LIKE '%"dashboard_visible":true%'
+                            OR a.dashboard_metadata_json LIKE '%"dashboard_visible": true%'
+                          )
+                          AND a.dashboard_metadata_json NOT LIKE '%"hide_for_guest":true%'
+                          AND a.dashboard_metadata_json NOT LIKE '%"hide_for_guest": true%'
+                      )
+                    )
+                  )
                 ORDER BY s.created_at DESC
-                LIMIT 100
+                LIMIT $1
                 "#,
             )
+            .bind(PUBLIC_STATUS_SERVICE_LIMIT)
             .fetch_all(pool)
             .await
             .map_err(|e| AppError::Database(e.into()))?;
@@ -472,8 +529,7 @@ async fn public_services(state: &AppState) -> Result<Vec<PublicServiceView>, App
 }
 
 async fn public_server_id_set(state: &AppState) -> Result<HashSet<String>, AppError> {
-    let agent_repo = AgentRepository::new(state.db.clone());
-    let (rows, _) = agent_repo.list_with_state(100, 0).await?;
+    let rows = public_agent_rows(state, PUBLIC_STATUS_SERVER_LIMIT).await?;
     let mut ids = HashSet::new();
     for row in rows {
         let dashboard = dashboard_metadata(row.dashboard_metadata_json.as_deref());
@@ -482,6 +538,61 @@ async fn public_server_id_set(state: &AppState) -> Result<HashSet<String>, AppEr
         }
     }
     Ok(ids)
+}
+
+async fn public_agent_rows(state: &AppState, limit: i64) -> Result<Vec<AgentWithState>, AppError> {
+    match &state.db {
+        DatabaseBackend::Sqlite(pool) => {
+            let rows: Vec<PublicAgentRow> = sqlx::query_as(
+                r#"
+                SELECT id, name, public_key, owner_user_id, last_seen_at, revoked_at,
+                       created_at, updated_at, remark, expires_at, renewal_price,
+                       dashboard_metadata_json, last_state_json, last_state_at,
+                       last_info_json, last_info_at
+                FROM agents
+                WHERE revoked_at IS NULL
+                  AND json_valid(dashboard_metadata_json)
+                  AND json_extract(dashboard_metadata_json, '$.dashboard_visible') = 1
+                  AND COALESCE(json_extract(dashboard_metadata_json, '$.hide_for_guest'), 0) != 1
+                ORDER BY created_at DESC
+                LIMIT ?
+                "#,
+            )
+            .bind(limit)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| AppError::Database(e.into()))?;
+            rows.into_iter().map(public_agent_row_to_state).collect()
+        }
+        DatabaseBackend::Postgres(pool) => {
+            let rows: Vec<PublicAgentRow> = sqlx::query_as(
+                r#"
+                SELECT id::text, name, public_key, owner_user_id::text,
+                       to_char(last_seen_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                       to_char(revoked_at,  'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                       to_char(created_at,  'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                       to_char(updated_at,  'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                       remark, expires_at, renewal_price, dashboard_metadata_json,
+                       last_state_json, last_state_at::text, last_info_json, last_info_at::text
+                FROM agents
+                WHERE revoked_at IS NULL
+                  AND (
+                    dashboard_metadata_json LIKE '%"dashboard_visible":true%'
+                    OR dashboard_metadata_json LIKE '%"dashboard_visible": true%'
+                  )
+                  AND dashboard_metadata_json NOT LIKE '%"hide_for_guest":true%'
+                  AND dashboard_metadata_json NOT LIKE '%"hide_for_guest": true%'
+                ORDER BY created_at DESC
+                LIMIT $1
+                "#,
+            )
+            .bind(limit)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| AppError::Database(e.into()))?;
+            rows.into_iter().map(public_agent_row_to_state).collect()
+        }
+    }
 }
 
 fn visible_public_service_server_ids(
@@ -498,6 +609,74 @@ fn visible_public_service_server_ids(
     ids.sort();
     ids.dedup();
     ids
+}
+
+type PublicAgentRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn public_agent_row_to_state(row: PublicAgentRow) -> Result<AgentWithState, AppError> {
+    let (
+        id,
+        name,
+        public_key,
+        owner_user_id,
+        last_seen_at,
+        revoked_at,
+        created_at,
+        updated_at,
+        remark,
+        expires_at,
+        renewal_price,
+        dashboard_metadata_json,
+        last_state_json,
+        _last_state_at,
+        last_info_json,
+        _last_info_at,
+    ) = row;
+    let id = Uuid::parse_str(&id)
+        .map_err(|e| AppError::Database(anyhow::anyhow!("invalid public agent id: {e}")))?;
+    let owner_user_id = Uuid::parse_str(&owner_user_id)
+        .map_err(|e| AppError::Database(anyhow::anyhow!("invalid public agent owner: {e}")))?;
+    Ok(AgentWithState {
+        agent: Agent {
+            id: AgentId(id),
+            name,
+            public_key,
+            owner_user_id: xlstatus_shared::UserId(owner_user_id),
+            last_seen_at: last_seen_at.as_deref().and_then(parse_public_rfc3339),
+            revoked_at: revoked_at.as_deref().and_then(parse_public_rfc3339),
+            created_at: parse_public_rfc3339(&created_at).unwrap_or_else(Utc::now),
+            updated_at: parse_public_rfc3339(&updated_at).unwrap_or_else(Utc::now),
+        },
+        remark,
+        expires_at,
+        renewal_price,
+        dashboard_metadata_json,
+        last_state_json,
+        last_info_json,
+    })
+}
+
+fn parse_public_rfc3339(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
 }
 
 fn public_service_last_from_history(
@@ -1542,6 +1721,103 @@ mod tests {
         assert!(history.iter().all(|item| item.status == "success"));
     }
 
+    #[tokio::test]
+    async fn public_servers_filter_visibility_before_limit() {
+        let state = test_state_with_public_site(true).await;
+        let DatabaseBackend::Sqlite(pool) = &state.db else {
+            unreachable!();
+        };
+        let owner = Uuid::now_v7().to_string();
+        seed_public_user(pool, &owner).await;
+        let public_server = Uuid::now_v7().to_string();
+        seed_public_agent(
+            pool,
+            &public_server,
+            &owner,
+            "public-server",
+            true,
+            false,
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+        for idx in 0..120 {
+            seed_public_agent(
+                pool,
+                &Uuid::now_v7().to_string(),
+                &owner,
+                &format!("private-{idx}"),
+                false,
+                false,
+                &format!("2026-01-02T00:{:02}:{:02}Z", idx / 60, idx % 60),
+            )
+            .await;
+        }
+
+        let servers = public_servers(&state).await.unwrap();
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].id, public_server);
+    }
+
+    #[tokio::test]
+    async fn public_services_filter_public_server_scope_before_limit() {
+        let state = test_state_with_public_site(true).await;
+        let DatabaseBackend::Sqlite(pool) = &state.db else {
+            unreachable!();
+        };
+        let owner = Uuid::now_v7().to_string();
+        seed_public_user(pool, &owner).await;
+        let public_server = Uuid::now_v7().to_string();
+        let private_server = Uuid::now_v7().to_string();
+        seed_public_agent(
+            pool,
+            &public_server,
+            &owner,
+            "public-server",
+            true,
+            false,
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+        seed_public_agent(
+            pool,
+            &private_server,
+            &owner,
+            "private-server",
+            false,
+            false,
+            "2026-01-02T00:00:00Z",
+        )
+        .await;
+        let public_service = Uuid::now_v7().to_string();
+        seed_public_service(
+            pool,
+            &public_service,
+            &owner,
+            "public-service",
+            &public_server,
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+        for idx in 0..120 {
+            seed_public_service(
+                pool,
+                &Uuid::now_v7().to_string(),
+                &owner,
+                &format!("private-service-{idx}"),
+                &private_server,
+                &format!("2026-01-02T00:{:02}:{:02}Z", idx / 60, idx % 60),
+            )
+            .await;
+        }
+
+        let services = public_services(&state).await.unwrap();
+
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].id, public_service);
+        assert_eq!(services[0].server_ids, vec![public_server]);
+    }
+
     async fn test_state_with_public_site(enabled: bool) -> AppState {
         let db = DatabaseBackend::connect("sqlite::memory:", true)
             .await
@@ -1570,6 +1846,77 @@ mod tests {
             terminal_sessions: crate::api::v1::terminal::TerminalSessionRegistry::new(),
             io_registry: crate::grpc::IoRegistry::new(),
         }
+    }
+
+    async fn seed_public_user(pool: &sqlx::SqlitePool, user_id: &str) {
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, role, created_at, updated_at) VALUES (?, ?, 'hash', 'admin', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(user_id)
+        .bind(format!("user-{user_id}"))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_public_agent(
+        pool: &sqlx::SqlitePool,
+        agent_id: &str,
+        owner_id: &str,
+        name: &str,
+        dashboard_visible: bool,
+        hide_for_guest: bool,
+        created_at: &str,
+    ) {
+        let metadata = serde_json::json!({
+            "dashboard_visible": dashboard_visible,
+            "hide_for_guest": hide_for_guest,
+            "public_note": format!("{name} note"),
+        })
+        .to_string();
+        sqlx::query(
+            "INSERT INTO agents (id, name, public_key, owner_user_id, created_at, updated_at, dashboard_metadata_json) VALUES (?, ?, 'pk', ?, ?, ?, ?)",
+        )
+        .bind(agent_id)
+        .bind(name)
+        .bind(owner_id)
+        .bind(created_at)
+        .bind(created_at)
+        .bind(metadata)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_public_service(
+        pool: &sqlx::SqlitePool,
+        service_id: &str,
+        owner_id: &str,
+        name: &str,
+        server_id: &str,
+        created_at: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO services (id, owner_user_id, name, type, target, interval_seconds, timeout_seconds, enabled, server_id, cover_mode, created_at, updated_at) VALUES (?, ?, ?, 'http', 'https://example.com', 60, 10, 1, ?, 'specific', ?, ?)",
+        )
+        .bind(service_id)
+        .bind(owner_id)
+        .bind(name)
+        .bind(server_id)
+        .bind(created_at)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO service_servers (service_id, server_id, created_at) VALUES (?, ?, ?)",
+        )
+        .bind(service_id)
+        .bind(server_id)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
