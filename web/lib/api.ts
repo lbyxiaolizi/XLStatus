@@ -658,19 +658,28 @@ class ApiClient {
     return `${this.baseUrl}/api/v1/oauth2/${encodeURIComponent(providerId)}?${query.toString()}`;
   }
 
-  async startOAuthBind(providerId: string, returnTo = "/settings"): Promise<ApiResponse<OAuthStartResponse>> {
+  async startOAuthBind(
+    providerId: string,
+    returnTo = "/settings",
+    totpCode?: string,
+  ): Promise<ApiResponse<OAuthStartResponse>> {
     const query = new URLSearchParams({ return_to: returnTo });
     return this.request<OAuthStartResponse>(
       `/api/v1/oauth2/${encodeURIComponent(providerId)}/bind?${query.toString()}`,
       {
         method: "POST",
+        headers: this.sensitiveHeaders(totpCode),
       },
     );
   }
 
-  async unbindOAuthProvider(providerId: string): Promise<ApiResponse<JsonObject>> {
+  async unbindOAuthProvider(
+    providerId: string,
+    totpCode?: string,
+  ): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(`/api/v1/oauth2/${encodeURIComponent(providerId)}/unbind`, {
       method: "POST",
+      headers: this.sensitiveHeaders(totpCode),
     });
   }
 

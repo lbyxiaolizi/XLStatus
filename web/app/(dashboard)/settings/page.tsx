@@ -735,7 +735,9 @@ export default function SettingsPage() {
 
   async function unbindOAuthProvider(providerId: string, displayName: string) {
     if (!confirm(`确定解绑 ${displayName}？解绑后将不能继续用该 OAuth 账号登录。`)) return;
-    const response = await apiClient.unbindOAuthProvider(providerId);
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
+    const response = await apiClient.unbindOAuthProvider(providerId, totpCode);
     if (response.success) {
       setNotice(`${displayName} 已解绑。`);
       await loadOAuthBindings();
@@ -745,7 +747,9 @@ export default function SettingsPage() {
   }
 
   async function bindOAuthProvider(providerId: string) {
-    const response = await apiClient.startOAuthBind(providerId, "/settings");
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
+    const response = await apiClient.startOAuthBind(providerId, "/settings", totpCode);
     if (response.success && response.data?.authorization_url) {
       window.location.href = response.data.authorization_url;
     } else {

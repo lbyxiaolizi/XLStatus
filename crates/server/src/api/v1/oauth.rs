@@ -2,8 +2,8 @@
 
 use crate::api::types::{ApiResponse, UserInfo};
 use crate::api::v1::auth::{
-    active_waf_ban, cookie_secure_attr, record_waf_event, register_oauth_failure, AppError,
-    AppState,
+    active_waf_ban, cookie_secure_attr, record_waf_event, register_oauth_failure,
+    require_sensitive_totp, AppError, AppState,
 };
 use crate::auth::middleware::{derive_csrf_token, AuthUser, CSRF_COOKIE_NAME, SESSION_COOKIE_NAME};
 use crate::auth::{generate_session_token, hash_token, SessionRepository};
@@ -185,11 +185,13 @@ pub async fn start_oauth_login(
 pub async fn start_oauth_bind(
     State(state): State<AppState>,
     auth_user: AuthUser,
+    headers: HeaderMap,
     uri: Uri,
 ) -> Result<Response, AppError> {
     let provider_id = parse_oauth_provider_path(&uri, true)?;
     let query = parse_oauth_start_query(&uri)?;
     require_cookie_session(&auth_user)?;
+    require_sensitive_totp(&state.db, auth_user.user.id, &headers).await?;
     let provider = oauth_provider(&state, &provider_id)?;
     let oauth_state = OAuthState {
         provider: provider.id.clone(),
@@ -215,9 +217,11 @@ pub async fn list_oauth_bindings(
 pub async fn unbind_oauth_provider(
     State(state): State<AppState>,
     auth_user: AuthUser,
+    headers: HeaderMap,
     Path(provider_id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
     require_cookie_session(&auth_user)?;
+    require_sensitive_totp(&state.db, auth_user.user.id, &headers).await?;
     let provider_id = normalize_oauth_provider_id(&provider_id)?;
     delete_oauth_account(&state.db, auth_user.user.id, &provider_id).await?;
     Ok(Json(ApiResponse::success(())))
@@ -1644,6 +1648,24 @@ mod tests {
             .any(|(key, value)| key == "nonce" && value == "abc"));
     }
 
+    #[tokio::test]
+    async fn oauth_binding_changes_require_sensitive_totp_when_enabled() {
+        let state = test_app_state().await;
+        let user_id = uuid::Uuid::from_bytes([1; 16]);
+        seed_user(&state.db, user_id).await;
+        seed_totp_enabled_user(&state.db, user_id).await;
+        let auth = auth_user(user_id);
+        let uri: Uri = "/api/v1/oauth2/oidc/bind?return_to=%2Fsettings"
+            .parse()
+            .unwrap();
+
+        let err = start_oauth_bind(State(state.clone()), auth, HeaderMap::new(), uri)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
     #[test]
     fn normalizes_userinfo_with_custom_claim_paths() {
         let mut provider = test_provider();
@@ -1749,6 +1771,7 @@ mod tests {
         let mut config = crate::config::Config::default();
         config.security.session_secret = "test-secret-with-enough-bytes".into();
         config.security.cookie_secure = false;
+        config.oauth2.providers = vec![test_provider()];
 
         AppState {
             db,
@@ -1762,5 +1785,59 @@ mod tests {
             terminal_sessions: crate::api::v1::terminal::TerminalSessionRegistry::new(),
             io_registry: crate::grpc::IoRegistry::new(),
         }
+    }
+
+    fn auth_user(user_id: uuid::Uuid) -> AuthUser {
+        let now = Utc::now();
+        AuthUser {
+            user: crate::db::User {
+                id: UserId(user_id),
+                username: "owner".into(),
+                password_hash: "hash".into(),
+                role: xlstatus_shared::UserRole::Admin,
+                token_version: 0,
+                created_at: now,
+                updated_at: now,
+            },
+            session_id: "session".into(),
+            csrf_token: "csrf".into(),
+            auth_kind: crate::auth::middleware::AuthKind::Session,
+            scopes: Vec::new(),
+            server_ids: None,
+            pat_id: None,
+        }
+    }
+
+    async fn seed_user(db: &DatabaseBackend, id: uuid::Uuid) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            INSERT INTO users (id, username, password_hash, role, token_version, created_at, updated_at)
+            VALUES (?, ?, ?, 'admin', 0, ?, ?)
+            "#,
+        )
+        .bind(id.to_string())
+        .bind(format!("oauth-sensitive-{id}"))
+        .bind("hash")
+        .bind(&now)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_totp_enabled_user(db: &DatabaseBackend, id: uuid::Uuid) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query("UPDATE users SET totp_secret = ?, totp_enabled = 1 WHERE id = ?")
+            .bind("totp-secret")
+            .bind(id.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
     }
 }
