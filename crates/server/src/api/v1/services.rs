@@ -237,6 +237,7 @@ async fn list_services_for_auth(
                 .map(service_from_sqlite_row)
                 .collect::<Vec<_>>();
             attach_service_server_ids(db, &mut services).await?;
+            apply_visible_latest_results(db, auth, &mut services).await?;
             Ok(ServiceListResponse { services, total })
         }
         crate::db::DatabaseBackend::Postgres(pool) => {
@@ -274,6 +275,7 @@ async fn list_services_for_auth(
                 .map(service_from_postgres_row)
                 .collect::<Vec<_>>();
             attach_service_server_ids(db, &mut services).await?;
+            apply_visible_latest_results(db, auth, &mut services).await?;
             Ok(ServiceListResponse { services, total })
         }
     }
@@ -285,8 +287,7 @@ pub async fn get_service(
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<ServiceResponse>>, AppError> {
     require_scope(&auth, "service:read")?;
-    let service = load_service(&state.db, &id).await?;
-    ensure_service_visible_to_auth(&state.db, &auth, &service).await?;
+    let service = load_service_for_auth(&state.db, &auth, &id).await?;
     Ok(Json(ApiResponse::success(service)))
 }
 
@@ -377,7 +378,7 @@ pub async fn create_service(
     replace_service_servers(&state.db, &id, &input.server_ids).await?;
     update_service_cover(&state.db, &id, &input.cover_mode, &input.exclude_server_ids).await?;
     Ok(Json(ApiResponse::success(
-        load_service(&state.db, &id).await?,
+        load_service_for_auth(&state.db, &auth, &id).await?,
     )))
 }
 
@@ -473,7 +474,7 @@ pub async fn update_service(
     replace_service_servers(&state.db, &id, &input.server_ids).await?;
     update_service_cover(&state.db, &id, &input.cover_mode, &input.exclude_server_ids).await?;
     Ok(Json(ApiResponse::success(
-        load_service(&state.db, &id).await?,
+        load_service_for_auth(&state.db, &auth, &id).await?,
     )))
 }
 
@@ -845,6 +846,17 @@ pub(crate) async fn load_service(
     }
 }
 
+async fn load_service_for_auth(
+    db: &crate::db::Db,
+    auth: &AuthSession,
+    id: &str,
+) -> Result<ServiceResponse, AppError> {
+    let mut service = load_service(db, id).await?;
+    ensure_service_visible_to_auth(db, auth, &service).await?;
+    apply_visible_latest_results(db, auth, std::slice::from_mut(&mut service)).await?;
+    Ok(service)
+}
+
 fn service_from_sqlite_row(row: sqlx::sqlite::SqliteRow) -> ServiceResponse {
     let kind: String = row.try_get("type").unwrap_or_else(|_| "http".into());
     ServiceResponse {
@@ -936,6 +948,118 @@ fn service_from_postgres_row(row: sqlx::postgres::PgRow) -> ServiceResponse {
         cert_not_after: row.try_get("cert_not_after").ok(),
         created_at: row.try_get("created_at").unwrap_or_default(),
         updated_at: row.try_get("updated_at").unwrap_or_default(),
+    }
+}
+
+struct LatestServiceResult {
+    status: Option<String>,
+    created_at: Option<String>,
+    cert_fingerprint: Option<String>,
+    cert_not_after: Option<String>,
+}
+
+async fn apply_visible_latest_results(
+    db: &crate::db::Db,
+    auth: &AuthSession,
+    services: &mut [ServiceResponse],
+) -> Result<(), AppError> {
+    if services.is_empty() || auth_has_global_service_visibility(auth) {
+        return Ok(());
+    }
+
+    let visible_server_ids = visible_server_ids_for_auth(db, auth).await?;
+    if visible_server_ids.is_empty() {
+        for service in services {
+            clear_service_latest_result(service);
+        }
+        return Ok(());
+    }
+
+    for service in services {
+        let mut server_ids = service_effective_server_ids(service);
+        server_ids.retain(|server_id| visible_server_ids.iter().any(|id| id == server_id));
+        server_ids = normalize_id_list(server_ids);
+        if server_ids.is_empty() {
+            clear_service_latest_result(service);
+            continue;
+        }
+        if let Some(result) =
+            load_latest_service_result_for_servers(db, &service.id, &server_ids).await?
+        {
+            service.last_status = result.status;
+            service.last_check_at = result.created_at;
+            service.cert_fingerprint = result.cert_fingerprint;
+            service.cert_not_after = result.cert_not_after;
+        } else {
+            clear_service_latest_result(service);
+        }
+    }
+
+    Ok(())
+}
+
+fn clear_service_latest_result(service: &mut ServiceResponse) {
+    service.last_status = None;
+    service.last_check_at = None;
+    service.cert_fingerprint = None;
+    service.cert_not_after = None;
+}
+
+async fn load_latest_service_result_for_servers(
+    db: &crate::db::Db,
+    service_id: &str,
+    server_ids: &[String],
+) -> Result<Option<LatestServiceResult>, AppError> {
+    match db {
+        crate::db::DatabaseBackend::Sqlite(pool) => {
+            let sql = format!(
+                r#"
+                SELECT status, created_at, cert_fingerprint, cert_not_after
+                FROM service_results
+                WHERE service_id = ? AND server_id IN ({})
+                ORDER BY created_at DESC
+                LIMIT 1
+                "#,
+                placeholders("?", server_ids.len())
+            );
+            let mut query = sqlx::query(&sql).bind(service_id);
+            for server_id in server_ids {
+                query = query.bind(server_id);
+            }
+            let row = query.fetch_optional(pool).await.map_err(db_err)?;
+            Ok(row.map(|row| LatestServiceResult {
+                status: row.try_get("status").ok(),
+                created_at: row.try_get("created_at").ok(),
+                cert_fingerprint: row.try_get("cert_fingerprint").ok(),
+                cert_not_after: row.try_get("cert_not_after").ok(),
+            }))
+        }
+        crate::db::DatabaseBackend::Postgres(pool) => {
+            let parsed_service_id = Uuid::parse_str(service_id)
+                .map_err(|e| AppError::BadRequest(format!("invalid service id: {e}")))?;
+            let parsed_server_ids = parse_uuid_ids(server_ids)?;
+            let row = sqlx::query(
+                r#"
+                SELECT status, created_at::text AS created_at, cert_fingerprint,
+                       cert_not_after::text AS cert_not_after
+                FROM service_results
+                WHERE service_id = $1 AND server_id = ANY($2::uuid[])
+                ORDER BY created_at DESC
+                LIMIT 1
+                "#,
+            )
+            .bind(parsed_service_id)
+            .bind(parsed_server_ids)
+            .fetch_optional(pool)
+            .await
+            .map_err(db_err)?;
+            Ok(row.map(|row| LatestServiceResult {
+                status: row.try_get("status").ok(),
+                created_at: row.try_get("created_at").ok(),
+                cert_fingerprint: row.try_get("cert_fingerprint").ok(),
+                cert_not_after: row.try_get("cert_not_after").ok(),
+            }))
+        }
     }
 }
 
@@ -1547,6 +1671,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_pat_service_summaries_use_only_visible_results() {
+        let db = test_db().await;
+        let admin = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let allowed_server = Uuid::parse_str("00000000-0000-0000-0000-000000000101").unwrap();
+        let blocked_server = Uuid::parse_str("00000000-0000-0000-0000-000000000202").unwrap();
+        let service_id = "00000000-0000-0000-0000-000000000301";
+
+        seed_user(&db, admin, "admin", "admin").await;
+        seed_agent(&db, allowed_server, admin, "allowed").await;
+        seed_agent(&db, blocked_server, admin, "blocked").await;
+        seed_service(
+            &db,
+            service_id,
+            "summary",
+            allowed_server,
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+        seed_service_result(
+            &db,
+            "00000000-0000-0000-0000-000000000401",
+            service_id,
+            allowed_server,
+            "success",
+            "allowed-cert",
+            "2026-03-01T00:00:00Z",
+            "2026-01-02T00:00:00Z",
+        )
+        .await;
+        seed_service_result(
+            &db,
+            "00000000-0000-0000-0000-000000000402",
+            service_id,
+            blocked_server,
+            "failure",
+            "blocked-cert",
+            "2026-04-01T00:00:00Z",
+            "2026-01-03T00:00:00Z",
+        )
+        .await;
+
+        let auth = admin_pat_session(admin, vec![allowed_server.to_string()]);
+        let response = list_services_for_auth(&db, &auth, 10, 0).await.unwrap();
+
+        assert_eq!(response.total, 1);
+        assert_eq!(response.services.len(), 1);
+        assert_eq!(response.services[0].last_status.as_deref(), Some("success"));
+        assert_eq!(
+            response.services[0].last_check_at.as_deref(),
+            Some("2026-01-02T00:00:00Z")
+        );
+        assert_eq!(
+            response.services[0].cert_fingerprint.as_deref(),
+            Some("allowed-cert")
+        );
+        assert_eq!(
+            response.services[0].cert_not_after.as_deref(),
+            Some("2026-03-01T00:00:00Z")
+        );
+
+        let detail = load_service_for_auth(&db, &auth, service_id).await.unwrap();
+        assert_eq!(detail.last_status.as_deref(), Some("success"));
+        assert_eq!(
+            detail.last_check_at.as_deref(),
+            Some("2026-01-02T00:00:00Z")
+        );
+        assert_eq!(detail.cert_fingerprint.as_deref(), Some("allowed-cert"));
+        assert_eq!(
+            detail.cert_not_after.as_deref(),
+            Some("2026-03-01T00:00:00Z")
+        );
+    }
+
+    #[tokio::test]
     async fn service_history_visibility_rejects_other_owner_service() {
         let db = test_db().await;
         let owner = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
@@ -1902,6 +2100,34 @@ mod tests {
             .await
             .unwrap();
         }
+    }
+
+    async fn seed_service_result(
+        db: &DatabaseBackend,
+        id: &str,
+        service_id: &str,
+        server_id: Uuid,
+        status: &str,
+        cert_fingerprint: &str,
+        cert_not_after: &str,
+        created_at: &str,
+    ) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO service_results (id, service_id, server_id, status, delay_ms, status_code, cert_fingerprint, cert_not_after, created_at) VALUES (?, ?, ?, ?, 1, 200, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(service_id)
+        .bind(server_id.to_string())
+        .bind(status)
+        .bind(cert_fingerprint)
+        .bind(cert_not_after)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     async fn seed_task_with_selector(
