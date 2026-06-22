@@ -222,14 +222,24 @@ impl AlertEngine {
     async fn evaluate_rule(&self, rule: &AlertRule) -> Result<()> {
         let mut any_triggered = false;
         let mut source_agent_id = None;
+        let mut trusted_conditions = Vec::new();
         for c in &rule.conditions {
+            if !self.condition_belongs_to_rule_owner(rule, c).await? {
+                warn!(
+                    "rule {} condition skipped: condition resource is outside rule owner scope",
+                    rule.id
+                );
+                continue;
+            }
+            trusted_conditions.push(c);
             if self.check_condition(c).await? {
                 any_triggered = true;
                 source_agent_id = condition_agent_id(c).map(str::to_string);
                 break;
             }
         }
-        let fallback_source_agent_id = source_agent_id.or_else(|| infer_rule_agent_id(rule));
+        let fallback_source_agent_id =
+            source_agent_id.or_else(|| infer_condition_agent_id(trusted_conditions.into_iter()));
 
         match rule.trigger_mode {
             TriggerMode::Once => {
@@ -311,6 +321,28 @@ impl AlertEngine {
             }
         }
         Ok(())
+    }
+
+    async fn condition_belongs_to_rule_owner(
+        &self,
+        rule: &AlertRule,
+        condition: &AlertCondition,
+    ) -> Result<bool> {
+        match condition {
+            AlertCondition::ServiceDown { service_id, .. }
+            | AlertCondition::ServiceLatency { service_id, .. }
+            | AlertCondition::CertificateExpiry { service_id, .. } => {
+                self.service_belongs_to_owner(service_id, &rule.owner_user_id)
+                    .await
+            }
+            AlertCondition::ServerExpiry { agent_id, .. }
+            | AlertCondition::ServerTrafficQuota { agent_id, .. }
+            | AlertCondition::ServerOffline { agent_id, .. }
+            | AlertCondition::ServerResource { agent_id, .. } => {
+                self.agent_belongs_to_owner(agent_id, &rule.owner_user_id)
+                    .await
+            }
+        }
     }
 
     async fn check_condition(&self, c: &AlertCondition) -> Result<bool> {
@@ -467,6 +499,72 @@ impl AlertEngine {
         window.sampled_at = now;
         window.last_result = triggered;
         Ok(triggered)
+    }
+
+    async fn service_belongs_to_owner(
+        &self,
+        service_id: &str,
+        owner_user_id: &str,
+    ) -> Result<bool> {
+        let Ok(owner_uuid) = uuid::Uuid::parse_str(owner_user_id) else {
+            return Ok(false);
+        };
+        match &self.db {
+            crate::db::DatabaseBackend::Sqlite(pool) => {
+                let row: Option<(String,)> =
+                    sqlx::query_as("SELECT owner_user_id FROM services WHERE id = ?")
+                        .bind(service_id)
+                        .fetch_optional(pool)
+                        .await?;
+                Ok(row
+                    .and_then(|(owner,)| uuid::Uuid::parse_str(owner.trim()).ok())
+                    .map(|owner| owner == owner_uuid)
+                    .unwrap_or(false))
+            }
+            crate::db::DatabaseBackend::Postgres(pool) => {
+                let Ok(service_uuid) = uuid::Uuid::parse_str(service_id) else {
+                    return Ok(false);
+                };
+                let row: Option<(uuid::Uuid,)> =
+                    sqlx::query_as("SELECT owner_user_id FROM services WHERE id = $1")
+                        .bind(service_uuid)
+                        .fetch_optional(pool)
+                        .await?;
+                Ok(row.map(|(owner,)| owner == owner_uuid).unwrap_or(false))
+            }
+        }
+    }
+
+    async fn agent_belongs_to_owner(&self, agent_id: &str, owner_user_id: &str) -> Result<bool> {
+        let Ok(owner_uuid) = uuid::Uuid::parse_str(owner_user_id) else {
+            return Ok(false);
+        };
+        match &self.db {
+            crate::db::DatabaseBackend::Sqlite(pool) => {
+                let row: Option<(String,)> = sqlx::query_as(
+                    "SELECT owner_user_id FROM agents WHERE id = ? AND revoked_at IS NULL",
+                )
+                .bind(agent_id)
+                .fetch_optional(pool)
+                .await?;
+                Ok(row
+                    .and_then(|(owner,)| uuid::Uuid::parse_str(owner.trim()).ok())
+                    .map(|owner| owner == owner_uuid)
+                    .unwrap_or(false))
+            }
+            crate::db::DatabaseBackend::Postgres(pool) => {
+                let Ok(agent_uuid) = uuid::Uuid::parse_str(agent_id) else {
+                    return Ok(false);
+                };
+                let row: Option<(uuid::Uuid,)> = sqlx::query_as(
+                    "SELECT owner_user_id FROM agents WHERE id = $1 AND revoked_at IS NULL",
+                )
+                .bind(agent_uuid)
+                .fetch_optional(pool)
+                .await?;
+                Ok(row.map(|(owner,)| owner == owner_uuid).unwrap_or(false))
+            }
+        }
     }
 
     async fn count_recent_service_failures(&self, service_id: &str, n: i64) -> Result<i64> {
@@ -1262,8 +1360,14 @@ fn condition_agent_id(condition: &AlertCondition) -> Option<&str> {
 }
 
 fn infer_rule_agent_id(rule: &AlertRule) -> Option<String> {
+    infer_condition_agent_id(rule.conditions.iter())
+}
+
+fn infer_condition_agent_id<'a>(
+    conditions: impl IntoIterator<Item = &'a AlertCondition>,
+) -> Option<String> {
     let mut found: Option<&str> = None;
-    for condition in &rule.conditions {
+    for condition in conditions {
         let Some(agent_id) = condition_agent_id(condition) else {
             continue;
         };
@@ -1775,6 +1879,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn alert_engine_skips_server_conditions_outside_rule_owner() {
+        let db = test_db().await;
+        let owner = "00000000-0000-0000-0000-000000000001";
+        let other = "00000000-0000-0000-0000-000000000002";
+        let other_server = "00000000-0000-0000-0000-000000000202";
+
+        seed_user(&db, owner, "owner").await;
+        seed_user(&db, other, "other").await;
+        seed_agent(&db, other_server, other, "other").await;
+
+        let engine = AlertEngine::new(
+            db,
+            crate::grpc::SessionRegistry::new(),
+            crate::current_task_response_registry(),
+        );
+        let rule = AlertRule {
+            id: "00000000-0000-0000-0000-000000000501".into(),
+            owner_user_id: owner.into(),
+            name: "dirty-server-rule".into(),
+            enabled: true,
+            trigger_mode: TriggerMode::Once,
+            conditions: vec![AlertCondition::ServerOffline {
+                agent_id: other_server.into(),
+                offline_seconds: 1,
+            }],
+            notification_group_id: None,
+            failure_task_ids: Vec::new(),
+            recovery_task_ids: Vec::new(),
+        };
+
+        assert!(!engine
+            .condition_belongs_to_rule_owner(&rule, &rule.conditions[0])
+            .await
+            .unwrap());
+        engine.evaluate_rule(&rule).await.unwrap();
+        assert!(!engine
+            .states
+            .read()
+            .await
+            .get(&rule.id)
+            .map(|state| state.is_active)
+            .unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn alert_engine_skips_service_conditions_outside_rule_owner() {
+        let db = test_db().await;
+        let owner = "00000000-0000-0000-0000-000000000001";
+        let other = "00000000-0000-0000-0000-000000000002";
+        let other_server = "00000000-0000-0000-0000-000000000202";
+        let other_service = "00000000-0000-0000-0000-000000000302";
+
+        seed_user(&db, owner, "owner").await;
+        seed_user(&db, other, "other").await;
+        seed_agent(&db, other_server, other, "other").await;
+        seed_service_with_servers(&db, other_service, other, &[other_server], "specific").await;
+        seed_service_result(
+            &db,
+            "00000000-0000-0000-0000-000000000401",
+            other_service,
+            other_server,
+            "failure",
+            None,
+            None,
+            "2026-01-03T00:00:00Z",
+        )
+        .await;
+
+        let engine = AlertEngine::new(
+            db,
+            crate::grpc::SessionRegistry::new(),
+            crate::current_task_response_registry(),
+        );
+        let rule = AlertRule {
+            id: "00000000-0000-0000-0000-000000000502".into(),
+            owner_user_id: owner.into(),
+            name: "dirty-service-rule".into(),
+            enabled: true,
+            trigger_mode: TriggerMode::Once,
+            conditions: vec![AlertCondition::ServiceDown {
+                service_id: other_service.into(),
+                consecutive_failures: 1,
+            }],
+            notification_group_id: None,
+            failure_task_ids: Vec::new(),
+            recovery_task_ids: Vec::new(),
+        };
+
+        assert!(!engine
+            .condition_belongs_to_rule_owner(&rule, &rule.conditions[0])
+            .await
+            .unwrap());
+        engine.evaluate_rule(&rule).await.unwrap();
+        assert!(!engine
+            .states
+            .read()
+            .await
+            .get(&rule.id)
+            .map(|state| state.is_active)
+            .unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn alert_recovery_source_ignores_skipped_foreign_agent_conditions() {
+        let db = test_db().await;
+        let owner = "00000000-0000-0000-0000-000000000001";
+        let other = "00000000-0000-0000-0000-000000000002";
+        let owner_server = "00000000-0000-0000-0000-000000000101";
+        let other_server = "00000000-0000-0000-0000-000000000202";
+        let rule_id = "00000000-0000-0000-0000-000000000503";
+
+        seed_user(&db, owner, "owner").await;
+        seed_user(&db, other, "other").await;
+        seed_agent(&db, owner_server, owner, "owner-server").await;
+        seed_agent(&db, other_server, other, "other-server").await;
+        seed_alert_rule(&db, rule_id, owner, "recovery-source-rule").await;
+
+        let engine = AlertEngine::new(
+            db,
+            crate::grpc::SessionRegistry::new(),
+            crate::current_task_response_registry(),
+        );
+        let rule = AlertRule {
+            id: rule_id.into(),
+            owner_user_id: owner.into(),
+            name: "recovery-source-rule".into(),
+            enabled: true,
+            trigger_mode: TriggerMode::Once,
+            conditions: vec![
+                AlertCondition::ServerOffline {
+                    agent_id: other_server.into(),
+                    offline_seconds: 1,
+                },
+                AlertCondition::ServerResource {
+                    agent_id: owner_server.into(),
+                    resource: ResourceType::Cpu,
+                    operator: Operator::Gt,
+                    threshold: 99.0,
+                    duration_seconds: 0,
+                },
+            ],
+            notification_group_id: None,
+            failure_task_ids: Vec::new(),
+            recovery_task_ids: Vec::new(),
+        };
+
+        engine.states.write().await.insert(
+            rule.id.clone(),
+            AlertState {
+                rule_id: rule.id.clone(),
+                is_active: true,
+                last_fired_at: Some(Utc::now()),
+                last_always_fire_at: None,
+            },
+        );
+        engine.evaluate_rule(&rule).await.unwrap();
+
+        let events = alert_events_for_rule(&engine.db, rule_id).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "recovered");
+        assert_eq!(events[0].agent_id.as_deref(), Some(owner_server));
+    }
+
+    #[tokio::test]
     async fn service_down_uses_current_service_server_scope() {
         let db = test_db().await;
         let owner = "00000000-0000-0000-0000-000000000001";
@@ -2246,8 +2514,59 @@ mod tests {
         .bind(cert_not_after)
         .bind(created_at)
         .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn seed_alert_rule(db: &Db, id: &str, owner: &str, name: &str) {
+        let Db::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        let rules_json = serde_json::to_string(&Vec::<AlertCondition>::new()).unwrap();
+        sqlx::query(
+            "INSERT INTO alert_rules (id, owner_user_id, name, enabled, trigger_mode, rules_json, created_at, updated_at) VALUES (?, ?, ?, 1, 'once', ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(owner)
+        .bind(name)
+        .bind(rules_json)
+        .execute(pool)
         .await
         .unwrap();
+    }
+
+    async fn alert_events_for_rule(
+        db: &Db,
+        rule_id: &str,
+    ) -> Vec<crate::db::repository::alerts::AlertEventRow> {
+        let Db::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        let rows: Vec<(String, String, Option<String>, Option<String>, String, String, String)> =
+            sqlx::query_as(
+                "SELECT id, rule_id, agent_id, service_id, kind, payload_json, fired_at FROM alert_events WHERE rule_id = ? ORDER BY fired_at ASC",
+            )
+            .bind(rule_id)
+            .fetch_all(pool)
+            .await
+            .unwrap();
+        rows.into_iter()
+            .map(
+                |(id, rule_id, agent_id, service_id, kind, payload_json, fired_at)| {
+                    crate::db::repository::alerts::AlertEventRow {
+                        id,
+                        rule_id,
+                        agent_id,
+                        service_id,
+                        kind,
+                        payload_json,
+                        fired_at: DateTime::parse_from_rfc3339(&fired_at)
+                            .unwrap()
+                            .with_timezone(&Utc),
+                    }
+                },
+            )
+            .collect()
     }
 
     async fn seed_notification_group(db: &Db, id: &str, owner: &str, name: &str) {
