@@ -134,7 +134,7 @@ pub async fn create_nat_mapping(
 
     require_scope_or_403(&auth_user, "nat:write")?;
     let req = normalize_create_nat_mapping_request(req).map_err(bad_request_with)?;
-    validate_nat_agent_or_403(&db, &auth_user, &req.agent_id).await?;
+    require_active_nat_agent_or_403(&db, &auth_user, &req.agent_id).await?;
     validate_nat_local_target_or_403(&req.local_host)?;
     validate_local_port_or_403(req.local_port)?;
     validate_public_port_or_403(req.public_port)?;
@@ -252,7 +252,7 @@ pub async fn list_nat_mappings(
 
     require_scope_or_403(&auth_user, "nat:read")?;
     let agent_id = normalize_nat_agent_id(agent_id).map_err(bad_request_with)?;
-    validate_nat_agent_or_403(&db, &auth_user, &agent_id).await?;
+    require_nat_agent_or_403(&db, &auth_user, &agent_id).await?;
     let mappings = NatMappingRepository::list_by_agent(&db, &agent_id)
         .await
         .map_err(|e| {
@@ -368,6 +368,9 @@ pub async fn update_nat_mapping(
     }
     if let Some(protocol) = req.protocol {
         mapping.protocol = protocol;
+    }
+    if req.enabled == Some(true) || (mapping.enabled && req.enabled != Some(false)) {
+        require_active_nat_agent_or_403(&db, &auth_user, &mapping.agent_id).await?;
     }
     if let Some(enabled) = req.enabled {
         mapping.enabled = enabled;
@@ -854,11 +857,11 @@ fn normalize_allowed_sources(value: Option<&str>) -> Result<Option<String>, Stri
     Ok(Some(entries.join(",")))
 }
 
-async fn validate_nat_agent_or_403(
+async fn load_authorized_nat_agent_or_403(
     db: &Db,
     auth_user: &AuthUser,
     agent_id: &str,
-) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<crate::db::Agent, (StatusCode, Json<ApiResponse<()>>)> {
     let agent_id = normalize_nat_agent_id(agent_id.to_string()).map_err(bad_request_with)?;
     let session = session_of(auth_user);
     if !nat_server_id_allowed(session.server_ids.as_deref(), &agent_id) {
@@ -883,7 +886,7 @@ async fn validate_nat_agent_or_403(
         }
     }
 
-    Ok(())
+    Ok(agent)
 }
 
 fn nat_server_id_allowed(allowed: Option<&[String]>, agent_id: &str) -> bool {
@@ -906,13 +909,28 @@ async fn require_nat_agent_or_403(
     auth_user: &AuthUser,
     agent_id: &str,
 ) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
-    validate_nat_agent_or_403(db, auth_user, agent_id).await
+    load_authorized_nat_agent_or_403(db, auth_user, agent_id)
+        .await
+        .map(|_| ())
+}
+
+async fn require_active_nat_agent_or_403(
+    db: &Db,
+    auth_user: &AuthUser,
+    agent_id: &str,
+) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
+    let agent = load_authorized_nat_agent_or_403(db, auth_user, agent_id).await?;
+    if agent.revoked_at.is_some() {
+        return Err(forbidden_with("agent has been revoked".to_string()));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xlstatus_shared::{UserId, UserRole};
+    use crate::db::{CreateAgentInput, CreateUserInput, DatabaseBackend, UserRepository};
+    use xlstatus_shared::{AgentId, UserId, UserRole};
 
     #[test]
     fn nat_global_list_rejects_admin_pat() {
@@ -1124,6 +1142,45 @@ mod tests {
         std::env::remove_var("XLSTATUS_ALLOW_PRIVATE_NAT_TARGETS");
     }
 
+    #[tokio::test]
+    async fn nat_write_rejects_revoked_agent_but_visibility_allows_cleanup() {
+        let db = test_db().await;
+        let user = UserRepository::new(db.clone())
+            .create(CreateUserInput {
+                username: format!("nat-api-owner-{}", uuid::Uuid::now_v7()),
+                password: "password123".into(),
+                role: UserRole::Member,
+            })
+            .await
+            .unwrap();
+        let agent_id = AgentId(uuid::Uuid::now_v7());
+        let agent_repo = AgentRepository::new(db.clone());
+        agent_repo
+            .create_with_id(
+                agent_id,
+                CreateAgentInput {
+                    name: "revoked-nat-agent".into(),
+                    public_key: "pk".into(),
+                    owner_user_id: user.id,
+                },
+            )
+            .await
+            .unwrap();
+        agent_repo.revoke(agent_id).await.unwrap();
+        let auth = auth_user_for(user.id, AuthKind::Session, UserRole::Member);
+
+        assert!(
+            require_nat_agent_or_403(&db, &auth, &agent_id.0.to_string())
+                .await
+                .is_ok()
+        );
+        let err = require_active_nat_agent_or_403(&db, &auth, &agent_id.0.to_string())
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
     #[test]
     fn nat_mapping_tunnel_limit_rejects_zero() {
         assert!(normalize_bounded_u32(
@@ -1229,9 +1286,13 @@ mod tests {
     }
 
     fn auth_user(auth_kind: AuthKind, role: UserRole) -> AuthUser {
+        auth_user_for(UserId(uuid::Uuid::from_bytes([8; 16])), auth_kind, role)
+    }
+
+    fn auth_user_for(user_id: UserId, auth_kind: AuthKind, role: UserRole) -> AuthUser {
         AuthUser {
             user: crate::db::User {
-                id: UserId(uuid::Uuid::from_bytes([8; 16])),
+                id: user_id,
                 username: "admin".into(),
                 password_hash: "hash".into(),
                 role,
@@ -1246,6 +1307,15 @@ mod tests {
             server_ids: None,
             pat_id: None,
         }
+    }
+
+    async fn test_db() -> DatabaseBackend {
+        let path =
+            std::env::temp_dir().join(format!("xlstatus-nat-api-test-{}.db", uuid::Uuid::now_v7()));
+        let url = format!("sqlite://{}?mode=rwc", path.to_string_lossy());
+        let db = DatabaseBackend::connect(&url, true).await.unwrap();
+        db.run_migrations().await.unwrap();
+        db
     }
 
     fn create_nat_request(agent_id: uuid::Uuid) -> CreateNatMappingRequest {

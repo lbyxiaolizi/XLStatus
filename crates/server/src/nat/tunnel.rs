@@ -63,7 +63,7 @@ impl NatTunnelManager {
     }
 
     pub async fn reload(&self) -> Result<()> {
-        let mappings = NatMappingRepository::list_enabled(&self.db)
+        let mappings = NatMappingRepository::list_enabled_for_active_agents(&self.db)
             .await
             .context("Failed to load NAT mappings")?;
         let mut tcp_mappings = Vec::new();
@@ -264,7 +264,8 @@ impl NatTunnelManager {
     }
 
     async fn current_mapping_for_port(&self, public_port: u16) -> Result<Option<NatMapping>> {
-        let Some(mapping) = NatMappingRepository::get_by_public_port(&self.db, public_port).await?
+        let Some(mapping) =
+            NatMappingRepository::get_active_by_public_port(&self.db, public_port).await?
         else {
             return Ok(None);
         };

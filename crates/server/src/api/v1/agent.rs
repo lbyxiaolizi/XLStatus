@@ -189,6 +189,11 @@ pub async fn revoke_agent(
         // the admin's revoke succeeds.
         tracing::debug!("no live session to force_disconnect: {}", e);
     }
+    if let Some(manager) = crate::current_nat_manager() {
+        if let Err(e) = manager.reload().await {
+            tracing::warn!("NAT manager reload failed after agent revoke: {}", e);
+        }
+    }
     Ok(Json(ApiResponse::success(serde_json::json!({
         "agent_id": agent_id.to_string(),
         "revoked": true,

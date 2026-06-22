@@ -138,6 +138,28 @@ impl NatMappingRepository {
         Ok(mapping)
     }
 
+    /// Get an enabled NAT mapping by public port only if the target Agent is active.
+    pub async fn get_active_by_public_port(db: &Db, port: u16) -> Result<Option<NatMapping>> {
+        let mapping = match db {
+            crate::db::DatabaseBackend::Sqlite(pool) => {
+                let row_opt = sqlx::query(NAT_MAPPING_SELECT_SQLITE_ACTIVE_BY_PUBLIC_PORT)
+                    .bind(port as i32)
+                    .fetch_optional(pool)
+                    .await?;
+                row_opt.map(Self::sqlite_row_to_mapping).transpose()?
+            }
+            crate::db::DatabaseBackend::Postgres(pool) => {
+                let row_opt = sqlx::query(NAT_MAPPING_SELECT_POSTGRES_ACTIVE_BY_PUBLIC_PORT)
+                    .bind(port as i32)
+                    .fetch_optional(pool)
+                    .await?;
+                row_opt.map(Self::postgres_row_to_mapping).transpose()?
+            }
+        };
+
+        Ok(mapping)
+    }
+
     /// List all NAT mappings for an agent
     pub async fn list_by_agent(db: &Db, agent_id: &str) -> Result<Vec<NatMapping>> {
         let mappings = match db {
@@ -177,6 +199,30 @@ impl NatMappingRepository {
             }
             crate::db::DatabaseBackend::Postgres(pool) => {
                 let rows = sqlx::query(NAT_MAPPING_SELECT_POSTGRES_ENABLED)
+                    .fetch_all(pool)
+                    .await?;
+                rows.into_iter()
+                    .map(Self::postgres_row_to_mapping)
+                    .collect::<Result<Vec<_>>>()?
+            }
+        };
+
+        Ok(mappings)
+    }
+
+    /// List enabled NAT mappings whose target Agent is not revoked.
+    pub async fn list_enabled_for_active_agents(db: &Db) -> Result<Vec<NatMapping>> {
+        let mappings = match db {
+            crate::db::DatabaseBackend::Sqlite(pool) => {
+                let rows = sqlx::query(NAT_MAPPING_SELECT_SQLITE_ENABLED_ACTIVE_AGENTS)
+                    .fetch_all(pool)
+                    .await?;
+                rows.into_iter()
+                    .map(Self::sqlite_row_to_mapping)
+                    .collect::<Result<Vec<_>>>()?
+            }
+            crate::db::DatabaseBackend::Postgres(pool) => {
+                let rows = sqlx::query(NAT_MAPPING_SELECT_POSTGRES_ENABLED_ACTIVE_AGENTS)
                     .fetch_all(pool)
                     .await?;
                 rows.into_iter()
@@ -397,6 +443,28 @@ const NAT_MAPPING_SELECT_SQLITE_BY_PUBLIC_PORT: &str =
     nat_mapping_select!("WHERE public_port = ? AND enabled = 1");
 const NAT_MAPPING_SELECT_POSTGRES_BY_PUBLIC_PORT: &str =
     nat_mapping_select!("WHERE public_port = $1 AND enabled = TRUE");
+const NAT_MAPPING_SELECT_SQLITE_ACTIVE_BY_PUBLIC_PORT: &str = r#"
+    SELECT m.id, m.agent_id, m.local_host, m.local_port, m.public_port,
+           m.protocol, m.enabled, m.description, m.allowed_sources,
+           m.max_active_tunnels, m.idle_timeout_seconds, m.max_bytes_per_tunnel,
+           m.max_bandwidth_bytes_per_second, m.rate_limit_window_seconds,
+           m.max_connections_per_window, m.max_bytes_per_window,
+           m.created_at, m.updated_at
+    FROM nat_mappings m
+    JOIN agents a ON a.id = m.agent_id
+    WHERE m.public_port = ? AND m.enabled = 1 AND a.revoked_at IS NULL
+"#;
+const NAT_MAPPING_SELECT_POSTGRES_ACTIVE_BY_PUBLIC_PORT: &str = r#"
+    SELECT m.id, m.agent_id, m.local_host, m.local_port, m.public_port,
+           m.protocol, m.enabled, m.description, m.allowed_sources,
+           m.max_active_tunnels, m.idle_timeout_seconds, m.max_bytes_per_tunnel,
+           m.max_bandwidth_bytes_per_second, m.rate_limit_window_seconds,
+           m.max_connections_per_window, m.max_bytes_per_window,
+           m.created_at, m.updated_at
+    FROM nat_mappings m
+    JOIN agents a ON a.id = m.agent_id
+    WHERE m.public_port = $1 AND m.enabled = TRUE AND a.revoked_at IS NULL
+"#;
 const NAT_MAPPING_SELECT_SQLITE_BY_AGENT: &str =
     nat_mapping_select!("WHERE agent_id = ? ORDER BY created_at DESC");
 const NAT_MAPPING_SELECT_POSTGRES_BY_AGENT: &str =
@@ -405,6 +473,30 @@ const NAT_MAPPING_SELECT_SQLITE_ENABLED: &str =
     nat_mapping_select!("WHERE enabled = 1 ORDER BY public_port ASC");
 const NAT_MAPPING_SELECT_POSTGRES_ENABLED: &str =
     nat_mapping_select!("WHERE enabled = TRUE ORDER BY public_port ASC");
+const NAT_MAPPING_SELECT_SQLITE_ENABLED_ACTIVE_AGENTS: &str = r#"
+    SELECT m.id, m.agent_id, m.local_host, m.local_port, m.public_port,
+           m.protocol, m.enabled, m.description, m.allowed_sources,
+           m.max_active_tunnels, m.idle_timeout_seconds, m.max_bytes_per_tunnel,
+           m.max_bandwidth_bytes_per_second, m.rate_limit_window_seconds,
+           m.max_connections_per_window, m.max_bytes_per_window,
+           m.created_at, m.updated_at
+    FROM nat_mappings m
+    JOIN agents a ON a.id = m.agent_id
+    WHERE m.enabled = 1 AND a.revoked_at IS NULL
+    ORDER BY m.public_port ASC
+"#;
+const NAT_MAPPING_SELECT_POSTGRES_ENABLED_ACTIVE_AGENTS: &str = r#"
+    SELECT m.id, m.agent_id, m.local_host, m.local_port, m.public_port,
+           m.protocol, m.enabled, m.description, m.allowed_sources,
+           m.max_active_tunnels, m.idle_timeout_seconds, m.max_bytes_per_tunnel,
+           m.max_bandwidth_bytes_per_second, m.rate_limit_window_seconds,
+           m.max_connections_per_window, m.max_bytes_per_window,
+           m.created_at, m.updated_at
+    FROM nat_mappings m
+    JOIN agents a ON a.id = m.agent_id
+    WHERE m.enabled = TRUE AND a.revoked_at IS NULL
+    ORDER BY m.public_port ASC
+"#;
 
 fn parse_uuid(value: &str, field: &str) -> Result<uuid::Uuid> {
     uuid::Uuid::parse_str(value).with_context(|| format!("invalid NAT mapping {field} UUID"))
@@ -460,7 +552,45 @@ mod tests {
         assert_eq!(bytes.bytes_transferred, 4096);
     }
 
+    #[tokio::test]
+    async fn nat_enabled_runtime_queries_ignore_revoked_agents() {
+        let db = test_db().await;
+        let active_mapping = create_test_mapping_with_port(&db, 12080, false).await;
+        let revoked_mapping = create_test_mapping_with_port(&db, 12081, true).await;
+
+        let mappings = NatMappingRepository::list_enabled_for_active_agents(&db)
+            .await
+            .unwrap();
+        let ids = mappings
+            .iter()
+            .map(|mapping| mapping.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(ids.contains(&active_mapping.id.as_str()));
+        assert!(!ids.contains(&revoked_mapping.id.as_str()));
+        assert!(
+            NatMappingRepository::get_active_by_public_port(&db, active_mapping.public_port)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            NatMappingRepository::get_active_by_public_port(&db, revoked_mapping.public_port)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
     async fn create_test_mapping(db: &DatabaseBackend) -> NatMapping {
+        create_test_mapping_with_port(db, 12080, false).await
+    }
+
+    async fn create_test_mapping_with_port(
+        db: &DatabaseBackend,
+        public_port: u16,
+        revoke_agent: bool,
+    ) -> NatMapping {
         let user = UserRepository::new(db.clone())
             .create(CreateUserInput {
                 username: format!("nat-owner-{}", uuid::Uuid::now_v7()),
@@ -481,13 +611,19 @@ mod tests {
             )
             .await
             .unwrap();
+        if revoke_agent {
+            crate::db::repository::AgentRepository::new(db.clone())
+                .revoke(agent_id)
+                .await
+                .unwrap();
+        }
         let now = Utc::now().to_rfc3339();
         let mapping = NatMapping {
             id: uuid::Uuid::now_v7().to_string(),
             agent_id: agent_id.0.to_string(),
             local_host: "127.0.0.1".into(),
             local_port: 80,
-            public_port: 12080,
+            public_port,
             protocol: Protocol::Tcp,
             enabled: true,
             description: None,
