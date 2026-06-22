@@ -417,6 +417,59 @@ impl TaskRunRepository {
 
         Ok(runs)
     }
+
+    /// List task runs for a task, filtered by a PAT server allowlist before pagination.
+    pub async fn list_by_task_for_server_ids(
+        db: &Db,
+        task_id: &str,
+        server_ids: &[String],
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<TaskRun>> {
+        if server_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let runs = match db {
+            crate::db::DatabaseBackend::Sqlite(pool) => {
+                let placeholders = sqlite_placeholders(server_ids.len());
+                let sql = format!(
+                    r#"
+                    SELECT id, task_id, server_id, status, delay_ms, output,
+                           output_truncated, error, created_at
+                    FROM task_runs
+                    WHERE task_id = ? AND server_id IN ({placeholders})
+                    ORDER BY created_at DESC
+                    LIMIT ? OFFSET ?
+                    "#,
+                );
+                let mut query = sqlx::query(&sql).bind(task_id);
+                for server_id in server_ids {
+                    query = query.bind(server_id);
+                }
+                let rows = query.bind(limit).bind(offset).fetch_all(pool).await?;
+
+                rows.into_iter()
+                    .map(sqlite_row_to_task_run)
+                    .collect::<Result<Vec<_>>>()?
+            }
+            crate::db::DatabaseBackend::Postgres(pool) => {
+                let parsed = parse_uuid_ids(server_ids)?;
+                let rows = sqlx::query(TASK_RUN_SELECT_POSTGRES_BY_TASK_AND_SERVERS)
+                    .bind(task_id)
+                    .bind(&parsed)
+                    .bind(limit)
+                    .bind(offset)
+                    .fetch_all(pool)
+                    .await?;
+
+                rows.into_iter()
+                    .map(postgres_row_to_task_run)
+                    .collect::<Result<Vec<_>>>()?
+            }
+        };
+
+        Ok(runs)
+    }
 }
 
 pub struct AuditLogRepository;
@@ -559,6 +612,14 @@ const TASK_RUN_SELECT_POSTGRES_BY_TASK: &str = r#"
     ORDER BY created_at DESC
     LIMIT $2 OFFSET $3
 "#;
+const TASK_RUN_SELECT_POSTGRES_BY_TASK_AND_SERVERS: &str = r#"
+    SELECT id, task_id, server_id, status, delay_ms, output,
+           output_truncated, error, created_at
+    FROM task_runs
+    WHERE task_id = $1 AND server_id = ANY($2::uuid[])
+    ORDER BY created_at DESC
+    LIMIT $3 OFFSET $4
+"#;
 const AUDIT_LOG_INSERT_SQLITE: &str = r#"
     INSERT INTO audit_logs (
         id, user_id, api_token_id, action, resource_type, resource_id,
@@ -621,6 +682,16 @@ fn parse_optional_uuid(value: Option<&str>, field: &str) -> Result<Option<uuid::
     value.map(|value| parse_uuid(value, field)).transpose()
 }
 
+fn parse_uuid_ids(ids: &[String]) -> Result<Vec<uuid::Uuid>> {
+    ids.iter()
+        .map(|id| parse_uuid(id, "server_id"))
+        .collect::<Result<Vec<_>>>()
+}
+
+fn sqlite_placeholders(len: usize) -> String {
+    std::iter::repeat_n("?", len).collect::<Vec<_>>().join(", ")
+}
+
 fn parse_timestamp(value: &str, field: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .map(|value| value.with_timezone(&Utc))
@@ -646,6 +717,7 @@ mod tests {
             TASK_RUN_UPDATE_RESULT_POSTGRES,
             TASK_RUN_INSERT_POSTGRES,
             TASK_RUN_SELECT_POSTGRES_BY_TASK,
+            TASK_RUN_SELECT_POSTGRES_BY_TASK_AND_SERVERS,
             AUDIT_LOG_INSERT_POSTGRES,
         ];
 

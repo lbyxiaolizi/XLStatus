@@ -22,6 +22,9 @@ use crate::tasks::{
 };
 use xlstatus_shared::tasks::*;
 
+const TASK_LIST_MAX_LIMIT: i64 = 500;
+const TASK_LIST_SCAN_BATCH: i64 = 500;
+
 #[derive(Debug, Deserialize)]
 pub struct CreateTaskRequest {
     pub name: String,
@@ -154,28 +157,9 @@ pub async fn list_tasks(
     let db = state.db.clone();
 
     require_scope_or_403(&auth_user, "task:read")?;
-    let tasks = TaskRepository::list_by_user(
-        &db,
-        &auth_user.user.id.0.to_string(),
-        query.limit,
-        query.offset,
-    )
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse {
-                success: false,
-                data: None,
-                error: Some(format!("Failed to list tasks: {}", e)),
-            }),
-        )
-    })?;
-
-    let tasks = tasks
-        .into_iter()
-        .filter(|task| task_visible_to_auth(&auth_user, task))
-        .collect::<Vec<_>>();
+    let limit = normalize_list_limit(query.limit);
+    let offset = normalize_list_offset(query.offset);
+    let tasks = list_visible_tasks(&db, &auth_user, limit, offset).await?;
     let total = tasks.len();
 
     Ok(Json(ApiResponse {
@@ -536,19 +520,24 @@ pub async fn get_task_runs(
     }
     ensure_task_visible_to_auth(&auth_user, &task)?;
 
-    let mut runs = TaskRunRepository::list_by_task(&db, &task_id, query.limit, query.offset)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse {
-                    success: false,
-                    data: None,
-                    error: Some(format!("Failed to list task runs: {}", e)),
-                }),
-            )
-        })?;
-    filter_task_runs_for_auth(&auth_user, &mut runs);
+    let limit = normalize_list_limit(query.limit);
+    let offset = normalize_list_offset(query.offset);
+    let runs = if let Some(server_ids) = auth_user.server_ids.as_ref() {
+        TaskRunRepository::list_by_task_for_server_ids(&db, &task_id, server_ids, limit, offset)
+            .await
+    } else {
+        TaskRunRepository::list_by_task(&db, &task_id, limit, offset).await
+    }
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse {
+                success: false,
+                data: None,
+                error: Some(format!("Failed to list task runs: {}", e)),
+            }),
+        )
+    })?;
 
     let total = runs.len();
 
@@ -561,6 +550,73 @@ pub async fn get_task_runs(
 
 pub fn task_body_limit() -> DefaultBodyLimit {
     DefaultBodyLimit::max(TASK_API_MAX_BODY_BYTES)
+}
+
+async fn list_visible_tasks(
+    db: &Db,
+    auth_user: &AuthUser,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<Task>, (StatusCode, Json<ApiResponse<()>>)> {
+    let owner = auth_user.user.id.0.to_string();
+    if auth_user.server_ids.is_none() {
+        return TaskRepository::list_by_user(db, &owner, limit, offset)
+            .await
+            .map_err(list_tasks_error);
+    }
+    if matches!(auth_user.server_ids.as_ref(), Some(ids) if ids.is_empty()) {
+        return Ok(Vec::new());
+    }
+
+    let mut db_offset = 0_i64;
+    let mut visible_seen = 0_i64;
+    let mut out = Vec::new();
+    loop {
+        let batch = TaskRepository::list_by_user(db, &owner, TASK_LIST_SCAN_BATCH, db_offset)
+            .await
+            .map_err(list_tasks_error)?;
+        if batch.is_empty() {
+            break;
+        }
+        db_offset += batch.len() as i64;
+        for task in batch {
+            if !task_visible_to_auth(auth_user, &task) {
+                continue;
+            }
+            if visible_seen < offset {
+                visible_seen += 1;
+                continue;
+            }
+            if out.len() >= limit as usize {
+                return Ok(out);
+            }
+            visible_seen += 1;
+            out.push(task);
+            if out.len() >= limit as usize {
+                return Ok(out);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn list_tasks_error(e: anyhow::Error) -> (StatusCode, Json<ApiResponse<()>>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(format!("Failed to list tasks: {}", e)),
+        }),
+    )
+}
+
+fn normalize_list_limit(limit: i64) -> i64 {
+    limit.clamp(1, TASK_LIST_MAX_LIMIT)
+}
+
+fn normalize_list_offset(offset: i64) -> i64 {
+    offset.max(0)
 }
 
 fn require_scope_or_403(
@@ -638,13 +694,6 @@ fn task_visible_to_auth(auth_user: &AuthUser, task: &Task) -> bool {
     ensure_task_visible_to_auth(auth_user, task).is_ok()
 }
 
-fn filter_task_runs_for_auth(auth_user: &AuthUser, runs: &mut Vec<TaskRun>) {
-    let Some(allowed) = auth_user.server_ids.as_ref() else {
-        return;
-    };
-    runs.retain(|run| allowed.iter().any(|server_id| server_id == &run.server_id));
-}
-
 async fn ensure_task_notification_group_owned(
     db: &Db,
     auth_user: &AuthUser,
@@ -693,7 +742,7 @@ fn api_error(
 mod tests {
     use super::*;
     use crate::auth::middleware::AuthKind;
-    use crate::db::User;
+    use crate::db::{DatabaseBackend, User};
     use chrono::Utc;
     use serde_json::json;
     use xlstatus_shared::{UserId, UserRole};
@@ -744,15 +793,74 @@ mod tests {
         assert!(!task_visible_to_auth(&auth, &task));
     }
 
-    #[test]
-    fn scoped_pat_filters_task_runs_to_allowlist() {
+    #[tokio::test]
+    async fn scoped_pat_task_list_filters_visibility_before_limit() {
+        let db = test_db().await;
         let auth = pat_with_servers(vec!["server-a"]);
-        let mut runs = vec![task_run("server-a"), task_run("server-b")];
+        let owner = auth.user.id.0.to_string();
+        seed_user(&db, &owner).await;
+        seed_task_with_selector(
+            &db,
+            "blocked",
+            &owner,
+            json!({ "server_ids": ["server-b"] }),
+            "2026-01-03T00:00:00Z",
+        )
+        .await;
+        seed_task_with_selector(
+            &db,
+            "allowed",
+            &owner,
+            json!({ "server_ids": ["server-a"] }),
+            "2026-01-02T00:00:00Z",
+        )
+        .await;
 
-        filter_task_runs_for_auth(&auth, &mut runs);
+        let visible = list_visible_tasks(&db, &auth, 1, 0).await.unwrap();
+
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, "allowed");
+    }
+
+    #[tokio::test]
+    async fn scoped_pat_task_runs_filter_allowlist_before_limit() {
+        let db = test_db().await;
+        let task_id = "task";
+        let owner = uuid::Uuid::from_bytes([1; 16]).to_string();
+        seed_user(&db, &owner).await;
+        seed_server(&db, "00000000-0000-0000-0000-0000000000aa", &owner).await;
+        seed_server(&db, "00000000-0000-0000-0000-0000000000bb", &owner).await;
+        seed_task(&db, task_id, &owner).await;
+        seed_task_run(
+            &db,
+            "run-blocked",
+            task_id,
+            "00000000-0000-0000-0000-0000000000bb",
+            "2026-01-03T00:00:00Z",
+        )
+        .await;
+        seed_task_run(
+            &db,
+            "run-allowed",
+            task_id,
+            "00000000-0000-0000-0000-0000000000aa",
+            "2026-01-02T00:00:00Z",
+        )
+        .await;
+
+        let runs = TaskRunRepository::list_by_task_for_server_ids(
+            &db,
+            task_id,
+            &["00000000-0000-0000-0000-0000000000aa".to_string()],
+            1,
+            0,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].server_id, "server-a");
+        assert_eq!(runs[0].id, "run-allowed");
+        assert_eq!(runs[0].server_id, "00000000-0000-0000-0000-0000000000aa");
     }
 
     #[test]
@@ -813,8 +921,12 @@ mod tests {
     }
 
     fn task(cover_mode: CoverMode, selector: serde_json::Value) -> Task {
+        task_with_id("task", cover_mode, selector)
+    }
+
+    fn task_with_id(id: &str, cover_mode: CoverMode, selector: serde_json::Value) -> Task {
         Task {
-            id: "task".into(),
+            id: id.into(),
             owner_user_id: uuid::Uuid::from_bytes([1; 16]).to_string(),
             name: "task".into(),
             task_type: TaskType::Shell,
@@ -833,17 +945,97 @@ mod tests {
         }
     }
 
-    fn task_run(server_id: &str) -> TaskRun {
-        TaskRun {
-            id: format!("run-{server_id}"),
-            task_id: "task".into(),
-            server_id: server_id.into(),
-            status: TaskStatus::Success,
-            delay_ms: Some(1),
-            output: None,
-            output_truncated: false,
-            error: None,
-            created_at: "2026-01-01T00:00:00Z".into(),
-        }
+    async fn test_db() -> DatabaseBackend {
+        let db = DatabaseBackend::connect("sqlite::memory:", true)
+            .await
+            .unwrap();
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    async fn seed_user(db: &DatabaseBackend, id: &str) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, role, created_at, updated_at) VALUES (?, ?, 'x', 'admin', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(format!("user-{id}"))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_server(db: &DatabaseBackend, id: &str, owner_user_id: &str) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO servers (id, owner_user_id, name, created_at, updated_at) VALUES (?, ?, 'server', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(owner_user_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_task(db: &DatabaseBackend, id: &str, owner_user_id: &str) {
+        seed_task_with_selector(
+            db,
+            id,
+            owner_user_id,
+            json!({ "server_ids": ["00000000-0000-0000-0000-0000000000aa"] }),
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+    }
+
+    async fn seed_task_with_selector(
+        db: &DatabaseBackend,
+        id: &str,
+        owner_user_id: &str,
+        selector: serde_json::Value,
+        created_at: &str,
+    ) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO tasks (id, owner_user_id, name, task_type, cover_mode, server_selector_json, created_at, updated_at) VALUES (?, ?, 'task', ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(owner_user_id)
+        .bind(serde_json::to_string(&TaskType::Shell).unwrap())
+        .bind(serde_json::to_string(&CoverMode::Specific).unwrap())
+        .bind(selector.to_string())
+        .bind(created_at)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_task_run(
+        db: &DatabaseBackend,
+        id: &str,
+        task_id: &str,
+        server_id: &str,
+        created_at: &str,
+    ) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO task_runs (id, task_id, server_id, status, delay_ms, output_truncated, created_at) VALUES (?, ?, ?, 'success', 1, 0, ?)",
+        )
+        .bind(id)
+        .bind(task_id)
+        .bind(server_id)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 }
