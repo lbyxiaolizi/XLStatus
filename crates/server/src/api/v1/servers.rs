@@ -564,6 +564,7 @@ struct DashboardMetadata {
 pub async fn update_server(
     State(state): State<AppState>,
     auth: AuthSession,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(req): Json<UpdateServerRequest>,
 ) -> Result<Json<ApiResponse<ServerDetailResponse>>, AppError> {
@@ -571,11 +572,12 @@ pub async fn update_server(
         return Err(AppError::Forbidden("missing scope: server:write".into()));
     }
     let agent_id = parse_agent_id(&id)?;
-    let agent = AgentRepository::new(state.db.clone())
-        .find_by_id(agent_id)
+    let agent_repo = AgentRepository::new(state.db.clone());
+    let row = agent_repo
+        .find_by_id_with_state(agent_id)
         .await?
         .ok_or(AppError::NotFound("agent not found".into()))?;
-    ensure_agent_visible(&auth, &agent)?;
+    ensure_agent_visible(&auth, &row.agent)?;
     let name = req
         .name
         .as_deref()
@@ -611,8 +613,15 @@ pub async fn update_server(
         hide_for_guest: req.hide_for_guest,
         display_order: normalize_display_order(req.display_order, "display_order")?,
     };
+    require_public_server_metadata_write_auth(
+        &state.db,
+        &auth,
+        &headers,
+        row.dashboard_metadata_json.as_deref(),
+        &dashboard_metadata,
+    )
+    .await?;
     let dashboard_metadata_json = dashboard_metadata_json(&dashboard_metadata)?;
-    let agent_repo = AgentRepository::new(state.db.clone());
     let updated = agent_repo
         .update_dashboard_metadata(
             agent_id,
@@ -645,6 +654,9 @@ pub async fn batch_update_servers(
         ServerBatchAction::Delete | ServerBatchAction::TransferOwner
     ) {
         require_sensitive_totp(&state.db, auth.user_id, &headers).await?;
+    }
+    if matches!(req.action, ServerBatchAction::SetDashboardVisible) {
+        require_public_server_visibility_write_auth(&state.db, &auth, &headers).await?;
     }
     let server_ids = dedupe_ids(req.server_ids, SERVER_BATCH_MAX_SERVER_IDS, "server_ids")?;
     if server_ids.is_empty() {
@@ -1729,6 +1741,38 @@ fn require_admin_cookie_session(auth: &AuthSession) -> Result<(), AppError> {
         return Err(AppError::Forbidden("Cookie session required".into()));
     }
     Ok(())
+}
+
+async fn require_public_server_metadata_write_auth(
+    db: &DatabaseBackend,
+    auth: &AuthSession,
+    headers: &HeaderMap,
+    stored: Option<&str>,
+    next: &DashboardMetadata,
+) -> Result<(), AppError> {
+    let current = dashboard_metadata(stored, &[]);
+    if public_server_visibility_metadata_changed(&current, next) {
+        require_public_server_visibility_write_auth(db, auth, headers).await?;
+    }
+    Ok(())
+}
+
+fn public_server_visibility_metadata_changed(
+    current: &DashboardMetadata,
+    next: &DashboardMetadata,
+) -> bool {
+    current.public_note != next.public_note
+        || current.dashboard_visible != next.dashboard_visible
+        || current.hide_for_guest != next.hide_for_guest
+}
+
+async fn require_public_server_visibility_write_auth(
+    db: &DatabaseBackend,
+    auth: &AuthSession,
+    headers: &HeaderMap,
+) -> Result<(), AppError> {
+    require_admin_cookie_session(auth)?;
+    require_sensitive_totp(db, auth.user_id, headers).await
 }
 
 fn ensure_transfer_server_scope(auth: &AuthSession, server_id: &str) -> Result<(), AppError> {
@@ -3253,6 +3297,19 @@ mod tests {
         .unwrap();
     }
 
+    async fn dashboard_metadata_value(db: &DatabaseBackend, id: Uuid) -> Option<serde_json::Value> {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        let value: Option<String> =
+            sqlx::query_scalar("SELECT dashboard_metadata_json FROM agents WHERE id = ?")
+                .bind(id.to_string())
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        value.and_then(|item| serde_json::from_str(&item).ok())
+    }
+
     async fn revoke_agent(db: &DatabaseBackend, id: Uuid) {
         let DatabaseBackend::Sqlite(pool) = db else {
             unreachable!();
@@ -3758,6 +3815,202 @@ mod tests {
             .unwrap();
         assert_eq!(still_failed.status, "failed");
         assert!(still_failed.cancelled_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn public_server_metadata_write_rejects_pat() {
+        let db = test_db().await;
+        let admin = Uuid::from_bytes([9; 16]);
+        let server = Uuid::parse_str("00000000-0000-0000-0000-000000000303").unwrap();
+        seed_user(&db, admin, "admin", "admin").await;
+        seed_agent(&db, server, admin, "server", "2026-01-01T00:00:00Z").await;
+
+        let mut auth = auth_session(AuthKind::PersonalAccessToken, UserRole::Admin);
+        auth.user_id = UserId(admin);
+        auth.server_ids = Some(vec![server.to_string()]);
+        auth.pat_id = Some("pat".into());
+        let err = update_server(
+            State(test_state(db.clone())),
+            auth,
+            HeaderMap::new(),
+            Path(server.to_string()),
+            Json(UpdateServerRequest {
+                name: Some("renamed".into()),
+                remark: None,
+                expires_at: None,
+                renewal_price: None,
+                public_note: Some("public".into()),
+                price: None,
+                currency: None,
+                billing_cycle: None,
+                auto_renew: None,
+                traffic_quota_bytes: None,
+                traffic_quota_type: None,
+                provider: None,
+                region: None,
+                country: None,
+                city: None,
+                latitude: None,
+                longitude: None,
+                plan: None,
+                tags: None,
+                accent_color: None,
+                dashboard_visible: Some(true),
+                hide_for_guest: None,
+                display_order: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+        assert!(dashboard_metadata_value(&db, server).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn public_server_metadata_write_requires_sensitive_totp_when_enabled() {
+        let db = test_db().await;
+        let admin = Uuid::from_bytes([9; 16]);
+        let server = Uuid::parse_str("00000000-0000-0000-0000-000000000303").unwrap();
+        seed_user(&db, admin, "admin", "admin").await;
+        seed_totp_enabled_user(&db, admin).await;
+        seed_agent(&db, server, admin, "server", "2026-01-01T00:00:00Z").await;
+
+        let mut auth = auth_session(AuthKind::Session, UserRole::Admin);
+        auth.user_id = UserId(admin);
+        let err = update_server(
+            State(test_state(db.clone())),
+            auth,
+            HeaderMap::new(),
+            Path(server.to_string()),
+            Json(UpdateServerRequest {
+                name: None,
+                remark: None,
+                expires_at: None,
+                renewal_price: None,
+                public_note: None,
+                price: None,
+                currency: None,
+                billing_cycle: None,
+                auto_renew: None,
+                traffic_quota_bytes: None,
+                traffic_quota_type: None,
+                provider: None,
+                region: None,
+                country: None,
+                city: None,
+                latitude: None,
+                longitude: None,
+                plan: None,
+                tags: None,
+                accent_color: None,
+                dashboard_visible: Some(true),
+                hide_for_guest: None,
+                display_order: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+        assert!(dashboard_metadata_value(&db, server).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn public_server_metadata_write_rejects_pat_implicit_clear() {
+        let db = test_db().await;
+        let admin = Uuid::from_bytes([9; 16]);
+        let server = Uuid::parse_str("00000000-0000-0000-0000-000000000303").unwrap();
+        seed_user(&db, admin, "admin", "admin").await;
+        seed_agent(&db, server, admin, "server", "2026-01-01T00:00:00Z").await;
+        let metadata = dashboard_metadata_json(&DashboardMetadata {
+            dashboard_visible: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+        update_agent_dashboard_metadata(&db, AgentId(server), &metadata)
+            .await
+            .unwrap();
+
+        let mut auth = auth_session(AuthKind::PersonalAccessToken, UserRole::Admin);
+        auth.user_id = UserId(admin);
+        auth.server_ids = Some(vec![server.to_string()]);
+        auth.pat_id = Some("pat".into());
+        let err = update_server(
+            State(test_state(db.clone())),
+            auth,
+            HeaderMap::new(),
+            Path(server.to_string()),
+            Json(UpdateServerRequest {
+                name: None,
+                remark: None,
+                expires_at: None,
+                renewal_price: None,
+                public_note: None,
+                price: None,
+                currency: None,
+                billing_cycle: None,
+                auto_renew: None,
+                traffic_quota_bytes: None,
+                traffic_quota_type: None,
+                provider: Some("provider".into()),
+                region: None,
+                country: None,
+                city: None,
+                latitude: None,
+                longitude: None,
+                plan: None,
+                tags: None,
+                accent_color: None,
+                dashboard_visible: None,
+                hide_for_guest: None,
+                display_order: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+        assert_eq!(
+            dashboard_metadata_value(&db, server)
+                .await
+                .and_then(|value| value
+                    .get("dashboard_visible")
+                    .and_then(|item| item.as_bool())),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_public_visibility_requires_sensitive_totp_when_enabled() {
+        let db = test_db().await;
+        let admin = Uuid::from_bytes([9; 16]);
+        let server = Uuid::parse_str("00000000-0000-0000-0000-000000000303").unwrap();
+        seed_user(&db, admin, "admin", "admin").await;
+        seed_totp_enabled_user(&db, admin).await;
+        seed_agent(&db, server, admin, "server", "2026-01-01T00:00:00Z").await;
+
+        let mut auth = auth_session(AuthKind::Session, UserRole::Admin);
+        auth.user_id = UserId(admin);
+        let err = batch_update_servers(
+            State(test_state(db.clone())),
+            auth,
+            ConnectInfo("127.0.0.1:12345".parse().unwrap()),
+            HeaderMap::new(),
+            Json(BatchUpdateServersRequest {
+                server_ids: vec![server.to_string()],
+                action: ServerBatchAction::SetDashboardVisible,
+                tags: vec![],
+                dashboard_visible: Some(true),
+                owner_user_id: None,
+                group_id: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+        assert!(dashboard_metadata_value(&db, server).await.is_none());
     }
 
     #[test]

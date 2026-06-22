@@ -544,9 +544,28 @@ export default function ServerDetailPage({ params }: PageProps) {
     }
   }
 
+  async function sensitiveTotpCode(): Promise<string | undefined | null> {
+    const status = await apiClient.getTotpStatus();
+    if (!status.success) {
+      setError(responseError(status));
+      return null;
+    }
+    if (!status.data?.enabled) return undefined;
+    const code = window.prompt("请输入 6 位 TOTP 验证码");
+    if (code === null) return null;
+    const trimmed = code.trim();
+    if (!/^\d{6}$/.test(trimmed)) {
+      setError("请输入 6 位 TOTP 验证码。");
+      return null;
+    }
+    return trimmed;
+  }
+
   async function saveServerMetadata(event: FormEvent) {
     event.preventDefault();
     if (!serverId) return;
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
     setSaving(true);
     const response = await apiClient.updateServer(serverId, {
       name: metadataForm.name.trim(),
@@ -572,7 +591,7 @@ export default function ServerDetailPage({ params }: PageProps) {
       dashboard_visible: metadataForm.dashboard_visible,
       hide_for_guest: metadataForm.hide_for_guest,
       display_order: metadataForm.display_order.trim() ? Number(metadataForm.display_order) : null,
-    });
+    }, totpCode);
     setSaving(false);
     if (response.success && response.data) {
       const detail = response.data as unknown as ServerDetail;

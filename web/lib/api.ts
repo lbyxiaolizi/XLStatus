@@ -833,11 +833,13 @@ class ApiClient {
   async updateServer(
     id: string,
     payload: JsonObject,
+    totpCode?: string,
   ): Promise<ApiResponse<JsonObject>> {
     return this.requestWithFallback<JsonObject>(
       `/api/v1/servers/${encodeURIComponent(id)}`,
       payload,
       ["POST", "PATCH", "PUT"],
+      { headers: this.sensitiveHeaders(totpCode) },
     );
   }
 
