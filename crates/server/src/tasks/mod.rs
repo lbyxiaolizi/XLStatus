@@ -27,6 +27,7 @@ pub(crate) const TASK_MAX_SELECTOR_IDS: usize = 64;
 pub(crate) const TASK_MAX_SELECTOR_TAGS: usize = 32;
 pub(crate) const TASK_MAX_SELECTOR_TOKEN_BYTES: usize = 128;
 pub(crate) const TASK_MAX_DISPATCH_TARGETS: usize = 64;
+pub(crate) const TASK_SCHEDULED_RUNTIME_SCAN_LIMIT: i64 = 1024;
 pub(crate) const TASK_RESULT_STDOUT_MAX_BYTES: usize = 64 * 1024;
 pub(crate) const TASK_RESULT_STDERR_MAX_BYTES: usize = 64 * 1024;
 pub(crate) const TASK_RESULT_ERROR_MAX_BYTES: usize = 16 * 1024;

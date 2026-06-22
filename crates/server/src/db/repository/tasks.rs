@@ -2,11 +2,13 @@
 #![allow(unused)]
 
 use crate::db::Db;
+use crate::tasks::{validate_task_definition, TASK_SCHEDULED_RUNTIME_SCAN_LIMIT};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use sqlx::postgres::PgRow;
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
+use tracing::warn;
 use xlstatus_shared::tasks::*;
 
 pub struct TaskRepository;
@@ -130,19 +132,45 @@ impl TaskRepository {
         let tasks = match db {
             crate::db::DatabaseBackend::Sqlite(pool) => {
                 let rows = sqlx::query(TASK_SELECT_SQLITE_SCHEDULED)
+                    .bind(TASK_SCHEDULED_RUNTIME_SCAN_LIMIT)
                     .fetch_all(pool)
                     .await?;
                 rows.into_iter()
-                    .map(Self::sqlite_row_to_task)
-                    .collect::<Result<Vec<_>>>()?
+                    .filter_map(|row| match Self::sqlite_row_to_task(row) {
+                        Ok(task) => match validate_task_definition(&task) {
+                            Ok(()) => Some(task),
+                            Err(err) => {
+                                warn!("historical scheduled task {} skipped: {err}", task.id);
+                                None
+                            }
+                        },
+                        Err(err) => {
+                            warn!("historical scheduled task row skipped: {err}");
+                            None
+                        }
+                    })
+                    .collect()
             }
             crate::db::DatabaseBackend::Postgres(pool) => {
                 let rows = sqlx::query(TASK_SELECT_POSTGRES_SCHEDULED)
+                    .bind(TASK_SCHEDULED_RUNTIME_SCAN_LIMIT)
                     .fetch_all(pool)
                     .await?;
                 rows.into_iter()
-                    .map(Self::postgres_row_to_task)
-                    .collect::<Result<Vec<_>>>()?
+                    .filter_map(|row| match Self::postgres_row_to_task(row) {
+                        Ok(task) => match validate_task_definition(&task) {
+                            Ok(()) => Some(task),
+                            Err(err) => {
+                                warn!("historical scheduled task {} skipped: {err}", task.id);
+                                None
+                            }
+                        },
+                        Err(err) => {
+                            warn!("historical scheduled task row skipped: {err}");
+                            None
+                        }
+                    })
+                    .collect()
             }
         };
 
@@ -556,9 +584,9 @@ const TASK_SELECT_SQLITE_BY_USER: &str =
 const TASK_SELECT_POSTGRES_BY_USER: &str =
     task_select!("WHERE owner_user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3");
 const TASK_SELECT_SQLITE_SCHEDULED: &str =
-    task_select!("WHERE enabled = 1 AND schedule IS NOT NULL ORDER BY created_at DESC");
+    task_select!("WHERE enabled = 1 AND schedule IS NOT NULL ORDER BY created_at DESC LIMIT ?");
 const TASK_SELECT_POSTGRES_SCHEDULED: &str =
-    task_select!("WHERE enabled = TRUE AND schedule IS NOT NULL ORDER BY created_at DESC");
+    task_select!("WHERE enabled = TRUE AND schedule IS NOT NULL ORDER BY created_at DESC LIMIT $1");
 const TASK_UPDATE_SQLITE: &str = r#"
     UPDATE tasks
     SET name = ?, schedule = ?, command = ?, payload_json = ?,
@@ -832,6 +860,72 @@ mod tests {
         assert_eq!(runs[0].status, TaskStatus::Success);
     }
 
+    #[tokio::test]
+    async fn invalid_historical_scheduled_tasks_are_not_loaded() {
+        let db = test_db().await;
+        let user_id = "00000000-0000-0000-0000-000000000001";
+        seed_user(&db, user_id).await;
+
+        let mut valid = test_task(user_id, "00000000-0000-0000-0000-000000000101");
+        valid.schedule = Some("0 * * * *".into());
+        TaskRepository::create(&db, &valid).await.unwrap();
+
+        seed_raw_task(
+            &db,
+            user_id,
+            "00000000-0000-0000-0000-000000000102",
+            "bad-kind",
+            r#""unknown""#,
+            r#""specific""#,
+            Some("0 * * * *"),
+            Some("true"),
+            "{}",
+        )
+        .await;
+        seed_raw_task(
+            &db,
+            user_id,
+            "00000000-0000-0000-0000-000000000103",
+            "bad-selector",
+            r#""shell""#,
+            r#""specific""#,
+            Some("0 * * * *"),
+            Some("true"),
+            "not json",
+        )
+        .await;
+        seed_raw_task(
+            &db,
+            user_id,
+            "00000000-0000-0000-0000-000000000104",
+            "bad-schedule",
+            r#""shell""#,
+            r#""specific""#,
+            Some("not a cron"),
+            Some("true"),
+            "{}",
+        )
+        .await;
+        seed_raw_task(
+            &db,
+            user_id,
+            "00000000-0000-0000-0000-000000000105",
+            "bad-command",
+            r#""shell""#,
+            r#""specific""#,
+            Some("0 * * * *"),
+            Some(&"x".repeat(crate::tasks::TASK_MAX_COMMAND_BYTES + 1)),
+            "{}",
+        )
+        .await;
+
+        let scheduled = TaskRepository::list_scheduled(&db).await.unwrap();
+
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(scheduled[0].id, valid.id);
+        assert_eq!(scheduled[0].command.as_deref(), Some("true"));
+    }
+
     async fn test_db() -> DatabaseBackend {
         let path = std::env::temp_dir().join(format!(
             "xlstatus-task-repository-test-{}.db",
@@ -841,5 +935,70 @@ mod tests {
         let db = DatabaseBackend::connect(&url, true).await.unwrap();
         db.run_migrations().await.unwrap();
         db
+    }
+
+    async fn seed_user(db: &DatabaseBackend, id: &str) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, role, created_at, updated_at) VALUES (?, ?, 'hash', 'member', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(format!("user-{id}"))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_raw_task(
+        db: &DatabaseBackend,
+        owner: &str,
+        id: &str,
+        name: &str,
+        task_type: &str,
+        cover_mode: &str,
+        schedule: Option<&str>,
+        command: Option<&str>,
+        selector: &str,
+    ) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO tasks (id, owner_user_id, name, task_type, schedule, command, cover_mode, server_selector_json, enabled, push_successful, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(owner)
+        .bind(name)
+        .bind(task_type)
+        .bind(schedule)
+        .bind(command)
+        .bind(cover_mode)
+        .bind(selector)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn test_task(owner: &str, id: &str) -> Task {
+        Task {
+            id: id.to_string(),
+            owner_user_id: owner.to_string(),
+            name: "valid".into(),
+            task_type: TaskType::Shell,
+            schedule: None,
+            command: Some("true".into()),
+            payload_json: None,
+            cover_mode: CoverMode::Specific,
+            server_selector_json: serde_json::to_string(&ServerSelector::default()).unwrap(),
+            push_successful: false,
+            notification_group_id: None,
+            last_executed_at: None,
+            last_result: None,
+            enabled: true,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        }
     }
 }
