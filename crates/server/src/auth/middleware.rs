@@ -22,6 +22,11 @@ use crate::security::client_ip_from_headers_and_peer;
 pub const SESSION_COOKIE_NAME: &str = "xlstatus_session";
 pub const CSRF_COOKIE_NAME: &str = "xlstatus_csrf";
 pub const CSRF_HEADER_NAME: &str = "x-csrf-token";
+const SESSION_TOKEN_BYTES: usize = 64;
+const PAT_PREFIX: &str = "xlp_";
+const PAT_TOKEN_HEX_BYTES: usize = 64;
+const PAT_TOKEN_BYTES: usize = PAT_PREFIX.len() + PAT_TOKEN_HEX_BYTES;
+const PAT_AUTHORIZATION_HEADER_MAX_BYTES: usize = "Bearer ".len() + PAT_TOKEN_BYTES;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AuthKind {
@@ -178,128 +183,133 @@ pub async fn session_middleware(
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(addr)| *addr);
     let client_ip = client_ip_from_headers_and_peer(request.headers(), peer_addr);
-    let bearer_token = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| {
-            value
-                .strip_prefix("Bearer ")
-                .or_else(|| value.strip_prefix("bearer "))
-        })
-        .filter(|token| token.starts_with("xlp_"))
-        .map(str::to_string);
-
-    if let Some(token) = bearer_token {
-        if active_waf_ban(&state.db, &client_ip)
-            .await
-            .ok()
-            .flatten()
-            .is_some()
-        {
-            let _ = record_waf_event(
-                &state.db,
-                &client_ip,
-                None,
-                "pat_blocked",
-                Some("active WAF ban"),
-            )
-            .await;
-            return StatusCode::FORBIDDEN.into_response();
+    match pat_bearer_token_from_headers(request.headers()) {
+        Err(reason) => {
+            let _ = register_pat_failure(&state.db, &client_ip, None, reason).await;
         }
+        Ok(Some(token)) => {
+            if active_waf_ban(&state.db, &client_ip)
+                .await
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                let _ = record_waf_event(
+                    &state.db,
+                    &client_ip,
+                    None,
+                    "pat_blocked",
+                    Some("active WAF ban"),
+                )
+                .await;
+                return StatusCode::FORBIDDEN.into_response();
+            }
 
-        let token_hash = hash_token(&token);
-        let pat_repo = PATRepository::new(state.db.clone());
-        match pat_repo.find_by_token_hash(&token_hash).await {
-            Ok(Some(pat)) => {
-                let is_expired = pat
-                    .expires_at
-                    .map(|expires_at| expires_at <= Utc::now())
-                    .unwrap_or(true);
-                if is_expired {
-                    let _ =
-                        register_pat_failure(&state.db, &client_ip, Some(&pat.id), "expired token")
-                            .await;
-                } else {
-                    let user_repo = UserRepository::new(state.db.clone());
-                    match user_repo.find_by_id(pat.user_id).await {
-                        Ok(Some(user)) => {
-                            match crate::auth::rbac::validate_pat_runtime(
-                                &pat.scopes,
-                                user.role.is_admin(),
-                                pat.server_ids.as_deref(),
-                            ) {
-                                Ok(()) => {
-                                    let auth_session = AuthSession {
-                                        session_id: pat.id.clone(),
-                                        user_id: user.id,
-                                        username: user.username.clone(),
-                                        role: user.role,
-                                        csrf_token: String::new(),
-                                        auth_kind: AuthKind::PersonalAccessToken,
-                                        scopes: pat.scopes.clone(),
-                                        server_ids: pat.server_ids.clone(),
-                                        pat_id: Some(pat.id.clone()),
-                                    };
-                                    let _ = pat_repo.mark_used(&pat.id, Some(&client_ip)).await;
-                                    request.extensions_mut().insert(auth_session);
-                                    request.extensions_mut().insert(user);
-                                }
-                                Err(reason) => {
-                                    let _ = register_pat_failure(
-                                        &state.db,
-                                        &client_ip,
-                                        Some(&pat.id),
-                                        &format!("invalid token policy: {reason}"),
-                                    )
-                                    .await;
+            let token_hash = hash_token(&token);
+            let pat_repo = PATRepository::new(state.db.clone());
+            match pat_repo.find_by_token_hash(&token_hash).await {
+                Ok(Some(pat)) => {
+                    let is_expired = pat
+                        .expires_at
+                        .map(|expires_at| expires_at <= Utc::now())
+                        .unwrap_or(true);
+                    if is_expired {
+                        let _ = register_pat_failure(
+                            &state.db,
+                            &client_ip,
+                            Some(&pat.id),
+                            "expired token",
+                        )
+                        .await;
+                    } else {
+                        let user_repo = UserRepository::new(state.db.clone());
+                        match user_repo.find_by_id(pat.user_id).await {
+                            Ok(Some(user)) => {
+                                match crate::auth::rbac::validate_pat_runtime(
+                                    &pat.scopes,
+                                    user.role.is_admin(),
+                                    pat.server_ids.as_deref(),
+                                ) {
+                                    Ok(()) => {
+                                        let auth_session = AuthSession {
+                                            session_id: pat.id.clone(),
+                                            user_id: user.id,
+                                            username: user.username.clone(),
+                                            role: user.role,
+                                            csrf_token: String::new(),
+                                            auth_kind: AuthKind::PersonalAccessToken,
+                                            scopes: pat.scopes.clone(),
+                                            server_ids: pat.server_ids.clone(),
+                                            pat_id: Some(pat.id.clone()),
+                                        };
+                                        let _ = pat_repo.mark_used(&pat.id, Some(&client_ip)).await;
+                                        request.extensions_mut().insert(auth_session);
+                                        request.extensions_mut().insert(user);
+                                    }
+                                    Err(reason) => {
+                                        let _ = register_pat_failure(
+                                            &state.db,
+                                            &client_ip,
+                                            Some(&pat.id),
+                                            &format!("invalid token policy: {reason}"),
+                                        )
+                                        .await;
+                                    }
                                 }
                             }
-                        }
-                        Ok(None) => {
-                            let _ = register_pat_failure(
-                                &state.db,
-                                &client_ip,
-                                Some(&pat.id),
-                                "token user not found",
-                            )
-                            .await;
-                        }
-                        Err(err) => {
-                            tracing::warn!("failed to load PAT user: {}", err);
+                            Ok(None) => {
+                                let _ = register_pat_failure(
+                                    &state.db,
+                                    &client_ip,
+                                    Some(&pat.id),
+                                    "token user not found",
+                                )
+                                .await;
+                            }
+                            Err(err) => {
+                                tracing::warn!("failed to load PAT user: {}", err);
+                            }
                         }
                     }
                 }
-            }
-            Ok(None) => {
-                let _ = register_pat_failure(&state.db, &client_ip, None, "invalid token").await;
-            }
-            Err(err) => {
-                tracing::warn!("failed to load PAT by token hash: {}", err);
+                Ok(None) => {
+                    let _ =
+                        register_pat_failure(&state.db, &client_ip, None, "invalid token").await;
+                }
+                Err(err) => {
+                    tracing::warn!("failed to load PAT by token hash: {}", err);
+                }
             }
         }
-    } else if let Some(cookie) = cookie_jar.get(SESSION_COOKIE_NAME) {
-        let token = cookie.value();
-        let token_hash = hash_token(token);
+        Ok(None) => {}
+    }
 
-        let session_repo = SessionRepository::new(state.db.clone());
-        if let Ok(Some(session)) = session_repo.find_by_token_hash(&token_hash).await {
-            let user_repo = UserRepository::new(state.db.clone());
-            if let Ok(Some(user)) = user_repo.find_by_id(session.user_id).await {
-                let csrf_token = derive_csrf_token(&token_hash);
-                let auth_session = AuthSession {
-                    session_id: session.id.clone(),
-                    user_id: user.id,
-                    username: user.username.clone(),
-                    role: user.role,
-                    csrf_token,
-                    auth_kind: AuthKind::Session,
-                    scopes: Vec::new(),
-                    server_ids: None,
-                    pat_id: None,
-                };
-                request.extensions_mut().insert(auth_session);
-                request.extensions_mut().insert(user);
+    if request.extensions().get::<AuthSession>().is_none() {
+        if let Some(cookie) = cookie_jar.get(SESSION_COOKIE_NAME) {
+            let token = cookie.value();
+            if session_cookie_token_is_valid(token) {
+                let token_hash = hash_token(token);
+
+                let session_repo = SessionRepository::new(state.db.clone());
+                if let Ok(Some(session)) = session_repo.find_by_token_hash(&token_hash).await {
+                    let user_repo = UserRepository::new(state.db.clone());
+                    if let Ok(Some(user)) = user_repo.find_by_id(session.user_id).await {
+                        let csrf_token = derive_csrf_token(&token_hash);
+                        let auth_session = AuthSession {
+                            session_id: session.id.clone(),
+                            user_id: user.id,
+                            username: user.username.clone(),
+                            role: user.role,
+                            csrf_token,
+                            auth_kind: AuthKind::Session,
+                            scopes: Vec::new(),
+                            server_ids: None,
+                            pat_id: None,
+                        };
+                        request.extensions_mut().insert(auth_session);
+                        request.extensions_mut().insert(user);
+                    }
+                }
             }
         }
     }
@@ -353,6 +363,46 @@ pub async fn csrf_middleware(request: Request, next: Next) -> Result<Response, S
     Ok(next.run(request).await)
 }
 
+fn pat_bearer_token_from_headers(headers: &HeaderMap) -> Result<Option<String>, &'static str> {
+    let Some(value) = headers.get(header::AUTHORIZATION) else {
+        return Ok(None);
+    };
+    let value = value.to_str().map_err(|_| "malformed bearer token")?.trim();
+    let Some(token) = value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))
+    else {
+        return Ok(None);
+    };
+    let token = token.trim();
+    if token.is_empty() {
+        return Ok(None);
+    }
+    if !token.starts_with(PAT_PREFIX) {
+        return Ok(None);
+    }
+    if value.len() > PAT_AUTHORIZATION_HEADER_MAX_BYTES {
+        return Err("bearer token too long");
+    }
+    if pat_token_is_valid(token) {
+        Ok(Some(token.to_string()))
+    } else {
+        Err("malformed PAT bearer token")
+    }
+}
+
+fn pat_token_is_valid(token: &str) -> bool {
+    token.len() == PAT_TOKEN_BYTES
+        && token.starts_with(PAT_PREFIX)
+        && token[PAT_PREFIX.len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn session_cookie_token_is_valid(token: &str) -> bool {
+    token.len() == SESSION_TOKEN_BYTES && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn session_request_requires_csrf(method: &str, session: Option<&AuthSession>) -> bool {
     matches!(method, "POST" | "PUT" | "PATCH" | "DELETE")
         && session
@@ -378,7 +428,12 @@ fn client_ip_from_headers(headers: &HeaderMap) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{session_request_requires_csrf, AuthKind, AuthSession};
+    use super::{
+        pat_bearer_token_from_headers, session_cookie_token_is_valid,
+        session_request_requires_csrf, AuthKind, AuthSession, PAT_AUTHORIZATION_HEADER_MAX_BYTES,
+        PAT_TOKEN_BYTES,
+    };
+    use axum::http::{header, HeaderMap};
     use xlstatus_shared::{UserId, UserRole};
 
     #[test]
@@ -400,6 +455,58 @@ mod tests {
         assert!(!session_request_requires_csrf("HEAD", Some(&session)));
         assert!(!session_request_requires_csrf("POST", Some(&pat)));
         assert!(!session_request_requires_csrf("POST", None));
+    }
+
+    #[test]
+    fn pat_bearer_token_shape_is_bounded_before_hashing() {
+        let token = format!("xlp_{}", "a".repeat(PAT_TOKEN_BYTES - "xlp_".len()));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        assert_eq!(
+            pat_bearer_token_from_headers(&headers).unwrap().as_deref(),
+            Some(token.as_str())
+        );
+
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer xlp_{}", "g".repeat(64)).parse().unwrap(),
+        );
+        assert_eq!(
+            pat_bearer_token_from_headers(&headers),
+            Err("malformed PAT bearer token")
+        );
+
+        headers.insert(
+            header::AUTHORIZATION,
+            format!(
+                "Bearer xlp_{}",
+                "a".repeat(PAT_AUTHORIZATION_HEADER_MAX_BYTES)
+            )
+            .parse()
+            .unwrap(),
+        );
+        assert_eq!(
+            pat_bearer_token_from_headers(&headers),
+            Err("bearer token too long")
+        );
+    }
+
+    #[test]
+    fn non_pat_bearer_is_ignored_for_cookie_fallback() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer oauth-token".parse().unwrap());
+        assert_eq!(pat_bearer_token_from_headers(&headers).unwrap(), None);
+    }
+
+    #[test]
+    fn session_cookie_token_shape_is_bounded_before_hashing() {
+        assert!(session_cookie_token_is_valid(&"a".repeat(64)));
+        assert!(session_cookie_token_is_valid(&"A".repeat(64)));
+        assert!(!session_cookie_token_is_valid(&"a".repeat(65)));
+        assert!(!session_cookie_token_is_valid(&"g".repeat(64)));
     }
 
     fn auth_session(auth_kind: AuthKind) -> AuthSession {
