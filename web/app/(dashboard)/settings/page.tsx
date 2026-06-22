@@ -760,11 +760,13 @@ export default function SettingsPage() {
   }
 
   async function updateGeoIpDatabase() {
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
     setGeoIpLoading(true);
     const response = await apiClient.updateGeoIpDatabase({
       source_url: geoIpMmdbUrl.trim() || undefined,
       source_path: geoIpMmdbPath.trim() || undefined,
-    });
+    }, totpCode);
     setGeoIpLoading(false);
     if (response.success && response.data) {
       if (response.data.status) setGeoIpMmdbStatus(response.data.status);
@@ -780,8 +782,10 @@ export default function SettingsPage() {
       setError("请选择 MMDB 文件。");
       return;
     }
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
     setGeoIpLoading(true);
-    const response = await apiClient.uploadGeoIpDatabase(geoIpMmdbFile);
+    const response = await apiClient.uploadGeoIpDatabase(geoIpMmdbFile, totpCode);
     setGeoIpLoading(false);
     if (response.success && response.data) {
       if (response.data.status) setGeoIpMmdbStatus(response.data.status);

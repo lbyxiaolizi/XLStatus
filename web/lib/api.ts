@@ -1538,20 +1538,28 @@ class ApiClient {
     return this.request<GeoIpMmdbStatus>("/api/v1/geoip/status");
   }
 
-  async updateGeoIpDatabase(input: JsonObject = {}): Promise<ApiResponse<GeoIpMaintenanceResponse>> {
+  async updateGeoIpDatabase(
+    input: JsonObject = {},
+    totpCode?: string,
+  ): Promise<ApiResponse<GeoIpMaintenanceResponse>> {
     const body = Object.keys(input).length ? JSON.stringify(input) : undefined;
     return this.request<GeoIpMaintenanceResponse>("/api/v1/geoip/update", {
       method: "POST",
       body,
+      headers: this.sensitiveHeaders(totpCode),
     });
   }
 
-  async uploadGeoIpDatabase(file: File): Promise<ApiResponse<GeoIpMaintenanceResponse>> {
+  async uploadGeoIpDatabase(
+    file: File,
+    totpCode?: string,
+  ): Promise<ApiResponse<GeoIpMaintenanceResponse>> {
     const form = new FormData();
     form.set("file", file);
     return this.request<GeoIpMaintenanceResponse>("/api/v1/geoip/upload", {
       method: "POST",
       body: form,
+      headers: this.sensitiveHeaders(totpCode),
     });
   }
 

@@ -1,7 +1,7 @@
 //! GeoIP lookup API and Agent IP-change events.
 
 use crate::api::types::ApiResponse;
-use crate::api::v1::auth::{AppError, AppState};
+use crate::api::v1::auth::{require_sensitive_totp, AppError, AppState};
 use crate::api::v1::settings;
 use crate::auth::middleware::{AuthKind, AuthSession};
 use crate::db::{AgentRepository, DatabaseBackend};
@@ -12,6 +12,7 @@ use crate::notifications::sender::{
 use crate::security::{secure_reqwest_client_builder, validate_outbound_url_resolved};
 use axum::{
     extract::{DefaultBodyLimit, Multipart, State},
+    http::HeaderMap,
     Json,
 };
 use chrono::Utc;
@@ -176,11 +177,13 @@ pub async fn geoip_status(
 }
 
 pub async fn update_geoip_database(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     auth: AuthSession,
+    headers: HeaderMap,
     payload: Option<Json<GeoIpUpdateRequest>>,
 ) -> Result<Json<ApiResponse<GeoIpMaintenanceResponse>>, AppError> {
     require_admin_cookie_session(&auth)?;
+    require_sensitive_totp(&state.db, auth.user_id, &headers).await?;
     let req = payload.map(|Json(req)| req).unwrap_or_default();
     let source_url = normalize_optional_update_text(
         req.source_url
@@ -230,11 +233,13 @@ pub async fn update_geoip_database(
 }
 
 pub async fn upload_geoip_database(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     auth: AuthSession,
+    headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Json<ApiResponse<GeoIpMaintenanceResponse>>, AppError> {
     require_admin_cookie_session(&auth)?;
+    require_sensitive_totp(&state.db, auth.user_id, &headers).await?;
     while let Some(field) = multipart
         .next_field()
         .await
@@ -1306,6 +1311,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn geoip_mmdb_writes_require_sensitive_totp_when_enabled() {
+        let db = test_db().await;
+        let user_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        seed_user(&db, user_id, "owner").await;
+        seed_totp_enabled_user(&db, user_id).await;
+
+        let err = require_sensitive_totp(&db, UserId(user_id), &HeaderMap::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[tokio::test]
     async fn geoip_notification_group_filters_member_channels_by_owner() {
         let db = test_db().await;
         let owner = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
@@ -1365,6 +1383,18 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    async fn seed_totp_enabled_user(db: &DatabaseBackend, id: uuid::Uuid) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query("UPDATE users SET totp_secret = ?, totp_enabled = 1 WHERE id = ?")
+            .bind("totp-secret")
+            .bind(id.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
     }
 
     async fn seed_notification_group(
