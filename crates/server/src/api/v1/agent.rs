@@ -1,5 +1,5 @@
 use crate::api::types::*;
-use crate::api::v1::auth::{AppError, AppState};
+use crate::api::v1::auth::{require_sensitive_totp, AppError, AppState};
 use crate::auth::hash_token;
 use crate::auth::middleware::{AuthKind, AuthUser};
 use crate::db::{
@@ -8,6 +8,7 @@ use crate::db::{
 use crate::grpc::{IoRegistry, SessionRegistry};
 use axum::{
     extract::{DefaultBodyLimit, Path, State},
+    http::HeaderMap,
     Json,
 };
 use chrono::{Duration, Utc};
@@ -48,9 +49,11 @@ pub struct EnrollResponse {
 pub async fn create_enrollment_token(
     State(state): State<AppState>,
     auth_user: AuthUser,
+    headers: HeaderMap,
     Json(req): Json<CreateEnrollmentTokenRequest>,
 ) -> Result<Json<ApiResponse<CreateEnrollmentTokenResponse>>, AppError> {
     require_admin_cookie_session(&auth_user)?;
+    require_sensitive_totp(&state.db, auth_user.user.id, &headers).await?;
 
     let repo = EnrollmentTokenRepository::new(state.db.clone());
 
@@ -160,9 +163,11 @@ pub async fn enroll(
 pub async fn revoke_agent(
     State(state): State<AppState>,
     auth_user: AuthUser,
+    headers: HeaderMap,
     Path(agent_id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     require_admin_cookie_session(&auth_user)?;
+    require_sensitive_totp(&state.db, auth_user.user.id, &headers).await?;
     let agent_id = parse_agent_resource_id(&agent_id)?;
     let agent_repo = AgentRepository::new(state.db.clone());
     let revoked = agent_repo.revoke(AgentId(agent_id)).await?;
@@ -298,6 +303,28 @@ mod tests {
         assert!(require_admin_cookie_session(&auth).is_ok());
     }
 
+    #[tokio::test]
+    async fn agent_global_admin_actions_require_sensitive_totp_when_enabled() {
+        let db = test_db().await;
+        let user_id = uuid::Uuid::from_bytes([1; 16]);
+        seed_user(&db, user_id).await;
+        seed_totp_enabled_user(&db, user_id).await;
+
+        let err = create_enrollment_token(
+            State(test_state(db.clone())),
+            auth_user(AuthKind::Session, UserRole::Admin),
+            HeaderMap::new(),
+            Json(CreateEnrollmentTokenRequest {
+                expires_in_hours: Some(1),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+        assert_eq!(enrollment_token_count(&db).await, 0);
+    }
+
     #[test]
     fn enrollment_token_ttl_is_bounded() {
         let _ = agent_auth_body_limit();
@@ -355,6 +382,65 @@ mod tests {
             validate_enroll_request(&bad_token),
             Err(AppError::BadRequest(_))
         ));
+    }
+
+    async fn test_db() -> crate::db::DatabaseBackend {
+        let db = crate::db::DatabaseBackend::connect("sqlite::memory:", true)
+            .await
+            .unwrap();
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    fn test_state(db: crate::db::DatabaseBackend) -> AppState {
+        AppState {
+            db,
+            config: std::sync::Arc::new(crate::config::Config::default()),
+            agent_jwt_challenges: std::sync::Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            metrics: xlstatus_tsdb::MetricStore::in_memory(),
+            realtime: crate::realtime::BroadcastHub::new(),
+            session_registry: crate::grpc::SessionRegistry::new(),
+            terminal_sessions: crate::api::v1::terminal::TerminalSessionRegistry::new(),
+            io_registry: crate::grpc::IoRegistry::new(),
+        }
+    }
+
+    async fn seed_user(db: &crate::db::DatabaseBackend, id: uuid::Uuid) {
+        let crate::db::DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, role, created_at, updated_at) VALUES (?, 'admin', 'hash', 'admin', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_totp_enabled_user(db: &crate::db::DatabaseBackend, id: uuid::Uuid) {
+        let crate::db::DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query("UPDATE users SET totp_secret = ?, totp_enabled = 1 WHERE id = ?")
+            .bind("totp-secret")
+            .bind(id.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn enrollment_token_count(db: &crate::db::DatabaseBackend) -> i64 {
+        let crate::db::DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM enrollment_tokens")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        count
     }
 
     fn auth_user(auth_kind: AuthKind, role: UserRole) -> AuthUser {

@@ -805,10 +805,12 @@ class ApiClient {
 
   async createEnrollmentToken(
     expiresInHours = 1,
+    totpCode?: string,
   ): Promise<ApiResponse<CreateEnrollmentTokenResponse>> {
     return this.request<CreateEnrollmentTokenResponse>("/api/v1/enrollment-tokens", {
       method: "POST",
       body: JSON.stringify({ expires_in_hours: expiresInHours }),
+      headers: this.sensitiveHeaders(totpCode),
     });
   }
 

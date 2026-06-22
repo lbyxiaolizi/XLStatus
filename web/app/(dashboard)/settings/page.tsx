@@ -922,8 +922,11 @@ export default function SettingsPage() {
 
   async function createEnrollmentToken() {
     const expiresInHours = Number.parseInt(enrollmentHours, 10);
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
     const response = await apiClient.createEnrollmentToken(
       Number.isFinite(expiresInHours) && expiresInHours > 0 ? expiresInHours : 1,
+      totpCode,
     );
     if (response.success && response.data) {
       setEnrollmentToken(response.data.token);

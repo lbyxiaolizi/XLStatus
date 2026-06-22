@@ -27,7 +27,7 @@
 | `GET` | `/api/v1/transfers/temp/download` | 临时下载 |
 | `PUT` | `/api/v1/transfers/temp/upload` | 临时上传 |
 
-Agent 注册、JWT challenge 和 JWT 签发请求体上限为 4KiB。JWT challenge/JWT 签发中的 `agent_id` 必须是 36 字节 canonical UUID 文本；JWT nonce 为 32 字节 hex，signature 为 64 字节 hex；JWT challenge 只有在 Agent 签名验证通过后才会被消费。管理员撤销 Agent 的 path `agent_id` 也必须是 36 字节 canonical UUID 文本，非法、simple 或大写 UUID 会在写入 `revoked_at` 前返回 400。管理员撤销 Agent 后，控制面会写入 `revoked_at`、向现有 session 发送 ForceDisconnect，并立即从进程内 session / IO registry 摘除该 Agent；撤销后的迟到注册或发送路径不会继续接收任务或 IO 帧，后续 JWT/gRPC 认证也会拒绝该 Agent。
+Agent 注册、JWT challenge 和 JWT 签发请求体上限为 4KiB。创建 enrollment token 和撤销 Agent 只允许管理员 Cookie session；若管理员已启用 TOTP，请求必须携带有效 `x-totp-code`。JWT challenge/JWT 签发中的 `agent_id` 必须是 36 字节 canonical UUID 文本；JWT nonce 为 32 字节 hex，signature 为 64 字节 hex；JWT challenge 只有在 Agent 签名验证通过后才会被消费。管理员撤销 Agent 的 path `agent_id` 也必须是 36 字节 canonical UUID 文本，非法、simple 或大写 UUID 会在写入 `revoked_at` 前返回 400。管理员撤销 Agent 后，控制面会写入 `revoked_at`、向现有 session 发送 ForceDisconnect，并立即从进程内 session / IO registry 摘除该 Agent；撤销后的迟到注册或发送路径不会继续接收任务或 IO 帧，后续 JWT/gRPC 认证也会拒绝该 Agent。
 
 登录请求体上限为 4KiB。`username` 最长 128 字节，`password` 最长 1024 字节，登录阶段的可选 TOTP code 必须是 6 位数字。
 
@@ -88,8 +88,8 @@ PAT 创建请求体上限为 16KiB。PAT 名称最长 128 字节，scopes 最多
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `POST` | `/api/v1/enrollment-tokens` | 创建 enrollment token，`expires_in_hours` 限制为 1 到 24 |
-| `POST` | `/api/v1/agents/:id/revoke` | 撤销 Agent |
+| `POST` | `/api/v1/enrollment-tokens` | 创建 enrollment token，启用 TOTP 时要求 `x-totp-code`，`expires_in_hours` 限制为 1 到 24 |
+| `POST` | `/api/v1/agents/:id/revoke` | 撤销 Agent，启用 TOTP 时要求 `x-totp-code` |
 | `GET` | `/api/v1/servers` | 服务器列表 |
 | `GET` | `/api/v1/servers/:id` | 服务器详情 |
 | `POST` | `/api/v1/servers/:id` | 更新服务器展示元数据 |
