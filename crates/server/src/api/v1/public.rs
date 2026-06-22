@@ -1,5 +1,6 @@
 use crate::api::types::ApiResponse;
 use crate::api::v1::auth::{AppError, AppState};
+use crate::api::v1::services::SERVICE_MAX_SERVER_IDS;
 use crate::api::v1::settings::{
     public_server_details_enabled, public_site_branding, PublicSiteBranding,
 };
@@ -439,7 +440,9 @@ async fn public_services(state: &AppState) -> Result<Vec<PublicServiceView>, App
             for row in rows {
                 let service_id: String = row.get("id");
                 let service_type: String = row.get("type");
-                let server_ids = public_service_server_ids(state, &service_id).await?;
+                let Some(server_ids) = public_service_server_ids(state, &service_id).await? else {
+                    continue;
+                };
                 let legacy_server_id: Option<String> = row.try_get("server_id").ok();
                 let visible_server_ids = visible_public_service_server_ids(
                     server_ids,
@@ -506,7 +509,9 @@ async fn public_services_postgres(
             }
             let service_id: String = row.get("id");
             let service_type: String = row.get("type");
-            let server_ids = public_service_server_ids(state, &service_id).await?;
+            let Some(server_ids) = public_service_server_ids(state, &service_id).await? else {
+                continue;
+            };
             let legacy_server_id: Option<String> = row.try_get("server_id").ok();
             let visible_server_ids =
                 visible_public_service_server_ids(server_ids, legacy_server_id, public_server_ids);
@@ -862,35 +867,60 @@ async fn public_service_history_postgres(
 async fn public_service_server_ids(
     state: &AppState,
     service_id: &str,
-) -> Result<Vec<String>, AppError> {
+) -> Result<Option<Vec<String>>, AppError> {
     match &state.db {
         DatabaseBackend::Sqlite(pool) => {
-            let rows = sqlx::query("SELECT server_id FROM service_servers WHERE service_id = ?")
-                .bind(service_id)
-                .fetch_all(pool)
-                .await
-                .map_err(|e| AppError::Database(e.into()))?;
-            Ok(rows
+            let rows = sqlx::query(
+                "SELECT server_id FROM service_servers WHERE service_id = ? ORDER BY created_at ASC, server_id ASC LIMIT ?",
+            )
+            .bind(service_id)
+            .bind((SERVICE_MAX_SERVER_IDS + 1) as i64)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| AppError::Database(e.into()))?;
+            let row_count = rows.len();
+            let ids = rows
                 .into_iter()
                 .filter_map(|row| row.try_get::<String, _>("server_id").ok())
-                .collect())
+                .collect::<Vec<_>>();
+            Ok(bound_public_service_server_ids(service_id, row_count, ids))
         }
         DatabaseBackend::Postgres(pool) => {
             let sid = Uuid::parse_str(service_id)
                 .map_err(|e| AppError::BadRequest(format!("invalid service id: {e}")))?;
             let rows = sqlx::query(
-                "SELECT server_id::text AS server_id FROM service_servers WHERE service_id = $1",
+                "SELECT server_id::text AS server_id FROM service_servers WHERE service_id = $1 ORDER BY created_at ASC, server_id ASC LIMIT $2",
             )
             .bind(sid)
+            .bind((SERVICE_MAX_SERVER_IDS + 1) as i64)
             .fetch_all(pool)
             .await
             .map_err(|e| AppError::Database(e.into()))?;
-            Ok(rows
+            let row_count = rows.len();
+            let ids = rows
                 .into_iter()
                 .filter_map(|row| row.try_get::<String, _>("server_id").ok())
-                .collect())
+                .collect::<Vec<_>>();
+            Ok(bound_public_service_server_ids(service_id, row_count, ids))
         }
     }
+}
+
+fn bound_public_service_server_ids(
+    service_id: &str,
+    row_count: usize,
+    ids: Vec<String>,
+) -> Option<Vec<String>> {
+    if row_count > SERVICE_MAX_SERVER_IDS {
+        tracing::warn!(
+            service_id = %service_id,
+            count = row_count,
+            max = SERVICE_MAX_SERVER_IDS,
+            "skipping public service with too many server assignments"
+        );
+        return None;
+    }
+    Some(ids)
 }
 
 fn build_mjpeg_frame(jpeg: &[u8]) -> Result<Vec<u8>, AppError> {
@@ -2153,6 +2183,87 @@ mod tests {
         assert_eq!(services.len(), 1);
         assert_eq!(services[0].id, public_service);
         assert_eq!(services[0].server_ids, vec![public_server]);
+    }
+
+    #[tokio::test]
+    async fn public_services_skip_historical_server_assignments_over_budget() {
+        let state = test_state_with_public_site(true).await;
+        let DatabaseBackend::Sqlite(pool) = &state.db else {
+            unreachable!();
+        };
+        let owner = Uuid::now_v7().to_string();
+        seed_public_user(pool, &owner).await;
+        let valid_server = Uuid::now_v7().to_string();
+        seed_public_agent(
+            pool,
+            &valid_server,
+            &owner,
+            "valid-public-server",
+            true,
+            false,
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+        let valid_service = Uuid::now_v7().to_string();
+        seed_public_service(
+            pool,
+            &valid_service,
+            &owner,
+            "valid-public-service",
+            &valid_server,
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+
+        let dirty_service = Uuid::now_v7().to_string();
+        let first_dirty_server = Uuid::now_v7().to_string();
+        seed_public_agent(
+            pool,
+            &first_dirty_server,
+            &owner,
+            "dirty-public-server-0",
+            true,
+            false,
+            "2026-01-02T00:00:00Z",
+        )
+        .await;
+        seed_public_service(
+            pool,
+            &dirty_service,
+            &owner,
+            "dirty-public-service",
+            &first_dirty_server,
+            "2026-01-02T00:00:00Z",
+        )
+        .await;
+        for idx in 1..=SERVICE_MAX_SERVER_IDS {
+            let server_id = Uuid::now_v7().to_string();
+            seed_public_agent(
+                pool,
+                &server_id,
+                &owner,
+                &format!("dirty-public-server-{idx}"),
+                true,
+                false,
+                &format!("2026-01-02T00:{:02}:{:02}Z", idx / 60, idx % 60),
+            )
+            .await;
+            sqlx::query(
+                "INSERT INTO service_servers (service_id, server_id, created_at) VALUES (?, ?, ?)",
+            )
+            .bind(&dirty_service)
+            .bind(&server_id)
+            .bind(format!("2026-01-02T00:{:02}:{:02}Z", idx / 60, idx % 60))
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        let services = public_services(&state).await.unwrap();
+
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].id, valid_service);
+        assert_eq!(services[0].server_ids, vec![valid_server]);
     }
 
     async fn test_state_without_public_settings() -> AppState {
