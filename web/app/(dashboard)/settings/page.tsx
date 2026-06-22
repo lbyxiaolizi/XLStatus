@@ -331,8 +331,10 @@ export default function SettingsPage() {
       setError("主题 JSON 需要是对象。");
       return;
     }
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
     setThemeLoading(true);
-    const response = await apiClient.importTheme(candidate as ImportThemeRequest["theme"]);
+    const response = await apiClient.importTheme(candidate as ImportThemeRequest["theme"], totpCode);
     setThemeLoading(false);
     if (response.success && response.data) {
       setNotice(`主题 ${response.data.name} 已导入。`);
@@ -352,8 +354,10 @@ export default function SettingsPage() {
   }
 
   async function selectTheme(theme: ThemeDefinition, target: "public" | "dashboard" | "both") {
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
     setThemeLoading(true);
-    const response = await apiClient.selectTheme(theme.id, target);
+    const response = await apiClient.selectTheme(theme.id, target, totpCode);
     setThemeLoading(false);
     if (response.success && response.data) {
       setThemes(response.data.themes ?? []);
@@ -367,8 +371,10 @@ export default function SettingsPage() {
 
   async function deleteTheme(theme: ThemeDefinition) {
     if (!confirm(`确定删除主题 ${theme.name}？`)) return;
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
     setThemeLoading(true);
-    const response = await apiClient.deleteTheme(theme.id);
+    const response = await apiClient.deleteTheme(theme.id, totpCode);
     setThemeLoading(false);
     if (response.success) {
       setNotice(`主题 ${theme.name} 已删除。`);

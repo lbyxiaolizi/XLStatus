@@ -1,11 +1,12 @@
 //! Theme catalog and selection API.
 
 use crate::api::types::ApiResponse;
-use crate::api::v1::auth::{AppError, AppState};
+use crate::api::v1::auth::{require_sensitive_totp, AppError, AppState};
 use crate::auth::middleware::{AuthKind, AuthSession};
 use crate::db::DatabaseBackend;
 use axum::{
     extract::{DefaultBodyLimit, Path, State},
+    http::HeaderMap,
     Json,
 };
 use chrono::Utc;
@@ -115,9 +116,11 @@ pub async fn list_themes(
 pub async fn import_theme(
     State(state): State<AppState>,
     auth: AuthSession,
+    headers: HeaderMap,
     Json(req): Json<ImportThemeRequest>,
 ) -> Result<Json<ApiResponse<ThemeDefinition>>, AppError> {
     require_admin_cookie_session(&auth)?;
+    require_sensitive_totp(&state.db, auth.user_id, &headers).await?;
     let mut theme = normalize_theme_input(req.theme, false)?;
     let now = Utc::now().to_rfc3339();
     theme.created_at = Some(now.clone());
@@ -129,10 +132,12 @@ pub async fn import_theme(
 pub async fn update_theme(
     State(state): State<AppState>,
     auth: AuthSession,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(req): Json<UpdateThemeRequest>,
 ) -> Result<Json<ApiResponse<ThemeDefinition>>, AppError> {
     require_admin_cookie_session(&auth)?;
+    require_sensitive_totp(&state.db, auth.user_id, &headers).await?;
     let id = require_theme_slug(&id, "theme id")?;
     if builtin_theme(&id).is_some() {
         return Err(AppError::BadRequest(
@@ -179,10 +184,12 @@ pub async fn update_theme(
 pub async fn select_theme(
     State(state): State<AppState>,
     auth: AuthSession,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(req): Json<SelectThemeRequest>,
 ) -> Result<Json<ApiResponse<ThemeListResponse>>, AppError> {
     require_admin_cookie_session(&auth)?;
+    require_sensitive_totp(&state.db, auth.user_id, &headers).await?;
     let id = require_theme_slug(&id, "theme id")?;
     let target = normalize_select_target(&req.target)?;
     let all = all_themes(&state.db).await?;
@@ -216,9 +223,11 @@ pub async fn select_theme(
 pub async fn delete_theme(
     State(state): State<AppState>,
     auth: AuthSession,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     require_admin_cookie_session(&auth)?;
+    require_sensitive_totp(&state.db, auth.user_id, &headers).await?;
     let id = require_theme_slug(&id, "theme id")?;
     if builtin_theme(&id).is_some() {
         return Err(AppError::BadRequest(
@@ -1026,6 +1035,36 @@ mod tests {
         assert!(require_admin_cookie_session(&auth).is_ok());
     }
 
+    #[tokio::test]
+    async fn theme_admin_mutations_require_sensitive_totp_when_enabled() {
+        let db = test_db().await;
+        let user_id = uuid::Uuid::from_bytes([1; 16]);
+        seed_user(&db, user_id, "owner").await;
+        seed_totp_enabled_user(&db, user_id).await;
+
+        let err = import_theme(
+            State(test_state(db.clone())),
+            auth_session(AuthKind::Session),
+            HeaderMap::new(),
+            Json(ImportThemeRequest {
+                theme: ThemeDefinitionInput {
+                    id: "custom-totp".into(),
+                    name: "Custom TOTP".into(),
+                    description: None,
+                    target: Some("both".into()),
+                    variables: HashMap::from([("--accent-color".into(), "#16a34a".into())]),
+                    light_variables: HashMap::new(),
+                    dark_variables: HashMap::new(),
+                },
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::Forbidden(_)));
+
+        assert!(custom_themes(&db).await.unwrap().is_empty());
+    }
+
     #[test]
     fn stored_custom_theme_css_is_cleared() {
         let mut theme = ThemeDefinition {
@@ -1075,6 +1114,21 @@ mod tests {
         db
     }
 
+    fn test_state(db: DatabaseBackend) -> AppState {
+        AppState {
+            db,
+            config: std::sync::Arc::new(crate::config::Config::default()),
+            agent_jwt_challenges: std::sync::Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            metrics: xlstatus_tsdb::MetricStore::in_memory(),
+            realtime: crate::realtime::BroadcastHub::new(),
+            session_registry: crate::grpc::SessionRegistry::new(),
+            terminal_sessions: crate::api::v1::terminal::TerminalSessionRegistry::new(),
+            io_registry: crate::grpc::IoRegistry::new(),
+        }
+    }
+
     async fn seed_string_setting(db: &DatabaseBackend, key: &str, value: &str) {
         let DatabaseBackend::Sqlite(pool) = db else {
             unreachable!();
@@ -1088,6 +1142,32 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    async fn seed_user(db: &DatabaseBackend, id: uuid::Uuid, username: &str) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, role, created_at, updated_at) VALUES (?, ?, 'hash', 'member', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id.to_string())
+        .bind(username)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_totp_enabled_user(db: &DatabaseBackend, id: uuid::Uuid) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query("UPDATE users SET totp_secret = ?, totp_enabled = 1 WHERE id = ?")
+            .bind("totp-secret")
+            .bind(id.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
     }
 
     fn auth_session(auth_kind: AuthKind) -> AuthSession {

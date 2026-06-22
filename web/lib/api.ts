@@ -542,11 +542,13 @@ class ApiClient {
     path: string,
     body: JsonObject,
     methods: string[],
+    options: Omit<ApiRequestOptions, "method" | "body"> = {},
   ): Promise<ApiResponse<T>> {
     let last: ApiResponse<T> | null = null;
 
     for (const method of methods) {
       const response = await this.request<T>(path, {
+        ...options,
         method,
         body: JSON.stringify(body),
       });
@@ -1581,41 +1583,52 @@ class ApiClient {
     return this.request<ThemeListResponse>("/api/v1/themes");
   }
 
-  async importTheme(theme: ImportThemeRequest["theme"]): Promise<ApiResponse<ThemeDefinition>> {
+  async importTheme(
+    theme: ImportThemeRequest["theme"],
+    totpCode?: string,
+  ): Promise<ApiResponse<ThemeDefinition>> {
     return this.request<ThemeDefinition>("/api/v1/themes/import", {
       method: "POST",
       body: JSON.stringify({ theme }),
+      headers: this.sensitiveHeaders(totpCode),
     });
   }
 
   async updateTheme(
     id: string,
     theme: JsonObject,
+    totpCode?: string,
   ): Promise<ApiResponse<ThemeDefinition>> {
     return this.requestWithFallback<ThemeDefinition>(
       `/api/v1/themes/${encodeURIComponent(id)}`,
       theme,
       ["PATCH", "POST"],
+      { headers: this.sensitiveHeaders(totpCode) },
     );
   }
 
   async selectTheme(
     id: string,
     target: "public" | "dashboard" | "both",
+    totpCode?: string,
   ): Promise<ApiResponse<ThemeListResponse>> {
     return this.request<ThemeListResponse>(
       `/api/v1/themes/${encodeURIComponent(id)}/select`,
       {
         method: "POST",
         body: JSON.stringify({ target }),
+        headers: this.sensitiveHeaders(totpCode),
       },
     );
   }
 
-  async deleteTheme(id: string): Promise<ApiResponse<JsonObject>> {
+  async deleteTheme(id: string, totpCode?: string): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
       `/api/v1/themes/${encodeURIComponent(id)}`,
-      { method: "DELETE" },
+      {
+        method: "DELETE",
+        headers: this.sensitiveHeaders(totpCode),
+      },
     );
   }
 
