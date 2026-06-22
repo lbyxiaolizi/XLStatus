@@ -42,7 +42,7 @@ const SERVER_DASHBOARD_METADATA_MAX_BYTES: usize = 16 * 1024;
 const SERVER_TAG_INPUT_MAX_ITEMS: usize = 64;
 const SERVER_TAG_INPUT_MAX_BYTES: usize = 128;
 const SERVER_BATCH_MAX_SERVER_IDS: usize = 200;
-const SERVER_UUID_TEXT_MAX_BYTES: usize = 64;
+const SERVER_UUID_TEXT_LEN: usize = 36;
 
 #[derive(Debug, Deserialize)]
 pub struct ListQuery {
@@ -1180,19 +1180,20 @@ pub async fn get_server_metrics(
 }
 
 fn parse_agent_id(id: &str) -> Result<AgentId, AppError> {
-    let parsed = uuid::Uuid::parse_str(id)
-        .map_err(|_| AppError::BadRequest(format!("invalid agent id: {id}")))?;
+    let id = require_server_uuid_text(id, "server_id")?;
+    let parsed = uuid::Uuid::parse_str(&id).expect("canonical UUID must parse after validation");
     Ok(AgentId(parsed))
 }
 
 fn parse_user_id(id: &str) -> Result<UserId, AppError> {
-    let parsed = uuid::Uuid::parse_str(id)
-        .map_err(|_| AppError::BadRequest(format!("invalid user id: {id}")))?;
+    let id = require_server_uuid_text(id, "user_id")?;
+    let parsed = uuid::Uuid::parse_str(&id).expect("canonical UUID must parse after validation");
     Ok(UserId(parsed))
 }
 
 fn parse_uuid(id: &str) -> Result<Uuid, AppError> {
-    Uuid::parse_str(id).map_err(|_| AppError::BadRequest(format!("invalid uuid: {id}")))
+    let id = require_server_uuid_text(id, "resource_id")?;
+    Ok(Uuid::parse_str(&id).expect("canonical UUID must parse after validation"))
 }
 
 async fn load_server_groups(
@@ -1341,6 +1342,7 @@ async fn load_server_group(
     auth: &AuthSession,
     id: &str,
 ) -> Result<ServerGroupView, AppError> {
+    let id = require_server_uuid_text(id, "group_id")?;
     match db {
         DatabaseBackend::Sqlite(pool) => {
             let row = sqlx::query(
@@ -1350,7 +1352,7 @@ async fn load_server_group(
                 WHERE id = ? AND owner_user_id = ?
                 "#,
             )
-            .bind(id)
+            .bind(&id)
             .bind(auth.user_id.0.to_string())
             .fetch_optional(pool)
             .await?;
@@ -1373,7 +1375,7 @@ async fn load_server_group(
                 WHERE id = $1 AND owner_user_id = $2
                 "#,
             )
-            .bind(parse_uuid(id)?)
+            .bind(parse_uuid(&id)?)
             .bind(auth.user_id.0)
             .fetch_optional(pool)
             .await?;
@@ -2253,6 +2255,7 @@ async fn load_server_owner_transfer(
     db: &DatabaseBackend,
     transfer_id: &str,
 ) -> Result<Option<ServerOwnerTransferView>, AppError> {
+    let transfer_id = require_server_uuid_text(transfer_id, "transfer_id")?;
     match db {
         DatabaseBackend::Sqlite(pool) => {
             let row = sqlx::query(
@@ -2264,7 +2267,7 @@ async fn load_server_owner_transfer(
                 WHERE id = ?
                 "#,
             )
-            .bind(transfer_id)
+            .bind(&transfer_id)
             .fetch_optional(pool)
             .await
             .map_err(db_err)?;
@@ -2283,7 +2286,7 @@ async fn load_server_owner_transfer(
                 WHERE id = $1
                 "#,
             )
-            .bind(transfer_id)
+            .bind(&transfer_id)
             .fetch_optional(pool)
             .await
             .map_err(db_err)?;
@@ -2853,16 +2856,29 @@ fn normalize_optional_label(
 }
 
 fn normalize_uuid_text(value: &str, field: &str) -> Result<String, AppError> {
-    let value = value.trim();
     if value.is_empty() {
         return Err(AppError::BadRequest(format!("{field} is required")));
     }
-    if value.len() > SERVER_UUID_TEXT_MAX_BYTES {
-        return Err(AppError::BadRequest(format!("{field} is too long")));
+    require_server_uuid_text(value, field)
+}
+
+fn require_server_uuid_text(value: &str, field: &str) -> Result<String, AppError> {
+    if value.is_empty() {
+        return Err(AppError::BadRequest(format!("{field} is required")));
     }
-    let uuid =
-        Uuid::parse_str(value).map_err(|_| AppError::BadRequest(format!("invalid {field}")))?;
-    Ok(uuid.to_string())
+    if value.len() != SERVER_UUID_TEXT_LEN {
+        return Err(AppError::BadRequest(format!(
+            "{field} must be a canonical UUID"
+        )));
+    }
+    let parsed = Uuid::parse_str(value)
+        .map_err(|_| AppError::BadRequest(format!("{field} must be a canonical UUID")))?;
+    if parsed.to_string() != value {
+        return Err(AppError::BadRequest(format!(
+            "{field} must be a canonical UUID"
+        )));
+    }
+    Ok(value.to_string())
 }
 
 fn normalize_display_order(value: Option<i64>, field: &str) -> Result<Option<i64>, AppError> {
@@ -3250,6 +3266,46 @@ mod tests {
         .unwrap();
     }
 
+    async fn seed_dirty_server_group(db: &DatabaseBackend, id: &str, owner: Uuid, name: &str) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO server_groups (id, owner_user_id, name, created_at, updated_at) VALUES (?, ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(owner.to_string())
+        .bind(name)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_dirty_server_owner_transfer(
+        db: &DatabaseBackend,
+        id: &str,
+        server_id: Uuid,
+        to_user_id: Uuid,
+    ) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            r#"
+            INSERT INTO server_owner_transfers (
+                id, agent_id, to_user_id, status, attempts,
+                last_attempt_at, created_at, updated_at
+            ) VALUES (?, ?, ?, 'failed', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+            "#,
+        )
+        .bind(id)
+        .bind(server_id.to_string())
+        .bind(to_user_id.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     async fn seed_server_group_with_order(
         db: &DatabaseBackend,
         id: Uuid,
@@ -3470,6 +3526,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_group_lookup_rejects_dirty_text_id_before_sql() {
+        let db = test_db().await;
+        let owner = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        seed_user(&db, owner, "owner", "member").await;
+        seed_dirty_server_group(&db, "group-a", owner, "dirty-group").await;
+
+        let mut auth = auth_session(AuthKind::Session, UserRole::Member);
+        auth.user_id = UserId(owner);
+
+        let err = load_server_group(&db, &auth, "group-a").await.unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn server_owner_transfer_lookup_rejects_dirty_text_id_before_sql() {
+        let db = test_db().await;
+        let owner = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let server_id = Uuid::parse_str("00000000-0000-0000-0000-000000000111").unwrap();
+        seed_user(&db, owner, "owner", "member").await;
+        seed_agent(
+            &db,
+            server_id,
+            owner,
+            "owner-server",
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+        seed_dirty_server_owner_transfer(&db, "transfer-a", server_id, owner).await;
+
+        let err = load_server_owner_transfer(&db, "transfer-a")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[tokio::test]
     async fn server_group_write_rejects_revoked_members_but_allows_cleanup() {
         let db = test_db().await;
         let owner = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
@@ -3599,6 +3691,7 @@ mod tests {
         assert_eq!(SERVER_DASHBOARD_METADATA_MAX_BYTES, 16 * 1024);
         assert_eq!(SERVER_TAG_INPUT_MAX_ITEMS, 64);
         assert_eq!(SERVER_BATCH_MAX_SERVER_IDS, 200);
+        assert_eq!(SERVER_UUID_TEXT_LEN, 36);
     }
 
     #[test]
@@ -3637,23 +3730,53 @@ mod tests {
     }
 
     #[test]
-    fn server_id_lists_are_bounded_and_canonicalized() {
+    fn server_resource_ids_must_be_canonical_uuid_text() {
+        let id = Uuid::parse_str("018f7e34-1234-4abc-8def-abcdefabcdef").unwrap();
+        let canonical = id.to_string();
+
+        assert_eq!(parse_agent_id(&canonical).unwrap().0, id);
+        assert_eq!(parse_user_id(&canonical).unwrap().0, id);
+        assert_eq!(parse_uuid(&canonical).unwrap(), id);
+        assert_eq!(
+            require_server_uuid_text(&canonical, "server_id").unwrap(),
+            canonical
+        );
+
+        assert!(require_server_uuid_text("server-a", "server_id").is_err());
+        assert!(require_server_uuid_text(&format!(" {id} "), "server_id").is_err());
+        assert!(require_server_uuid_text(&id.simple().to_string(), "server_id").is_err());
+        assert!(require_server_uuid_text(&canonical.to_uppercase(), "server_id").is_err());
+        assert!(
+            require_server_uuid_text(&"a".repeat(SERVER_UUID_TEXT_LEN + 1), "server_id").is_err()
+        );
+    }
+
+    #[test]
+    fn server_id_lists_are_bounded_and_require_canonical_ids() {
         let ids = (0..=SERVER_BATCH_MAX_SERVER_IDS)
             .map(|idx| Uuid::from_u128(idx as u128 + 1).to_string())
             .collect();
         let err = dedupe_ids(ids, SERVER_BATCH_MAX_SERVER_IDS, "server_ids").unwrap_err();
         assert!(matches!(err, AppError::BadRequest(_)));
 
-        let canonical = dedupe_ids(
+        let deduped = dedupe_ids(
             vec![
-                "00000000000000000000000000000001".into(),
+                "00000000-0000-0000-0000-000000000001".into(),
                 "00000000-0000-0000-0000-000000000001".into(),
             ],
             SERVER_BATCH_MAX_SERVER_IDS,
             "server_ids",
         )
         .unwrap();
-        assert_eq!(canonical, vec!["00000000-0000-0000-0000-000000000001"]);
+        assert_eq!(deduped, vec!["00000000-0000-0000-0000-000000000001"]);
+
+        let err = dedupe_ids(
+            vec!["00000000000000000000000000000001".into()],
+            SERVER_BATCH_MAX_SERVER_IDS,
+            "server_ids",
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
     }
 
     #[test]

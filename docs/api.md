@@ -90,6 +90,9 @@ PAT 创建请求体上限为 16KiB。PAT 名称最长 128 字节，scopes 最多
 | `GET` | `/api/v1/servers/:id` | 服务器详情 |
 | `POST` | `/api/v1/servers/:id` | 更新服务器展示元数据 |
 | `POST` | `/api/v1/servers/batch` | 批量服务器管理 |
+| `GET` | `/api/v1/server-transfers` | 服务器所有权转移记录 |
+| `POST` | `/api/v1/server-transfers/:id/retry` | 重试服务器所有权转移 |
+| `POST` | `/api/v1/server-transfers/:id/cancel` | 取消服务器所有权转移 |
 | `GET` | `/api/v1/server-groups` | 服务器分组列表 |
 | `POST` | `/api/v1/server-groups` | 创建服务器分组 |
 | `POST` / `PATCH` | `/api/v1/server-groups/:id` | 更新服务器分组 |
@@ -99,7 +102,7 @@ PAT 创建请求体上限为 16KiB。PAT 名称最长 128 字节，scopes 最多
 | `GET` | `/api/v1/servers/:id/metrics` | 指标查询 |
 | `GET` | `/ws/servers` | 服务器实时 WebSocket |
 
-服务器展示元数据更新、批量管理、服务器分组创建/更新/加成员请求体上限为 64KiB。服务器名称最长 128 字节，备注、公开说明、供应商、地域、套餐、价格、计费周期等展示 label 最长 512 字节；dashboard metadata 序列化后最多 16KiB。标签输入最多 64 项、单项最长 128 字节，保存后最多保留 8 个展示标签。批量服务器 ID 和分组成员单次最多 200 个 UUID，并会规范化为 canonical 文本。`display_order` 必须在数据库 `INTEGER` 范围内。服务器分组新增成员和批量 `move_group` 都要求目标 Agent 当前未撤销；删除历史成员仍按可见性允许，以便清理撤销后的残留分组关系。服务器分组列表会先按分组 owner、有效成员 owner 和 PAT server allowlist 过滤后再应用 `limit` / `offset`；分组详情返回的 `server_ids` 只包含该分组 owner 名下且当前凭据可见的 Agent。
+服务器展示元数据更新、批量管理、服务器分组创建/更新/加成员请求体上限为 64KiB。服务器名称最长 128 字节，备注、公开说明、供应商、地域、套餐、价格、计费周期等展示 label 最长 512 字节；dashboard metadata 序列化后最多 16KiB。标签输入最多 64 项、单项最长 128 字节，保存后最多保留 8 个展示标签。服务器详情、更新、指标 path `:id`，所有权转移列表 query `server_id`，所有权转移 retry/cancel path `:id`，服务器分组 path `:id`、成员 path `:server_id`，批量 `server_ids`、`owner_user_id` 和 `group_id` 都必须是 36 字节 canonical UUID 文本；非法、simple、大写或带空格 UUID 会在 SQL/管理操作前返回 400。批量服务器 ID 和分组成员单次最多 200 个 UUID。`display_order` 必须在数据库 `INTEGER` 范围内。服务器分组新增成员和批量 `move_group` 都要求目标 Agent 当前未撤销；删除历史成员仍按可见性允许，以便清理撤销后的残留分组关系。服务器分组列表会先按分组 owner、有效成员 owner 和 PAT server allowlist 过滤后再应用 `limit` / `offset`；分组详情返回的 `server_ids` 只包含该分组 owner 名下且当前凭据可见的 Agent。
 
 `/ws/servers` 实时 WebSocket 需要 `server:read`，升级前校验 `Origin`，初始快照和后续事件都会按当前 Cookie session / PAT 可见服务器集合过滤；非管理员只能接收自己名下服务器事件，PAT 还会受 server allowlist 限制。
 
