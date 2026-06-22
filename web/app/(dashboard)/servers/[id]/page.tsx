@@ -500,6 +500,8 @@ export default function ServerDetailPage({ params }: PageProps) {
 
   async function applyConfig(event: FormEvent) {
     event.preventDefault();
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
     const config: JsonObject = {
       report_interval_seconds: Number(configForm.report_interval_seconds),
       ip_report_interval_seconds: Number(configForm.ip_report_interval_seconds),
@@ -510,7 +512,7 @@ export default function ServerDetailPage({ params }: PageProps) {
       disable_send_query: configForm.disable_send_query,
     };
     setSaving(true);
-    const response = await apiClient.applyServerConfig(serverId, config);
+    const response = await apiClient.applyServerConfig(serverId, config, totpCode);
     setSaving(false);
     if (response.success) {
       setNotice("配置补丁已发送到 Agent。");
@@ -529,12 +531,14 @@ export default function ServerDetailPage({ params }: PageProps) {
       setError("版本、下载 URL 和 SHA-256 校验和均为必填。");
       return;
     }
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
     setSaving(true);
     const response = await apiClient.forceUpdateServer(serverId, {
       version,
       download_url: downloadUrl,
       checksum,
-    });
+    }, totpCode);
     setSaving(false);
     if (response.success) {
       setNotice("强制更新请求已发送。");

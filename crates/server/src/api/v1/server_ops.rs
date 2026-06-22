@@ -1,5 +1,6 @@
 use axum::{
     extract::{DefaultBodyLimit, Path, State},
+    http::HeaderMap,
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -11,7 +12,7 @@ use xlstatus_proto_gen::xlstatus::v1::{
 use xlstatus_shared::AgentId;
 
 use crate::api::types::ApiResponse;
-use crate::api::v1::auth::{AppError, AppState};
+use crate::api::v1::auth::{require_sensitive_totp, AppError, AppState};
 use crate::api::v1::servers::{ensure_agent_visible, server_visible};
 use crate::auth::generate_temporary_transfer_token;
 use crate::auth::middleware::{AuthKind, AuthSession};
@@ -37,6 +38,26 @@ const FILE_LIST_RESULT_MAX_BYTES: usize = 2 * 1024 * 1024;
 const FILE_SMALL_RESULT_MAX_BYTES: usize = 4096;
 const FORCE_UPDATE_REPO_HOST: &str = "github.com";
 const FORCE_UPDATE_REPO_PATH_PREFIX: &str = "/lbyxiaolizi/XLStatus/releases/download/";
+const REMOTE_CONFIG_LOW_RISK_FIELDS: &[&str] = &[
+    "name",
+    "report_interval_seconds",
+    "ip_report_interval_seconds",
+];
+const REMOTE_CONFIG_SENSITIVE_FIELDS: &[&str] = &[
+    "server",
+    "grpc_server",
+    "grpc_tls_ca_path",
+    "grpc_tls_domain_name",
+    "grpc_tls_client_cert_path",
+    "grpc_tls_client_key_path",
+    "disable_auto_update",
+    "disable_force_update",
+    "disable_command_execute",
+    "disable_nat",
+    "disable_send_query",
+    "file_allowed_roots",
+];
+const REMOTE_CONFIG_FORBIDDEN_FIELDS: &[&str] = &["agent_id", "public_key", "private_key"];
 
 #[derive(Debug, Deserialize)]
 pub struct FileListRequest {
@@ -390,13 +411,13 @@ pub async fn get_config(
 pub async fn apply_config(
     State(state): State<AppState>,
     auth: AuthSession,
+    headers: HeaderMap,
     Path(server_id): Path<String>,
     Json(req): Json<ApplyConfigRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     if !has_scope(&auth, "server:write") {
         return Err(AppError::Forbidden("missing scope: server:write".into()));
     }
-    let agent_id = ensure_server_online(&state, &auth, &server_id).await?;
     if req
         .config
         .as_object()
@@ -407,6 +428,8 @@ pub async fn apply_config(
             "config patch must not be empty".into(),
         ));
     }
+    require_remote_config_patch_auth(&state.db, &auth, &headers, &req.config).await?;
+    let agent_id = ensure_server_online(&state, &auth, &server_id).await?;
     let payload = serialize_config_patch(&req.config)?;
     state
         .session_registry
@@ -429,10 +452,11 @@ pub async fn apply_config(
 pub async fn force_update(
     State(state): State<AppState>,
     auth: AuthSession,
+    headers: HeaderMap,
     Path(server_id): Path<String>,
     Json(req): Json<ForceUpdateRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
-    require_force_update_scope(&auth)?;
+    require_force_update_auth(&state.db, &auth, &headers).await?;
     let agent_id = ensure_server_online(&state, &auth, &server_id).await?;
     let force_update = validate_force_update_request(req)?;
     state
@@ -666,6 +690,57 @@ fn ensure_file_task_result_text(
     .map_err(AppError::BadRequest)
 }
 
+async fn require_remote_config_patch_auth(
+    db: &crate::db::Db,
+    auth: &AuthSession,
+    headers: &HeaderMap,
+    config: &serde_json::Value,
+) -> Result<(), AppError> {
+    if remote_config_patch_contains_sensitive_fields(config)? {
+        require_admin_cookie_session(auth)?;
+        require_sensitive_totp(db, auth.user_id, headers).await?;
+    }
+    Ok(())
+}
+
+fn remote_config_patch_contains_sensitive_fields(
+    config: &serde_json::Value,
+) -> Result<bool, AppError> {
+    let Some(object) = config.as_object() else {
+        return Err(AppError::BadRequest(
+            "config patch must be an object".into(),
+        ));
+    };
+    let mut sensitive = false;
+    for key in object.keys() {
+        if REMOTE_CONFIG_FORBIDDEN_FIELDS.contains(&key.as_str()) {
+            return Err(AppError::BadRequest(format!(
+                "remote config field {key} cannot be changed from the dashboard"
+            )));
+        }
+        if REMOTE_CONFIG_SENSITIVE_FIELDS.contains(&key.as_str()) {
+            sensitive = true;
+            continue;
+        }
+        if !REMOTE_CONFIG_LOW_RISK_FIELDS.contains(&key.as_str()) {
+            return Err(AppError::BadRequest(format!(
+                "unknown remote config field: {key}"
+            )));
+        }
+    }
+    Ok(sensitive)
+}
+
+fn require_admin_cookie_session(auth: &AuthSession) -> Result<(), AppError> {
+    if !auth.role.is_admin() {
+        return Err(AppError::Forbidden("admin role required".into()));
+    }
+    if matches!(auth.auth_kind, AuthKind::PersonalAccessToken) {
+        return Err(AppError::Forbidden("Cookie session required".into()));
+    }
+    Ok(())
+}
+
 fn serialize_config_patch(config: &serde_json::Value) -> Result<Vec<u8>, AppError> {
     let payload = serde_json::to_vec(config)
         .map_err(|e| AppError::BadRequest(format!("invalid config patch: {e}")))?;
@@ -683,6 +758,15 @@ fn require_force_update_scope(auth: &AuthSession) -> Result<(), AppError> {
     } else {
         Err(AppError::Forbidden("missing scope: server:exec".into()))
     }
+}
+
+async fn require_force_update_auth(
+    db: &crate::db::Db,
+    auth: &AuthSession,
+    headers: &HeaderMap,
+) -> Result<(), AppError> {
+    require_force_update_scope(auth)?;
+    require_sensitive_totp(db, auth.user_id, headers).await
 }
 
 fn validate_force_update_request(req: ForceUpdateRequest) -> Result<ForceUpdate, AppError> {
@@ -954,6 +1038,36 @@ mod tests {
         assert!(require_force_update_scope(&admin_cookie).is_ok());
     }
 
+    #[tokio::test]
+    async fn force_update_requires_sensitive_totp_when_enabled() {
+        let state = test_state().await;
+        let user = UserRepository::new(state.db.clone())
+            .create(CreateUserInput {
+                username: "admin".into(),
+                password: "secret-password".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        seed_totp_enabled_user(&state.db, user.id.0).await;
+        let auth = AuthSession {
+            session_id: "sess".into(),
+            user_id: user.id,
+            username: user.username,
+            role: user.role,
+            csrf_token: "csrf".into(),
+            auth_kind: AuthKind::Session,
+            scopes: Vec::new(),
+            server_ids: None,
+            pat_id: None,
+        };
+        let err = require_force_update_auth(&state.db, &auth, &HeaderMap::new())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
     #[test]
     fn server_ops_resource_limits_are_explicit() {
         assert_eq!(SERVER_OPS_API_MAX_BODY_BYTES, 3 * 1024 * 1024);
@@ -962,6 +1076,122 @@ mod tests {
         assert_eq!(CONFIG_PATCH_MAX_BYTES, 128 * 1024);
         assert_eq!(FILE_LIST_RESULT_MAX_BYTES, 2 * 1024 * 1024);
         assert_eq!(FILE_SMALL_RESULT_MAX_BYTES, 4096);
+    }
+
+    #[test]
+    fn remote_config_patch_fields_are_classified() {
+        assert!(
+            !remote_config_patch_contains_sensitive_fields(&serde_json::json!({
+                "name": "agent",
+                "report_interval_seconds": 30,
+            }))
+            .unwrap()
+        );
+        assert!(
+            remote_config_patch_contains_sensitive_fields(&serde_json::json!({
+                "disable_command_execute": true,
+            }))
+            .unwrap()
+        );
+        assert!(
+            remote_config_patch_contains_sensitive_fields(&serde_json::json!({
+                "file_allowed_roots": ["/var/lib/xlstatus/files"],
+            }))
+            .unwrap()
+        );
+        assert!(
+            remote_config_patch_contains_sensitive_fields(&serde_json::json!({
+                "agent_id": "00000000-0000-0000-0000-000000000001",
+            }))
+            .is_err()
+        );
+        assert!(
+            remote_config_patch_contains_sensitive_fields(&serde_json::json!({
+                "private_key": "secret",
+            }))
+            .is_err()
+        );
+        assert!(
+            remote_config_patch_contains_sensitive_fields(&serde_json::json!({
+                "unexpected": true,
+            }))
+            .is_err()
+        );
+        assert!(remote_config_patch_contains_sensitive_fields(&serde_json::json!(true)).is_err());
+    }
+
+    #[tokio::test]
+    async fn sensitive_remote_config_patch_rejects_pat() {
+        let state = test_state().await;
+        let auth = auth_session(
+            AuthKind::PersonalAccessToken,
+            xlstatus_shared::UserRole::Admin,
+            vec!["server:write"],
+        );
+        let err = require_remote_config_patch_auth(
+            &state.db,
+            &auth,
+            &HeaderMap::new(),
+            &serde_json::json!({ "disable_command_execute": true }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(app_error_message(&err).contains("Cookie session required"));
+    }
+
+    #[tokio::test]
+    async fn sensitive_remote_config_patch_requires_totp_when_enabled() {
+        let state = test_state().await;
+        let user = UserRepository::new(state.db.clone())
+            .create(CreateUserInput {
+                username: "admin".into(),
+                password: "secret-password".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        seed_totp_enabled_user(&state.db, user.id.0).await;
+        let auth = AuthSession {
+            session_id: "sess".into(),
+            user_id: user.id,
+            username: user.username,
+            role: user.role,
+            csrf_token: "csrf".into(),
+            auth_kind: AuthKind::Session,
+            scopes: Vec::new(),
+            server_ids: None,
+            pat_id: None,
+        };
+        let err = require_remote_config_patch_auth(
+            &state.db,
+            &auth,
+            &HeaderMap::new(),
+            &serde_json::json!({ "disable_nat": true }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn low_risk_remote_config_patch_allows_pat() {
+        let state = test_state().await;
+        let auth = auth_session(
+            AuthKind::PersonalAccessToken,
+            xlstatus_shared::UserRole::Admin,
+            vec!["server:write"],
+        );
+
+        require_remote_config_patch_auth(
+            &state.db,
+            &auth,
+            &HeaderMap::new(),
+            &serde_json::json!({ "report_interval_seconds": 30 }),
+        )
+        .await
+        .unwrap();
     }
 
     #[test]
@@ -1245,6 +1475,18 @@ mod tests {
             terminal_sessions: crate::api::v1::terminal::TerminalSessionRegistry::new(),
             io_registry: crate::grpc::IoRegistry::new(),
         }
+    }
+
+    async fn seed_totp_enabled_user(db: &DatabaseBackend, id: uuid::Uuid) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query("UPDATE users SET totp_secret = ?, totp_enabled = 1 WHERE id = ?")
+            .bind("totp-secret")
+            .bind(id.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
     }
 
     fn app_error_message(err: &AppError) -> String {

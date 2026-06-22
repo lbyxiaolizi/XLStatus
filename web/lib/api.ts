@@ -1044,11 +1044,13 @@ class ApiClient {
   async applyServerConfig(
     id: string,
     config: JsonObject,
+    totpCode?: string,
   ): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
       `/api/v1/servers/${encodeURIComponent(id)}/config`,
       {
         method: "POST",
+        headers: this.sensitiveHeaders(totpCode),
         body: JSON.stringify({ config }),
       },
     );
@@ -1057,11 +1059,13 @@ class ApiClient {
   async forceUpdateServer(
     id: string,
     payload: JsonObject,
+    totpCode?: string,
   ): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
       `/api/v1/servers/${encodeURIComponent(id)}/force-update`,
       {
         method: "POST",
+        headers: this.sensitiveHeaders(totpCode),
         body: JSON.stringify(payload),
       },
     );
