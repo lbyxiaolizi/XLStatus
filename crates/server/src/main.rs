@@ -1088,8 +1088,19 @@ fn request_authority(headers: &HeaderMap) -> Result<Option<String>, String> {
     if value.chars().any(char::is_control) {
         return Err("Host header must not contain control characters".to_string());
     }
+    if value.contains('\\') {
+        return Err("Host header must not contain backslashes".to_string());
+    }
     let url =
         reqwest::Url::parse(&format!("http://{value}")).map_err(|_| "Host header is invalid")?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "" | "/")
+    {
+        return Err("Host header must be a plain authority".to_string());
+    }
     Ok(Some(url_origin_authority(&url)))
 }
 
@@ -1491,6 +1502,24 @@ mod tests {
 
         assert!(body.contains("export SERVER_URL='http://status.example.com:8080'"));
         assert!(body.contains("export GRPC_SERVER='http://status.example.com:50051'"));
+    }
+
+    #[test]
+    fn install_bootstrap_rejects_non_authority_host_header() {
+        for host in [
+            "user@status.example.com",
+            "status.example.com/path",
+            "status.example.com?x=1",
+            "status.example.com#fragment",
+            "status.example.com\\@evil.example",
+        ] {
+            let headers = headers_with_host(host);
+            let err = build_install_agent_script(&headers, install_query(None, None)).unwrap_err();
+            assert!(
+                err.contains("Host header"),
+                "{host} should be rejected as invalid Host authority"
+            );
+        }
     }
 
     #[test]
