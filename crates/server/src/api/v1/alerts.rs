@@ -350,13 +350,15 @@ async fn ensure_alert_agent_visible_to_auth(
         .find_by_id(agent_id)
         .await?
         .ok_or_else(|| AppError::NotFound("server not found".into()))?;
-    if server_visible(auth, &agent.id)
-        && (auth.role.is_admin() || agent.owner_user_id == auth.user_id)
+    if !server_visible(auth, &agent.id)
+        || !(auth.role.is_admin() || agent.owner_user_id == auth.user_id)
     {
-        Ok(())
-    } else {
-        Err(AppError::Forbidden("server not in scope".into()))
+        return Err(AppError::Forbidden("server not in scope".into()));
     }
+    if agent.revoked_at.is_some() {
+        return Err(AppError::BadRequest("server has been revoked".into()));
+    }
+    Ok(())
 }
 
 fn alert_event_visible_to_auth(
@@ -516,6 +518,31 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn alert_rule_rejects_revoked_server_condition() {
+        let db = test_db().await;
+        let owner = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let revoked_server = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000202").unwrap();
+
+        seed_user(&db, owner, "owner", "member").await;
+        seed_agent(&db, revoked_server, owner, "revoked").await;
+        revoke_agent(&db, revoked_server).await;
+
+        let err = ensure_alert_conditions_visible_to_auth(
+            &db,
+            &member_alert_session(owner),
+            &[AlertCondition::ServerOffline {
+                agent_id: revoked_server.to_string(),
+                offline_seconds: 60,
+            }],
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::BadRequest(_)));
+        assert!(app_error_message(&err).contains("revoked"));
     }
 
     #[tokio::test]
@@ -965,6 +992,17 @@ mod tests {
         .unwrap();
     }
 
+    async fn revoke_agent(db: &DatabaseBackend, id: uuid::Uuid) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query("UPDATE agents SET revoked_at = '2026-06-22T00:00:00Z' WHERE id = ?")
+            .bind(id.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
     async fn seed_service(db: &DatabaseBackend, id: &str, server_id: uuid::Uuid) {
         let DatabaseBackend::Sqlite(pool) = db else {
             unreachable!();
@@ -1119,5 +1157,16 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    fn app_error_message(err: &AppError) -> String {
+        match err {
+            AppError::BadRequest(message)
+            | AppError::Forbidden(message)
+            | AppError::Unauthorized(message)
+            | AppError::NotFound(message)
+            | AppError::TooManyRequests(message) => message.clone(),
+            AppError::Database(err) => err.to_string(),
+        }
     }
 }
