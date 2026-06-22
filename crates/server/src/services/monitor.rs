@@ -261,7 +261,10 @@ impl ServiceMonitor {
 
         let task_id = uuid::Uuid::now_v7().to_string();
         let task = build_agent_probe_task(&task_id, s)?;
-        let rx = self.response_registry.register(task_id.clone()).await;
+        let rx = self
+            .response_registry
+            .register(task_id.clone(), agent_id)
+            .await;
         if let Err(e) = self
             .session_registry
             .send_server_task(&agent_id, task)

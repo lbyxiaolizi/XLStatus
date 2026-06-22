@@ -857,7 +857,7 @@ async fn dispatch_server_task(
     let response_registry = crate::current_task_response_registry();
     let run_id = uuid::Uuid::now_v7().to_string();
     task.task_id = run_id.clone();
-    let rx = response_registry.register(run_id.clone()).await;
+    let rx = response_registry.register(run_id.clone(), agent_id).await;
     if let Err(e) = state
         .session_registry
         .send_server_task(&agent_id, task)

@@ -233,7 +233,7 @@ pub async fn dispatch_task_to_agents_with_source(
             continue;
         }
 
-        let rx = response_registry.register(run_id.clone()).await;
+        let rx = response_registry.register(run_id.clone(), agent_id).await;
         if let Err(e) = session_registry
             .send_task(&agent_id, &run_id, &shell_command, 30)
             .await

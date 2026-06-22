@@ -150,7 +150,7 @@ impl AgentService for AgentServiceImpl {
                         // run_task handler (best-effort). The handler
                         // also persists the row to `task_runs`.
                         crate::current_task_response_registry()
-                            .deliver(&result.task_id, result.clone())
+                            .deliver(&agent_id, &result.task_id, result.clone())
                             .await;
                     }
                     Some(agent_message::Payload::HostInfoUpdate(info_msg)) => {
@@ -245,7 +245,7 @@ impl AgentService for AgentServiceImpl {
                     frame.stream_id,
                     frame.sequence
                 );
-                let _ = io_registry.deliver_from_agent(frame).await;
+                let _ = io_registry.deliver_from_agent(&agent_id, frame).await;
             }
             io_registry.unregister_agent(&agent_id).await;
         });

@@ -212,7 +212,9 @@ async fn handle_terminal_socket(
     session: TerminalSession,
 ) -> Result<(), ()> {
     let (mut sender, mut receiver) = socket.split();
-    let mut inbound = io_registry.subscribe_stream(session.id.clone()).await;
+    let mut inbound = io_registry
+        .subscribe_stream(session.id.clone(), session.agent_id)
+        .await;
     let mut next_sequence = 1_u64;
 
     if io_registry

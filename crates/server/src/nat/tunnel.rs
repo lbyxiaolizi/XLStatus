@@ -313,7 +313,10 @@ impl NatTunnelManager {
             .await
             .insert(tunnel_id.clone(), tunnel);
 
-        let mut inbound = self.io_registry.subscribe_stream(tunnel_id.clone()).await;
+        let mut inbound = self
+            .io_registry
+            .subscribe_stream(tunnel_id.clone(), agent_id)
+            .await;
         self.io_registry
             .send_to_agent(
                 &agent_id,

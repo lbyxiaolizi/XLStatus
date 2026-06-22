@@ -179,7 +179,7 @@ impl McpExecutor {
         }
         let response_registry = crate::current_task_response_registry();
         let run_id = uuid::Uuid::now_v7().to_string();
-        let rx = response_registry.register(run_id.clone()).await;
+        let rx = response_registry.register(run_id.clone(), agent_id).await;
         if let Err(e) = self
             .session_registry
             .send_task(&agent_id, &run_id, command, timeout)
@@ -433,7 +433,7 @@ impl McpExecutor {
         }
         let response_registry = crate::current_task_response_registry();
         let run_id = uuid::Uuid::now_v7().to_string();
-        let rx = response_registry.register(run_id.clone()).await;
+        let rx = response_registry.register(run_id.clone(), agent_id).await;
         if let Err(e) = self
             .session_registry
             .send_task(&agent_id, &run_id, command, timeout_seconds)
@@ -490,7 +490,7 @@ impl McpExecutor {
         let response_registry = crate::current_task_response_registry();
         let run_id = uuid::Uuid::now_v7().to_string();
         task.task_id = run_id.clone();
-        let rx = response_registry.register(run_id.clone()).await;
+        let rx = response_registry.register(run_id.clone(), agent_id).await;
         if let Err(e) = self
             .session_registry
             .send_server_task(&agent_id, task)

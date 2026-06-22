@@ -222,6 +222,47 @@ mod registry_tests {
             .contains("revoked"));
         assert!(rx.try_recv().is_err());
     }
+
+    #[tokio::test]
+    async fn io_delivery_requires_matching_agent() {
+        let registry = IoRegistry::new();
+        let expected_agent = AgentId(uuid::Uuid::now_v7());
+        let other_agent = AgentId(uuid::Uuid::now_v7());
+        let mut rx = registry
+            .subscribe_stream("stream-1".to_string(), expected_agent)
+            .await;
+
+        assert!(
+            !registry
+                .deliver_from_agent(
+                    &other_agent,
+                    IoFrame {
+                        stream_id: "stream-1".into(),
+                        sequence: 1,
+                        agent_id: other_agent.0.to_string(),
+                        payload: None,
+                    },
+                )
+                .await
+        );
+        assert!(rx.try_recv().is_err());
+
+        assert!(
+            registry
+                .deliver_from_agent(
+                    &expected_agent,
+                    IoFrame {
+                        stream_id: "stream-1".into(),
+                        sequence: 2,
+                        agent_id: expected_agent.0.to_string(),
+                        payload: None,
+                    },
+                )
+                .await
+        );
+        let delivered = rx.try_recv().unwrap();
+        assert_eq!(delivered.sequence, 2);
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -299,8 +340,14 @@ pub fn truncate_utf8_to_bytes(value: &str, max_bytes: usize) -> (String, bool) {
 #[derive(Clone, Default)]
 pub struct IoRegistry {
     agent_streams: Arc<RwLock<HashMap<AgentId, IoSender>>>,
-    stream_subscribers: Arc<RwLock<HashMap<String, mpsc::Sender<IoFrame>>>>,
+    stream_subscribers: Arc<RwLock<HashMap<String, IoSubscriber>>>,
     revoked_agents: Arc<RwLock<HashSet<AgentId>>>,
+}
+
+#[derive(Clone)]
+struct IoSubscriber {
+    agent_id: AgentId,
+    sender: mpsc::Sender<IoFrame>,
 }
 
 impl IoRegistry {
@@ -329,10 +376,20 @@ impl IoRegistry {
         self.unregister_agent(agent_id).await;
     }
 
-    pub async fn subscribe_stream(&self, stream_id: String) -> mpsc::Receiver<IoFrame> {
+    pub async fn subscribe_stream(
+        &self,
+        stream_id: String,
+        agent_id: AgentId,
+    ) -> mpsc::Receiver<IoFrame> {
         let (tx, rx) = mpsc::channel(128);
         let mut subscribers = self.stream_subscribers.write().await;
-        subscribers.insert(stream_id, tx);
+        subscribers.insert(
+            stream_id,
+            IoSubscriber {
+                agent_id,
+                sender: tx,
+            },
+        );
         rx
     }
 
@@ -356,10 +413,13 @@ impl IoRegistry {
         }
     }
 
-    pub async fn deliver_from_agent(&self, frame: IoFrame) -> bool {
+    pub async fn deliver_from_agent(&self, agent_id: &AgentId, frame: IoFrame) -> bool {
         let sender = {
             let subscribers = self.stream_subscribers.read().await;
-            subscribers.get(&frame.stream_id).cloned()
+            subscribers
+                .get(&frame.stream_id)
+                .filter(|subscriber| subscriber.agent_id == *agent_id)
+                .map(|subscriber| subscriber.sender.clone())
         };
         if let Some(sender) = sender {
             sender.send(frame).await.is_ok()
@@ -383,14 +443,12 @@ impl IoRegistry {
 /// an `AgentMessage::TaskResult` arrives and forwards the result.
 #[derive(Clone, Default)]
 pub struct TaskResponseRegistry {
-    pending: Arc<
-        RwLock<
-            HashMap<
-                String,
-                tokio::sync::oneshot::Sender<xlstatus_proto_gen::xlstatus::v1::TaskResult>,
-            >,
-        >,
-    >,
+    pending: Arc<RwLock<HashMap<String, PendingTaskResponse>>>,
+}
+
+struct PendingTaskResponse {
+    agent_id: AgentId,
+    sender: tokio::sync::oneshot::Sender<xlstatus_proto_gen::xlstatus::v1::TaskResult>,
 }
 
 impl TaskResponseRegistry {
@@ -403,10 +461,17 @@ impl TaskResponseRegistry {
     pub async fn register(
         &self,
         task_id: String,
+        agent_id: AgentId,
     ) -> tokio::sync::oneshot::Receiver<xlstatus_proto_gen::xlstatus::v1::TaskResult> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let mut pending = self.pending.write().await;
-        pending.insert(task_id, tx);
+        pending.insert(
+            task_id,
+            PendingTaskResponse {
+                agent_id,
+                sender: tx,
+            },
+        );
         rx
     }
 
@@ -414,16 +479,22 @@ impl TaskResponseRegistry {
     /// Returns true if a waiter consumed the value.
     pub async fn deliver(
         &self,
+        agent_id: &AgentId,
         task_id: &str,
         result: xlstatus_proto_gen::xlstatus::v1::TaskResult,
     ) -> bool {
         let mut pending = self.pending.write().await;
-        if let Some(tx) = pending.remove(task_id) {
-            let _ = tx.send(result);
-            true
-        } else {
-            false
+        let Some(waiter) = pending.get(task_id) else {
+            return false;
+        };
+        if waiter.agent_id != *agent_id {
+            return false;
         }
+        let waiter = pending
+            .remove(task_id)
+            .expect("pending task waiter existed before removal");
+        let _ = waiter.sender.send(result);
+        true
     }
 
     /// Cancel a waiter (e.g. when the agent session is offline).
@@ -477,5 +548,32 @@ mod tests {
         assert_eq!(base64_encoded_len(2), 4);
         assert_eq!(base64_encoded_len(3), 4);
         assert_eq!(base64_encoded_len(4), 8);
+    }
+
+    #[tokio::test]
+    async fn task_result_delivery_requires_matching_agent() {
+        let registry = TaskResponseRegistry::new();
+        let expected_agent = AgentId(uuid::Uuid::now_v7());
+        let other_agent = AgentId(uuid::Uuid::now_v7());
+        let mut rx = registry
+            .register("task-1".to_string(), expected_agent)
+            .await;
+
+        let spoofed = TaskResult {
+            task_id: "task-1".into(),
+            stdout: "spoofed".into(),
+            ..TaskResult::default()
+        };
+        assert!(!registry.deliver(&other_agent, "task-1", spoofed).await);
+        assert!(rx.try_recv().is_err());
+
+        let expected = TaskResult {
+            task_id: "task-1".into(),
+            stdout: "expected".into(),
+            ..TaskResult::default()
+        };
+        assert!(registry.deliver(&expected_agent, "task-1", expected).await);
+        let delivered = rx.await.unwrap();
+        assert_eq!(delivered.stdout, "expected");
     }
 }
