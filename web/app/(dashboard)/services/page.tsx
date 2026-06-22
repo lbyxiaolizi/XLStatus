@@ -41,6 +41,7 @@ interface Service {
   exclude_server_ids?: string[];
   failure_task_ids?: string[];
   recovery_task_ids?: string[];
+  config_warnings?: string[];
   last_status?: string;
   last_check_at?: string;
   cert_fingerprint?: string;
@@ -131,6 +132,7 @@ export default function ServicesPage() {
         service.target,
         serviceKind(service),
         service.last_status,
+        ...serviceConfigWarnings(service),
         ...serviceServerIds(service),
         serviceServerLabel(servers, service),
       ]
@@ -283,7 +285,16 @@ export default function ServicesPage() {
               <tbody>
                 {filtered.map((service) => (
                   <tr key={service.id}>
-                    <td className={tdClass}>{service.name}</td>
+                    <td className={tdClass}>
+                      <div className="space-y-2">
+                        <div>{service.name}</div>
+                        {serviceConfigWarnings(service).length ? (
+                          <div className="text-xs font-bold text-[var(--text-muted)]">
+                            {serviceWarningText(service)}
+                          </div>
+                        ) : null}
+                      </div>
+                    </td>
                     <td className={tdClass}>{service.target}</td>
                     <td className={tdClass}>{serviceServerLabel(servers, service)}</td>
                     <td className={tdClass}>{serviceKind(service)}</td>
@@ -303,6 +314,9 @@ export default function ServicesPage() {
         {modal ? (
           <Modal title={modal === "edit" ? "编辑服务" : "新增服务"} onClose={() => setModal(null)}>
             <form onSubmit={submitForm} className="space-y-4">
+              {editing && serviceConfigWarnings(editing).length ? (
+                <InlineNotice tone="yellow">{serviceWarningText(editing)}</InlineNotice>
+              ) : null}
               <div className="grid gap-4 sm:grid-cols-2">
                 <Field label="名称">
                   <input className={inputClass} value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} required />
@@ -493,6 +507,18 @@ function serviceServerIds(service: Service): string[] {
   const ids = Array.isArray(service.server_ids) ? service.server_ids : [];
   const all = [...ids, ...(service.server_id ? [service.server_id] : [])];
   return all.filter((id, index) => id && all.indexOf(id) === index);
+}
+
+function serviceConfigWarnings(service: Service): string[] {
+  return Array.isArray(service.config_warnings)
+    ? service.config_warnings.filter((warning) => typeof warning === "string" && warning.trim())
+    : [];
+}
+
+function serviceWarningText(service: Service): string {
+  const warnings = serviceConfigWarnings(service);
+  if (!warnings.length) return "";
+  return `历史配置异常：${warnings.join("；")}`;
 }
 
 function serviceServerLabel(servers: ServerOption[], service: Service): string {

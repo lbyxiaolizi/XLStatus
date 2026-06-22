@@ -81,6 +81,8 @@ pub struct ServiceResponse {
     pub notification_group_id: Option<String>,
     pub failure_task_ids: Vec<String>,
     pub recovery_task_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub config_warnings: Vec<String>,
     pub last_status: Option<String>,
     pub last_check_at: Option<String>,
     pub cert_fingerprint: Option<String>,
@@ -154,6 +156,8 @@ pub(crate) const SERVICE_MAX_SERVER_IDS: usize = 64;
 pub(crate) const SERVICE_MAX_TASK_IDS: usize = 32;
 pub(crate) const SERVICE_MAX_TARGETS_PER_PROBE: usize = 64;
 const SERVICE_UUID_TEXT_LEN: usize = 36;
+const SERVICE_SERVER_IDS_JSON_MAX_BYTES: usize = 8 * 1024;
+const SERVICE_TASK_IDS_JSON_MAX_BYTES: usize = 4 * 1024;
 
 const VISIBLE_SERVICE_FILTER_SQL: &str = r#"
                 (
@@ -888,8 +892,33 @@ async fn load_service_for_auth(
 
 fn service_from_sqlite_row(row: sqlx::sqlite::SqliteRow) -> ServiceResponse {
     let kind: String = row.try_get("type").unwrap_or_else(|_| "http".into());
+    let id: String = row.try_get("id").unwrap_or_default();
+    let mut config_warnings = Vec::new();
+    let exclude_server_ids = parse_server_ids_json(
+        row.try_get::<Option<String>, _>("exclude_server_ids_json")
+            .ok()
+            .flatten(),
+        &id,
+        &mut config_warnings,
+    );
+    let failure_task_ids = parse_task_ids_json(
+        row.try_get::<Option<String>, _>("failure_task_ids_json")
+            .ok()
+            .flatten(),
+        "failure_task_ids_json",
+        &id,
+        &mut config_warnings,
+    );
+    let recovery_task_ids = parse_task_ids_json(
+        row.try_get::<Option<String>, _>("recovery_task_ids_json")
+            .ok()
+            .flatten(),
+        "recovery_task_ids_json",
+        &id,
+        &mut config_warnings,
+    );
     ServiceResponse {
-        id: row.try_get("id").unwrap_or_default(),
+        id,
         name: row.try_get("name").unwrap_or_default(),
         service_type: kind.clone(),
         kind: kind.clone(),
@@ -908,22 +937,11 @@ fn service_from_sqlite_row(row: sqlx::sqlite::SqliteRow) -> ServiceResponse {
         cover_mode: row
             .try_get::<String, _>("cover_mode")
             .unwrap_or_else(|_| "local".into()),
-        exclude_server_ids: parse_server_ids_json(
-            row.try_get::<Option<String>, _>("exclude_server_ids_json")
-                .ok()
-                .flatten(),
-        ),
+        exclude_server_ids,
         notification_group_id: row.try_get("notification_group_id").ok(),
-        failure_task_ids: parse_task_ids_json(
-            row.try_get::<Option<String>, _>("failure_task_ids_json")
-                .ok()
-                .flatten(),
-        ),
-        recovery_task_ids: parse_task_ids_json(
-            row.try_get::<Option<String>, _>("recovery_task_ids_json")
-                .ok()
-                .flatten(),
-        ),
+        failure_task_ids,
+        recovery_task_ids,
+        config_warnings,
         last_status: row.try_get("last_status").ok(),
         last_check_at: row.try_get("last_check_at").ok(),
         cert_fingerprint: row.try_get("cert_fingerprint").ok(),
@@ -935,8 +953,33 @@ fn service_from_sqlite_row(row: sqlx::sqlite::SqliteRow) -> ServiceResponse {
 
 fn service_from_postgres_row(row: sqlx::postgres::PgRow) -> ServiceResponse {
     let kind: String = row.try_get("type").unwrap_or_else(|_| "http".into());
+    let id: String = row.try_get("id").unwrap_or_default();
+    let mut config_warnings = Vec::new();
+    let exclude_server_ids = parse_server_ids_json(
+        row.try_get::<Option<String>, _>("exclude_server_ids_json")
+            .ok()
+            .flatten(),
+        &id,
+        &mut config_warnings,
+    );
+    let failure_task_ids = parse_task_ids_json(
+        row.try_get::<Option<String>, _>("failure_task_ids_json")
+            .ok()
+            .flatten(),
+        "failure_task_ids_json",
+        &id,
+        &mut config_warnings,
+    );
+    let recovery_task_ids = parse_task_ids_json(
+        row.try_get::<Option<String>, _>("recovery_task_ids_json")
+            .ok()
+            .flatten(),
+        "recovery_task_ids_json",
+        &id,
+        &mut config_warnings,
+    );
     ServiceResponse {
-        id: row.try_get("id").unwrap_or_default(),
+        id,
         name: row.try_get("name").unwrap_or_default(),
         service_type: kind.clone(),
         kind: kind.clone(),
@@ -955,22 +998,11 @@ fn service_from_postgres_row(row: sqlx::postgres::PgRow) -> ServiceResponse {
         cover_mode: row
             .try_get::<String, _>("cover_mode")
             .unwrap_or_else(|_| "local".into()),
-        exclude_server_ids: parse_server_ids_json(
-            row.try_get::<Option<String>, _>("exclude_server_ids_json")
-                .ok()
-                .flatten(),
-        ),
+        exclude_server_ids,
         notification_group_id: row.try_get("notification_group_id").ok(),
-        failure_task_ids: parse_task_ids_json(
-            row.try_get::<Option<String>, _>("failure_task_ids_json")
-                .ok()
-                .flatten(),
-        ),
-        recovery_task_ids: parse_task_ids_json(
-            row.try_get::<Option<String>, _>("recovery_task_ids_json")
-                .ok()
-                .flatten(),
-        ),
+        failure_task_ids,
+        recovery_task_ids,
+        config_warnings,
         last_status: row.try_get("last_status").ok(),
         last_check_at: row.try_get("last_check_at").ok(),
         cert_fingerprint: row.try_get("cert_fingerprint").ok(),
@@ -1556,18 +1588,108 @@ async fn update_service_cover(
     Ok(())
 }
 
-fn parse_server_ids_json(value: Option<String>) -> Vec<String> {
-    value
-        .as_deref()
-        .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
-        .unwrap_or_default()
+fn parse_server_ids_json(
+    value: Option<String>,
+    service_id: &str,
+    warnings: &mut Vec<String>,
+) -> Vec<String> {
+    parse_bounded_uuid_json_list(
+        value,
+        SERVICE_MAX_SERVER_IDS,
+        SERVICE_SERVER_IDS_JSON_MAX_BYTES,
+        "exclude_server_ids_json",
+        false,
+        service_id,
+        warnings,
+    )
 }
 
-fn parse_task_ids_json(value: Option<String>) -> Vec<String> {
-    value
-        .as_deref()
-        .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
-        .unwrap_or_default()
+fn parse_task_ids_json(
+    value: Option<String>,
+    field: &str,
+    service_id: &str,
+    warnings: &mut Vec<String>,
+) -> Vec<String> {
+    parse_bounded_uuid_json_list(
+        value,
+        SERVICE_MAX_TASK_IDS,
+        SERVICE_TASK_IDS_JSON_MAX_BYTES,
+        field,
+        true,
+        service_id,
+        warnings,
+    )
+}
+
+fn parse_bounded_uuid_json_list(
+    value: Option<String>,
+    max_len: usize,
+    max_bytes: usize,
+    field: &str,
+    canonical_only: bool,
+    service_id: &str,
+    warnings: &mut Vec<String>,
+) -> Vec<String> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    if value.trim().is_empty() {
+        return Vec::new();
+    }
+    let parsed = (|| -> Result<Vec<String>, String> {
+        if value.len() > max_bytes {
+            return Err(format!("{field} must be at most {max_bytes} bytes"));
+        }
+        let values = serde_json::from_str::<Vec<String>>(&value)
+            .map_err(|_| format!("{field} must be a JSON string array"))?;
+        if values.len() > max_len {
+            return Err(format!("{field} must contain at most {max_len} entries"));
+        }
+        let mut out = Vec::new();
+        for raw in values {
+            let id = if canonical_only {
+                require_canonical_uuid_text(&raw, field)?
+            } else {
+                canonical_uuid_text(&raw, field)?
+            };
+            if !out.iter().any(|existing| existing == &id) {
+                out.push(id);
+            }
+        }
+        Ok(out)
+    })();
+
+    match parsed {
+        Ok(values) => values,
+        Err(message) => {
+            let warning = format!("{field} is invalid: {message}");
+            tracing::warn!("historical service API view row {service_id} degraded: {warning}");
+            warnings.push(warning);
+            Vec::new()
+        }
+    }
+}
+
+fn require_canonical_uuid_text(value: &str, field: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.len() != SERVICE_UUID_TEXT_LEN {
+        return Err(format!("{field} must be a canonical UUID"));
+    }
+    let parsed = Uuid::parse_str(trimmed).map_err(|_| format!("{field} must be a UUID"))?;
+    if parsed.to_string() != trimmed {
+        return Err(format!("{field} must be a canonical UUID"));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn canonical_uuid_text(value: &str, field: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{field} contains an empty UUID"));
+    }
+    Uuid::parse_str(trimmed)
+        .map(|parsed| parsed.to_string())
+        .map_err(|_| format!("{field} must be a UUID"))
 }
 
 fn normalize_id_list(values: Vec<String>) -> Vec<String> {
@@ -2190,6 +2312,104 @@ mod tests {
         assert!(app_error_message(&err).contains("canonical UUID"));
     }
 
+    #[tokio::test]
+    async fn service_api_view_bounds_historical_relation_json() {
+        let db = test_db().await;
+        let owner = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let server = Uuid::parse_str("00000000-0000-0000-0000-000000000101").unwrap();
+        let service_bad_exclude = "00000000-0000-0000-0000-000000000301";
+        let service_bad_tasks = "00000000-0000-0000-0000-000000000302";
+        let service_oversized_tasks = "00000000-0000-0000-0000-000000000303";
+
+        seed_user(&db, owner, "owner", "admin").await;
+        seed_agent(&db, server, owner, "server").await;
+        seed_service(
+            &db,
+            service_bad_exclude,
+            "bad-exclude",
+            server,
+            "2026-01-02T00:00:00Z",
+        )
+        .await;
+        seed_service(
+            &db,
+            service_bad_tasks,
+            "bad-tasks",
+            server,
+            "2026-01-03T00:00:00Z",
+        )
+        .await;
+        seed_service(
+            &db,
+            service_oversized_tasks,
+            "oversized-tasks",
+            server,
+            "2026-01-04T00:00:00Z",
+        )
+        .await;
+
+        update_service_json_fields(&db, service_bad_exclude, Some("not json"), None, None).await;
+        update_service_json_fields(
+            &db,
+            service_bad_tasks,
+            Some(r#"["00000000000000000000000000000101"]"#),
+            Some(r#"["00000000000000000000000000000401"]"#),
+            Some(r#"["00000000-0000-0000-0000-000000000402"]"#),
+        )
+        .await;
+        update_service_json_fields(
+            &db,
+            service_oversized_tasks,
+            None,
+            Some(&format!(
+                "[{}]",
+                (0..=SERVICE_MAX_TASK_IDS)
+                    .map(|idx| format!(r#""00000000-0000-0000-0000-{idx:012}""#))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )),
+            None,
+        )
+        .await;
+
+        let bad_exclude = load_service(&db, service_bad_exclude).await.unwrap();
+        assert!(bad_exclude.exclude_server_ids.is_empty());
+        assert_eq!(bad_exclude.config_warnings.len(), 1);
+        assert!(bad_exclude.config_warnings[0].contains("exclude_server_ids_json"));
+
+        let bad_tasks = load_service(&db, service_bad_tasks).await.unwrap();
+        assert_eq!(
+            bad_tasks.exclude_server_ids,
+            vec!["00000000-0000-0000-0000-000000000101".to_string()]
+        );
+        assert!(bad_tasks.failure_task_ids.is_empty());
+        assert_eq!(
+            bad_tasks.recovery_task_ids,
+            vec!["00000000-0000-0000-0000-000000000402".to_string()]
+        );
+        assert_eq!(bad_tasks.config_warnings.len(), 1);
+        assert!(bad_tasks.config_warnings[0].contains("failure_task_ids_json"));
+
+        let oversized_tasks = load_service(&db, service_oversized_tasks).await.unwrap();
+        assert!(oversized_tasks.failure_task_ids.is_empty());
+        assert_eq!(oversized_tasks.config_warnings.len(), 1);
+        assert!(oversized_tasks.config_warnings[0].contains("at most 32 entries"));
+
+        let response = list_services_for_auth(&db, &member_session(owner), 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(response.total, 3);
+        assert_eq!(response.services.len(), 3);
+        assert!(response
+            .services
+            .iter()
+            .any(|service| service.id == service_bad_exclude
+                && service
+                    .config_warnings
+                    .iter()
+                    .any(|warning| warning.contains("exclude_server_ids_json"))));
+    }
+
     async fn test_db() -> DatabaseBackend {
         let db = DatabaseBackend::connect("sqlite::memory:", true)
             .await
@@ -2393,6 +2613,28 @@ mod tests {
         .bind(cert_fingerprint)
         .bind(cert_not_after)
         .bind(created_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn update_service_json_fields(
+        db: &DatabaseBackend,
+        service_id: &str,
+        exclude_server_ids_json: Option<&str>,
+        failure_task_ids_json: Option<&str>,
+        recovery_task_ids_json: Option<&str>,
+    ) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "UPDATE services SET exclude_server_ids_json = ?, failure_task_ids_json = ?, recovery_task_ids_json = ? WHERE id = ?",
+        )
+        .bind(exclude_server_ids_json)
+        .bind(failure_task_ids_json)
+        .bind(recovery_task_ids_json)
+        .bind(service_id)
         .execute(pool)
         .await
         .unwrap();
