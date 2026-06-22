@@ -18,8 +18,11 @@ use sqlx::{
     Pool, Row, Sqlite,
 };
 use std::io::{Cursor, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use zip::write::SimpleFileOptions;
+
+#[cfg(unix)]
+use std::os::unix::fs::DirBuilderExt;
 
 const RESTORE_MAX_BYTES: usize = 512 * 1024 * 1024;
 const RESTORE_SCHEMA_ALIAS: &str = "restore_src";
@@ -151,14 +154,13 @@ pub async fn download_backup(
         ));
     };
 
-    let tmp_path =
-        std::env::temp_dir().join(format!("xlstatus-backup-{}.sqlite3", uuid::Uuid::now_v7()));
+    let tmp_dir = PrivateTempDir::new("xlstatus-backup")?;
+    let tmp_path = tmp_dir.path().join("database.sqlite3");
     let sql = format!("VACUUM INTO '{}'", sql_quote_path(&tmp_path));
     sqlx::query(&sql).execute(pool).await.map_err(db_err)?;
     let bytes = tokio::fs::read(&tmp_path)
         .await
         .map_err(|e| AppError::Database(anyhow::anyhow!(e)))?;
-    let _ = tokio::fs::remove_file(&tmp_path).await;
 
     let filename = format!(
         "xlstatus-backup-{}.sqlite3",
@@ -291,8 +293,8 @@ pub async fn restore_backup(
         return Err(AppError::BadRequest("backup file is empty".into()));
     }
 
-    let tmp_path =
-        std::env::temp_dir().join(format!("xlstatus-restore-{}.sqlite3", uuid::Uuid::now_v7()));
+    let tmp_dir = PrivateTempDir::new("xlstatus-restore")?;
+    let tmp_path = tmp_dir.path().join("restore.sqlite3");
     tokio::fs::write(&tmp_path, &body)
         .await
         .map_err(|e| AppError::Database(anyhow::anyhow!(e)))?;
@@ -319,7 +321,6 @@ pub async fn restore_backup(
     }
     .await;
 
-    let _ = tokio::fs::remove_file(&tmp_path).await;
     result
 }
 
@@ -332,14 +333,13 @@ pub fn maintenance_action_body_limit() -> DefaultBodyLimit {
 }
 
 async fn sqlite_backup_bytes(pool: &Pool<Sqlite>) -> Result<Vec<u8>, AppError> {
-    let tmp_path =
-        std::env::temp_dir().join(format!("xlstatus-backup-{}.sqlite3", uuid::Uuid::now_v7()));
+    let tmp_dir = PrivateTempDir::new("xlstatus-backup")?;
+    let tmp_path = tmp_dir.path().join("database.sqlite3");
     let sql = format!("VACUUM INTO '{}'", sql_quote_path(&tmp_path));
     sqlx::query(&sql).execute(pool).await.map_err(db_err)?;
     let bytes = tokio::fs::read(&tmp_path)
         .await
         .map_err(|e| AppError::Database(anyhow::anyhow!(e)))?;
-    let _ = tokio::fs::remove_file(&tmp_path).await;
     Ok(bytes)
 }
 
@@ -651,6 +651,43 @@ fn require_admin_cookie_session(auth: &AuthSession) -> Result<(), AppError> {
     Ok(())
 }
 
+struct PrivateTempDir {
+    path: PathBuf,
+}
+
+impl PrivateTempDir {
+    fn new(prefix: &str) -> Result<Self, AppError> {
+        for _ in 0..16 {
+            let path = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::now_v7()));
+            match create_private_temp_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(AppError::Database(anyhow::anyhow!(err))),
+            }
+        }
+        Err(AppError::Database(anyhow::anyhow!(
+            "failed to allocate private temporary directory"
+        )))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for PrivateTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+fn create_private_temp_dir(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(path)
+}
+
 fn sql_quote_path(path: &Path) -> String {
     path.to_string_lossy().replace('\'', "''")
 }
@@ -679,6 +716,24 @@ mod tests {
     fn quotes_sqlite_identifier() {
         assert_eq!(sqlite_quote_identifier("users"), "\"users\"");
         assert_eq!(sqlite_quote_identifier("a\"b"), "\"a\"\"b\"");
+    }
+
+    #[test]
+    fn maintenance_temp_dirs_are_private_and_removed() {
+        let path;
+        {
+            let dir = PrivateTempDir::new("xlstatus-maintenance-test").unwrap();
+            path = dir.path().to_path_buf();
+            assert!(path.is_dir());
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o700);
+            }
+        }
+        assert!(!path.exists());
     }
 
     #[test]
