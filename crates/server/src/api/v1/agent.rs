@@ -21,6 +21,11 @@ const DEFAULT_ENROLLMENT_TOKEN_TTL_HOURS: i64 = 1;
 const MAX_ENROLLMENT_TOKEN_TTL_HOURS: i64 = 24;
 pub(crate) const AGENT_AUTH_API_MAX_BODY_BYTES: usize = 4 * 1024;
 const AGENT_RESOURCE_UUID_TEXT_LEN: usize = 36;
+const AGENT_ENROLL_NAME_MAX_BYTES: usize = 255;
+const ENROLLMENT_TOKEN_PREFIX: &str = "xle_";
+const ENROLLMENT_TOKEN_SECRET_HEX_BYTES: usize = 64;
+const ENROLLMENT_TOKEN_BYTES: usize =
+    ENROLLMENT_TOKEN_PREFIX.len() + ENROLLMENT_TOKEN_SECRET_HEX_BYTES;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateEnrollmentTokenRequest {
@@ -89,8 +94,8 @@ pub async fn enroll(
     State(state): State<AppState>,
     Json(req): Json<EnrollRequest>,
 ) -> Result<Json<ApiResponse<EnrollResponse>>, AppError> {
-    validate_enroll_request(&req)?;
-    let token_hash = hash_token(&req.enrollment_token);
+    let normalized = normalize_enroll_request(req)?;
+    let token_hash = hash_token(&normalized.enrollment_token);
 
     let enrollment_repo = EnrollmentTokenRepository::new(state.db.clone());
     let agent_id = AgentId::new();
@@ -109,8 +114,8 @@ pub async fn enroll(
         .create_with_id(
             agent_id,
             CreateAgentInput {
-                name: req.name.clone(),
-                public_key: req.public_key,
+                name: normalized.name.clone(),
+                public_key: normalized.public_key,
                 owner_user_id: token.created_by_user_id.clone(),
             },
         )
@@ -129,7 +134,7 @@ pub async fn enroll(
             )
             .bind(&server_id)
             .bind(&user_id_str)
-            .bind(&req.name)
+            .bind(&normalized.name)
             .bind(&now)
             .bind(&now)
             .bind(&server_id)
@@ -142,7 +147,7 @@ pub async fn enroll(
             )
             .bind(agent.id.0)
             .bind(token.created_by_user_id.0)
-            .bind(&req.name)
+            .bind(&normalized.name)
             .bind(agent.created_at)
             .bind(agent.updated_at)
             .bind(agent.id.0)
@@ -253,26 +258,56 @@ fn normalize_enrollment_token_ttl(expires_in_hours: Option<i64>) -> Result<i64, 
     Ok(ttl)
 }
 
-fn validate_enroll_request(req: &EnrollRequest) -> Result<(), AppError> {
-    let name = req.name.trim();
-    if name.is_empty() || name.len() > 255 {
-        return Err(AppError::BadRequest(
-            "agent name must be between 1 and 255 characters".into(),
-        ));
-    }
+struct NormalizedEnrollRequest {
+    name: String,
+    enrollment_token: String,
+    public_key: String,
+}
+
+fn normalize_enroll_request(req: EnrollRequest) -> Result<NormalizedEnrollRequest, AppError> {
+    let name = normalize_enroll_name(&req.name)?;
     if !valid_agent_public_key(&req.public_key) {
         return Err(AppError::BadRequest(
             "agent public_key must be a 32-byte Ed25519 hex public key".into(),
         ));
     }
-    if !req.enrollment_token.starts_with("xle_") || req.enrollment_token.len() != 68 {
+    if !valid_enrollment_token(&req.enrollment_token) {
         return Err(AppError::BadRequest("invalid enrollment token".to_string()));
     }
-    Ok(())
+    Ok(NormalizedEnrollRequest {
+        name,
+        enrollment_token: req.enrollment_token,
+        public_key: req.public_key,
+    })
+}
+
+fn normalize_enroll_name(value: &str) -> Result<String, AppError> {
+    let name = value.trim();
+    if name.is_empty() || name.len() > AGENT_ENROLL_NAME_MAX_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "agent name must be between 1 and {AGENT_ENROLL_NAME_MAX_BYTES} bytes"
+        )));
+    }
+    if name.chars().any(char::is_control) {
+        return Err(AppError::BadRequest(
+            "agent name must not contain control characters".into(),
+        ));
+    }
+    Ok(name.to_string())
 }
 
 fn valid_agent_public_key(public_key: &str) -> bool {
     public_key.len() == 64 && public_key.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_enrollment_token(token: &str) -> bool {
+    token.len() == ENROLLMENT_TOKEN_BYTES
+        && token
+            .strip_prefix(ENROLLMENT_TOKEN_PREFIX)
+            .is_some_and(|secret| {
+                secret.len() == ENROLLMENT_TOKEN_SECRET_HEX_BYTES
+                    && secret.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
 }
 
 fn require_admin_cookie_session(auth_user: &AuthUser) -> Result<(), AppError> {
@@ -330,6 +365,8 @@ mod tests {
         let _ = agent_auth_body_limit();
         assert_eq!(AGENT_AUTH_API_MAX_BODY_BYTES, 4 * 1024);
         assert_eq!(AGENT_RESOURCE_UUID_TEXT_LEN, 36);
+        assert_eq!(AGENT_ENROLL_NAME_MAX_BYTES, 255);
+        assert_eq!(ENROLLMENT_TOKEN_BYTES, 68);
         assert_eq!(normalize_enrollment_token_ttl(None).unwrap(), 1);
         assert_eq!(normalize_enrollment_token_ttl(Some(24)).unwrap(), 24);
         assert!(matches!(
@@ -358,30 +395,149 @@ mod tests {
     }
 
     #[test]
-    fn enroll_request_validates_before_token_consumption() {
+    fn enroll_request_is_normalized_before_token_consumption() {
         let valid = EnrollRequest {
-            name: "agent".into(),
+            name: "  agent  ".into(),
             enrollment_token: format!("xle_{}", "a".repeat(64)),
             public_key: "b".repeat(64),
         };
-        assert!(validate_enroll_request(&valid).is_ok());
+        let normalized = normalize_enroll_request(valid).unwrap();
+        assert_eq!(normalized.name, "agent");
+        assert_eq!(
+            normalized.enrollment_token,
+            format!("xle_{}", "a".repeat(64))
+        );
+        assert_eq!(normalized.public_key, "b".repeat(64));
 
-        let mut bad_key = valid;
-        bad_key.public_key = "not-hex".into();
         assert!(matches!(
-            validate_enroll_request(&bad_key),
+            normalize_enroll_request(EnrollRequest {
+                name: "agent".into(),
+                enrollment_token: format!("xle_{}", "a".repeat(64)),
+                public_key: "not-hex".into(),
+            }),
             Err(AppError::BadRequest(_))
         ));
 
-        let bad_token = EnrollRequest {
-            name: "agent".into(),
-            enrollment_token: "xle_short".into(),
+        assert!(matches!(
+            normalize_enroll_request(EnrollRequest {
+                name: "agent".into(),
+                enrollment_token: "xle_short".into(),
+                public_key: "b".repeat(64),
+            }),
+            Err(AppError::BadRequest(_))
+        ));
+
+        assert!(matches!(
+            normalize_enroll_request(EnrollRequest {
+                name: "agent".into(),
+                enrollment_token: format!("xle_{}", "z".repeat(64)),
+                public_key: "b".repeat(64),
+            }),
+            Err(AppError::BadRequest(_))
+        ));
+
+        let padded = normalize_enroll_request(EnrollRequest {
+            name: format!("{}agent{}", " ".repeat(300), " ".repeat(300)),
+            enrollment_token: format!("xle_{}", "a".repeat(64)),
             public_key: "b".repeat(64),
-        };
+        })
+        .unwrap();
+        assert_eq!(padded.name, "agent");
+
         assert!(matches!(
-            validate_enroll_request(&bad_token),
+            normalize_enroll_request(EnrollRequest {
+                name: "a".repeat(AGENT_ENROLL_NAME_MAX_BYTES + 1),
+                enrollment_token: format!("xle_{}", "a".repeat(64)),
+                public_key: "b".repeat(64),
+            }),
             Err(AppError::BadRequest(_))
         ));
+
+        assert!(matches!(
+            normalize_enroll_request(EnrollRequest {
+                name: "agent\nname".into(),
+                enrollment_token: format!("xle_{}", "a".repeat(64)),
+                public_key: "b".repeat(64),
+            }),
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn enroll_persists_normalized_agent_name() {
+        let db = test_db().await;
+        let user_id = uuid::Uuid::from_bytes([2; 16]);
+        seed_user(&db, user_id).await;
+        let token = seed_enrollment_token(&db, user_id, "xle_", "a").await;
+
+        let response = enroll(
+            State(test_state(db.clone())),
+            Json(EnrollRequest {
+                name: "  edge-1  ".into(),
+                enrollment_token: token,
+                public_key: "b".repeat(64),
+            }),
+        )
+        .await
+        .unwrap();
+        let data = response.0.data.expect("enroll response data");
+        assert_eq!(data.name, "edge-1");
+
+        assert_eq!(
+            agent_name(&db, &data.agent_id).await.as_deref(),
+            Some("edge-1")
+        );
+        assert_eq!(
+            server_name(&db, &data.agent_id).await.as_deref(),
+            Some("edge-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_enroll_input_does_not_consume_token() {
+        let db = test_db().await;
+        let user_id = uuid::Uuid::from_bytes([3; 16]);
+        seed_user(&db, user_id).await;
+        let token = seed_enrollment_token(&db, user_id, "xle_", "c").await;
+
+        let err = enroll(
+            State(test_state(db.clone())),
+            Json(EnrollRequest {
+                name: "agent\nname".into(),
+                enrollment_token: token.clone(),
+                public_key: "b".repeat(64),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+        assert_eq!(unused_enrollment_token_count(&db).await, 1);
+
+        let err = enroll(
+            State(test_state(db.clone())),
+            Json(EnrollRequest {
+                name: "agent".into(),
+                enrollment_token: format!("xle_{}", "z".repeat(64)),
+                public_key: "b".repeat(64),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+        assert_eq!(unused_enrollment_token_count(&db).await, 1);
+
+        let response = enroll(
+            State(test_state(db.clone())),
+            Json(EnrollRequest {
+                name: "agent".into(),
+                enrollment_token: token,
+                public_key: "b".repeat(64),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.0.data.expect("enroll response data").name, "agent");
+        assert_eq!(unused_enrollment_token_count(&db).await, 0);
     }
 
     async fn test_db() -> crate::db::DatabaseBackend {
@@ -441,6 +597,64 @@ mod tests {
             .await
             .unwrap();
         count
+    }
+
+    async fn unused_enrollment_token_count(db: &crate::db::DatabaseBackend) -> i64 {
+        let crate::db::DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM enrollment_tokens WHERE used_at IS NULL")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        count
+    }
+
+    async fn seed_enrollment_token(
+        db: &crate::db::DatabaseBackend,
+        user_id: uuid::Uuid,
+        prefix: &str,
+        hex_digit: &str,
+    ) -> String {
+        let crate::db::DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        let token = format!("{prefix}{}", hex_digit.repeat(64));
+        sqlx::query(
+            "INSERT INTO enrollment_tokens (id, token_hash, created_by_user_id, expires_at, created_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(uuid::Uuid::now_v7().to_string())
+        .bind(hash_token(&token))
+        .bind(user_id.to_string())
+        .bind((Utc::now() + Duration::hours(1)).to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .execute(pool)
+        .await
+        .unwrap();
+        token
+    }
+
+    async fn agent_name(db: &crate::db::DatabaseBackend, agent_id: &str) -> Option<String> {
+        let crate::db::DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query_scalar("SELECT name FROM agents WHERE id = ?")
+            .bind(agent_id)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn server_name(db: &crate::db::DatabaseBackend, server_id: &str) -> Option<String> {
+        let crate::db::DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query_scalar("SELECT name FROM servers WHERE id = ?")
+            .bind(server_id)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
     }
 
     fn auth_user(auth_kind: AuthKind, role: UserRole) -> AuthUser {
