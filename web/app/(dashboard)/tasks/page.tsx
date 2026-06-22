@@ -23,7 +23,7 @@ import {
   textareaClass,
   thClass,
 } from "@/app/components/M7Primitives";
-import { apiClient, type JsonObject, type ServerGroup } from "@/lib/api";
+import { apiClient, type JsonObject, type ServerGroup, type TotpStatusResponse } from "@/lib/api";
 
 type TaskType = "shell" | "http_get" | "icmp_ping" | "tcp_ping";
 type CoverMode = "all" | "any" | "specific";
@@ -115,6 +115,7 @@ export default function TasksPage() {
   const [editing, setEditing] = useState<Task | null>(null);
   const [form, setForm] = useState<TaskForm>(blankForm);
   const [query, setQuery] = useState("");
+  const [totpStatus, setTotpStatus] = useState<TotpStatusResponse | null>(null);
 
   const loadTasks = useCallback(async () => {
     setLoading(true);
@@ -216,8 +217,10 @@ export default function TasksPage() {
 
   async function runTask(task: Task) {
     if (!confirm(`现在运行任务「${task.name}」？`)) return;
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
     setRunningTaskId(task.id);
-    const response = await apiClient.runTask(task.id);
+    const response = await apiClient.runTask(task.id, totpCode);
     setRunningTaskId(null);
     if (response.success) {
       setNotice("任务运行请求已发送。");
@@ -225,6 +228,28 @@ export default function TasksPage() {
     } else {
       setError(responseError(response));
     }
+  }
+
+  async function sensitiveTotpCode(): Promise<string | undefined | null> {
+    let enabled = totpStatus?.enabled;
+    if (totpStatus === null) {
+      const response = await apiClient.getTotpStatus();
+      if (!response.success || !response.data) {
+        setError(responseError(response));
+        return null;
+      }
+      setTotpStatus(response.data);
+      enabled = response.data.enabled;
+    }
+    if (!enabled) return undefined;
+    const code = window.prompt("请输入 6 位 TOTP 验证码");
+    if (code === null) return null;
+    const trimmed = code.trim();
+    if (!/^\d{6}$/.test(trimmed)) {
+      setError("请输入 6 位 TOTP 验证码。");
+      return null;
+    }
+    return trimmed;
   }
 
   async function deleteTask(task: Task) {

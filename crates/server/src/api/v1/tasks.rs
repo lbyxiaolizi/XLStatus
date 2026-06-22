@@ -3,7 +3,7 @@
 
 use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -11,9 +11,9 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::api::types::ApiResponse;
-use crate::api::v1::auth::{AppError, AppState};
+use crate::api::v1::auth::{require_sensitive_totp, AppError, AppState};
 use crate::api::v1::notifications::ensure_notification_group_owned_by;
-use crate::auth::middleware::{AuthSession, AuthUser};
+use crate::auth::middleware::{AuthKind, AuthSession, AuthUser};
 use crate::auth::rbac::{can_access_servers, has_scope};
 use crate::db::repository::tasks::{TaskRepository, TaskRunRepository};
 use crate::db::Db;
@@ -411,11 +411,12 @@ pub async fn delete_task(
 pub async fn run_task(
     State(state): State<AppState>,
     auth_user: AuthUser,
+    headers: HeaderMap,
     Path(task_id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     let db = state.db.clone();
 
-    require_scope_or_403(&auth_user, "task:exec")?;
+    require_task_run_sensitive_scope(&db, &auth_user, &headers).await?;
     let task_id = normalize_task_resource_id(task_id, "task_id")?;
     let task = TaskRepository::get_by_id(&db, &task_id)
         .await
@@ -690,6 +691,23 @@ fn require_scope_or_403(
             format!("missing required scope: {}", required_scope),
         ))
     }
+}
+
+async fn require_task_run_sensitive_scope(
+    db: &Db,
+    auth_user: &AuthUser,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
+    require_scope_or_403(auth_user, "task:exec")?;
+    if matches!(auth_user.auth_kind, AuthKind::PersonalAccessToken) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "manual task runs require a cookie session",
+        ));
+    }
+    require_sensitive_totp(db, auth_user.user.id, headers)
+        .await
+        .map_err(app_error_to_api)
 }
 
 fn validate_task_selector_or_403(
@@ -1037,6 +1055,61 @@ mod tests {
         assert_eq!(runs[0].server_id, "00000000-0000-0000-0000-0000000000aa");
     }
 
+    #[tokio::test]
+    async fn manual_task_run_rejects_pat_session() {
+        let db = test_db().await;
+        let auth = pat_with_servers(vec!["server-a"]);
+
+        let err = require_task_run_sensitive_scope(&db, &auth, &HeaderMap::new())
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(err
+            .1
+             .0
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("cookie session"));
+    }
+
+    #[tokio::test]
+    async fn manual_task_run_requires_sensitive_totp_when_enabled() {
+        let db = test_db().await;
+        let auth = cookie_admin();
+        let owner = auth.user.id.0.to_string();
+        seed_user(&db, &owner).await;
+        seed_totp_enabled_user(&db, &owner).await;
+
+        let err = require_task_run_sensitive_scope(&db, &auth, &HeaderMap::new())
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(err
+            .1
+             .0
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("TOTP"));
+    }
+
+    #[tokio::test]
+    async fn manual_task_run_allows_cookie_session_without_totp() {
+        let db = test_db().await;
+        let auth = cookie_admin();
+        let owner = auth.user.id.0.to_string();
+        seed_user(&db, &owner).await;
+
+        assert!(
+            require_task_run_sensitive_scope(&db, &auth, &HeaderMap::new())
+                .await
+                .is_ok()
+        );
+    }
+
     #[test]
     fn task_definition_rejects_oversized_command() {
         let mut task = task(CoverMode::Specific, json!({ "server_ids": ["server-a"] }));
@@ -1227,6 +1300,18 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    async fn seed_totp_enabled_user(db: &DatabaseBackend, id: &str) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query("UPDATE users SET totp_secret = ?, totp_enabled = 1 WHERE id = ?")
+            .bind("totp-secret")
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
     }
 
     async fn seed_server(db: &DatabaseBackend, id: &str, owner_user_id: &str) {

@@ -1349,9 +1349,10 @@ class ApiClient {
     });
   }
 
-  async runTask(id: string): Promise<ApiResponse<JsonObject>> {
+  async runTask(id: string, totpCode?: string): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(`/api/v1/tasks/${encodeURIComponent(id)}/run`, {
       method: "POST",
+      headers: this.sensitiveHeaders(totpCode),
     });
   }
 
