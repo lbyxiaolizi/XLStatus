@@ -5,7 +5,7 @@ use crate::db::{
     Agent, AgentWithState, CreateAgentInput, CreateEnrollmentTokenInput, DatabaseBackend,
     EnrollmentToken,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use xlstatus_shared::{AgentId, UserId};
 
@@ -243,41 +243,19 @@ impl AgentRepository {
                 .fetch_optional(pool)
                 .await?;
 
-                Ok(row.map(
-                    |(
-                        id,
-                        name,
-                        public_key,
-                        owner_user_id,
-                        last_seen_at,
-                        revoked_at,
-                        created_at,
-                        updated_at,
-                    )| {
-                        Agent {
-                            id: AgentId(uuid::Uuid::parse_str(&id).unwrap()),
-                            name,
-                            public_key,
-                            owner_user_id: UserId(uuid::Uuid::parse_str(&owner_user_id).unwrap()),
-                            last_seen_at: last_seen_at.and_then(|s| {
-                                DateTime::parse_from_rfc3339(&s)
-                                    .ok()
-                                    .map(|dt| dt.with_timezone(&Utc))
-                            }),
-                            revoked_at: revoked_at.and_then(|s| {
-                                DateTime::parse_from_rfc3339(&s)
-                                    .ok()
-                                    .map(|dt| dt.with_timezone(&Utc))
-                            }),
-                            created_at: DateTime::parse_from_rfc3339(&created_at)
-                                .unwrap()
-                                .with_timezone(&Utc),
-                            updated_at: DateTime::parse_from_rfc3339(&updated_at)
-                                .unwrap()
-                                .with_timezone(&Utc),
+                match row {
+                    Some(row) => match sqlite_agent_row_to_agent(row) {
+                        Ok(agent) => Ok(Some(agent)),
+                        Err(err) => {
+                            tracing::warn!(
+                                agent_id = %id.0,
+                                "treating invalid agent row as not found: {err}"
+                            );
+                            Ok(None)
                         }
                     },
-                ))
+                    None => Ok(None),
+                }
             }
             DatabaseBackend::Postgres(pool) => {
                 let row = sqlx::query_as::<_, (uuid::Uuid, String, String, uuid::Uuid, Option<DateTime<Utc>>, Option<DateTime<Utc>>, DateTime<Utc>, DateTime<Utc>)>(
@@ -337,46 +315,7 @@ impl AgentRepository {
                 .fetch_all(pool)
                 .await?;
 
-                Ok(rows
-                    .into_iter()
-                    .map(
-                        |(
-                            id,
-                            name,
-                            public_key,
-                            owner_user_id,
-                            last_seen_at,
-                            revoked_at,
-                            created_at,
-                            updated_at,
-                        )| {
-                            Agent {
-                                id: AgentId(uuid::Uuid::parse_str(&id).unwrap()),
-                                name,
-                                public_key,
-                                owner_user_id: UserId(
-                                    uuid::Uuid::parse_str(&owner_user_id).unwrap(),
-                                ),
-                                last_seen_at: last_seen_at.and_then(|s| {
-                                    DateTime::parse_from_rfc3339(&s)
-                                        .ok()
-                                        .map(|dt| dt.with_timezone(&Utc))
-                                }),
-                                revoked_at: revoked_at.and_then(|s| {
-                                    DateTime::parse_from_rfc3339(&s)
-                                        .ok()
-                                        .map(|dt| dt.with_timezone(&Utc))
-                                }),
-                                created_at: DateTime::parse_from_rfc3339(&created_at)
-                                    .unwrap()
-                                    .with_timezone(&Utc),
-                                updated_at: DateTime::parse_from_rfc3339(&updated_at)
-                                    .unwrap()
-                                    .with_timezone(&Utc),
-                            }
-                        },
-                    )
-                    .collect())
+                Ok(sqlite_agent_rows_to_agents(rows))
             }
             DatabaseBackend::Postgres(pool) => {
                 let rows = sqlx::query_as::<_, (uuid::Uuid, String, String, uuid::Uuid, Option<DateTime<Utc>>, Option<DateTime<Utc>>, DateTime<Utc>, DateTime<Utc>)>(
@@ -923,47 +862,19 @@ impl AgentRepository {
                 .bind(id.0.to_string())
                 .fetch_optional(pool)
                 .await?;
-                Ok(row.map(
-                    |(
-                        id,
-                        name,
-                        public_key,
-                        owner_user_id,
-                        last_seen_at,
-                        revoked_at,
-                        created_at,
-                        updated_at,
-                        remark,
-                        expires_at,
-                        renewal_price,
-                        dashboard_metadata_json,
-                        last_state_json,
-                        _last_state_at,
-                        last_info_json,
-                        _last_info_at,
-                    )| {
-                        AgentWithState {
-                            agent: Agent {
-                                id: AgentId(uuid::Uuid::parse_str(&id).unwrap()),
-                                name,
-                                public_key,
-                                owner_user_id: UserId(
-                                    uuid::Uuid::parse_str(&owner_user_id).unwrap(),
-                                ),
-                                last_seen_at: last_seen_at.as_deref().and_then(parse_rfc3339_opt),
-                                revoked_at: revoked_at.as_deref().and_then(parse_rfc3339_opt),
-                                created_at: parse_rfc3339_opt(&created_at).unwrap_or_else(Utc::now),
-                                updated_at: parse_rfc3339_opt(&updated_at).unwrap_or_else(Utc::now),
-                            },
-                            remark,
-                            expires_at,
-                            renewal_price,
-                            dashboard_metadata_json,
-                            last_state_json,
-                            last_info_json,
+                match row {
+                    Some(row) => match agent_with_state_row_to_agent(row) {
+                        Ok(agent) => Ok(Some(agent)),
+                        Err(err) => {
+                            tracing::warn!(
+                                agent_id = %id.0,
+                                "treating invalid agent state row as not found: {err}"
+                            );
+                            Ok(None)
                         }
                     },
-                ))
+                    None => Ok(None),
+                }
             }
             DatabaseBackend::Postgres(pool) => {
                 let row = sqlx::query_as::<_, (uuid::Uuid, String, String, uuid::Uuid, Option<DateTime<Utc>>, Option<DateTime<Utc>>, DateTime<Utc>, DateTime<Utc>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<DateTime<Utc>>, Option<String>, Option<DateTime<Utc>>)>(
@@ -1016,6 +927,17 @@ impl AgentRepository {
     }
 }
 
+type AgentRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+);
+
 type AgentWithStateRow = (
     String,
     String,
@@ -1037,54 +959,108 @@ type AgentWithStateRow = (
 
 fn agent_with_state_rows(rows: Vec<AgentWithStateRow>) -> Vec<AgentWithState> {
     rows.into_iter()
-        .map(
-            |(
-                id,
-                name,
-                public_key,
-                owner_user_id,
-                last_seen_at,
-                revoked_at,
-                created_at,
-                updated_at,
-                remark,
-                expires_at,
-                renewal_price,
-                dashboard_metadata_json,
-                last_state_json,
-                _last_state_at,
-                last_info_json,
-                _last_info_at,
-            )| {
-                let agent = Agent {
-                    id: AgentId(uuid::Uuid::parse_str(&id).unwrap()),
-                    name,
-                    public_key,
-                    owner_user_id: UserId(uuid::Uuid::parse_str(&owner_user_id).unwrap()),
-                    last_seen_at: last_seen_at.as_deref().and_then(parse_rfc3339_opt),
-                    revoked_at: revoked_at.as_deref().and_then(parse_rfc3339_opt),
-                    created_at: parse_rfc3339_opt(&created_at).unwrap_or_else(Utc::now),
-                    updated_at: parse_rfc3339_opt(&updated_at).unwrap_or_else(Utc::now),
-                };
-                AgentWithState {
-                    agent,
-                    remark,
-                    expires_at,
-                    renewal_price,
-                    dashboard_metadata_json,
-                    last_state_json,
-                    last_info_json,
+        .filter_map(|row| {
+            let agent_id = row.0.clone();
+            match agent_with_state_row_to_agent(row) {
+                Ok(agent) => Some(agent),
+                Err(err) => {
+                    tracing::warn!(
+                        agent_id = %agent_id,
+                        "skipping invalid agent state row: {err}"
+                    );
+                    None
                 }
-            },
-        )
+            }
+        })
         .collect()
 }
 
-/// M3: best-effort rfc3339 parse that returns None on bad input.
-fn parse_rfc3339_opt(s: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(s)
-        .ok()
+fn sqlite_agent_rows_to_agents(rows: Vec<AgentRow>) -> Vec<Agent> {
+    rows.into_iter()
+        .filter_map(|row| {
+            let agent_id = row.0.clone();
+            match sqlite_agent_row_to_agent(row) {
+                Ok(agent) => Some(agent),
+                Err(err) => {
+                    tracing::warn!(agent_id = %agent_id, "skipping invalid agent row: {err}");
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+fn sqlite_agent_row_to_agent(row: AgentRow) -> Result<Agent> {
+    let (id, name, public_key, owner_user_id, last_seen_at, revoked_at, created_at, updated_at) =
+        row;
+
+    Ok(Agent {
+        id: AgentId(parse_agent_uuid(&id, "id")?),
+        name,
+        public_key,
+        owner_user_id: UserId(parse_agent_uuid(&owner_user_id, "owner_user_id")?),
+        last_seen_at: parse_optional_agent_rfc3339(last_seen_at.as_deref(), "last_seen_at")?,
+        revoked_at: parse_optional_agent_rfc3339(revoked_at.as_deref(), "revoked_at")?,
+        created_at: parse_agent_rfc3339(&created_at, "created_at")?,
+        updated_at: parse_agent_rfc3339(&updated_at, "updated_at")?,
+    })
+}
+
+fn agent_with_state_row_to_agent(row: AgentWithStateRow) -> Result<AgentWithState> {
+    let (
+        id,
+        name,
+        public_key,
+        owner_user_id,
+        last_seen_at,
+        revoked_at,
+        created_at,
+        updated_at,
+        remark,
+        expires_at,
+        renewal_price,
+        dashboard_metadata_json,
+        last_state_json,
+        _last_state_at,
+        last_info_json,
+        _last_info_at,
+    ) = row;
+
+    let agent = Agent {
+        id: AgentId(parse_agent_uuid(&id, "id")?),
+        name,
+        public_key,
+        owner_user_id: UserId(parse_agent_uuid(&owner_user_id, "owner_user_id")?),
+        last_seen_at: parse_optional_agent_rfc3339(last_seen_at.as_deref(), "last_seen_at")?,
+        revoked_at: parse_optional_agent_rfc3339(revoked_at.as_deref(), "revoked_at")?,
+        created_at: parse_agent_rfc3339(&created_at, "created_at")?,
+        updated_at: parse_agent_rfc3339(&updated_at, "updated_at")?,
+    };
+    Ok(AgentWithState {
+        agent,
+        remark,
+        expires_at,
+        renewal_price,
+        dashboard_metadata_json,
+        last_state_json,
+        last_info_json,
+    })
+}
+
+fn parse_agent_uuid(value: &str, field: &str) -> Result<uuid::Uuid> {
+    uuid::Uuid::parse_str(value).with_context(|| format!("invalid agent {field} UUID"))
+}
+
+fn parse_agent_rfc3339(value: &str, field: &str) -> Result<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .with_context(|| format!("invalid agent {field} timestamp"))
         .map(|dt| dt.with_timezone(&Utc))
+}
+
+fn parse_optional_agent_rfc3339(value: Option<&str>, field: &str) -> Result<Option<DateTime<Utc>>> {
+    value
+        .map(|value| parse_agent_rfc3339(value, field))
+        .transpose()
 }
 
 #[cfg(test)]
@@ -1170,6 +1146,130 @@ mod tests {
 
         assert_eq!(token.used_by_agent_id, Some(agent.id));
         assert_eq!(agent.id, agent_id);
+    }
+
+    #[tokio::test]
+    async fn invalid_agent_timestamp_is_treated_as_missing_by_id() {
+        let db = test_db().await;
+        let user = UserRepository::new(db.clone())
+            .create(CreateUserInput {
+                username: "owner-dirty-agent".into(),
+                password: "password123".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        let agent_id = AgentId(uuid::Uuid::now_v7());
+        insert_raw_agent(
+            &db,
+            agent_id.0.to_string().as_str(),
+            user.id.0.to_string().as_str(),
+            "not-a-timestamp",
+            &Utc::now().to_rfc3339(),
+        )
+        .await;
+
+        let found = AgentRepository::new(db).find_by_id(agent_id).await.unwrap();
+
+        assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_agents_skips_invalid_historical_rows() {
+        let db = test_db().await;
+        let user = UserRepository::new(db.clone())
+            .create(CreateUserInput {
+                username: "owner-dirty-list".into(),
+                password: "password123".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        let valid_agent = AgentRepository::new(db.clone())
+            .create(CreateAgentInput {
+                name: "valid".into(),
+                public_key: "public-key".into(),
+                owner_user_id: user.id,
+            })
+            .await
+            .unwrap();
+        insert_raw_agent(
+            &db,
+            "not-a-uuid",
+            user.id.0.to_string().as_str(),
+            &Utc::now().to_rfc3339(),
+            &Utc::now().to_rfc3339(),
+        )
+        .await;
+
+        let listed = AgentRepository::new(db)
+            .list_by_owner(user.id, 10, 0)
+            .await
+            .unwrap();
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, valid_agent.id);
+    }
+
+    #[tokio::test]
+    async fn list_agent_state_skips_invalid_historical_rows() {
+        let db = test_db().await;
+        let user = UserRepository::new(db.clone())
+            .create(CreateUserInput {
+                username: "owner-dirty-state".into(),
+                password: "password123".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        let valid_agent = AgentRepository::new(db.clone())
+            .create(CreateAgentInput {
+                name: "valid-state".into(),
+                public_key: "public-key".into(),
+                owner_user_id: user.id,
+            })
+            .await
+            .unwrap();
+        insert_raw_agent(
+            &db,
+            &uuid::Uuid::now_v7().to_string(),
+            user.id.0.to_string().as_str(),
+            "9999-99-99T99:99:99Z",
+            &Utc::now().to_rfc3339(),
+        )
+        .await;
+
+        let (listed, total) = AgentRepository::new(db)
+            .list_with_state_by_owner(user.id, 10, 0)
+            .await
+            .unwrap();
+
+        assert_eq!(total, 2);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].agent.id, valid_agent.id);
+    }
+
+    async fn insert_raw_agent(
+        db: &DatabaseBackend,
+        agent_id: &str,
+        owner_id: &str,
+        created_at: &str,
+        updated_at: &str,
+    ) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO agents (id, name, public_key, owner_user_id, created_at, updated_at) VALUES (?, ?, 'public-key', ?, ?, ?)",
+        )
+        .bind(agent_id)
+        .bind(format!("raw-{agent_id}"))
+        .bind(owner_id)
+        .bind(created_at)
+        .bind(updated_at)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     async fn test_db() -> DatabaseBackend {

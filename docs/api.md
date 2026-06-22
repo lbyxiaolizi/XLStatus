@@ -103,6 +103,8 @@ PAT 创建请求体上限为 16KiB。PAT 名称最长 128 字节，scopes 最多
 
 Enrollment token 创建请求体上限为 4KiB，`expires_in_hours` 必须在 1 到 24 小时之间，默认 1 小时；创建入口只允许管理员 Cookie session。
 
+历史 Agent 行必须保持 UUID 形态的 `id` / `owner_user_id` 和 RFC3339 时间形态；无效历史 Agent 行会被视为不可用或在列表中跳过，不会打崩服务器列表、实时快照、公开状态页或后台读取路径。
+
 ### 服务监控
 
 | 方法 | 路径 | 说明 |

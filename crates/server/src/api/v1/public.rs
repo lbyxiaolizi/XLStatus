@@ -562,7 +562,7 @@ async fn public_agent_rows(state: &AppState, limit: i64) -> Result<Vec<AgentWith
             .fetch_all(pool)
             .await
             .map_err(|e| AppError::Database(e.into()))?;
-            rows.into_iter().map(public_agent_row_to_state).collect()
+            Ok(public_agent_rows_to_state(rows))
         }
         DatabaseBackend::Postgres(pool) => {
             let rows: Vec<PublicAgentRow> = sqlx::query_as(
@@ -590,7 +590,7 @@ async fn public_agent_rows(state: &AppState, limit: i64) -> Result<Vec<AgentWith
             .fetch_all(pool)
             .await
             .map_err(|e| AppError::Database(e.into()))?;
-            rows.into_iter().map(public_agent_row_to_state).collect()
+            Ok(public_agent_rows_to_state(rows))
         }
     }
 }
@@ -630,7 +630,25 @@ type PublicAgentRow = (
     Option<String>,
 );
 
-fn public_agent_row_to_state(row: PublicAgentRow) -> Result<AgentWithState, AppError> {
+fn public_agent_rows_to_state(rows: Vec<PublicAgentRow>) -> Vec<AgentWithState> {
+    rows.into_iter()
+        .filter_map(|row| {
+            let agent_id = row.0.clone();
+            match public_agent_row_to_state(row) {
+                Ok(agent) => Some(agent),
+                Err(err) => {
+                    tracing::warn!(
+                        agent_id = %agent_id,
+                        "skipping invalid public agent row: {err}"
+                    );
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+fn public_agent_row_to_state(row: PublicAgentRow) -> Result<AgentWithState, anyhow::Error> {
     let (
         id,
         name,
@@ -649,20 +667,19 @@ fn public_agent_row_to_state(row: PublicAgentRow) -> Result<AgentWithState, AppE
         last_info_json,
         _last_info_at,
     ) = row;
-    let id = Uuid::parse_str(&id)
-        .map_err(|e| AppError::Database(anyhow::anyhow!("invalid public agent id: {e}")))?;
+    let id = Uuid::parse_str(&id).map_err(|e| anyhow::anyhow!("invalid public agent id: {e}"))?;
     let owner_user_id = Uuid::parse_str(&owner_user_id)
-        .map_err(|e| AppError::Database(anyhow::anyhow!("invalid public agent owner: {e}")))?;
+        .map_err(|e| anyhow::anyhow!("invalid public agent owner: {e}"))?;
     Ok(AgentWithState {
         agent: Agent {
             id: AgentId(id),
             name,
             public_key,
             owner_user_id: xlstatus_shared::UserId(owner_user_id),
-            last_seen_at: last_seen_at.as_deref().and_then(parse_public_rfc3339),
-            revoked_at: revoked_at.as_deref().and_then(parse_public_rfc3339),
-            created_at: parse_public_rfc3339(&created_at).unwrap_or_else(Utc::now),
-            updated_at: parse_public_rfc3339(&updated_at).unwrap_or_else(Utc::now),
+            last_seen_at: parse_optional_public_rfc3339(last_seen_at.as_deref(), "last_seen_at")?,
+            revoked_at: parse_optional_public_rfc3339(revoked_at.as_deref(), "revoked_at")?,
+            created_at: parse_public_rfc3339(&created_at, "created_at")?,
+            updated_at: parse_public_rfc3339(&updated_at, "updated_at")?,
         },
         remark,
         expires_at,
@@ -673,10 +690,19 @@ fn public_agent_row_to_state(row: PublicAgentRow) -> Result<AgentWithState, AppE
     })
 }
 
-fn parse_public_rfc3339(value: &str) -> Option<DateTime<Utc>> {
+fn parse_public_rfc3339(value: &str, field: &str) -> Result<DateTime<Utc>, anyhow::Error> {
     DateTime::parse_from_rfc3339(value)
-        .ok()
         .map(|value| value.with_timezone(&Utc))
+        .map_err(|e| anyhow::anyhow!("invalid public agent {field}: {e}"))
+}
+
+fn parse_optional_public_rfc3339(
+    value: Option<&str>,
+    field: &str,
+) -> Result<Option<DateTime<Utc>>, anyhow::Error> {
+    value
+        .map(|value| parse_public_rfc3339(value, field))
+        .transpose()
 }
 
 fn public_service_last_from_history(
@@ -1756,6 +1782,42 @@ mod tests {
             )
             .await;
         }
+
+        let servers = public_servers(&state).await.unwrap();
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].id, public_server);
+    }
+
+    #[tokio::test]
+    async fn public_servers_skip_invalid_historical_agent_rows() {
+        let state = test_state_with_public_site(true).await;
+        let DatabaseBackend::Sqlite(pool) = &state.db else {
+            unreachable!();
+        };
+        let owner = Uuid::now_v7().to_string();
+        seed_public_user(pool, &owner).await;
+        let public_server = Uuid::now_v7().to_string();
+        seed_public_agent(
+            pool,
+            &public_server,
+            &owner,
+            "public-server",
+            true,
+            false,
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+        seed_public_agent(
+            pool,
+            &Uuid::now_v7().to_string(),
+            &owner,
+            "dirty-public-server",
+            true,
+            false,
+            "not-a-timestamp",
+        )
+        .await;
 
         let servers = public_servers(&state).await.unwrap();
 
