@@ -121,14 +121,15 @@ impl ServiceMonitor {
                 }
                 Ok(())
             }
-            "specific" if !s.server_ids.is_empty() => {
-                ensure_probe_target_count(s.server_ids.len())?;
-                for server_id in &s.server_ids {
-                    let result = match self.probe_via_agent(s, server_id).await {
+            "specific" => {
+                let server_ids = self.specific_agent_ids(s).await?;
+                ensure_probe_target_count(server_ids.len())?;
+                for server_id in server_ids {
+                    let result = match self.probe_via_agent(s, &server_id).await {
                         Ok(result) => result,
                         Err(e) => failure_probe(format!("agent probe failed: {e}")),
                     };
-                    self.save(s, Some(server_id), &result).await?;
+                    self.save(s, Some(&server_id), &result).await?;
                 }
                 Ok(())
             }
@@ -141,34 +142,81 @@ impl ServiceMonitor {
     }
 
     async fn covered_agent_ids(&self, s: &ServiceConfig) -> Result<Vec<String>> {
-        let all = self.load_agent_ids().await?;
+        let Some(owner_user_id) = trusted_service_owner_uuid_from_config(s) else {
+            warn!(
+                "service {} {} probe skipped: missing or invalid owner",
+                s.id, s.cover_mode
+            );
+            return Ok(Vec::new());
+        };
+        let all = self.load_agent_ids_for_owner(owner_user_id).await?;
         if s.cover_mode == "exclude" {
+            let excluded = normalize_uuid_id_list(&s.exclude_server_ids);
             Ok(all
                 .into_iter()
-                .filter(|id| !s.exclude_server_ids.iter().any(|excluded| excluded == id))
+                .filter(|id| !excluded.iter().any(|excluded| excluded == id))
                 .collect())
         } else {
             Ok(all)
         }
     }
 
-    async fn load_agent_ids(&self) -> Result<Vec<String>> {
+    async fn specific_agent_ids(&self, s: &ServiceConfig) -> Result<Vec<String>> {
+        let Some(owner_user_id) = self.service_probe_owner(s).await? else {
+            warn!(
+                "service {} specific probe skipped: missing trusted owner",
+                s.id
+            );
+            return Ok(Vec::new());
+        };
+        let requested = normalize_uuid_id_list(&s.server_ids);
+        if requested.is_empty() {
+            return Ok(Vec::new());
+        }
+        let owned = self.load_agent_ids_for_owner(owner_user_id).await?;
+        Ok(requested
+            .into_iter()
+            .filter(|id| owned.iter().any(|owned_id| owned_id == id))
+            .collect())
+    }
+
+    async fn service_probe_owner(&self, service: &ServiceConfig) -> Result<Option<uuid::Uuid>> {
+        if let Some(owner_user_id) = trusted_service_owner_from_config(service) {
+            return match uuid::Uuid::parse_str(&owner_user_id) {
+                Ok(owner_user_id) => Ok(Some(owner_user_id)),
+                Err(_) => Ok(None),
+            };
+        }
+        Ok(self
+            .unique_owner_from_service_servers(service)
+            .await?
+            .as_deref()
+            .and_then(|owner_user_id| uuid::Uuid::parse_str(owner_user_id).ok()))
+    }
+
+    async fn load_agent_ids_for_owner(&self, owner_user_id: uuid::Uuid) -> Result<Vec<String>> {
         match &self.db {
             crate::db::DatabaseBackend::Sqlite(pool) => {
                 let rows: Vec<(String,)> = sqlx::query_as(
-                    "SELECT id FROM agents WHERE revoked_at IS NULL ORDER BY created_at ASC",
+                    "SELECT id FROM agents WHERE owner_user_id = ? AND revoked_at IS NULL ORDER BY created_at ASC, id ASC",
                 )
+                .bind(owner_user_id.to_string())
                 .fetch_all(pool)
                 .await?;
-                Ok(rows.into_iter().map(|(id,)| id).collect())
+                Ok(normalize_uuid_id_list(
+                    &rows.into_iter().map(|(id,)| id).collect::<Vec<_>>(),
+                ))
             }
             crate::db::DatabaseBackend::Postgres(pool) => {
                 let rows: Vec<(String,)> = sqlx::query_as(
-                    "SELECT id::text FROM agents WHERE revoked_at IS NULL ORDER BY created_at ASC",
+                    "SELECT id::text FROM agents WHERE owner_user_id = $1 AND revoked_at IS NULL ORDER BY created_at ASC, id ASC",
                 )
+                .bind(owner_user_id)
                 .fetch_all(pool)
                 .await?;
-                Ok(rows.into_iter().map(|(id,)| id).collect())
+                Ok(normalize_uuid_id_list(
+                    &rows.into_iter().map(|(id,)| id).collect::<Vec<_>>(),
+                ))
             }
         }
     }
@@ -804,6 +852,12 @@ fn trusted_service_owner_from_config(service: &ServiceConfig) -> Option<String> 
         .map(str::to_string)
 }
 
+fn trusted_service_owner_uuid_from_config(service: &ServiceConfig) -> Option<uuid::Uuid> {
+    trusted_service_owner_from_config(service)
+        .as_deref()
+        .and_then(|owner| uuid::Uuid::parse_str(owner).ok())
+}
+
 fn service_effective_server_ids(service: &ServiceConfig) -> Vec<String> {
     if service.cover_mode != "specific" {
         return Vec::new();
@@ -816,6 +870,20 @@ fn service_effective_server_ids(service: &ServiceConfig) -> Vec<String> {
         }
     }
     server_ids
+}
+
+fn normalize_uuid_id_list(values: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for value in values {
+        let Ok(id) = uuid::Uuid::parse_str(value.trim()) else {
+            continue;
+        };
+        let id = id.to_string();
+        if !out.iter().any(|existing| existing == &id) {
+            out.push(id);
+        }
+    }
+    out
 }
 
 fn unique_nonempty_value(values: Vec<String>) -> Option<String> {
@@ -905,6 +973,18 @@ mod tests {
             None
         );
         assert_eq!(unique_nonempty_value(vec![" ".into()]), None);
+    }
+
+    #[test]
+    fn normalizes_uuid_id_lists() {
+        assert_eq!(
+            normalize_uuid_id_list(&[
+                "00000000-0000-0000-0000-000000000101".into(),
+                "00000000000000000000000000000101".into(),
+                "not-a-uuid".into(),
+            ]),
+            vec!["00000000-0000-0000-0000-000000000101".to_string()]
+        );
     }
 
     #[test]
@@ -1009,6 +1089,117 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn service_monitor_all_cover_mode_uses_service_owner_scope() {
+        let db = test_db().await;
+        let owner = "00000000-0000-0000-0000-000000000001";
+        let other = "00000000-0000-0000-0000-000000000002";
+        let own_server = "00000000-0000-0000-0000-000000000101";
+        let other_server = "00000000-0000-0000-0000-000000000202";
+        seed_user(&db, owner, "owner").await;
+        seed_user(&db, other, "other").await;
+        seed_agent(&db, own_server, owner, "own").await;
+        seed_agent(&db, other_server, other, "other").await;
+
+        let monitor = ServiceMonitor::new(
+            db,
+            SessionRegistry::new(),
+            Arc::new(TaskResponseRegistry::new()),
+        );
+        let mut service = test_service_config();
+        service.cover_mode = "all".into();
+        service.owner_user_id = Some(owner.into());
+
+        assert_eq!(
+            monitor.covered_agent_ids(&service).await.unwrap(),
+            vec![own_server.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn service_monitor_exclude_cover_mode_uses_service_owner_scope() {
+        let db = test_db().await;
+        let owner = "00000000-0000-0000-0000-000000000001";
+        let other = "00000000-0000-0000-0000-000000000002";
+        let own_a = "00000000-0000-0000-0000-000000000101";
+        let own_b = "00000000-0000-0000-0000-000000000102";
+        let other_server = "00000000-0000-0000-0000-000000000202";
+        seed_user(&db, owner, "owner").await;
+        seed_user(&db, other, "other").await;
+        seed_agent(&db, own_a, owner, "own-a").await;
+        seed_agent(&db, own_b, owner, "own-b").await;
+        seed_agent(&db, other_server, other, "other").await;
+
+        let monitor = ServiceMonitor::new(
+            db,
+            SessionRegistry::new(),
+            Arc::new(TaskResponseRegistry::new()),
+        );
+        let mut service = test_service_config();
+        service.cover_mode = "exclude".into();
+        service.owner_user_id = Some(owner.into());
+        service.exclude_server_ids = vec![
+            "00000000000000000000000000000101".into(),
+            other_server.into(),
+        ];
+
+        assert_eq!(
+            monitor.covered_agent_ids(&service).await.unwrap(),
+            vec![own_b.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn service_monitor_all_cover_mode_without_owner_skips_targets() {
+        let db = test_db().await;
+        let owner = "00000000-0000-0000-0000-000000000001";
+        let server = "00000000-0000-0000-0000-000000000101";
+        seed_user(&db, owner, "owner").await;
+        seed_agent(&db, server, owner, "server").await;
+
+        let monitor = ServiceMonitor::new(
+            db,
+            SessionRegistry::new(),
+            Arc::new(TaskResponseRegistry::new()),
+        );
+        let mut service = test_service_config();
+        service.cover_mode = "all".into();
+
+        assert!(monitor
+            .covered_agent_ids(&service)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn service_monitor_specific_cover_mode_filters_to_owner_scope() {
+        let db = test_db().await;
+        let owner = "00000000-0000-0000-0000-000000000001";
+        let other = "00000000-0000-0000-0000-000000000002";
+        let own_server = "00000000-0000-0000-0000-000000000101";
+        let other_server = "00000000-0000-0000-0000-000000000202";
+        seed_user(&db, owner, "owner").await;
+        seed_user(&db, other, "other").await;
+        seed_agent(&db, own_server, owner, "own").await;
+        seed_agent(&db, other_server, other, "other").await;
+
+        let monitor = ServiceMonitor::new(
+            db,
+            SessionRegistry::new(),
+            Arc::new(TaskResponseRegistry::new()),
+        );
+        let mut service = test_service_config();
+        service.cover_mode = "specific".into();
+        service.owner_user_id = Some(owner.into());
+        service.server_ids = vec![own_server.into(), other_server.into(), "not-a-uuid".into()];
+
+        assert_eq!(
+            monitor.specific_agent_ids(&service).await.unwrap(),
+            vec![own_server.to_string()]
+        );
     }
 
     async fn test_db() -> DatabaseBackend {
