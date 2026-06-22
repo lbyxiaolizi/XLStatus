@@ -259,9 +259,9 @@ pub async fn public_site_enabled(db: &DatabaseBackend) -> Result<bool, AppError>
 }
 
 pub async fn public_server_details_enabled(db: &DatabaseBackend) -> Result<bool, AppError> {
-    Ok(get_bool_setting(db, PUBLIC_SERVER_DETAILS_ENABLED)
-        .await?
-        .unwrap_or(false))
+    Ok(default_public_server_details_enabled(
+        get_bool_setting(db, PUBLIC_SERVER_DETAILS_ENABLED).await?,
+    ))
 }
 
 pub async fn public_site_branding(db: &DatabaseBackend) -> Result<PublicSiteBranding, AppError> {
@@ -620,7 +620,11 @@ fn normalize_optional_public_background_url(value: Option<String>) -> Result<Str
 }
 
 fn default_public_site_enabled(value: Option<bool>) -> bool {
-    value.unwrap_or(false)
+    value.unwrap_or(true)
+}
+
+fn default_public_server_details_enabled(value: Option<bool>) -> bool {
+    value.unwrap_or(true)
 }
 
 fn normalize_disabled_custom_html(value: Option<String>, field: &str) -> Result<String, AppError> {
@@ -805,15 +809,16 @@ fn require_admin_cookie_session(auth: &AuthSession) -> Result<(), AppError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_public_site_enabled, ensure_geoip_ip_change_servers_active,
-        normalize_disabled_custom_html, normalize_geoip_ip_change_server_ids,
-        normalize_optional_public_asset_url, normalize_optional_public_background_url,
-        normalize_optional_secret_text, normalize_optional_url_setting,
-        normalize_optional_uuid_text, public_site_branding, require_admin_cookie_session,
-        set_string_setting, settings_body_limit, PUBLIC_BACKGROUND_URL, PUBLIC_FAVICON_URL,
-        PUBLIC_LOGO_URL, SETTINGS_MAX_BODY_BYTES, SETTINGS_MAX_CLOUDFLARED_TOKEN_BYTES,
-        SETTINGS_MAX_DISABLED_CUSTOM_HTML_BYTES, SETTINGS_MAX_GEOIP_IP_CHANGE_SERVERS,
-        SETTINGS_MAX_GEOIP_TOKEN_BYTES, SETTINGS_MAX_URL_BYTES,
+        default_public_server_details_enabled, default_public_site_enabled,
+        ensure_geoip_ip_change_servers_active, normalize_disabled_custom_html,
+        normalize_geoip_ip_change_server_ids, normalize_optional_public_asset_url,
+        normalize_optional_public_background_url, normalize_optional_secret_text,
+        normalize_optional_url_setting, normalize_optional_uuid_text, public_site_branding,
+        require_admin_cookie_session, set_string_setting, settings_body_limit,
+        PUBLIC_BACKGROUND_URL, PUBLIC_FAVICON_URL, PUBLIC_LOGO_URL, SETTINGS_MAX_BODY_BYTES,
+        SETTINGS_MAX_CLOUDFLARED_TOKEN_BYTES, SETTINGS_MAX_DISABLED_CUSTOM_HTML_BYTES,
+        SETTINGS_MAX_GEOIP_IP_CHANGE_SERVERS, SETTINGS_MAX_GEOIP_TOKEN_BYTES,
+        SETTINGS_MAX_URL_BYTES,
     };
     use crate::auth::middleware::{AuthKind, AuthSession};
     use crate::db::DatabaseBackend;
@@ -1022,10 +1027,17 @@ mod tests {
     }
 
     #[test]
-    fn public_site_is_private_by_default() {
-        assert!(!default_public_site_enabled(None));
+    fn public_site_is_public_by_default() {
+        assert!(default_public_site_enabled(None));
         assert!(default_public_site_enabled(Some(true)));
         assert!(!default_public_site_enabled(Some(false)));
+    }
+
+    #[test]
+    fn public_server_details_are_visible_by_default() {
+        assert!(default_public_server_details_enabled(None));
+        assert!(default_public_server_details_enabled(Some(true)));
+        assert!(!default_public_server_details_enabled(Some(false)));
     }
 
     #[test]

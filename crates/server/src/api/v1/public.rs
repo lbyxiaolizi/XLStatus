@@ -1872,6 +1872,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_status_defaults_to_anonymous_with_server_details() {
+        let state = test_state_without_public_settings().await;
+        let DatabaseBackend::Sqlite(pool) = &state.db else {
+            unreachable!();
+        };
+        let owner = Uuid::now_v7().to_string();
+        let server_id = Uuid::now_v7().to_string();
+        seed_public_user(pool, &owner).await;
+        seed_public_agent(
+            pool,
+            &server_id,
+            &owner,
+            "public-server",
+            true,
+            false,
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+        sqlx::query(
+            "UPDATE agents SET last_state_json = ?, last_state_at = '2026-06-22T00:00:00Z' WHERE id = ?",
+        )
+        .bind(
+            serde_json::json!({
+                "cpu_percent": 42.0,
+                "memory_used": 1024,
+                "memory_total": 2048,
+                "net_rx_bps": 128,
+                "net_tx_bps": 64
+            })
+            .to_string(),
+        )
+        .bind(&server_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let response = public_status(axum::extract::State(state)).await.unwrap();
+        let data = response.0.data.expect("public status response data");
+
+        assert_eq!(data.servers.len(), 1);
+        let resources = data.servers[0]
+            .resources
+            .as_ref()
+            .expect("public server details default to visible");
+        assert_eq!(resources.cpu_percent, Some(42.0));
+        assert_eq!(resources.memory_percent, Some(50.0));
+        assert_eq!(resources.net_rx_bps, Some(128));
+        assert_eq!(resources.net_tx_bps, Some(64));
+    }
+
+    #[tokio::test]
+    async fn public_status_hides_server_details_when_setting_is_disabled() {
+        let state = test_state_with_public_site(true).await;
+        let DatabaseBackend::Sqlite(pool) = &state.db else {
+            unreachable!();
+        };
+        disable_public_server_details(pool).await;
+        let owner = Uuid::now_v7().to_string();
+        let server_id = Uuid::now_v7().to_string();
+        seed_public_user(pool, &owner).await;
+        seed_public_agent(
+            pool,
+            &server_id,
+            &owner,
+            "public-server",
+            true,
+            false,
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+        sqlx::query(
+            "UPDATE agents SET last_state_json = ?, last_state_at = '2026-06-22T00:00:00Z' WHERE id = ?",
+        )
+        .bind(serde_json::json!({ "cpu_percent": 42.0 }).to_string())
+        .bind(&server_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let response = public_status(axum::extract::State(state)).await.unwrap();
+        let data = response.0.data.expect("public status response data");
+
+        assert_eq!(data.servers.len(), 1);
+        assert!(data.servers[0].resources.is_none());
+    }
+
+    #[tokio::test]
     async fn public_services_filter_public_server_scope_before_limit() {
         let state = test_state_with_public_site(true).await;
         let DatabaseBackend::Sqlite(pool) = &state.db else {
@@ -1930,6 +2017,14 @@ mod tests {
         assert_eq!(services[0].server_ids, vec![public_server]);
     }
 
+    async fn test_state_without_public_settings() -> AppState {
+        let db = DatabaseBackend::connect("sqlite::memory:", true)
+            .await
+            .unwrap();
+        db.run_migrations().await.unwrap();
+        app_state_from_db(db)
+    }
+
     async fn test_state_with_public_site(enabled: bool) -> AppState {
         let db = DatabaseBackend::connect("sqlite::memory:", true)
             .await
@@ -1946,6 +2041,10 @@ mod tests {
         .await
         .unwrap();
 
+        app_state_from_db(db)
+    }
+
+    fn app_state_from_db(db: DatabaseBackend) -> AppState {
         AppState {
             db,
             config: Arc::new(crate::config::Config::default()),
@@ -1958,6 +2057,15 @@ mod tests {
             terminal_sessions: crate::api::v1::terminal::TerminalSessionRegistry::new(),
             io_registry: crate::grpc::IoRegistry::new(),
         }
+    }
+
+    async fn disable_public_server_details(pool: &sqlx::SqlitePool) {
+        sqlx::query(
+            "INSERT INTO system_settings (key, value_json, updated_at) VALUES ('public_server_details_enabled', 'false', '2026-06-22T00:00:00Z')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     async fn seed_public_user(pool: &sqlx::SqlitePool, user_id: &str) {
