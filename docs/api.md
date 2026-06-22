@@ -97,6 +97,8 @@ PAT 创建请求体上限为 16KiB。PAT 名称最长 128 字节，scopes 最多
 
 服务器展示元数据更新、批量管理、服务器分组创建/更新/加成员请求体上限为 64KiB。服务器名称最长 128 字节，备注、公开说明、供应商、地域、套餐、价格、计费周期等展示 label 最长 512 字节；dashboard metadata 序列化后最多 16KiB。标签输入最多 64 项、单项最长 128 字节，保存后最多保留 8 个展示标签。批量服务器 ID 和分组成员单次最多 200 个 UUID，并会规范化为 canonical 文本。`display_order` 必须在数据库 `INTEGER` 范围内。
 
+`/ws/servers` 实时 WebSocket 需要 `server:read`，升级前校验 `Origin`，初始快照和后续事件都会按当前 Cookie session / PAT 可见服务器集合过滤；非管理员只能接收自己名下服务器事件，PAT 还会受 server allowlist 限制。
+
 Enrollment token 创建请求体上限为 4KiB，`expires_in_hours` 必须在 1 到 24 小时之间，默认 1 小时；创建入口只允许管理员 Cookie session。
 
 ### 服务监控
