@@ -39,6 +39,7 @@ const SETTINGS_MAX_GEOIP_TOKEN_BYTES: usize = 4096;
 const SETTINGS_MAX_CLOUDFLARED_TOKEN_BYTES: usize = 8192;
 const SETTINGS_MAX_DISABLED_CUSTOM_HTML_BYTES: usize = 1024;
 const SETTINGS_MAX_GEOIP_IP_CHANGE_SERVERS: usize = 64;
+const SETTINGS_MAX_VALUE_JSON_BYTES: usize = SETTINGS_MAX_BODY_BYTES;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PublicSiteBranding {
@@ -256,37 +257,62 @@ async fn system_settings_response(
 }
 
 pub async fn public_site_enabled(db: &DatabaseBackend) -> Result<bool, AppError> {
-    Ok(default_public_site_enabled(
-        get_bool_setting(db, PUBLIC_SITE_ENABLED).await?,
-    ))
+    match get_bool_setting(db, PUBLIC_SITE_ENABLED).await {
+        Ok(value) => Ok(default_public_site_enabled(value)),
+        Err(err) => {
+            tracing::warn!("ignoring invalid historical public_site_enabled setting: {err:?}");
+            Ok(false)
+        }
+    }
 }
 
 pub async fn public_server_details_enabled(db: &DatabaseBackend) -> Result<bool, AppError> {
-    Ok(default_public_server_details_enabled(
-        get_bool_setting(db, PUBLIC_SERVER_DETAILS_ENABLED).await?,
-    ))
+    match get_bool_setting(db, PUBLIC_SERVER_DETAILS_ENABLED).await {
+        Ok(value) => Ok(default_public_server_details_enabled(value)),
+        Err(err) => {
+            tracing::warn!(
+                "ignoring invalid historical public_server_details_enabled setting: {err:?}"
+            );
+            Ok(false)
+        }
+    }
 }
 
 pub async fn public_site_branding(db: &DatabaseBackend) -> Result<PublicSiteBranding, AppError> {
+    let site_name = get_string_setting(db, PUBLIC_SITE_NAME)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| normalize_short_text(&value, 80, PUBLIC_SITE_NAME).ok())
+        .unwrap_or_else(|| "XLStatus".to_string());
+    let theme_color = get_string_setting(db, PUBLIC_THEME_COLOR)
+        .await
+        .ok()
+        .and_then(|value| normalize_optional_theme_color(value).ok())
+        .filter(|value| !value.is_empty());
     Ok(PublicSiteBranding {
-        site_name: get_string_setting(db, PUBLIC_SITE_NAME)
-            .await?
-            .unwrap_or_else(|| "XLStatus".to_string()),
+        site_name,
         logo_url: normalize_optional_public_asset_url(
-            get_string_setting(db, PUBLIC_LOGO_URL).await?,
+            get_string_setting(db, PUBLIC_LOGO_URL).await.ok().flatten(),
             PUBLIC_LOGO_URL,
         )
         .ok()
         .filter(|value| !value.is_empty()),
         favicon_url: normalize_optional_public_asset_url(
-            get_string_setting(db, PUBLIC_FAVICON_URL).await?,
+            get_string_setting(db, PUBLIC_FAVICON_URL)
+                .await
+                .ok()
+                .flatten(),
             PUBLIC_FAVICON_URL,
         )
         .ok()
         .filter(|value| !value.is_empty()),
-        theme_color: get_string_setting(db, PUBLIC_THEME_COLOR).await?,
+        theme_color,
         background_url: normalize_optional_public_background_url(
-            get_string_setting(db, PUBLIC_BACKGROUND_URL).await?,
+            get_string_setting(db, PUBLIC_BACKGROUND_URL)
+                .await
+                .ok()
+                .flatten(),
         )
         .ok()
         .filter(|value| !value.is_empty()),
@@ -305,23 +331,36 @@ pub async fn geoip_provider(db: &DatabaseBackend) -> Result<String, AppError> {
 }
 
 pub async fn geoip_ipinfo_token(db: &DatabaseBackend) -> Result<Option<String>, AppError> {
-    Ok(get_secret_string_setting(db, GEOIP_IPINFO_TOKEN).await?)
+    normalize_runtime_secret_setting(
+        get_secret_string_setting(db, GEOIP_IPINFO_TOKEN).await?,
+        SETTINGS_MAX_GEOIP_TOKEN_BYTES,
+        GEOIP_IPINFO_TOKEN,
+    )
 }
 
 pub async fn geoip_ip_change_enabled(db: &DatabaseBackend) -> Result<bool, AppError> {
-    Ok(get_bool_setting(db, GEOIP_IP_CHANGE_ENABLED)
-        .await?
-        .unwrap_or(true))
+    match get_bool_setting(db, GEOIP_IP_CHANGE_ENABLED).await {
+        Ok(value) => Ok(value.unwrap_or(true)),
+        Err(err) => {
+            tracing::warn!("ignoring invalid historical geoip_ip_change_enabled setting: {err:?}");
+            Ok(false)
+        }
+    }
 }
 
 pub async fn geoip_ip_change_notification_group_id(
     db: &DatabaseBackend,
 ) -> Result<Option<String>, AppError> {
-    Ok(get_string_setting(db, GEOIP_IP_CHANGE_NOTIFICATION_GROUP_ID).await?)
+    normalize_optional_uuid_text(
+        get_string_setting(db, GEOIP_IP_CHANGE_NOTIFICATION_GROUP_ID).await?,
+        GEOIP_IP_CHANGE_NOTIFICATION_GROUP_ID,
+    )
 }
 
 pub async fn geoip_ip_change_server_ids(db: &DatabaseBackend) -> Result<Vec<String>, AppError> {
-    Ok(get_string_list_setting(db, GEOIP_IP_CHANGE_SERVER_IDS).await?)
+    normalize_geoip_ip_change_server_ids(
+        get_string_list_setting(db, GEOIP_IP_CHANGE_SERVER_IDS).await?,
+    )
 }
 
 pub async fn geoip_ip_change_severity(db: &DatabaseBackend) -> Result<String, AppError> {
@@ -334,7 +373,16 @@ pub async fn geoip_ip_change_severity(db: &DatabaseBackend) -> Result<String, Ap
 }
 
 pub async fn ddns_resolver_url(db: &DatabaseBackend) -> Result<Option<String>, AppError> {
-    Ok(get_string_setting(db, DDNS_RESOLVER_URL).await?)
+    Ok(normalize_optional_url_setting(
+        get_string_setting(db, DDNS_RESOLVER_URL)
+            .await
+            .ok()
+            .flatten(),
+        SETTINGS_MAX_URL_BYTES,
+        DDNS_RESOLVER_URL,
+    )
+    .ok()
+    .filter(|value| !value.is_empty()))
 }
 
 pub async fn tsdb_retention_days(db: &DatabaseBackend) -> Result<i64, AppError> {
@@ -354,7 +402,11 @@ pub async fn set_tsdb_retention_days(db: &DatabaseBackend, days: i64) -> Result<
 }
 
 pub async fn cloudflared_token(db: &DatabaseBackend) -> Result<Option<String>, AppError> {
-    get_secret_string_setting(db, CLOUDFLARED_TOKEN).await
+    normalize_runtime_secret_setting(
+        get_secret_string_setting(db, CLOUDFLARED_TOKEN).await?,
+        SETTINGS_MAX_CLOUDFLARED_TOKEN_BYTES,
+        CLOUDFLARED_TOKEN,
+    )
 }
 
 pub async fn cloudflared_token_configured(db: &DatabaseBackend) -> Result<bool, AppError> {
@@ -392,9 +444,12 @@ async fn get_bool_setting(db: &DatabaseBackend, key: &str) -> Result<Option<bool
             row.map(|(value,)| value)
         }
     };
-    raw.map(|value| serde_json::from_str::<bool>(&value))
-        .transpose()
-        .map_err(|e| AppError::BadRequest(format!("invalid setting value for {key}: {e}")))
+    raw.map(|value| {
+        ensure_setting_value_json_allowed(&value, key)?;
+        serde_json::from_str::<bool>(&value)
+            .map_err(|e| AppError::BadRequest(format!("invalid setting value for {key}: {e}")))
+    })
+    .transpose()
 }
 
 async fn get_i64_setting(db: &DatabaseBackend, key: &str) -> Result<Option<i64>, AppError> {
@@ -416,9 +471,12 @@ async fn get_i64_setting(db: &DatabaseBackend, key: &str) -> Result<Option<i64>,
             row.map(|(value,)| value)
         }
     };
-    raw.map(|value| serde_json::from_str::<i64>(&value))
-        .transpose()
-        .map_err(|e| AppError::BadRequest(format!("invalid setting value for {key}: {e}")))
+    raw.map(|value| {
+        ensure_setting_value_json_allowed(&value, key)?;
+        serde_json::from_str::<i64>(&value)
+            .map_err(|e| AppError::BadRequest(format!("invalid setting value for {key}: {e}")))
+    })
+    .transpose()
 }
 
 async fn get_string_setting(db: &DatabaseBackend, key: &str) -> Result<Option<String>, AppError> {
@@ -440,14 +498,17 @@ async fn get_string_setting(db: &DatabaseBackend, key: &str) -> Result<Option<St
             row.map(|(value,)| value)
         }
     };
-    raw.map(|value| serde_json::from_str::<String>(&value))
-        .transpose()
-        .map(|value| {
-            value
-                .map(|item| item.trim().to_string())
-                .filter(|item| !item.is_empty())
-        })
-        .map_err(|e| AppError::BadRequest(format!("invalid setting value for {key}: {e}")))
+    raw.map(|value| {
+        ensure_setting_value_json_allowed(&value, key)?;
+        serde_json::from_str::<String>(&value)
+            .map_err(|e| AppError::BadRequest(format!("invalid setting value for {key}: {e}")))
+    })
+    .transpose()
+    .map(|value| {
+        value
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())
+    })
 }
 
 async fn get_string_list_setting(db: &DatabaseBackend, key: &str) -> Result<Vec<String>, AppError> {
@@ -469,10 +530,22 @@ async fn get_string_list_setting(db: &DatabaseBackend, key: &str) -> Result<Vec<
             row.map(|(value,)| value)
         }
     };
-    raw.map(|value| serde_json::from_str::<Vec<String>>(&value))
-        .transpose()
-        .map(|value| normalize_string_list(value.unwrap_or_default()))
-        .map_err(|e| AppError::BadRequest(format!("invalid setting value for {key}: {e}")))
+    raw.map(|value| {
+        ensure_setting_value_json_allowed(&value, key)?;
+        serde_json::from_str::<Vec<String>>(&value)
+            .map_err(|e| AppError::BadRequest(format!("invalid setting value for {key}: {e}")))
+    })
+    .transpose()
+    .map(|value| normalize_string_list(value.unwrap_or_default()))
+}
+
+fn ensure_setting_value_json_allowed(value: &str, key: &str) -> Result<(), AppError> {
+    if value.len() > SETTINGS_MAX_VALUE_JSON_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "setting {key} exceeds {SETTINGS_MAX_VALUE_JSON_BYTES} bytes"
+        )));
+    }
+    Ok(())
 }
 
 async fn set_bool_setting(db: &DatabaseBackend, key: &str, value: bool) -> Result<(), AppError> {
@@ -731,6 +804,15 @@ fn normalize_optional_secret_text(
     Ok(value.to_string())
 }
 
+fn normalize_runtime_secret_setting(
+    value: Option<String>,
+    max_bytes: usize,
+    field: &str,
+) -> Result<Option<String>, AppError> {
+    let normalized = normalize_optional_secret_text(value, max_bytes, field)?;
+    Ok((!normalized.is_empty()).then_some(normalized))
+}
+
 fn normalize_optional_url_setting(
     value: Option<String>,
     max_bytes: usize,
@@ -817,11 +899,13 @@ mod tests {
         normalize_geoip_ip_change_server_ids, normalize_optional_public_asset_url,
         normalize_optional_public_background_url, normalize_optional_secret_text,
         normalize_optional_url_setting, normalize_optional_uuid_text, public_site_branding,
-        public_site_enabled, require_admin_cookie_session, set_string_setting, settings_body_limit,
-        update_settings, PUBLIC_BACKGROUND_URL, PUBLIC_FAVICON_URL, PUBLIC_LOGO_URL,
-        SETTINGS_MAX_BODY_BYTES, SETTINGS_MAX_CLOUDFLARED_TOKEN_BYTES,
-        SETTINGS_MAX_DISABLED_CUSTOM_HTML_BYTES, SETTINGS_MAX_GEOIP_IP_CHANGE_SERVERS,
-        SETTINGS_MAX_GEOIP_TOKEN_BYTES, SETTINGS_MAX_URL_BYTES,
+        public_site_enabled, require_admin_cookie_session, set_raw_setting, set_string_setting,
+        settings_body_limit, update_settings, DDNS_RESOLVER_URL, GEOIP_IPINFO_TOKEN,
+        GEOIP_IP_CHANGE_SERVER_IDS, PUBLIC_BACKGROUND_URL, PUBLIC_FAVICON_URL, PUBLIC_LOGO_URL,
+        PUBLIC_SITE_ENABLED, PUBLIC_SITE_NAME, PUBLIC_THEME_COLOR, SETTINGS_MAX_BODY_BYTES,
+        SETTINGS_MAX_CLOUDFLARED_TOKEN_BYTES, SETTINGS_MAX_DISABLED_CUSTOM_HTML_BYTES,
+        SETTINGS_MAX_GEOIP_IP_CHANGE_SERVERS, SETTINGS_MAX_GEOIP_TOKEN_BYTES,
+        SETTINGS_MAX_URL_BYTES, SETTINGS_MAX_VALUE_JSON_BYTES,
     };
     use crate::auth::middleware::{AuthKind, AuthSession};
     use crate::db::DatabaseBackend;
@@ -974,6 +1058,85 @@ mod tests {
         assert!(branding.logo_url.is_none());
         assert!(branding.favicon_url.is_none());
         assert!(branding.background_url.is_none());
+    }
+
+    #[tokio::test]
+    async fn historical_public_branding_values_are_bounded_at_read_time() {
+        let db = DatabaseBackend::connect("sqlite::memory:", true)
+            .await
+            .unwrap();
+        db.run_migrations().await.unwrap();
+
+        set_string_setting(&db, PUBLIC_SITE_NAME, &"x".repeat(81))
+            .await
+            .unwrap();
+        set_string_setting(&db, PUBLIC_THEME_COLOR, "red")
+            .await
+            .unwrap();
+        let oversized_logo = format!(
+            "https://example.com/{}",
+            "a".repeat(SETTINGS_MAX_VALUE_JSON_BYTES)
+        );
+        set_raw_setting(
+            &db,
+            PUBLIC_LOGO_URL,
+            &serde_json::to_string(&oversized_logo).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let branding = public_site_branding(&db).await.unwrap();
+
+        assert_eq!(branding.site_name, "XLStatus");
+        assert!(branding.theme_color.is_none());
+        assert!(branding.logo_url.is_none());
+    }
+
+    #[tokio::test]
+    async fn historical_public_enable_flag_fails_closed_when_invalid() {
+        let db = DatabaseBackend::connect("sqlite::memory:", true)
+            .await
+            .unwrap();
+        db.run_migrations().await.unwrap();
+
+        set_raw_setting(&db, PUBLIC_SITE_ENABLED, "\"not bool\"")
+            .await
+            .unwrap();
+
+        assert!(!public_site_enabled(&db).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn historical_runtime_settings_are_revalidated_at_read_time() {
+        let db = DatabaseBackend::connect("sqlite::memory:", true)
+            .await
+            .unwrap();
+        db.run_migrations().await.unwrap();
+
+        let too_many_servers = (0..=SETTINGS_MAX_GEOIP_IP_CHANGE_SERVERS)
+            .map(|idx| uuid::Uuid::from_u128(idx as u128 + 1).to_string())
+            .collect::<Vec<_>>();
+        set_raw_setting(
+            &db,
+            GEOIP_IP_CHANGE_SERVER_IDS,
+            &serde_json::to_string(&too_many_servers).unwrap(),
+        )
+        .await
+        .unwrap();
+        set_string_setting(&db, DDNS_RESOLVER_URL, "file:///etc/passwd")
+            .await
+            .unwrap();
+        set_string_setting(
+            &db,
+            GEOIP_IPINFO_TOKEN,
+            &"x".repeat(SETTINGS_MAX_GEOIP_TOKEN_BYTES + 1),
+        )
+        .await
+        .unwrap();
+
+        assert!(super::geoip_ip_change_server_ids(&db).await.is_err());
+        assert!(super::ddns_resolver_url(&db).await.unwrap().is_none());
+        assert!(super::geoip_ipinfo_token(&db).await.is_err());
     }
 
     #[tokio::test]
