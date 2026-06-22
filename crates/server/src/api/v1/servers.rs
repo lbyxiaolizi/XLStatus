@@ -592,6 +592,7 @@ pub async fn update_server(
             "traffic_quota_bytes must be greater than or equal to 0".into(),
         ));
     }
+    let tags = normalize_tag_input(req.tags.unwrap_or_default())?;
     let dashboard_metadata = DashboardMetadata {
         public_note: normalize_optional_label(req.public_note, "public_note")?,
         provider: normalize_optional_label(req.provider, "provider")?,
@@ -607,13 +608,21 @@ pub async fn update_server(
         auto_renew: req.auto_renew,
         traffic_quota_bytes: req.traffic_quota_bytes,
         traffic_quota_type: normalize_optional_label(req.traffic_quota_type, "traffic_quota_type")?,
-        tags: normalize_tag_input(req.tags.unwrap_or_default())?,
+        tags,
         accent_color: normalize_accent_color(req.accent_color)?,
         dashboard_visible: req.dashboard_visible,
         hide_for_guest: req.hide_for_guest,
         display_order: normalize_display_order(req.display_order, "display_order")?,
     };
     require_public_server_metadata_write_auth(
+        &state.db,
+        &auth,
+        &headers,
+        row.dashboard_metadata_json.as_deref(),
+        &dashboard_metadata,
+    )
+    .await?;
+    require_server_tag_write_auth_if_changed(
         &state.db,
         &auth,
         &headers,
@@ -660,6 +669,12 @@ pub async fn batch_update_servers(
     }
     if matches!(req.action, ServerBatchAction::SetDashboardVisible) {
         require_public_server_visibility_write_auth(&state.db, &auth, &headers).await?;
+    }
+    if matches!(
+        req.action,
+        ServerBatchAction::SetTags | ServerBatchAction::AddTags | ServerBatchAction::RemoveTags
+    ) {
+        require_server_tag_write_auth(&state.db, &auth, &headers).await?;
     }
     let server_ids = dedupe_ids(req.server_ids, SERVER_BATCH_MAX_SERVER_IDS, "server_ids")?;
     if server_ids.is_empty() {
@@ -1770,6 +1785,20 @@ async fn require_public_server_metadata_write_auth(
     Ok(())
 }
 
+async fn require_server_tag_write_auth_if_changed(
+    db: &DatabaseBackend,
+    auth: &AuthSession,
+    headers: &HeaderMap,
+    stored: Option<&str>,
+    next: &DashboardMetadata,
+) -> Result<(), AppError> {
+    let current = dashboard_metadata(stored, &[]);
+    if current.tags != next.tags {
+        require_server_tag_write_auth(db, auth, headers).await?;
+    }
+    Ok(())
+}
+
 fn public_server_visibility_metadata_changed(
     current: &DashboardMetadata,
     next: &DashboardMetadata,
@@ -1796,6 +1825,19 @@ async fn require_server_group_write_auth(
     if matches!(auth.auth_kind, AuthKind::PersonalAccessToken) {
         return Err(AppError::Forbidden(
             "server group changes require a cookie session".into(),
+        ));
+    }
+    require_sensitive_totp(db, auth.user_id, headers).await
+}
+
+async fn require_server_tag_write_auth(
+    db: &DatabaseBackend,
+    auth: &AuthSession,
+    headers: &HeaderMap,
+) -> Result<(), AppError> {
+    if matches!(auth.auth_kind, AuthKind::PersonalAccessToken) {
+        return Err(AppError::Forbidden(
+            "server tag changes require a cookie session".into(),
         ));
     }
     require_sensitive_totp(db, auth.user_id, headers).await
@@ -3842,6 +3884,129 @@ mod tests {
         require_server_group_write_auth(&db, &auth, &HeaderMap::new())
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_tag_changes_reject_pat_session() {
+        let db = test_db().await;
+        let auth = auth_session(AuthKind::PersonalAccessToken, UserRole::Admin);
+
+        let err = require_server_tag_write_auth(&db, &auth, &HeaderMap::new())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+        assert!(error_message(err).contains("cookie session"));
+    }
+
+    #[tokio::test]
+    async fn server_tag_changes_require_sensitive_totp_when_enabled() {
+        let db = test_db().await;
+        let admin = Uuid::from_bytes([9; 16]);
+        seed_user(&db, admin, "admin", "admin").await;
+        seed_totp_enabled_user(&db, admin).await;
+        let auth = auth_session(AuthKind::Session, UserRole::Admin);
+
+        let err = require_server_tag_write_auth(&db, &auth, &HeaderMap::new())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+        assert!(error_message(err).contains("TOTP"));
+    }
+
+    #[tokio::test]
+    async fn server_tag_changes_allow_cookie_without_totp() {
+        let db = test_db().await;
+        let admin = Uuid::from_bytes([9; 16]);
+        seed_user(&db, admin, "admin", "admin").await;
+        let auth = auth_session(AuthKind::Session, UserRole::Admin);
+
+        require_server_tag_write_auth(&db, &auth, &HeaderMap::new())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_tag_metadata_write_rejects_pat() {
+        let db = test_db().await;
+        let admin = Uuid::from_bytes([9; 16]);
+        let server = Uuid::parse_str("00000000-0000-0000-0000-000000000303").unwrap();
+        seed_user(&db, admin, "admin", "admin").await;
+        seed_agent(&db, server, admin, "server", "2026-01-01T00:00:00Z").await;
+
+        let mut auth = auth_session(AuthKind::PersonalAccessToken, UserRole::Admin);
+        auth.user_id = UserId(admin);
+        auth.server_ids = Some(vec![server.to_string()]);
+        auth.pat_id = Some("pat".into());
+        let err = update_server(
+            State(test_state(db.clone())),
+            auth,
+            HeaderMap::new(),
+            Path(server.to_string()),
+            Json(UpdateServerRequest {
+                name: None,
+                remark: None,
+                expires_at: None,
+                renewal_price: None,
+                public_note: None,
+                price: None,
+                currency: None,
+                billing_cycle: None,
+                auto_renew: None,
+                traffic_quota_bytes: None,
+                traffic_quota_type: None,
+                provider: None,
+                region: None,
+                country: None,
+                city: None,
+                latitude: None,
+                longitude: None,
+                plan: None,
+                tags: Some(vec!["production".into()]),
+                accent_color: None,
+                dashboard_visible: None,
+                hide_for_guest: None,
+                display_order: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+        assert!(dashboard_metadata_value(&db, server).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn batch_server_tag_write_requires_sensitive_totp_when_enabled() {
+        let db = test_db().await;
+        let admin = Uuid::from_bytes([9; 16]);
+        let server = Uuid::parse_str("00000000-0000-0000-0000-000000000303").unwrap();
+        seed_user(&db, admin, "admin", "admin").await;
+        seed_totp_enabled_user(&db, admin).await;
+        seed_agent(&db, server, admin, "server", "2026-01-01T00:00:00Z").await;
+
+        let mut auth = auth_session(AuthKind::Session, UserRole::Admin);
+        auth.user_id = UserId(admin);
+        let err = batch_update_servers(
+            State(test_state(db.clone())),
+            auth,
+            ConnectInfo("127.0.0.1:12345".parse().unwrap()),
+            HeaderMap::new(),
+            Json(BatchUpdateServersRequest {
+                server_ids: vec![server.to_string()],
+                action: ServerBatchAction::AddTags,
+                tags: vec!["production".into()],
+                dashboard_visible: None,
+                owner_user_id: None,
+                group_id: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+        assert!(dashboard_metadata_value(&db, server).await.is_none());
     }
 
     #[test]

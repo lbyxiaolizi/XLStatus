@@ -432,7 +432,13 @@ export default function ServersPage() {
     setError(null);
     setBatchNotice(null);
     const totpCode = await sensitiveTotpCodeForAction(
-      action === "delete" || action === "transfer_owner" || action === "set_dashboard_visible" || action === "move_group",
+      action === "delete" ||
+        action === "transfer_owner" ||
+        action === "set_dashboard_visible" ||
+        action === "move_group" ||
+        action === "set_tags" ||
+        action === "add_tags" ||
+        action === "remove_tags",
     );
     if (totpCode === null) return false;
     const payload: JsonObject = {
