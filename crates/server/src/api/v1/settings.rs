@@ -204,7 +204,7 @@ pub async fn update_settings(
     }
     if let Some(server_ids) = req.geoip_ip_change_server_ids {
         let server_ids = normalize_geoip_ip_change_server_ids(server_ids)?;
-        ensure_geoip_ip_change_servers_exist(&state.db, &server_ids).await?;
+        ensure_geoip_ip_change_servers_active(&state.db, &server_ids).await?;
         set_string_list_setting(&state.db, GEOIP_IP_CHANGE_SERVER_IDS, server_ids).await?;
     }
     if let Some(severity) = req.geoip_ip_change_severity {
@@ -762,7 +762,7 @@ fn normalize_optional_url_setting(
     Ok(parsed.to_string())
 }
 
-async fn ensure_geoip_ip_change_servers_exist(
+async fn ensure_geoip_ip_change_servers_active(
     db: &DatabaseBackend,
     server_ids: &[String],
 ) -> Result<(), AppError> {
@@ -770,9 +770,14 @@ async fn ensure_geoip_ip_change_servers_exist(
     for server_id in server_ids {
         let parsed = uuid::Uuid::parse_str(server_id)
             .map_err(|_| AppError::BadRequest(format!("invalid server id: {server_id}")))?;
-        if repo.find_by_id(AgentId(parsed)).await?.is_none() {
-            return Err(AppError::BadRequest(format!(
+        let agent = repo.find_by_id(AgentId(parsed)).await?.ok_or_else(|| {
+            AppError::BadRequest(format!(
                 "geoip_ip_change_server_ids contains unknown server: {server_id}"
+            ))
+        })?;
+        if agent.revoked_at.is_some() {
+            return Err(AppError::BadRequest(format!(
+                "geoip_ip_change_server_ids contains revoked server: {server_id}"
             )));
         }
     }
@@ -800,15 +805,15 @@ fn require_admin_cookie_session(auth: &AuthSession) -> Result<(), AppError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_public_site_enabled, normalize_disabled_custom_html,
-        normalize_geoip_ip_change_server_ids, normalize_optional_public_asset_url,
-        normalize_optional_public_background_url, normalize_optional_secret_text,
-        normalize_optional_url_setting, normalize_optional_uuid_text, public_site_branding,
-        require_admin_cookie_session, set_string_setting, settings_body_limit,
-        PUBLIC_BACKGROUND_URL, PUBLIC_FAVICON_URL, PUBLIC_LOGO_URL, SETTINGS_MAX_BODY_BYTES,
-        SETTINGS_MAX_CLOUDFLARED_TOKEN_BYTES, SETTINGS_MAX_DISABLED_CUSTOM_HTML_BYTES,
-        SETTINGS_MAX_GEOIP_IP_CHANGE_SERVERS, SETTINGS_MAX_GEOIP_TOKEN_BYTES,
-        SETTINGS_MAX_URL_BYTES,
+        default_public_site_enabled, ensure_geoip_ip_change_servers_active,
+        normalize_disabled_custom_html, normalize_geoip_ip_change_server_ids,
+        normalize_optional_public_asset_url, normalize_optional_public_background_url,
+        normalize_optional_secret_text, normalize_optional_url_setting,
+        normalize_optional_uuid_text, public_site_branding, require_admin_cookie_session,
+        set_string_setting, settings_body_limit, PUBLIC_BACKGROUND_URL, PUBLIC_FAVICON_URL,
+        PUBLIC_LOGO_URL, SETTINGS_MAX_BODY_BYTES, SETTINGS_MAX_CLOUDFLARED_TOKEN_BYTES,
+        SETTINGS_MAX_DISABLED_CUSTOM_HTML_BYTES, SETTINGS_MAX_GEOIP_IP_CHANGE_SERVERS,
+        SETTINGS_MAX_GEOIP_TOKEN_BYTES, SETTINGS_MAX_URL_BYTES,
     };
     use crate::auth::middleware::{AuthKind, AuthSession};
     use crate::db::DatabaseBackend;
@@ -962,6 +967,31 @@ mod tests {
         assert!(branding.background_url.is_none());
     }
 
+    #[tokio::test]
+    async fn geoip_ip_change_server_list_rejects_revoked_servers() {
+        let db = DatabaseBackend::connect("sqlite::memory:", true)
+            .await
+            .unwrap();
+        db.run_migrations().await.unwrap();
+
+        let owner = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let active_server = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000101").unwrap();
+        let revoked_server = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000202").unwrap();
+        seed_user(&db, owner).await;
+        seed_agent(&db, active_server, owner, "active-server").await;
+        seed_agent(&db, revoked_server, owner, "revoked-server").await;
+        revoke_agent(&db, revoked_server).await;
+
+        ensure_geoip_ip_change_servers_active(&db, &[active_server.to_string()])
+            .await
+            .unwrap();
+
+        let err = ensure_geoip_ip_change_servers_active(&db, &[revoked_server.to_string()])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, super::AppError::BadRequest(_)));
+    }
+
     #[test]
     fn normalizes_uuid_settings_and_bounds_server_lists() {
         let id = uuid::Uuid::now_v7();
@@ -1027,5 +1057,44 @@ mod tests {
             server_ids: None,
             pat_id: None,
         }
+    }
+
+    async fn seed_user(db: &DatabaseBackend, id: uuid::Uuid) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, role, created_at, updated_at) VALUES (?, 'owner', 'x', 'admin', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_agent(db: &DatabaseBackend, id: uuid::Uuid, owner: uuid::Uuid, name: &str) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO agents (id, name, public_key, owner_user_id, created_at, updated_at) VALUES (?, ?, 'pk', ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id.to_string())
+        .bind(name)
+        .bind(owner.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn revoke_agent(db: &DatabaseBackend, id: uuid::Uuid) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query("UPDATE agents SET revoked_at = '2026-06-22T00:00:00Z' WHERE id = ?")
+            .bind(id.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
     }
 }
