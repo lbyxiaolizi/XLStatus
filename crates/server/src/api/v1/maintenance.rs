@@ -169,16 +169,26 @@ pub async fn download_backup(
             .map_err(|e| AppError::BadRequest(e.to_string()))?;
     Ok((
         StatusCode::OK,
-        [
-            (
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/vnd.sqlite3"),
-            ),
-            (header::CONTENT_DISPOSITION, content_disposition),
-        ],
+        sensitive_download_headers(
+            HeaderValue::from_static("application/vnd.sqlite3"),
+            content_disposition,
+        ),
         Body::from(bytes),
     )
         .into_response())
+}
+
+fn sensitive_download_headers(
+    content_type: HeaderValue,
+    content_disposition: HeaderValue,
+) -> [(header::HeaderName, HeaderValue); 5] {
+    [
+        (header::CONTENT_TYPE, content_type),
+        (header::CONTENT_DISPOSITION, content_disposition),
+        (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        (header::PRAGMA, HeaderValue::from_static("no-cache")),
+        (header::EXPIRES, HeaderValue::from_static("0")),
+    ]
 }
 
 pub async fn download_archive(
@@ -252,13 +262,10 @@ pub async fn download_archive(
             .map_err(|e| AppError::BadRequest(e.to_string()))?;
     Ok((
         StatusCode::OK,
-        [
-            (
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/zip"),
-            ),
-            (header::CONTENT_DISPOSITION, content_disposition),
-        ],
+        sensitive_download_headers(
+            HeaderValue::from_static("application/zip"),
+            content_disposition,
+        ),
         Body::from(bytes),
     )
         .into_response())
@@ -694,6 +701,27 @@ mod tests {
     fn maintenance_action_body_limit_is_small() {
         let _ = maintenance_action_body_limit();
         assert_eq!(MAINTENANCE_ACTION_MAX_BODY_BYTES, 4 * 1024);
+    }
+
+    #[test]
+    fn maintenance_sensitive_download_headers_are_not_cacheable() {
+        let headers = sensitive_download_headers(
+            HeaderValue::from_static("application/zip"),
+            HeaderValue::from_static("attachment; filename=\"backup.zip\""),
+        );
+        let header_map = HeaderMap::from_iter(headers);
+
+        assert_eq!(
+            header_map.get(header::CONTENT_TYPE).unwrap(),
+            "application/zip"
+        );
+        assert_eq!(
+            header_map.get(header::CONTENT_DISPOSITION).unwrap(),
+            "attachment; filename=\"backup.zip\""
+        );
+        assert_eq!(header_map.get(header::CACHE_CONTROL).unwrap(), "no-store");
+        assert_eq!(header_map.get(header::PRAGMA).unwrap(), "no-cache");
+        assert_eq!(header_map.get(header::EXPIRES).unwrap(), "0");
     }
 
     #[test]

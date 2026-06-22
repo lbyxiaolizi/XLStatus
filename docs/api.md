@@ -173,7 +173,7 @@ Enrollment token 创建请求体上限为 4KiB，`expires_in_hours` 必须在 1 
 
 强制更新需要 `server:exec` 权限、明确版本、HTTPS 下载 URL 和 SHA-256 校验和。默认只允许 `https://github.com/lbyxiaolizi/XLStatus/releases/download/<VERSION>/xlstatus-agent-*` 这类官方 Agent release 资产；自托管更新源必须显式设置 `XLSTATUS_ALLOW_CUSTOM_FORCE_UPDATE_URL=1`，但仍要求 HTTPS 和 SHA-256。
 
-维护导出、SQLite VACUUM、TSDB compact 和 TSDB retention 均只允许管理员 Cookie session，敏感写操作仍要求 TOTP。TSDB retention 请求体上限为 4KiB，`retention_days` 必须在 1 到 3650 天之间；超出范围会拒绝而不是静默修正。
+维护导出、SQLite VACUUM、TSDB compact 和 TSDB retention 均只允许管理员 Cookie session，敏感写操作仍要求 TOTP。维护导出附件响应会发送 `Cache-Control: no-store`、`Pragma: no-cache` 和 `Expires: 0`，避免数据库备份或完整归档被浏览器、代理或 CDN 缓存。TSDB retention 请求体上限为 4KiB，`retention_days` 必须在 1 到 3650 天之间；超出范围会拒绝而不是静默修正。
 
 ### DDNS、NAT、MCP
 
