@@ -31,6 +31,7 @@ const PUBLIC_SITE_PRIVATE_MESSAGE: &str = "public status page is private";
 const PUBLIC_MJPEG_MAX_CONNECTIONS: usize = 32;
 const PUBLIC_MJPEG_FRAME_CACHE_TTL: StdDuration = StdDuration::from_secs(1);
 const PUBLIC_METRIC_SAMPLE_LIMIT: usize = 240;
+const PUBLIC_POSTGRES_SCAN_BATCH: i64 = 500;
 const PUBLIC_SERVICE_HISTORY_LIMIT: i64 = 240;
 const PUBLIC_SERVER_ID_PATH_BYTES: usize = 36;
 const PUBLIC_STATUS_SERVER_LIMIT: i64 = 100;
@@ -467,83 +468,73 @@ async fn public_services(state: &AppState) -> Result<Vec<PublicServiceView>, App
             Ok(services)
         }
         DatabaseBackend::Postgres(pool) => {
-            let rows = sqlx::query(
-                r#"
-                SELECT s.id::text AS id, s.name, s.type, s.server_id::text AS server_id
-                FROM services s
-                WHERE s.enabled = true
-                  AND (
-                    EXISTS (
-                      SELECT 1
-                      FROM service_servers ss
-                      JOIN agents a ON a.id = ss.server_id
-                      WHERE ss.service_id = s.id
-                        AND a.revoked_at IS NULL
-                        AND (
-                          a.dashboard_metadata_json LIKE '%"dashboard_visible":true%'
-                          OR a.dashboard_metadata_json LIKE '%"dashboard_visible": true%'
-                        )
-                        AND a.dashboard_metadata_json NOT LIKE '%"hide_for_guest":true%'
-                        AND a.dashboard_metadata_json NOT LIKE '%"hide_for_guest": true%'
-                    )
-                    OR (
-                      NOT EXISTS (SELECT 1 FROM service_servers ss WHERE ss.service_id = s.id)
-                      AND EXISTS (
-                        SELECT 1
-                        FROM agents a
-                        WHERE a.id = s.server_id
-                          AND a.revoked_at IS NULL
-                          AND (
-                            a.dashboard_metadata_json LIKE '%"dashboard_visible":true%'
-                            OR a.dashboard_metadata_json LIKE '%"dashboard_visible": true%'
-                          )
-                          AND a.dashboard_metadata_json NOT LIKE '%"hide_for_guest":true%'
-                          AND a.dashboard_metadata_json NOT LIKE '%"hide_for_guest": true%'
-                      )
-                    )
-                  )
-                ORDER BY s.created_at DESC
-                LIMIT $1
-                "#,
-            )
-            .bind(PUBLIC_STATUS_SERVICE_LIMIT)
-            .fetch_all(pool)
-            .await
-            .map_err(|e| AppError::Database(e.into()))?;
-
-            let mut services = Vec::with_capacity(rows.len());
-            for row in rows {
-                let service_id: String = row.get("id");
-                let service_type: String = row.get("type");
-                let server_ids = public_service_server_ids(state, &service_id).await?;
-                let legacy_server_id: Option<String> = row.try_get("server_id").ok();
-                let visible_server_ids = visible_public_service_server_ids(
-                    server_ids,
-                    legacy_server_id,
-                    &public_server_ids,
-                );
-                if visible_server_ids.is_empty() {
-                    continue;
-                }
-                let history =
-                    public_service_history_postgres(pool, &service_id, &visible_server_ids).await?;
-                let (last_status, last_check_at) = public_service_last_from_history(&history);
-                services.push(PublicServiceView {
-                    id: service_id,
-                    name: row.get("name"),
-                    service_type: service_type.clone(),
-                    kind: service_type.clone(),
-                    service_type_alias: service_type,
-                    server_id: visible_server_ids.first().cloned(),
-                    server_ids: visible_server_ids,
-                    last_status,
-                    last_check_at,
-                    history,
-                });
-            }
-            Ok(services)
+            public_services_postgres(state, pool, &public_server_ids).await
         }
     }
+}
+
+async fn public_services_postgres(
+    state: &AppState,
+    pool: &sqlx::PgPool,
+    public_server_ids: &HashSet<String>,
+) -> Result<Vec<PublicServiceView>, AppError> {
+    let mut offset = 0_i64;
+    let mut services = Vec::new();
+    while services.len() < PUBLIC_STATUS_SERVICE_LIMIT as usize {
+        let rows = sqlx::query(
+            r#"
+            SELECT s.id::text AS id, s.name, s.type, s.server_id::text AS server_id
+            FROM services s
+            WHERE s.enabled = true
+            ORDER BY s.created_at DESC
+            LIMIT $1 OFFSET $2
+            "#,
+        )
+        .bind(PUBLIC_POSTGRES_SCAN_BATCH)
+        .bind(offset)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AppError::Database(e.into()))?;
+
+        if rows.is_empty() {
+            break;
+        }
+        let count = rows.len() as i64;
+        for row in rows {
+            if services.len() >= PUBLIC_STATUS_SERVICE_LIMIT as usize {
+                break;
+            }
+            let service_id: String = row.get("id");
+            let service_type: String = row.get("type");
+            let server_ids = public_service_server_ids(state, &service_id).await?;
+            let legacy_server_id: Option<String> = row.try_get("server_id").ok();
+            let visible_server_ids =
+                visible_public_service_server_ids(server_ids, legacy_server_id, public_server_ids);
+            if visible_server_ids.is_empty() {
+                continue;
+            }
+            let history =
+                public_service_history_postgres(pool, &service_id, &visible_server_ids).await?;
+            let (last_status, last_check_at) = public_service_last_from_history(&history);
+            services.push(PublicServiceView {
+                id: service_id,
+                name: row.get("name"),
+                service_type: service_type.clone(),
+                kind: service_type.clone(),
+                service_type_alias: service_type,
+                server_id: visible_server_ids.first().cloned(),
+                server_ids: visible_server_ids,
+                last_status,
+                last_check_at,
+                history,
+            });
+        }
+        offset += count;
+        if count < PUBLIC_POSTGRES_SCAN_BATCH {
+            break;
+        }
+    }
+    Ok(services)
 }
 
 async fn public_server_id_set(state: &AppState) -> Result<HashSet<String>, AppError> {
@@ -583,34 +574,51 @@ async fn public_agent_rows(state: &AppState, limit: i64) -> Result<Vec<AgentWith
             Ok(public_agent_rows_to_state(rows))
         }
         DatabaseBackend::Postgres(pool) => {
-            let rows: Vec<PublicAgentRow> = sqlx::query_as(
-                r#"
-                SELECT id::text, name, public_key, owner_user_id::text,
-                       to_char(last_seen_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
-                       to_char(revoked_at,  'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
-                       to_char(created_at,  'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
-                       to_char(updated_at,  'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
-                       remark, expires_at, renewal_price, dashboard_metadata_json,
-                       last_state_json, last_state_at::text, last_info_json, last_info_at::text
-                FROM agents
-                WHERE revoked_at IS NULL
-                  AND (
-                    dashboard_metadata_json LIKE '%"dashboard_visible":true%'
-                    OR dashboard_metadata_json LIKE '%"dashboard_visible": true%'
-                  )
-                  AND dashboard_metadata_json NOT LIKE '%"hide_for_guest":true%'
-                  AND dashboard_metadata_json NOT LIKE '%"hide_for_guest": true%'
-                ORDER BY created_at DESC
-                LIMIT $1
-                "#,
-            )
-            .bind(limit)
-            .fetch_all(pool)
-            .await
-            .map_err(|e| AppError::Database(e.into()))?;
-            Ok(public_agent_rows_to_state(rows))
+            let rows = public_agent_rows_postgres(pool, limit).await?;
+            Ok(rows)
         }
     }
+}
+
+async fn public_agent_rows_postgres(
+    pool: &sqlx::PgPool,
+    limit: i64,
+) -> Result<Vec<AgentWithState>, AppError> {
+    let mut offset = 0_i64;
+    let mut out = Vec::new();
+    while (out.len() as i64) < limit {
+        let rows: Vec<PublicAgentRow> = sqlx::query_as(
+            r#"
+            SELECT id::text, name, public_key, owner_user_id::text,
+                   to_char(last_seen_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                   to_char(revoked_at,  'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                   to_char(created_at,  'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                   to_char(updated_at,  'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                   remark, expires_at, renewal_price, dashboard_metadata_json,
+                   last_state_json, last_state_at::text, last_info_json, last_info_at::text
+            FROM agents
+            WHERE revoked_at IS NULL
+            ORDER BY created_at DESC
+            LIMIT $1 OFFSET $2
+            "#,
+        )
+        .bind(PUBLIC_POSTGRES_SCAN_BATCH)
+        .bind(offset)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AppError::Database(e.into()))?;
+
+        if rows.is_empty() {
+            break;
+        }
+        let count = rows.len() as i64;
+        append_visible_public_agent_rows(&mut out, rows, limit as usize);
+        offset += count;
+        if count < PUBLIC_POSTGRES_SCAN_BATCH {
+            break;
+        }
+    }
+    Ok(out)
 }
 
 fn visible_public_service_server_ids(
@@ -664,6 +672,29 @@ fn public_agent_rows_to_state(rows: Vec<PublicAgentRow>) -> Vec<AgentWithState> 
             }
         })
         .collect()
+}
+
+fn public_agent_rows_to_visible_state(rows: Vec<PublicAgentRow>) -> Vec<AgentWithState> {
+    public_agent_rows_to_state(rows)
+        .into_iter()
+        .filter(|row| {
+            let dashboard = dashboard_metadata(row.dashboard_metadata_json.as_deref());
+            agent_visible_to_public(&row.agent, &dashboard)
+        })
+        .collect()
+}
+
+fn append_visible_public_agent_rows(
+    out: &mut Vec<AgentWithState>,
+    rows: Vec<PublicAgentRow>,
+    limit: usize,
+) {
+    for row in public_agent_rows_to_visible_state(rows) {
+        if out.len() >= limit {
+            break;
+        }
+        out.push(row);
+    }
 }
 
 fn public_agent_row_to_state(row: PublicAgentRow) -> Result<AgentWithState, anyhow::Error> {
@@ -1700,6 +1731,45 @@ mod tests {
     }
 
     #[test]
+    fn visible_public_agent_filter_ignores_json_text_false_positives_before_limit() {
+        let owner = Uuid::now_v7();
+        let public_id = Uuid::now_v7();
+        let mut rows = Vec::new();
+        for idx in 0..120 {
+            rows.push(public_agent_row(
+                Uuid::now_v7(),
+                owner,
+                &format!("dirty-private-{idx}"),
+                serde_json::json!({
+                    "dashboard_visible": false,
+                    "hide_for_guest": false,
+                    "public_note": "contains LIKE bait: \"dashboard_visible\":true"
+                })
+                .to_string(),
+                &format!("2026-01-02T00:{:02}:{:02}Z", idx / 60, idx % 60),
+            ));
+        }
+        rows.push(public_agent_row(
+            public_id,
+            owner,
+            "public-server",
+            serde_json::json!({
+                "dashboard_visible": true,
+                "hide_for_guest": false,
+                "public_note": "public"
+            })
+            .to_string(),
+            "2026-01-01T00:00:00Z",
+        ));
+
+        let mut visible = Vec::new();
+        append_visible_public_agent_rows(&mut visible, rows, 1);
+
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].agent.id.0, public_id);
+    }
+
+    #[test]
     fn public_service_last_status_uses_first_public_history_row() {
         let public_server = Uuid::now_v7().to_string();
         let history = vec![PublicServiceResultView {
@@ -2112,6 +2182,33 @@ mod tests {
             terminal_sessions: crate::api::v1::terminal::TerminalSessionRegistry::new(),
             io_registry: crate::grpc::IoRegistry::new(),
         }
+    }
+
+    fn public_agent_row(
+        id: Uuid,
+        owner_id: Uuid,
+        name: &str,
+        dashboard_metadata_json: String,
+        created_at: &str,
+    ) -> PublicAgentRow {
+        (
+            id.to_string(),
+            name.to_string(),
+            "pk".to_string(),
+            owner_id.to_string(),
+            None,
+            None,
+            created_at.to_string(),
+            created_at.to_string(),
+            None,
+            None,
+            None,
+            Some(dashboard_metadata_json),
+            None,
+            None,
+            None,
+            None,
+        )
     }
 
     async fn disable_public_server_details(pool: &sqlx::SqlitePool) {
