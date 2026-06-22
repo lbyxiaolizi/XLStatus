@@ -938,7 +938,7 @@ fn service_from_postgres_row(row: sqlx::postgres::PgRow) -> ServiceResponse {
     }
 }
 
-async fn visible_server_ids_for_auth(
+pub(crate) async fn visible_server_ids_for_auth(
     db: &crate::db::Db,
     auth: &AuthSession,
 ) -> Result<Vec<String>, AppError> {
@@ -1120,7 +1120,7 @@ fn parse_uuid_ids(ids: &[String]) -> Result<Vec<Uuid>, AppError> {
         .collect()
 }
 
-fn auth_has_global_service_visibility(auth: &AuthSession) -> bool {
+pub(crate) fn auth_has_global_service_visibility(auth: &AuthSession) -> bool {
     auth.role.is_admin() && auth.server_ids.is_none()
 }
 
