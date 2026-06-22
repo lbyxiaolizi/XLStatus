@@ -106,6 +106,7 @@ use auth::middleware::session_middleware;
 use xlstatus_shared::UserRole;
 
 const GRPC_MESSAGE_LIMIT: usize = 256 * 1024 * 1024;
+const HTTP_MAX_PATH_BYTES: usize = 4096;
 const HTTP_MAX_QUERY_BYTES: usize = 16 * 1024;
 const DEFAULT_AGENT_INSTALL_VERSION: &str = "v0.1.0-alpha.3";
 const INSTALL_BOOTSTRAP_MAX_QUERY_BYTES: usize = 16 * 1024;
@@ -690,6 +691,7 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .merge(protected)
                 .with_state(state)
+                .layer(middleware::from_fn(limit_http_request_target_length))
                 .layer(middleware::from_fn(limit_http_query_length))
                 .layer(cors);
 
@@ -1286,6 +1288,26 @@ fn ensure_http_query_length(uri: &Uri) -> Result<(), String> {
     Ok(())
 }
 
+async fn limit_http_request_target_length(request: Request, next: Next) -> Response {
+    match ensure_http_path_length(request.uri()) {
+        Ok(()) => next.run(request).await,
+        Err(message) => (
+            StatusCode::URI_TOO_LONG,
+            [(header::CONTENT_TYPE, "application/json")],
+            format!(r#"{{"success":false,"error":"{message}"}}"#),
+        )
+            .into_response(),
+    }
+}
+
+fn ensure_http_path_length(uri: &Uri) -> Result<(), String> {
+    let raw_path = uri.path();
+    if raw_path.len() > HTTP_MAX_PATH_BYTES {
+        return Err(format!("path must be at most {HTTP_MAX_PATH_BYTES} bytes"));
+    }
+    Ok(())
+}
+
 fn server_task_result(
     name: &str,
     result: Result<anyhow::Result<()>, tokio::task::JoinError>,
@@ -1375,6 +1397,22 @@ mod tests {
             .unwrap();
         let err = ensure_http_query_length(&uri).unwrap_err();
         assert!(err.contains("query string must be at most"));
+    }
+
+    #[test]
+    fn global_http_path_resource_budget_is_bounded() {
+        assert_eq!(HTTP_MAX_PATH_BYTES, 4096);
+
+        let uri: Uri = "/api/v1/servers/00000000-0000-0000-0000-000000000001"
+            .parse()
+            .unwrap();
+        assert!(ensure_http_path_length(&uri).is_ok());
+
+        let uri: Uri = format!("/api/v1/servers/{}", "a".repeat(HTTP_MAX_PATH_BYTES))
+            .parse()
+            .unwrap();
+        let err = ensure_http_path_length(&uri).unwrap_err();
+        assert!(err.contains("path must be at most"));
     }
 
     #[test]
