@@ -152,6 +152,7 @@ pub(crate) const SERVICE_MAX_TIMEOUT_SECONDS: i32 = 30;
 pub(crate) const SERVICE_MAX_SERVER_IDS: usize = 64;
 pub(crate) const SERVICE_MAX_TASK_IDS: usize = 32;
 pub(crate) const SERVICE_MAX_TARGETS_PER_PROBE: usize = 64;
+const SERVICE_UUID_TEXT_LEN: usize = 36;
 
 const VISIBLE_SERVICE_FILTER_SQL: &str = r#"
                 (
@@ -287,6 +288,7 @@ pub async fn get_service(
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<ServiceResponse>>, AppError> {
     require_scope(&auth, "service:read")?;
+    let id = require_service_uuid_text(&id, "service_id")?;
     let service = load_service_for_auth(&state.db, &auth, &id).await?;
     Ok(Json(ApiResponse::success(service)))
 }
@@ -389,6 +391,7 @@ pub async fn update_service(
     Json(req): Json<CreateServiceRequest>,
 ) -> Result<Json<ApiResponse<ServiceResponse>>, AppError> {
     require_scope(&auth, "service:write")?;
+    let id = require_service_uuid_text(&id, "service_id")?;
     let input = validate_service_request(req).await?;
     let existing = load_service(&state.db, &id).await?;
     ensure_service_visible_to_auth(&state.db, &auth, &existing).await?;
@@ -484,6 +487,7 @@ pub async fn delete_service(
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     require_scope(&auth, "service:delete")?;
+    let id = require_service_uuid_text(&id, "service_id")?;
     let service = load_service(&state.db, &id).await?;
     ensure_service_visible_to_auth(&state.db, &auth, &service).await?;
     let affected = match &state.db {
@@ -732,6 +736,25 @@ fn validate_task_id_list(task_ids: &[String]) -> Result<(), AppError> {
     Ok(())
 }
 
+pub(crate) fn require_service_uuid_text(value: &str, field: &str) -> Result<String, AppError> {
+    if value.is_empty() {
+        return Err(AppError::BadRequest(format!("{field} is required")));
+    }
+    if value.len() != SERVICE_UUID_TEXT_LEN {
+        return Err(AppError::BadRequest(format!(
+            "{field} must be a canonical UUID"
+        )));
+    }
+    let parsed = Uuid::parse_str(value)
+        .map_err(|_| AppError::BadRequest(format!("{field} must be a canonical UUID")))?;
+    if parsed.to_string() != value {
+        return Err(AppError::BadRequest(format!(
+            "{field} must be a canonical UUID"
+        )));
+    }
+    Ok(value.to_string())
+}
+
 impl ProbeType {
     fn as_db(&self) -> &'static str {
         match self {
@@ -777,6 +800,7 @@ pub(crate) async fn load_service(
     db: &crate::db::Db,
     id: &str,
 ) -> Result<ServiceResponse, AppError> {
+    let id = require_service_uuid_text(id, "service_id")?;
     match db {
         crate::db::DatabaseBackend::Sqlite(pool) => {
             let row = sqlx::query(
@@ -799,7 +823,7 @@ pub(crate) async fn load_service(
                 WHERE s.id = ?
                 "#,
             )
-            .bind(id)
+            .bind(&id)
             .fetch_optional(pool)
             .await
             .map_err(db_err)?;
@@ -810,7 +834,7 @@ pub(crate) async fn load_service(
             Ok(service)
         }
         crate::db::DatabaseBackend::Postgres(pool) => {
-            let service_id = Uuid::parse_str(id)
+            let service_id = Uuid::parse_str(&id)
                 .map_err(|e| AppError::BadRequest(format!("invalid service id: {e}")))?;
             let row = sqlx::query(
                 r#"
@@ -2025,6 +2049,44 @@ mod tests {
                 "{task_id:?} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn service_resource_ids_require_canonical_uuid_text() {
+        let canonical = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        assert_eq!(
+            require_service_uuid_text(canonical, "service_id").unwrap(),
+            canonical
+        );
+
+        for service_id in [
+            "service-a",
+            " aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa ",
+            "aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaaaaaa",
+            "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaax",
+        ] {
+            assert!(
+                require_service_uuid_text(service_id, "service_id").is_err(),
+                "{service_id:?} should be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn load_service_rejects_historical_text_ids_before_sql() {
+        let db = test_db().await;
+        let owner = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let server = Uuid::parse_str("00000000-0000-0000-0000-000000000101").unwrap();
+
+        seed_user(&db, owner, "owner", "admin").await;
+        seed_agent(&db, server, owner, "server").await;
+        seed_service(&db, "service-a", "dirty", server, "2026-01-02T00:00:00Z").await;
+
+        let err = load_service(&db, "service-a").await.unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+        assert!(app_error_message(&err).contains("canonical UUID"));
     }
 
     async fn test_db() -> DatabaseBackend {
