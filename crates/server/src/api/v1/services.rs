@@ -298,8 +298,8 @@ pub async fn create_service(
 ) -> Result<Json<ApiResponse<ServiceResponse>>, AppError> {
     require_scope(&auth, "service:write")?;
     let input = validate_service_request(req).await?;
-    ensure_servers_exist(&state.db, &input.server_ids).await?;
-    ensure_servers_exist(&state.db, &input.exclude_server_ids).await?;
+    ensure_servers_active(&state.db, &input.server_ids).await?;
+    ensure_servers_active(&state.db, &input.exclude_server_ids).await?;
     ensure_service_input_servers_visible(&state.db, &auth, &input).await?;
     let owner = auth.user_id.0.to_string();
     ensure_notification_group_owned_by(
@@ -392,8 +392,8 @@ pub async fn update_service(
     let input = validate_service_request(req).await?;
     let existing = load_service(&state.db, &id).await?;
     ensure_service_visible_to_auth(&state.db, &auth, &existing).await?;
-    ensure_servers_exist(&state.db, &input.server_ids).await?;
-    ensure_servers_exist(&state.db, &input.exclude_server_ids).await?;
+    ensure_servers_active(&state.db, &input.server_ids).await?;
+    ensure_servers_active(&state.db, &input.exclude_server_ids).await?;
     ensure_service_input_servers_visible(&state.db, &auth, &input).await?;
     let owner = auth.user_id.0.to_string();
     ensure_notification_group_owned_by(
@@ -1295,31 +1295,35 @@ async fn load_service_server_ids(
     }
 }
 
-async fn ensure_servers_exist(db: &crate::db::Db, server_ids: &[String]) -> Result<(), AppError> {
+async fn ensure_servers_active(db: &crate::db::Db, server_ids: &[String]) -> Result<(), AppError> {
     for server_id in server_ids {
         let exists = match db {
             crate::db::DatabaseBackend::Sqlite(pool) => {
-                let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM agents WHERE id = ?")
-                    .bind(server_id)
-                    .fetch_one(pool)
-                    .await
-                    .map_err(db_err)?;
+                let row: (i64,) = sqlx::query_as(
+                    "SELECT COUNT(*) FROM agents WHERE id = ? AND revoked_at IS NULL",
+                )
+                .bind(server_id)
+                .fetch_one(pool)
+                .await
+                .map_err(db_err)?;
                 row.0 > 0
             }
             crate::db::DatabaseBackend::Postgres(pool) => {
                 let parsed = Uuid::parse_str(server_id)
                     .map_err(|e| AppError::BadRequest(format!("invalid server_id: {e}")))?;
-                let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM agents WHERE id = $1")
-                    .bind(parsed)
-                    .fetch_one(pool)
-                    .await
-                    .map_err(db_err)?;
+                let row: (i64,) = sqlx::query_as(
+                    "SELECT COUNT(*) FROM agents WHERE id = $1 AND revoked_at IS NULL",
+                )
+                .bind(parsed)
+                .fetch_one(pool)
+                .await
+                .map_err(db_err)?;
                 row.0 > 0
             }
         };
         if !exists {
             return Err(AppError::BadRequest(format!(
-                "server_id not found: {server_id}"
+                "server_id not found or revoked: {server_id}"
             )));
         }
     }
@@ -1800,6 +1804,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn service_write_rejects_revoked_server_targets() {
+        let db = test_db().await;
+        let owner = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let active_server = Uuid::parse_str("00000000-0000-0000-0000-000000000101").unwrap();
+        let revoked_server = Uuid::parse_str("00000000-0000-0000-0000-000000000202").unwrap();
+
+        seed_user(&db, owner, "owner", "admin").await;
+        seed_agent(&db, active_server, owner, "active").await;
+        seed_agent(&db, revoked_server, owner, "revoked").await;
+        revoke_agent(&db, revoked_server).await;
+
+        assert!(ensure_servers_active(&db, &[active_server.to_string()])
+            .await
+            .is_ok());
+        let err = ensure_servers_active(&db, &[revoked_server.to_string()])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+        assert!(app_error_message(&err).contains("not found or revoked"));
+    }
+
+    #[tokio::test]
     async fn admin_pat_service_trigger_tasks_must_be_visible() {
         let db = test_db().await;
         let admin = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
@@ -2057,6 +2083,17 @@ mod tests {
         .unwrap();
     }
 
+    async fn revoke_agent(db: &DatabaseBackend, id: Uuid) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query("UPDATE agents SET revoked_at = '2026-06-22T00:00:00Z' WHERE id = ?")
+            .bind(id.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
     async fn seed_service(
         db: &DatabaseBackend,
         id: &str,
@@ -2150,5 +2187,16 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    fn app_error_message(err: &AppError) -> String {
+        match err {
+            AppError::BadRequest(message)
+            | AppError::Forbidden(message)
+            | AppError::Unauthorized(message)
+            | AppError::NotFound(message)
+            | AppError::TooManyRequests(message) => message.clone(),
+            AppError::Database(err) => err.to_string(),
+        }
     }
 }
