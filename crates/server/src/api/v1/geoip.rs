@@ -5,6 +5,7 @@ use crate::api::v1::auth::{require_sensitive_totp, AppError, AppState};
 use crate::api::v1::settings;
 use crate::auth::middleware::{AuthKind, AuthSession};
 use crate::db::{AgentRepository, DatabaseBackend};
+use crate::notifications::policy::notification_channel_from_values as validated_notification_channel_from_values;
 use crate::notifications::sender::{
     ensure_notification_channel_count_allowed, NotificationChannel, NotificationMessage,
     NotificationSender, NotificationSeverity, NOTIFICATION_MAX_GROUP_CHANNELS,
@@ -890,7 +891,17 @@ async fn list_notification_channels_for_group(
             .fetch_all(pool)
             .await?;
             ensure_notification_channel_count_allowed(rows.len())?;
-            rows.into_iter().map(channel_from_sqlite_row).collect()
+            let mut out = Vec::new();
+            for row in rows {
+                let id = row.try_get::<String, _>("id")?;
+                match channel_from_sqlite_row(row) {
+                    Ok(channel) => out.push(channel),
+                    Err(err) => {
+                        tracing::warn!("historical GeoIP notification channel {id} skipped: {err}")
+                    }
+                }
+            }
+            Ok(out)
         }
         DatabaseBackend::Postgres(pool) => {
             let rows = sqlx::query(
@@ -910,7 +921,17 @@ async fn list_notification_channels_for_group(
             .fetch_all(pool)
             .await?;
             ensure_notification_channel_count_allowed(rows.len())?;
-            rows.into_iter().map(channel_from_pg_row).collect()
+            let mut out = Vec::new();
+            for row in rows {
+                let id = row.try_get::<String, _>("id")?;
+                match channel_from_pg_row(row) {
+                    Ok(channel) => out.push(channel),
+                    Err(err) => {
+                        tracing::warn!("historical GeoIP notification channel {id} skipped: {err}")
+                    }
+                }
+            }
+            Ok(out)
         }
     }
 }
@@ -935,7 +956,17 @@ async fn list_notification_channels_for_owner(
             .fetch_all(pool)
             .await?;
             ensure_notification_channel_count_allowed(rows.len())?;
-            rows.into_iter().map(channel_from_sqlite_row).collect()
+            let mut out = Vec::new();
+            for row in rows {
+                let id = row.try_get::<String, _>("id")?;
+                match channel_from_sqlite_row(row) {
+                    Ok(channel) => out.push(channel),
+                    Err(err) => {
+                        tracing::warn!("historical GeoIP notification channel {id} skipped: {err}")
+                    }
+                }
+            }
+            Ok(out)
         }
         DatabaseBackend::Postgres(pool) => {
             let rows = sqlx::query(
@@ -952,13 +983,23 @@ async fn list_notification_channels_for_owner(
             .fetch_all(pool)
             .await?;
             ensure_notification_channel_count_allowed(rows.len())?;
-            rows.into_iter().map(channel_from_pg_row).collect()
+            let mut out = Vec::new();
+            for row in rows {
+                let id = row.try_get::<String, _>("id")?;
+                match channel_from_pg_row(row) {
+                    Ok(channel) => out.push(channel),
+                    Err(err) => {
+                        tracing::warn!("historical GeoIP notification channel {id} skipped: {err}")
+                    }
+                }
+            }
+            Ok(out)
         }
     }
 }
 
 fn channel_from_pg_row(row: sqlx::postgres::PgRow) -> anyhow::Result<NotificationChannel> {
-    notification_channel_from_values(
+    geoip_notification_channel_from_values(
         row.try_get("id")?,
         row.try_get("name")?,
         row.try_get("url")?,
@@ -972,7 +1013,7 @@ fn channel_from_pg_row(row: sqlx::postgres::PgRow) -> anyhow::Result<Notificatio
 }
 
 fn channel_from_sqlite_row(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<NotificationChannel> {
-    notification_channel_from_values(
+    geoip_notification_channel_from_values(
         row.try_get("id")?,
         row.try_get("name")?,
         row.try_get("url")?,
@@ -985,7 +1026,7 @@ fn channel_from_sqlite_row(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<Notif
     )
 }
 
-fn notification_channel_from_values(
+fn geoip_notification_channel_from_values(
     id: String,
     name: String,
     url: String,
@@ -995,22 +1036,16 @@ fn notification_channel_from_values(
     body_template: String,
     verify_tls: bool,
 ) -> anyhow::Result<NotificationChannel> {
-    let headers = headers_json
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .map(serde_json::from_str::<HashMap<String, String>>)
-        .transpose()?
-        .unwrap_or_default();
-    Ok(NotificationChannel {
+    validated_notification_channel_from_values(
         id,
         name,
         url,
         request_method,
         request_type,
-        headers,
+        headers_json,
         body_template,
         verify_tls,
-    })
+    )
 }
 
 fn notification_severity_from_setting(value: &str) -> NotificationSeverity {

@@ -5,6 +5,7 @@ use crate::api::v1::auth::{require_sensitive_totp, AppError, AppState};
 use crate::auth::middleware::{AuthKind, AuthSession};
 use crate::auth::rbac::has_scope;
 use crate::db::DatabaseBackend;
+use crate::notifications::policy::parse_notification_headers_json;
 use crate::notifications::sender::{
     ensure_headers_allowed, NotificationChannel, NotificationMessage, NotificationSender,
     NotificationSeverity, NOTIFICATION_MAX_BODY_TEMPLATE_BYTES, NOTIFICATION_MAX_GROUP_CHANNELS,
@@ -202,15 +203,14 @@ struct NotificationRecord {
 
 impl NotificationRecord {
     fn to_view(&self) -> Result<NotificationView, AppError> {
-        let headers_json = redacted_headers_json(self.headers_json.as_deref())?;
-        let headers = parse_headers_json(headers_json.as_deref())?;
+        let (headers_json, headers) = redacted_headers_for_view(self.headers_json.as_deref());
         Ok(NotificationView {
             id: self.id.clone(),
             owner_user_id: self.owner_user_id.clone(),
-            name: self.name.clone(),
-            url: redact_notification_url(&self.url),
-            request_method: self.request_method.clone(),
-            request_type: self.request_type.clone(),
+            name: notification_view_name(&self.name),
+            url: redact_notification_url_for_view(&self.url),
+            request_method: notification_view_method(&self.request_method),
+            request_type: notification_view_request_type(&self.request_type),
             headers_json,
             headers,
             body_template: redact_body_template(&self.body_template),
@@ -1671,16 +1671,7 @@ fn normalize_headers(
 }
 
 fn parse_headers_json(value: Option<&str>) -> Result<HashMap<String, String>, AppError> {
-    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(HashMap::new());
-    };
-    if value.len() > NOTIFICATION_MAX_HEADERS_JSON_BYTES {
-        return Err(AppError::BadRequest(format!(
-            "headers_json must be at most {NOTIFICATION_MAX_HEADERS_JSON_BYTES} bytes"
-        )));
-    }
-    serde_json::from_str(value)
-        .map_err(|e| AppError::BadRequest(format!("headers_json must be a string map: {e}")))
+    parse_notification_headers_json(value).map_err(|e| AppError::BadRequest(e.to_string()))
 }
 
 fn normalize_body_template(value: Option<String>) -> Result<String, AppError> {
@@ -1693,18 +1684,52 @@ fn normalize_body_template(value: Option<String>) -> Result<String, AppError> {
     Ok(value)
 }
 
-fn redacted_headers_json(value: Option<&str>) -> Result<Option<String>, AppError> {
-    let headers = parse_headers_json(value)?;
+fn redacted_headers_for_view(value: Option<&str>) -> (Option<String>, HashMap<String, String>) {
+    let headers = match parse_headers_json(value) {
+        Ok(headers) => headers,
+        Err(err) => {
+            tracing::warn!("historical notification headers omitted from API view: {err:?}");
+            return (None, HashMap::new());
+        }
+    };
     if headers.is_empty() {
-        return Ok(None);
+        return (None, HashMap::new());
     }
     let redacted = headers
         .into_keys()
         .map(|key| (key, REDACTED_NOTIFICATION_SECRET.to_string()))
         .collect::<HashMap<_, _>>();
-    serde_json::to_string(&redacted)
-        .map(Some)
-        .map_err(|e| AppError::BadRequest(format!("invalid headers: {e}")))
+    let headers_json = serde_json::to_string(&redacted).ok();
+    (headers_json, redacted)
+}
+
+fn notification_view_name(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.len() > NOTIFICATION_MAX_NAME_BYTES {
+        return "Invalid notification".to_string();
+    }
+    trimmed.to_string()
+}
+
+fn redact_notification_url_for_view(value: &str) -> String {
+    if value.len() > NOTIFICATION_MAX_URL_BYTES {
+        return REDACTED_NOTIFICATION_SECRET.to_string();
+    }
+    redact_notification_url(value)
+}
+
+fn notification_view_method(value: &str) -> String {
+    if value.trim().len() > 8 {
+        return "POST".to_string();
+    }
+    normalize_method(value).unwrap_or_else(|_| "POST".to_string())
+}
+
+fn notification_view_request_type(value: &str) -> String {
+    if value.trim().len() > 16 {
+        return "json".to_string();
+    }
+    normalize_request_type(value).unwrap_or_else(|_| "json".to_string())
 }
 
 fn redact_body_template(value: &str) -> String {
@@ -1848,6 +1873,77 @@ mod tests {
         assert!(!serde_json::to_string(&view)
             .unwrap()
             .contains("secret-token"));
+    }
+
+    #[test]
+    fn notification_api_view_tolerates_historical_dirty_fields() {
+        let record = NotificationRecord {
+            id: "notification-1".to_string(),
+            owner_user_id: "user-1".to_string(),
+            name: "x".repeat(NOTIFICATION_MAX_NAME_BYTES + 1),
+            url: "x".repeat(NOTIFICATION_MAX_URL_BYTES + 1),
+            request_method: "TRACE".to_string(),
+            request_type: "xml".to_string(),
+            headers_json: Some("{not-json".to_string()),
+            body_template: r#"{"token":"secret"}"#.to_string(),
+            verify_tls: true,
+            format_metric_units: true,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+
+        let view = record.to_view().unwrap();
+
+        assert_eq!(view.name, "Invalid notification");
+        assert_eq!(view.url, REDACTED_NOTIFICATION_SECRET);
+        assert_eq!(view.request_method, "POST");
+        assert_eq!(view.request_type, "json");
+        assert!(view.headers_json.is_none());
+        assert!(view.headers.is_empty());
+        assert_eq!(view.body_template, REDACTED_NOTIFICATION_SECRET);
+    }
+
+    #[tokio::test]
+    async fn list_notifications_skips_dirty_headers_in_api_view() {
+        let db = test_db().await;
+        let owner = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        seed_user(&db, owner, "owner").await;
+        seed_notification_with_headers(
+            &db,
+            "00000000-0000-0000-0000-000000000101",
+            owner,
+            "dirty",
+            Some("{not-json"),
+        )
+        .await;
+        seed_notification_with_headers(
+            &db,
+            "00000000-0000-0000-0000-000000000102",
+            owner,
+            "clean",
+            Some(r#"{"Authorization":"secret"}"#),
+        )
+        .await;
+
+        let (records, total) = list_notifications_for_owner(&db, owner, 10, 0)
+            .await
+            .unwrap();
+        let views = records
+            .into_iter()
+            .map(|record| record.to_view())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(total, 2);
+        assert_eq!(views.len(), 2);
+        let dirty = views.iter().find(|view| view.name == "dirty").unwrap();
+        assert!(dirty.headers_json.is_none());
+        assert!(dirty.headers.is_empty());
+        let clean = views.iter().find(|view| view.name == "clean").unwrap();
+        assert_eq!(
+            clean.headers.get("Authorization").map(String::as_str),
+            Some(REDACTED_NOTIFICATION_SECRET)
+        );
     }
 
     #[test]
@@ -2152,6 +2248,28 @@ mod tests {
         .bind(id)
         .bind(owner.to_string())
         .bind(name)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_notification_with_headers(
+        db: &DatabaseBackend,
+        id: &str,
+        owner: Uuid,
+        name: &str,
+        headers_json: Option<&str>,
+    ) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO notifications (id, owner_user_id, name, url, request_method, request_type, headers_json, verify_tls, format_metric_units, created_at, updated_at) VALUES (?, ?, ?, 'https://example.com/hook', 'POST', 'json', ?, 1, 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(owner.to_string())
+        .bind(name)
+        .bind(headers_json)
         .execute(pool)
         .await
         .unwrap();

@@ -12,6 +12,7 @@ use xlstatus_shared::tasks::*;
 use crate::db::repository::tasks::{TaskRepository, TaskRunRepository};
 use crate::db::Db;
 use crate::grpc::{truncate_task_result_text, SessionRegistry, TaskResponseRegistry};
+use crate::notifications::policy::notification_channel_from_values;
 use crate::notifications::sender::{
     ensure_notification_channel_count_allowed, NotificationChannel, NotificationMessage,
     NotificationSender, NotificationSeverity, NOTIFICATION_MAX_GROUP_CHANNELS,
@@ -889,36 +890,25 @@ async fn notification_channels_for_group(
     };
     ensure_notification_channel_count_allowed(rows.len())?;
 
-    Ok(rows
-        .into_iter()
-        .map(
-            |(
-                id,
-                name,
-                url,
-                request_method,
-                request_type,
-                headers_json,
-                body_template,
-                verify_tls,
-            )| {
-                let headers: HashMap<String, String> = headers_json
-                    .as_deref()
-                    .and_then(|value| serde_json::from_str(value).ok())
-                    .unwrap_or_default();
-                NotificationChannel {
-                    id,
-                    name,
-                    url,
-                    request_method,
-                    request_type,
-                    headers,
-                    body_template: body_template.unwrap_or_default(),
-                    verify_tls,
-                }
-            },
-        )
-        .collect())
+    let mut out = Vec::new();
+    for (id, name, url, request_method, request_type, headers_json, body_template, verify_tls) in
+        rows
+    {
+        match notification_channel_from_values(
+            id.clone(),
+            name,
+            url,
+            request_method,
+            request_type,
+            headers_json,
+            body_template.unwrap_or_default(),
+            verify_tls,
+        ) {
+            Ok(channel) => out.push(channel),
+            Err(err) => warn!("historical task notification channel {id} skipped: {err}"),
+        }
+    }
+    Ok(out)
 }
 
 async fn create_run(
@@ -1096,6 +1086,63 @@ mod tests {
         assert_eq!(resolved, vec![owner_agent.to_string()]);
     }
 
+    #[tokio::test]
+    async fn notification_channels_skip_invalid_historical_rows() {
+        let db = test_db().await;
+        let owner = "00000000-0000-0000-0000-000000000001";
+        let group_id = "00000000-0000-0000-0000-000000000101";
+        let valid_id = "00000000-0000-0000-0000-000000000201";
+        let dirty_headers_id = "00000000-0000-0000-0000-000000000202";
+        let dirty_method_id = "00000000-0000-0000-0000-000000000203";
+
+        seed_user(&db, owner, "owner").await;
+        seed_notification_group(&db, group_id, owner).await;
+        seed_notification(
+            &db,
+            valid_id,
+            owner,
+            "valid",
+            Some(r#"{"Authorization":"secret"}"#),
+            "POST",
+            "json",
+        )
+        .await;
+        seed_notification(
+            &db,
+            dirty_headers_id,
+            owner,
+            "dirty-headers",
+            Some("{not-json"),
+            "POST",
+            "json",
+        )
+        .await;
+        seed_notification(
+            &db,
+            dirty_method_id,
+            owner,
+            "dirty-method",
+            None,
+            "TRACE",
+            "json",
+        )
+        .await;
+        for id in [valid_id, dirty_headers_id, dirty_method_id] {
+            seed_notification_group_member(&db, group_id, id).await;
+        }
+
+        let channels = notification_channels_for_group(&db, group_id, owner)
+            .await
+            .unwrap();
+
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0].id, valid_id);
+        assert_eq!(
+            channels[0].headers.get("Authorization").map(String::as_str),
+            Some("secret")
+        );
+    }
+
     async fn test_db() -> Db {
         let db = Db::connect("sqlite::memory:", true).await.unwrap();
         db.run_migrations().await.unwrap();
@@ -1155,6 +1202,60 @@ mod tests {
         )
         .bind(group_id)
         .bind(agent_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_notification_group(db: &Db, id: &str, owner: &str) {
+        let Db::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO notification_groups (id, owner_user_id, name, created_at, updated_at) VALUES (?, ?, 'group', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(owner)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_notification(
+        db: &Db,
+        id: &str,
+        owner: &str,
+        name: &str,
+        headers_json: Option<&str>,
+        request_method: &str,
+        request_type: &str,
+    ) {
+        let Db::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO notifications (id, owner_user_id, name, url, request_method, request_type, headers_json, verify_tls, format_metric_units, created_at, updated_at) VALUES (?, ?, ?, 'https://example.com/hook', ?, ?, ?, 1, 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(owner)
+        .bind(name)
+        .bind(request_method)
+        .bind(request_type)
+        .bind(headers_json)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_notification_group_member(db: &Db, group_id: &str, notification_id: &str) {
+        let Db::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO notification_group_members (group_id, notification_id) VALUES (?, ?)",
+        )
+        .bind(group_id)
+        .bind(notification_id)
         .execute(pool)
         .await
         .unwrap();

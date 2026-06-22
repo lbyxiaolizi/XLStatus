@@ -11,6 +11,7 @@ use crate::api::v1::alerts::{
 use crate::api::v1::services::SERVICE_MAX_SERVER_IDS;
 use crate::db::Db;
 use crate::grpc::{SessionRegistry, TaskResponseRegistry};
+use crate::notifications::policy::notification_channel_from_values;
 use crate::notifications::sender::{
     ensure_notification_channel_count_allowed, NotificationChannel, NotificationMessage,
     NotificationSender, NotificationSeverity, NOTIFICATION_MAX_GROUP_CHANNELS,
@@ -1252,20 +1253,19 @@ impl AlertEngine {
             verify_tls,
         ) in rows
         {
-            let headers: HashMap<String, String> = headers_json
-                .as_deref()
-                .and_then(|s| serde_json::from_str(s).ok())
-                .unwrap_or_default();
-            out.push(NotificationChannel {
-                id,
+            match notification_channel_from_values(
+                id.clone(),
                 name,
                 url,
                 request_method,
                 request_type,
-                headers,
-                body_template: body_template.unwrap_or_default(),
+                headers_json,
+                body_template.unwrap_or_default(),
                 verify_tls,
-            });
+            ) {
+                Ok(channel) => out.push(channel),
+                Err(err) => warn!("historical alert notification channel {id} skipped: {err}"),
+            }
         }
         Ok(out)
     }
