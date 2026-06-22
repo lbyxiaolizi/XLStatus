@@ -169,10 +169,15 @@ export default function ServicesPage() {
     event.preventDefault();
     setSaving(true);
     const payload = formToPayload(form);
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) {
+      setSaving(false);
+      return;
+    }
     const response =
       modal === "edit" && editing
-        ? await apiClient.updateService(editing.id, payload)
-        : await apiClient.createService(payload);
+        ? await apiClient.updateService(editing.id, payload, totpCode)
+        : await apiClient.createService(payload, totpCode);
     setSaving(false);
 
     if (response.success) {
@@ -230,7 +235,9 @@ export default function ServicesPage() {
 
   async function deleteService(service: Service) {
     if (!confirm(`确定删除服务「${service.name}」？`)) return;
-    const response = await apiClient.deleteService(service.id);
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
+    const response = await apiClient.deleteService(service.id, totpCode);
     if (response.success) {
       setNotice("服务已删除。");
       await loadServices();

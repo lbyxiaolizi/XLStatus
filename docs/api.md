@@ -127,7 +127,7 @@ Enrollment token 创建请求体上限为 4KiB，`expires_in_hours` 必须在 1 
 | `GET` | `/api/v1/services/:id/history` | 历史结果 |
 | `GET` | `/api/v1/services/:id/uptime` | 可用率 |
 
-服务创建、更新和测试探测请求体上限为 128KiB。测试探测会让主控立即发起 HTTP/TCP/ICMP 出站连接，只允许 Cookie session；若账号已启用 TOTP，请求必须携带有效 `x-totp-code`，PAT 不能触发测试探测。服务名称最长 128 字节，target 最长 2048 字节，`interval_seconds` 必须在 10 到 86400 秒之间，`timeout_seconds` 必须在 1 到 30 秒之间。服务详情、更新、删除、历史和 uptime path `:id` 必须是 36 字节 canonical UUID 文本；非法、simple、大写或带空格 UUID 会在 SQL 前返回 400。单个服务最多关联或排除 64 台服务器，失败/恢复触发任务各最多 32 个；创建或更新服务时，显式关联和排除的服务器必须存在且未撤销；引用的触发任务 ID 必须是 36 字节 canonical UUID 文本，且任务必须属于当前用户、任务选择器也必须对当前凭据可见。后台一次服务探测最多下发到 64 台 Agent；`specific`、`all` 和 `exclude` 覆盖模式只会在服务 owner 拥有的未撤销 Agent 集合内展开，缺少有效 owner 的历史远端服务不会全局展开。服务列表会在 SQL 层按当前凭据可见服务器过滤后再分页/count；服务列表和详情中的 `last_status`、`last_check_at`、证书摘要字段只从当前凭据可见服务器的 `service_results.server_id` 派生；服务历史和 uptime 会在 SQL 层按当前凭据可见的 `service_results.server_id` 过滤后再应用 `limit` / `offset` 或聚合。
+服务创建、更新、删除和测试探测请求体上限为 128KiB。服务监控配置变更和测试探测只允许 Cookie session；若账号已启用 TOTP，请求必须携带有效 `x-totp-code`，PAT 不能保存、删除服务监控或触发测试探测。服务名称最长 128 字节，target 最长 2048 字节，`interval_seconds` 必须在 10 到 86400 秒之间，`timeout_seconds` 必须在 1 到 30 秒之间。服务详情、更新、删除、历史和 uptime path `:id` 必须是 36 字节 canonical UUID 文本；非法、simple、大写或带空格 UUID 会在 SQL 前返回 400。单个服务最多关联或排除 64 台服务器，失败/恢复触发任务各最多 32 个；创建或更新服务时，显式关联和排除的服务器必须存在且未撤销；引用的触发任务 ID 必须是 36 字节 canonical UUID 文本，且任务必须属于当前用户、任务选择器也必须对当前凭据可见。后台一次服务探测最多下发到 64 台 Agent；`specific`、`all` 和 `exclude` 覆盖模式只会在服务 owner 拥有的未撤销 Agent 集合内展开，缺少有效 owner 的历史远端服务不会全局展开。服务列表会在 SQL 层按当前凭据可见服务器过滤后再分页/count；服务列表和详情中的 `last_status`、`last_check_at`、证书摘要字段只从当前凭据可见服务器的 `service_results.server_id` 派生；服务历史和 uptime 会在 SQL 层按当前凭据可见的 `service_results.server_id` 过滤后再应用 `limit` / `offset` 或聚合。
 
 ### 告警
 

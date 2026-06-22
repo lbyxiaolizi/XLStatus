@@ -1115,9 +1115,10 @@ class ApiClient {
     return this.request<JsonObject>(`/api/v1/services/${encodeURIComponent(id)}`);
   }
 
-  async createService(service: JsonObject): Promise<ApiResponse<JsonObject>> {
+  async createService(service: JsonObject, totpCode?: string): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>("/api/v1/services", {
       method: "POST",
+      headers: this.sensitiveHeaders(totpCode),
       body: JSON.stringify(service),
     });
   }
@@ -1125,17 +1126,20 @@ class ApiClient {
   async updateService(
     id: string,
     service: JsonObject,
+    totpCode?: string,
   ): Promise<ApiResponse<JsonObject>> {
     return this.requestWithFallback<JsonObject>(
       `/api/v1/services/${encodeURIComponent(id)}`,
       service,
       ["PATCH", "POST", "PUT"],
+      { headers: this.sensitiveHeaders(totpCode) },
     );
   }
 
-  async deleteService(id: string): Promise<ApiResponse<JsonObject>> {
+  async deleteService(id: string, totpCode?: string): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(`/api/v1/services/${encodeURIComponent(id)}`, {
       method: "DELETE",
+      headers: this.sensitiveHeaders(totpCode),
     });
   }
 

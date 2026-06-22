@@ -297,9 +297,10 @@ pub async fn get_service(
 pub async fn create_service(
     State(state): State<AppState>,
     auth: AuthSession,
+    headers: HeaderMap,
     Json(req): Json<CreateServiceRequest>,
 ) -> Result<Json<ApiResponse<ServiceResponse>>, AppError> {
-    require_scope(&auth, "service:write")?;
+    require_service_mutation_scope(&state.db, &auth, "service:write", &headers).await?;
     let input = validate_service_request(req).await?;
     ensure_servers_active(&state.db, &input.server_ids).await?;
     ensure_servers_active(&state.db, &input.exclude_server_ids).await?;
@@ -388,10 +389,11 @@ pub async fn create_service(
 pub async fn update_service(
     State(state): State<AppState>,
     auth: AuthSession,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(req): Json<CreateServiceRequest>,
 ) -> Result<Json<ApiResponse<ServiceResponse>>, AppError> {
-    require_scope(&auth, "service:write")?;
+    require_service_mutation_scope(&state.db, &auth, "service:write", &headers).await?;
     let id = require_service_uuid_text(&id, "service_id")?;
     let input = validate_service_request(req).await?;
     let existing = load_service(&state.db, &id).await?;
@@ -485,9 +487,10 @@ pub async fn update_service(
 pub async fn delete_service(
     State(state): State<AppState>,
     auth: AuthSession,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
-    require_scope(&auth, "service:delete")?;
+    require_service_mutation_scope(&state.db, &auth, "service:delete", &headers).await?;
     let id = require_service_uuid_text(&id, "service_id")?;
     let service = load_service(&state.db, &id).await?;
     ensure_service_visible_to_auth(&state.db, &auth, &service).await?;
@@ -1603,6 +1606,21 @@ async fn require_probe_test_scope(
     require_sensitive_totp(db, auth.user_id, headers).await
 }
 
+async fn require_service_mutation_scope(
+    db: &DatabaseBackend,
+    auth: &AuthSession,
+    scope: &str,
+    headers: &HeaderMap,
+) -> Result<(), AppError> {
+    require_scope(auth, scope)?;
+    if matches!(auth.auth_kind, AuthKind::PersonalAccessToken) {
+        return Err(AppError::Forbidden(
+            "service changes require a cookie session".into(),
+        ));
+    }
+    require_sensitive_totp(db, auth.user_id, headers).await
+}
+
 fn db_err(err: sqlx::Error) -> AppError {
     AppError::Database(anyhow::anyhow!(err))
 }
@@ -1976,6 +1994,48 @@ mod tests {
         let auth = admin_cookie_session(admin);
 
         require_probe_test_scope(&db, &auth, &HeaderMap::new())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn service_changes_reject_pat_session() {
+        let db = test_db().await;
+        let admin = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let auth = admin_pat_session_with_scopes(admin, vec!["service:write".into()]);
+
+        let err = require_service_mutation_scope(&db, &auth, "service:write", &HeaderMap::new())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+        assert!(app_error_message(&err).contains("cookie session"));
+    }
+
+    #[tokio::test]
+    async fn service_changes_require_sensitive_totp_when_enabled() {
+        let db = test_db().await;
+        let admin = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        seed_user(&db, admin, "admin", "admin").await;
+        seed_totp_enabled_user(&db, admin).await;
+        let auth = admin_cookie_session(admin);
+
+        let err = require_service_mutation_scope(&db, &auth, "service:write", &HeaderMap::new())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+        assert!(app_error_message(&err).contains("TOTP"));
+    }
+
+    #[tokio::test]
+    async fn service_changes_allow_cookie_without_totp() {
+        let db = test_db().await;
+        let admin = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        seed_user(&db, admin, "admin", "admin").await;
+        let auth = admin_cookie_session(admin);
+
+        require_service_mutation_scope(&db, &auth, "service:delete", &HeaderMap::new())
             .await
             .unwrap();
     }
