@@ -675,34 +675,12 @@ pub async fn delete_notification_group_member(
 ) -> Result<Json<ApiResponse<NotificationGroupView>>, AppError> {
     require_scope(&auth, "notification:write")?;
     let owner = auth.user_id.0;
-    ensure_group_exists(&state.db, &id, owner).await?;
-    let affected = match &state.db {
-        DatabaseBackend::Sqlite(pool) => sqlx::query(
-            "DELETE FROM notification_group_members WHERE group_id = ? AND notification_id = ?",
-        )
-        .bind(&id)
-        .bind(&notification_id)
-        .execute(pool)
-        .await
-        .map_err(db_err)?
-        .rows_affected(),
-        DatabaseBackend::Postgres(pool) => sqlx::query(
-            "DELETE FROM notification_group_members WHERE group_id = $1 AND notification_id = $2",
-        )
-        .bind(&id)
-        .bind(&notification_id)
-        .execute(pool)
-        .await
-        .map_err(db_err)?
-        .rows_affected(),
-    };
-    if affected == 0 {
-        return Err(AppError::NotFound(
-            "notification group member not found".into(),
-        ));
-    }
+    let group_id = require_uuid_text(id, "group_id")?;
+    let notification_id = require_uuid_text(notification_id, "notification_id")?;
+    delete_notification_group_member_for_owner(&state.db, &group_id, &notification_id, owner)
+        .await?;
     Ok(Json(ApiResponse::success(
-        load_group_for_owner(&state.db, &id, owner).await?,
+        load_group_for_owner(&state.db, &group_id, owner).await?,
     )))
 }
 
@@ -1345,6 +1323,73 @@ async fn notification_group_member_exists(
     }
 }
 
+async fn delete_notification_group_member_for_owner(
+    db: &DatabaseBackend,
+    group_id: &str,
+    notification_id: &str,
+    owner: Uuid,
+) -> Result<(), AppError> {
+    ensure_group_exists(db, group_id, owner).await?;
+    ensure_notification_exists(db, notification_id, owner).await?;
+    let affected = match db {
+        DatabaseBackend::Sqlite(pool) => sqlx::query(
+            r#"
+            DELETE FROM notification_group_members
+            WHERE group_id = ?
+              AND notification_id = ?
+              AND EXISTS (
+                  SELECT 1 FROM notification_groups ng
+                  WHERE ng.id = notification_group_members.group_id
+                    AND ng.owner_user_id = ?
+              )
+              AND EXISTS (
+                  SELECT 1 FROM notifications n
+                  WHERE n.id = notification_group_members.notification_id
+                    AND n.owner_user_id = ?
+              )
+            "#,
+        )
+        .bind(group_id)
+        .bind(notification_id)
+        .bind(owner.to_string())
+        .bind(owner.to_string())
+        .execute(pool)
+        .await
+        .map_err(db_err)?
+        .rows_affected(),
+        DatabaseBackend::Postgres(pool) => sqlx::query(
+            r#"
+            DELETE FROM notification_group_members
+            WHERE group_id = $1
+              AND notification_id = $2
+              AND EXISTS (
+                  SELECT 1 FROM notification_groups ng
+                  WHERE ng.id = notification_group_members.group_id
+                    AND ng.owner_user_id = $3
+              )
+              AND EXISTS (
+                  SELECT 1 FROM notifications n
+                  WHERE n.id = notification_group_members.notification_id
+                    AND n.owner_user_id = $3
+              )
+            "#,
+        )
+        .bind(group_id)
+        .bind(notification_id)
+        .bind(owner)
+        .execute(pool)
+        .await
+        .map_err(db_err)?
+        .rows_affected(),
+    };
+    if affected == 0 {
+        return Err(AppError::NotFound(
+            "notification group member not found".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn row_to_notification_record_sqlite(
     row: sqlx::sqlite::SqliteRow,
 ) -> Result<NotificationRecord, AppError> {
@@ -1845,6 +1890,40 @@ mod tests {
         )
         .await
         .unwrap());
+    }
+
+    #[tokio::test]
+    async fn notification_group_member_delete_requires_member_owner() {
+        let db = test_db().await;
+        let owner = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let other = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let group_id = "00000000-0000-0000-0000-000000000101";
+        let other_notification_id = "00000000-0000-0000-0000-000000000202";
+
+        seed_user(&db, owner, "owner").await;
+        seed_user(&db, other, "other").await;
+        seed_notification_group(&db, group_id, owner, "group").await;
+        seed_notification(&db, other_notification_id, other, "other-channel").await;
+        seed_notification_group_member(&db, group_id, other_notification_id).await;
+
+        let err =
+            delete_notification_group_member_for_owner(&db, group_id, other_notification_id, owner)
+                .await
+                .unwrap_err();
+        assert!(matches!(err, AppError::NotFound(_)));
+
+        let raw_member_exists: (i64,) = match &db {
+            DatabaseBackend::Sqlite(pool) => sqlx::query_as(
+                "SELECT COUNT(*) FROM notification_group_members WHERE group_id = ? AND notification_id = ?",
+            )
+            .bind(group_id)
+            .bind(other_notification_id)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+            DatabaseBackend::Postgres(_) => unreachable!(),
+        };
+        assert_eq!(raw_member_exists.0, 1);
     }
 
     #[test]
