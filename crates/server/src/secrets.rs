@@ -10,6 +10,7 @@ use std::sync::OnceLock;
 const PREFIX: &str = "xlsec:v1:";
 const AAD: &[u8] = b"xlstatus.secrets.v1";
 const NONCE_LEN: usize = 12;
+const SECRET_SETTING_VALUE_JSON_MAX_BYTES: usize = 64 * 1024;
 
 static SECRET_CRYPTO: OnceLock<SecretCrypto> = OnceLock::new();
 
@@ -242,8 +243,10 @@ async fn migrate_setting_secrets(db: &DatabaseBackend) -> Result<usize> {
                     continue;
                 }
                 let value_json: String = row.try_get("value_json")?;
-                let value = serde_json::from_str::<String>(&value_json)
-                    .with_context(|| format!("invalid string setting for {key}"))?;
+                let value = match parse_migratable_secret_setting(&key, &value_json) {
+                    Some(value) => value,
+                    None => continue,
+                };
                 if value.trim().is_empty() || is_encrypted_secret(&value) {
                     continue;
                 }
@@ -266,8 +269,10 @@ async fn migrate_setting_secrets(db: &DatabaseBackend) -> Result<usize> {
                     continue;
                 }
                 let value_json: String = row.try_get("value_json")?;
-                let value = serde_json::from_str::<String>(&value_json)
-                    .with_context(|| format!("invalid string setting for {key}"))?;
+                let value = match parse_migratable_secret_setting(&key, &value_json) {
+                    Some(value) => value,
+                    None => continue,
+                };
                 if value.trim().is_empty() || is_encrypted_secret(&value) {
                     continue;
                 }
@@ -282,6 +287,24 @@ async fn migrate_setting_secrets(db: &DatabaseBackend) -> Result<usize> {
         }
     }
     Ok(changed)
+}
+
+fn parse_migratable_secret_setting(key: &str, value_json: &str) -> Option<String> {
+    if value_json.len() > SECRET_SETTING_VALUE_JSON_MAX_BYTES {
+        tracing::warn!(
+            "historical secret setting {key} skipped during plaintext migration: value_json exceeds {SECRET_SETTING_VALUE_JSON_MAX_BYTES} bytes"
+        );
+        return None;
+    }
+    match serde_json::from_str::<String>(value_json) {
+        Ok(value) => Some(value),
+        Err(err) => {
+            tracing::warn!(
+                "historical secret setting {key} skipped during plaintext migration: {err}"
+            );
+            None
+        }
+    }
 }
 
 async fn migrate_totp_secrets(db: &DatabaseBackend) -> Result<usize> {
@@ -453,6 +476,74 @@ mod tests {
             .unwrap();
         assert!(is_encrypted_secret(&totp_raw));
         assert_eq!(decrypt_secret_if_needed(&totp_raw).unwrap(), "LEGACYTOTP");
+    }
+
+    #[tokio::test]
+    async fn secret_setting_migration_skips_invalid_historical_values() {
+        let db = test_db().await;
+        raw_sqlite(
+            &db,
+            "INSERT INTO system_settings (key, value_json, updated_at) VALUES ('geoip_ipinfo_token', '{not-json', 'now')",
+        )
+        .await
+        .unwrap();
+        raw_sqlite(
+            &db,
+            "INSERT INTO system_settings (key, value_json, updated_at) VALUES ('cloudflared_token', '123', 'now')",
+        )
+        .await
+        .unwrap();
+        raw_sqlite(
+            &db,
+            "INSERT INTO system_settings (key, value_json, updated_at) VALUES ('public_site_name', '123', 'now')",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(migrate_plaintext_secrets(&db).await.unwrap(), 0);
+        assert_eq!(migrate_plaintext_secrets(&db).await.unwrap(), 0);
+
+        let geoip_raw = scalar_sqlite(
+            &db,
+            "SELECT value_json FROM system_settings WHERE key = 'geoip_ipinfo_token'",
+        )
+        .await
+        .unwrap();
+        assert_eq!(geoip_raw, "{not-json");
+
+        let cloudflared_raw = scalar_sqlite(
+            &db,
+            "SELECT value_json FROM system_settings WHERE key = 'cloudflared_token'",
+        )
+        .await
+        .unwrap();
+        assert_eq!(cloudflared_raw, "123");
+    }
+
+    #[tokio::test]
+    async fn secret_setting_migration_bounds_historical_value_json() {
+        let db = test_db().await;
+        let oversized = format!("'{}'", "x".repeat(SECRET_SETTING_VALUE_JSON_MAX_BYTES + 1));
+        sqlx::query(
+            "INSERT INTO system_settings (key, value_json, updated_at) VALUES (?, ?, 'now')",
+        )
+        .bind("geoip_ipinfo_token")
+        .bind(oversized)
+        .execute(match &db {
+            DatabaseBackend::Sqlite(pool) => pool,
+            _ => unreachable!(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(migrate_plaintext_secrets(&db).await.unwrap(), 0);
+        let raw = scalar_sqlite(
+            &db,
+            "SELECT value_json FROM system_settings WHERE key = 'geoip_ipinfo_token'",
+        )
+        .await
+        .unwrap();
+        assert_eq!(raw.len(), SECRET_SETTING_VALUE_JSON_MAX_BYTES + 3);
     }
 
     async fn test_db() -> DatabaseBackend {
