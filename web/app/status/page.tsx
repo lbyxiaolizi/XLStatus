@@ -32,6 +32,7 @@ interface Server {
   status: string;
   last_seen_at?: string;
   resources?: PublicServerResources | null;
+  metrics?: PublicServerMetrics | null;
 }
 
 interface PublicServerResources {
@@ -72,12 +73,44 @@ interface PublicServiceResult {
   created_at: string;
 }
 
+interface PublicServerMetrics {
+  range: string;
+  samples: PublicMetricSample[];
+}
+
+interface PublicMetricSample {
+  sample_at: string;
+  cpu_percent?: number | null;
+  memory_percent?: number | null;
+  disk_percent?: number | null;
+  load_1?: number | null;
+  net_rx_bps?: number | null;
+  net_tx_bps?: number | null;
+  network_in_total?: number | null;
+  network_out_total?: number | null;
+  tcp_connections?: number | null;
+  udp_connections?: number | null;
+  process_count?: number | null;
+}
+
 interface PublicServiceDay {
   key: string;
   label: string;
   uptime: number;
   avgDelay?: number;
   total: number;
+}
+
+interface ChartPoint {
+  time: number;
+  value: number;
+}
+
+interface ChartSeries {
+  id: string;
+  label: string;
+  color: string;
+  points: ChartPoint[];
 }
 
 type PublicServerViewMode = "cards" | "compact";
@@ -307,6 +340,7 @@ function PublicServerCard({ server }: { server: Server }) {
         <Metric label="最后上报" value={formatDate(server.last_seen_at)} />
       </div>
       {server.resources ? <PublicServerResourceStrip resources={server.resources} /> : null}
+      {server.metrics?.samples?.length ? <PublicServerMiniCharts metrics={server.metrics} /> : null}
     </Link>
   );
 }
@@ -335,6 +369,11 @@ function PublicCompactServerRow({ server }: { server: Server }) {
           <CompactMetric label="上传" value={formatRate(server.resources.net_tx_bps)} />
         </div>
       ) : null}
+      {server.metrics?.samples?.length ? (
+        <div className="md:col-span-3">
+          <PublicServerMiniCharts metrics={server.metrics} compact />
+        </div>
+      ) : null}
     </Link>
   );
 }
@@ -349,6 +388,144 @@ function PublicServerResourceStrip({ resources }: { resources: PublicServerResou
         <Metric label="下载/上传" value={`${formatRate(resources.net_rx_bps)} / ${formatRate(resources.net_tx_bps)}`} />
       </div>
     </div>
+  );
+}
+
+function PublicServerMiniCharts({ metrics, compact = false }: { metrics: PublicServerMetrics; compact?: boolean }) {
+  const charts = buildMetricCharts(metrics.samples);
+  const resourceSeries = [
+    { id: "cpu", label: "CPU", color: "var(--accent-color)", points: charts.cpu },
+    { id: "memory", label: "内存", color: "var(--btn-bg)", points: charts.memory },
+    { id: "disk", label: "磁盘", color: "#f97316", points: charts.disk },
+  ].filter((series) => series.points.length > 0);
+  const networkSeries = [
+    { id: "rx", label: "下载", color: "var(--accent-color)", points: charts.rx },
+    { id: "tx", label: "上传", color: "var(--btn-bg)", points: charts.tx },
+  ].filter((series) => series.points.length > 0);
+
+  if (!resourceSeries.length && !networkSeries.length) return null;
+
+  return (
+    <div className="mt-4 border-t-2 border-black pt-3">
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs font-black text-[var(--text-muted)]">
+        <span>监控图表</span>
+        <span>{metrics.range || "1d"}</span>
+      </div>
+      <div className={`grid gap-3 ${compact ? "" : "lg:grid-cols-2"}`}>
+        {resourceSeries.length ? (
+          <MetricChartCard
+            title="资源使用率"
+            value={latestPercentLabel(resourceSeries)}
+            series={resourceSeries}
+            maxValue={100}
+            formatValue={formatPercent}
+          />
+        ) : null}
+        {networkSeries.length ? (
+          <MetricChartCard
+            title="网络速率"
+            value={latestRateLabel(networkSeries)}
+            series={networkSeries}
+            formatValue={formatRate}
+          />
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function MetricChartCard({
+  title,
+  value,
+  series,
+  maxValue,
+  formatValue,
+}: {
+  title: string;
+  value: string;
+  series: ChartSeries[];
+  maxValue?: number;
+  formatValue: (value?: number | null) => string;
+}) {
+  return (
+    <div className="min-w-0">
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+        <span className="text-xs font-black uppercase text-[var(--text-muted)]">{title}</span>
+        <span className="max-w-full truncate text-xs font-black text-[var(--text-muted)]">{value}</span>
+      </div>
+      <MiniLineChart series={series} maxValue={maxValue} formatValue={formatValue} />
+      <div className="mt-2 flex flex-wrap gap-2">
+        {series.map((item) => (
+          <span key={item.id} className="inline-flex items-center gap-1.5 border-2 border-black bg-[var(--accent-bg)] px-2 py-1 text-[10px] font-black">
+            <span className="h-2.5 w-2.5 border-2 border-black" style={{ background: item.color }} />
+            {item.label}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function MiniLineChart({ series, maxValue, formatValue }: { series: ChartSeries[]; maxValue?: number; formatValue: (value?: number | null) => string }) {
+  const width = 640;
+  const height = 160;
+  const padding = { top: 12, right: 14, bottom: 28, left: 44 };
+  const plotWidth = width - padding.left - padding.right;
+  const plotHeight = height - padding.top - padding.bottom;
+  const allPoints = series.flatMap((item) => item.points).filter((point) => Number.isFinite(point.time) && Number.isFinite(point.value));
+  if (!allPoints.length) {
+    return (
+      <div className="flex h-36 items-center justify-center border-2 border-black bg-[var(--accent-bg)] text-xs font-black">
+        暂无历史数据
+      </div>
+    );
+  }
+
+  const minTime = Math.min(...allPoints.map((point) => point.time));
+  const maxTime = Math.max(...allPoints.map((point) => point.time));
+  const maxSeriesValue = Math.max(...allPoints.map((point) => point.value), 1);
+  const yMax = maxValue ?? Math.max(1, Math.ceil(maxSeriesValue * 1.2));
+  const timeSpan = Math.max(maxTime - minTime, 1);
+
+  function x(time: number): number {
+    if (allPoints.length === 1) return padding.left + plotWidth / 2;
+    return padding.left + ((time - minTime) / timeSpan) * plotWidth;
+  }
+
+  function y(value: number): number {
+    const clamped = Math.max(0, Math.min(yMax, value));
+    return padding.top + plotHeight - (clamped / yMax) * plotHeight;
+  }
+
+  return (
+    <svg className="h-40 w-full border-2 border-black bg-[var(--bg-page)]" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="公开服务器监控趋势图">
+      {[0, 0.25, 0.5, 0.75, 1].map((ratio) => {
+        const lineY = padding.top + plotHeight * ratio;
+        return <line key={ratio} x1={padding.left} x2={width - padding.right} y1={lineY} y2={lineY} stroke="var(--border-color)" strokeOpacity="0.18" strokeWidth="2" />;
+      })}
+      <text x={8} y={padding.top + 10} fill="var(--text-muted)" fontSize="12" fontWeight="900">
+        {formatValue(yMax)}
+      </text>
+      <text x={8} y={padding.top + plotHeight} fill="var(--text-muted)" fontSize="12" fontWeight="900">
+        {formatValue(0)}
+      </text>
+      <text x={padding.left} y={height - 9} fill="var(--text-muted)" fontSize="12" fontWeight="900">
+        {formatChartTime(minTime)}
+      </text>
+      <text x={width - padding.right} y={height - 9} fill="var(--text-muted)" fontSize="12" fontWeight="900" textAnchor="end">
+        {formatChartTime(maxTime)}
+      </text>
+      {series.map((item) => {
+        const points = item.points.filter((point) => Number.isFinite(point.time) && Number.isFinite(point.value));
+        const path = points.map((point, index) => `${index === 0 ? "M" : "L"} ${x(point.time).toFixed(2)} ${y(point.value).toFixed(2)}`).join(" ");
+        return (
+          <g key={item.id}>
+            <path d={path} fill="none" stroke={item.color} strokeLinecap="square" strokeLinejoin="round" strokeWidth="4" />
+            {points.length === 1 ? <circle cx={x(points[0].time)} cy={y(points[0].value)} r="5" fill={item.color} stroke="var(--border-color)" strokeWidth="2" /> : null}
+          </g>
+        );
+      })}
+    </svg>
   );
 }
 
@@ -392,6 +569,48 @@ function resourceBytes(used?: number | null, total?: number | null, percent?: nu
   return "N/A";
 }
 
+function buildMetricCharts(samples: PublicMetricSample[]) {
+  const cpu: ChartPoint[] = [];
+  const memory: ChartPoint[] = [];
+  const disk: ChartPoint[] = [];
+  const rx: ChartPoint[] = [];
+  const tx: ChartPoint[] = [];
+
+  for (const sample of samples) {
+    const time = new Date(sample.sample_at).getTime();
+    if (!Number.isFinite(time)) continue;
+    pushPoint(cpu, time, sample.cpu_percent);
+    pushPoint(memory, time, sample.memory_percent);
+    pushPoint(disk, time, sample.disk_percent);
+    pushPoint(rx, time, sample.net_rx_bps);
+    pushPoint(tx, time, sample.net_tx_bps);
+  }
+
+  return { cpu, memory, disk, rx, tx };
+}
+
+function pushPoint(points: ChartPoint[], time: number, value?: number | null) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    points.push({ time, value });
+  }
+}
+
+function latestPercentLabel(series: ChartSeries[]): string {
+  return series
+    .map((item) => `${item.label} ${formatPercent(latestPointValue(item.points))}`)
+    .join(" / ");
+}
+
+function latestRateLabel(series: ChartSeries[]): string {
+  return series
+    .map((item) => `${item.label} ${formatRate(latestPointValue(item.points))}`)
+    .join(" / ");
+}
+
+function latestPointValue(points: ChartPoint[]): number | undefined {
+  return points.length ? points[points.length - 1]?.value : undefined;
+}
+
 function percentFromUsedTotal(used?: number | null, total?: number | null): number | undefined {
   if (used === undefined || used === null || !total) return undefined;
   return (used / total) * 100;
@@ -400,6 +619,17 @@ function percentFromUsedTotal(used?: number | null, total?: number | null): numb
 function formatRate(value?: number | null): string {
   if (value === undefined || value === null || Number.isNaN(value)) return "N/A";
   return `${formatBytes(value)}/s`;
+}
+
+function formatChartTime(value: number): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 function serverTone(status: string): "green" | "red" | "yellow" | "gray" {

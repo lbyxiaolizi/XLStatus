@@ -61,6 +61,8 @@ pub struct PublicServerView {
     pub last_seen_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resources: Option<PublicServerResourcesView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<PublicServerMetricsView>,
 }
 
 #[derive(Debug, Serialize)]
@@ -298,7 +300,7 @@ fn public_site_disabled_error(err: &AppError) -> bool {
 }
 
 async fn build_public_status_mjpeg_frame(state: &AppState) -> Result<Vec<u8>, AppError> {
-    let servers = public_servers(state).await?;
+    let servers = public_servers_summary(state).await?;
     let services = public_services(state).await?;
     let site = public_site_branding(&state.db).await?;
     let online_servers = servers
@@ -333,6 +335,17 @@ async fn build_public_status_mjpeg_frame(state: &AppState) -> Result<Vec<u8>, Ap
 }
 
 async fn public_servers(state: &AppState) -> Result<Vec<PublicServerView>, AppError> {
+    public_servers_with_metric_option(state, true).await
+}
+
+async fn public_servers_summary(state: &AppState) -> Result<Vec<PublicServerView>, AppError> {
+    public_servers_with_metric_option(state, false).await
+}
+
+async fn public_servers_with_metric_option(
+    state: &AppState,
+    include_metrics_when_details_enabled: bool,
+) -> Result<Vec<PublicServerView>, AppError> {
     let rows = public_agent_rows(state, PUBLIC_STATUS_SERVER_LIMIT).await?;
     let include_server_details = public_server_details_enabled(&state.db).await?;
 
@@ -361,6 +374,11 @@ async fn public_servers(state: &AppState) -> Result<Vec<PublicServerView>, AppEr
             resources: include_server_details
                 .then(|| public_resources_from_state(parsed.as_ref(), network_rates))
                 .flatten(),
+            metrics: if include_server_details && include_metrics_when_details_enabled {
+                public_server_metrics(state, agent.id.0)
+            } else {
+                None
+            },
         });
     }
     Ok(servers)
@@ -1583,6 +1601,7 @@ mod tests {
             status: "online".into(),
             last_seen_at: None,
             resources: None,
+            metrics: None,
         })
         .expect("public server view serializes");
 
@@ -1597,7 +1616,6 @@ mod tests {
             "network_in_total",
             "last_state",
             "last_info",
-            "metrics",
         ] {
             assert!(
                 serialized.get(hidden_field).is_none(),
@@ -1907,6 +1925,34 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+        state
+            .metrics
+            .write(xlstatus_tsdb::MetricSample {
+                agent_id: xlstatus_tsdb::AgentId(Uuid::parse_str(&server_id).unwrap()),
+                sample_at: "2026-06-22T00:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+                fields_json: serde_json::json!({
+                    "cpu_percent": 38.0,
+                    "memory_used": 1536,
+                    "memory_total": 2048,
+                    "network_in_total": 1000,
+                    "network_out_total": 2000
+                }),
+            })
+            .unwrap();
+        state
+            .metrics
+            .write(xlstatus_tsdb::MetricSample {
+                agent_id: xlstatus_tsdb::AgentId(Uuid::parse_str(&server_id).unwrap()),
+                sample_at: "2026-06-22T00:01:00Z".parse::<DateTime<Utc>>().unwrap(),
+                fields_json: serde_json::json!({
+                    "cpu_percent": 42.0,
+                    "memory_used": 1024,
+                    "memory_total": 2048,
+                    "network_in_total": 7000,
+                    "network_out_total": 5000
+                }),
+            })
+            .unwrap();
 
         let response = public_status(axum::extract::State(state)).await.unwrap();
         let data = response.0.data.expect("public status response data");
@@ -1920,6 +1966,14 @@ mod tests {
         assert_eq!(resources.memory_percent, Some(50.0));
         assert_eq!(resources.net_rx_bps, Some(128));
         assert_eq!(resources.net_tx_bps, Some(64));
+        let metrics = data.servers[0]
+            .metrics
+            .as_ref()
+            .expect("public server metrics default to visible");
+        assert_eq!(metrics.range, QueryRange::Day1.as_str());
+        assert_eq!(metrics.samples.len(), 2);
+        assert_eq!(metrics.samples[1].cpu_percent, Some(42.0));
+        assert_eq!(metrics.samples[1].net_rx_bps, Some(100));
     }
 
     #[tokio::test]
@@ -1956,6 +2010,7 @@ mod tests {
 
         assert_eq!(data.servers.len(), 1);
         assert!(data.servers[0].resources.is_none());
+        assert!(data.servers[0].metrics.is_none());
     }
 
     #[tokio::test]
