@@ -160,6 +160,12 @@ struct TrafficWindow {
     last_result: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ServiceResultScope {
+    Local,
+    Servers(Vec<String>),
+}
+
 pub struct AlertEngine {
     db: Db,
     session_registry: SessionRegistry,
@@ -464,9 +470,45 @@ impl AlertEngine {
     }
 
     async fn count_recent_service_failures(&self, service_id: &str, n: i64) -> Result<i64> {
+        let scope = self.service_result_scope(service_id).await?;
+        let ServiceResultScope::Servers(server_ids) = &scope else {
+            return self
+                .count_recent_local_service_failures(service_id, n)
+                .await;
+        };
+        if server_ids.is_empty() {
+            return Ok(0);
+        }
         let rows: Vec<(String,)> = match &self.db {
             crate::db::DatabaseBackend::Sqlite(pool) => {
-                sqlx::query_as("SELECT status FROM service_results WHERE service_id = ? ORDER BY created_at DESC LIMIT ?")
+                let sql = format!(
+                    "SELECT status FROM service_results WHERE service_id = ? AND server_id IN ({}) ORDER BY created_at DESC LIMIT ?",
+                    sqlite_placeholders(server_ids.len())
+                );
+                let mut query = sqlx::query_as(&sql).bind(service_id);
+                for server_id in server_ids {
+                    query = query.bind(server_id);
+                }
+                query.bind(n).fetch_all(pool).await?
+            }
+            crate::db::DatabaseBackend::Postgres(pool) => {
+                let sid = uuid::Uuid::parse_str(service_id)?;
+                let parsed_server_ids = parse_uuid_ids(server_ids)?;
+                sqlx::query_as("SELECT status FROM service_results WHERE service_id = $1 AND server_id = ANY($2::uuid[]) ORDER BY created_at DESC LIMIT $3")
+                    .bind(sid)
+                    .bind(parsed_server_ids)
+                    .bind(n)
+                    .fetch_all(pool)
+                    .await?
+            }
+        };
+        Ok(rows.iter().filter(|(s,)| s == "failure").count() as i64)
+    }
+
+    async fn count_recent_local_service_failures(&self, service_id: &str, n: i64) -> Result<i64> {
+        let rows: Vec<(String,)> = match &self.db {
+            crate::db::DatabaseBackend::Sqlite(pool) => {
+                sqlx::query_as("SELECT status FROM service_results WHERE service_id = ? AND server_id IS NULL ORDER BY created_at DESC LIMIT ?")
                     .bind(service_id)
                     .bind(n)
                     .fetch_all(pool)
@@ -474,7 +516,7 @@ impl AlertEngine {
             }
             crate::db::DatabaseBackend::Postgres(pool) => {
                 let sid = uuid::Uuid::parse_str(service_id)?;
-                sqlx::query_as("SELECT status FROM service_results WHERE service_id = $1 ORDER BY created_at DESC LIMIT $2")
+                sqlx::query_as("SELECT status FROM service_results WHERE service_id = $1 AND server_id IS NULL ORDER BY created_at DESC LIMIT $2")
                     .bind(sid)
                     .bind(n)
                     .fetch_all(pool)
@@ -485,16 +527,49 @@ impl AlertEngine {
     }
 
     async fn latest_service_latency_ms(&self, service_id: &str) -> Result<i64> {
+        let scope = self.service_result_scope(service_id).await?;
+        let ServiceResultScope::Servers(server_ids) = &scope else {
+            return self.latest_local_service_latency_ms(service_id).await;
+        };
+        if server_ids.is_empty() {
+            return Ok(-1);
+        }
         let row: Option<(Option<i64>,)> = match &self.db {
             crate::db::DatabaseBackend::Sqlite(pool) => {
-                sqlx::query_as("SELECT delay_ms FROM service_results WHERE service_id = ? AND status = 'success' ORDER BY created_at DESC LIMIT 1")
+                let sql = format!(
+                    "SELECT delay_ms FROM service_results WHERE service_id = ? AND status = 'success' AND server_id IN ({}) ORDER BY created_at DESC LIMIT 1",
+                    sqlite_placeholders(server_ids.len())
+                );
+                let mut query = sqlx::query_as(&sql).bind(service_id);
+                for server_id in server_ids {
+                    query = query.bind(server_id);
+                }
+                query.fetch_optional(pool).await?
+            }
+            crate::db::DatabaseBackend::Postgres(pool) => {
+                let sid = uuid::Uuid::parse_str(service_id)?;
+                let parsed_server_ids = parse_uuid_ids(server_ids)?;
+                sqlx::query_as("SELECT delay_ms FROM service_results WHERE service_id = $1 AND status = 'success' AND server_id = ANY($2::uuid[]) ORDER BY created_at DESC LIMIT 1")
+                    .bind(sid)
+                    .bind(parsed_server_ids)
+                    .fetch_optional(pool)
+                    .await?
+            }
+        };
+        Ok(row.and_then(|(v,)| v).unwrap_or(-1))
+    }
+
+    async fn latest_local_service_latency_ms(&self, service_id: &str) -> Result<i64> {
+        let row: Option<(Option<i64>,)> = match &self.db {
+            crate::db::DatabaseBackend::Sqlite(pool) => {
+                sqlx::query_as("SELECT delay_ms FROM service_results WHERE service_id = ? AND status = 'success' AND server_id IS NULL ORDER BY created_at DESC LIMIT 1")
                     .bind(service_id)
                     .fetch_optional(pool)
                     .await?
             }
             crate::db::DatabaseBackend::Postgres(pool) => {
                 let sid = uuid::Uuid::parse_str(service_id)?;
-                sqlx::query_as("SELECT delay_ms FROM service_results WHERE service_id = $1 AND status = 'success' ORDER BY created_at DESC LIMIT 1")
+                sqlx::query_as("SELECT delay_ms FROM service_results WHERE service_id = $1 AND status = 'success' AND server_id IS NULL ORDER BY created_at DESC LIMIT 1")
                     .bind(sid)
                     .fetch_optional(pool)
                     .await?
@@ -504,10 +579,50 @@ impl AlertEngine {
     }
 
     async fn latest_cert_not_after(&self, service_id: &str) -> Result<Option<DateTime<Utc>>> {
+        let scope = self.service_result_scope(service_id).await?;
+        let ServiceResultScope::Servers(server_ids) = &scope else {
+            return self.latest_local_cert_not_after(service_id).await;
+        };
+        if server_ids.is_empty() {
+            return Ok(None);
+        }
+        match &self.db {
+            crate::db::DatabaseBackend::Sqlite(pool) => {
+                let sql = format!(
+                    "SELECT cert_not_after FROM service_results WHERE service_id = ? AND cert_not_after IS NOT NULL AND server_id IN ({}) ORDER BY created_at DESC LIMIT 1",
+                    sqlite_placeholders(server_ids.len())
+                );
+                let mut query = sqlx::query_as(&sql).bind(service_id);
+                for server_id in server_ids {
+                    query = query.bind(server_id);
+                }
+                let row: Option<(String,)> = query.fetch_optional(pool).await?;
+                row.map(|(value,)| {
+                    DateTime::parse_from_rfc3339(&value).map(|dt| dt.with_timezone(&Utc))
+                })
+                .transpose()
+                .map_err(Into::into)
+            }
+            crate::db::DatabaseBackend::Postgres(pool) => {
+                let sid = uuid::Uuid::parse_str(service_id)?;
+                let parsed_server_ids = parse_uuid_ids(server_ids)?;
+                let row: Option<(DateTime<Utc>,)> = sqlx::query_as(
+                    "SELECT cert_not_after FROM service_results WHERE service_id = $1 AND cert_not_after IS NOT NULL AND server_id = ANY($2::uuid[]) ORDER BY created_at DESC LIMIT 1",
+                )
+                .bind(sid)
+                .bind(parsed_server_ids)
+                .fetch_optional(pool)
+                .await?;
+                Ok(row.map(|(value,)| value))
+            }
+        }
+    }
+
+    async fn latest_local_cert_not_after(&self, service_id: &str) -> Result<Option<DateTime<Utc>>> {
         match &self.db {
             crate::db::DatabaseBackend::Sqlite(pool) => {
                 let row: Option<(String,)> = sqlx::query_as(
-                    "SELECT cert_not_after FROM service_results WHERE service_id = ? AND cert_not_after IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+                    "SELECT cert_not_after FROM service_results WHERE service_id = ? AND cert_not_after IS NOT NULL AND server_id IS NULL ORDER BY created_at DESC LIMIT 1",
                 )
                 .bind(service_id)
                 .fetch_optional(pool)
@@ -521,12 +636,137 @@ impl AlertEngine {
             crate::db::DatabaseBackend::Postgres(pool) => {
                 let sid = uuid::Uuid::parse_str(service_id)?;
                 let row: Option<(DateTime<Utc>,)> = sqlx::query_as(
-                    "SELECT cert_not_after FROM service_results WHERE service_id = $1 AND cert_not_after IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+                    "SELECT cert_not_after FROM service_results WHERE service_id = $1 AND cert_not_after IS NOT NULL AND server_id IS NULL ORDER BY created_at DESC LIMIT 1",
                 )
                 .bind(sid)
                 .fetch_optional(pool)
                 .await?;
                 Ok(row.map(|(value,)| value))
+            }
+        }
+    }
+
+    async fn service_result_scope(&self, service_id: &str) -> Result<ServiceResultScope> {
+        let Some((cover_mode, legacy_server_id, exclude_server_ids)) =
+            self.load_service_scope_config(service_id).await?
+        else {
+            return Ok(ServiceResultScope::Servers(Vec::new()));
+        };
+        match cover_mode.as_str() {
+            "specific" => {
+                let mut server_ids = self.load_service_server_ids(service_id).await?;
+                if server_ids.is_empty() {
+                    if let Some(server_id) = legacy_server_id {
+                        server_ids.push(server_id);
+                    }
+                }
+                Ok(ServiceResultScope::Servers(normalize_id_list(server_ids)))
+            }
+            "all" => Ok(ServiceResultScope::Servers(
+                self.load_active_agent_ids().await?,
+            )),
+            "exclude" => {
+                let excluded = normalize_id_list(exclude_server_ids);
+                let mut server_ids = self.load_active_agent_ids().await?;
+                server_ids.retain(|server_id| !excluded.iter().any(|id| id == server_id));
+                Ok(ServiceResultScope::Servers(server_ids))
+            }
+            _ => Ok(ServiceResultScope::Local),
+        }
+    }
+
+    async fn load_service_scope_config(
+        &self,
+        service_id: &str,
+    ) -> Result<Option<(String, Option<String>, Vec<String>)>> {
+        match &self.db {
+            crate::db::DatabaseBackend::Sqlite(pool) => {
+                let row: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+                    "SELECT COALESCE(cover_mode, 'local'), server_id, exclude_server_ids_json FROM services WHERE id = ?",
+                )
+                .bind(service_id)
+                .fetch_optional(pool)
+                .await?;
+                Ok(row.map(|(cover_mode, server_id, exclude_json)| {
+                    (
+                        cover_mode,
+                        server_id
+                            .map(|value| value.trim().to_string())
+                            .filter(|value| !value.is_empty()),
+                        parse_id_list_json(exclude_json),
+                    )
+                }))
+            }
+            crate::db::DatabaseBackend::Postgres(pool) => {
+                let sid = uuid::Uuid::parse_str(service_id)?;
+                let row: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+                    "SELECT COALESCE(cover_mode, 'local'), server_id::text, exclude_server_ids_json FROM services WHERE id = $1",
+                )
+                .bind(sid)
+                .fetch_optional(pool)
+                .await?;
+                Ok(row.map(|(cover_mode, server_id, exclude_json)| {
+                    (
+                        cover_mode,
+                        server_id
+                            .map(|value| value.trim().to_string())
+                            .filter(|value| !value.is_empty()),
+                        parse_id_list_json(exclude_json),
+                    )
+                }))
+            }
+        }
+    }
+
+    async fn load_service_server_ids(&self, service_id: &str) -> Result<Vec<String>> {
+        match &self.db {
+            crate::db::DatabaseBackend::Sqlite(pool) => {
+                let rows: Vec<(String,)> = sqlx::query_as(
+                    "SELECT server_id FROM service_servers WHERE service_id = ? ORDER BY created_at ASC, server_id ASC",
+                )
+                .bind(service_id)
+                .fetch_all(pool)
+                .await?;
+                Ok(normalize_id_list(
+                    rows.into_iter().map(|(id,)| id).collect(),
+                ))
+            }
+            crate::db::DatabaseBackend::Postgres(pool) => {
+                let sid = uuid::Uuid::parse_str(service_id)?;
+                let rows: Vec<(String,)> = sqlx::query_as(
+                    "SELECT server_id::text FROM service_servers WHERE service_id = $1 ORDER BY created_at ASC, server_id ASC",
+                )
+                .bind(sid)
+                .fetch_all(pool)
+                .await?;
+                Ok(normalize_id_list(
+                    rows.into_iter().map(|(id,)| id).collect(),
+                ))
+            }
+        }
+    }
+
+    async fn load_active_agent_ids(&self) -> Result<Vec<String>> {
+        match &self.db {
+            crate::db::DatabaseBackend::Sqlite(pool) => {
+                let rows: Vec<(String,)> = sqlx::query_as(
+                    "SELECT id FROM agents WHERE revoked_at IS NULL ORDER BY created_at ASC, id ASC",
+                )
+                .fetch_all(pool)
+                .await?;
+                Ok(normalize_id_list(
+                    rows.into_iter().map(|(id,)| id).collect(),
+                ))
+            }
+            crate::db::DatabaseBackend::Postgres(pool) => {
+                let rows: Vec<(String,)> = sqlx::query_as(
+                    "SELECT id::text FROM agents WHERE revoked_at IS NULL ORDER BY created_at ASC, id ASC",
+                )
+                .fetch_all(pool)
+                .await?;
+                Ok(normalize_id_list(
+                    rows.into_iter().map(|(id,)| id).collect(),
+                ))
             }
         }
     }
@@ -1077,6 +1317,35 @@ fn parse_task_ids_json(value: Option<String>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn parse_id_list_json(value: Option<String>) -> Vec<String> {
+    value
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+        .map(normalize_id_list)
+        .unwrap_or_default()
+}
+
+fn normalize_id_list(values: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for value in values {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() && !out.iter().any(|existing| existing == trimmed) {
+            out.push(trimmed.to_string());
+        }
+    }
+    out
+}
+
+fn sqlite_placeholders(len: usize) -> String {
+    std::iter::repeat_n("?", len).collect::<Vec<_>>().join(", ")
+}
+
+fn parse_uuid_ids(ids: &[String]) -> Result<Vec<uuid::Uuid>> {
+    ids.iter()
+        .map(|id| uuid::Uuid::parse_str(id).context("invalid server_id"))
+        .collect()
+}
+
 fn network_total_by_field(state: &serde_json::Value, field: &str) -> Option<u64> {
     let direct_keys = match field {
         "bytes_recv" => &["network_in_total", "net_rx_bytes", "bytes_recv_total"][..],
@@ -1354,6 +1623,147 @@ mod tests {
         assert!(channels.is_empty());
     }
 
+    #[tokio::test]
+    async fn service_down_uses_current_service_server_scope() {
+        let db = test_db().await;
+        let owner = "00000000-0000-0000-0000-000000000001";
+        let allowed_server = "00000000-0000-0000-0000-000000000101";
+        let stale_server = "00000000-0000-0000-0000-000000000202";
+        let service = "00000000-0000-0000-0000-000000000301";
+
+        seed_user(&db, owner, "owner").await;
+        seed_agent(&db, allowed_server, owner, "allowed").await;
+        seed_agent(&db, stale_server, owner, "stale").await;
+        seed_service_with_servers(&db, service, owner, &[allowed_server], "specific").await;
+        seed_service_result(
+            &db,
+            "00000000-0000-0000-0000-000000000401",
+            service,
+            allowed_server,
+            "success",
+            None,
+            None,
+            "2026-01-02T00:00:00Z",
+        )
+        .await;
+        seed_service_result(
+            &db,
+            "00000000-0000-0000-0000-000000000402",
+            service,
+            stale_server,
+            "failure",
+            None,
+            None,
+            "2026-01-03T00:00:00Z",
+        )
+        .await;
+
+        let engine = AlertEngine::new(
+            db,
+            crate::grpc::SessionRegistry::new(),
+            crate::current_task_response_registry(),
+        );
+
+        assert_eq!(
+            engine
+                .count_recent_service_failures(service, 1)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn service_latency_uses_local_scope_for_local_services() {
+        let db = test_db().await;
+        let owner = "00000000-0000-0000-0000-000000000001";
+        let server = "00000000-0000-0000-0000-000000000101";
+        let service = "00000000-0000-0000-0000-000000000302";
+
+        seed_user(&db, owner, "owner").await;
+        seed_agent(&db, server, owner, "server").await;
+        seed_service_with_servers(&db, service, owner, &[], "local").await;
+        seed_service_result(
+            &db,
+            "00000000-0000-0000-0000-000000000411",
+            service,
+            "",
+            "success",
+            Some(50),
+            None,
+            "2026-01-02T00:00:00Z",
+        )
+        .await;
+        seed_service_result(
+            &db,
+            "00000000-0000-0000-0000-000000000412",
+            service,
+            server,
+            "success",
+            Some(5000),
+            None,
+            "2026-01-03T00:00:00Z",
+        )
+        .await;
+
+        let engine = AlertEngine::new(
+            db,
+            crate::grpc::SessionRegistry::new(),
+            crate::current_task_response_registry(),
+        );
+
+        assert_eq!(engine.latest_service_latency_ms(service).await.unwrap(), 50);
+    }
+
+    #[tokio::test]
+    async fn certificate_expiry_uses_current_service_server_scope() {
+        let db = test_db().await;
+        let owner = "00000000-0000-0000-0000-000000000001";
+        let allowed_server = "00000000-0000-0000-0000-000000000101";
+        let stale_server = "00000000-0000-0000-0000-000000000202";
+        let service = "00000000-0000-0000-0000-000000000303";
+
+        seed_user(&db, owner, "owner").await;
+        seed_agent(&db, allowed_server, owner, "allowed").await;
+        seed_agent(&db, stale_server, owner, "stale").await;
+        seed_service_with_servers(&db, service, owner, &[allowed_server], "specific").await;
+        seed_service_result(
+            &db,
+            "00000000-0000-0000-0000-000000000421",
+            service,
+            allowed_server,
+            "success",
+            Some(10),
+            Some("2026-06-01T00:00:00Z"),
+            "2026-01-02T00:00:00Z",
+        )
+        .await;
+        seed_service_result(
+            &db,
+            "00000000-0000-0000-0000-000000000422",
+            service,
+            stale_server,
+            "success",
+            Some(10),
+            Some("2026-01-01T00:00:00Z"),
+            "2026-01-03T00:00:00Z",
+        )
+        .await;
+
+        let engine = AlertEngine::new(
+            db,
+            crate::grpc::SessionRegistry::new(),
+            crate::current_task_response_registry(),
+        );
+
+        let not_after = engine
+            .latest_cert_not_after(service)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(not_after.to_rfc3339(), "2026-06-01T00:00:00+00:00");
+    }
+
     async fn test_db() -> Db {
         let db = Db::connect("sqlite::memory:", true).await.unwrap();
         db.run_migrations().await.unwrap();
@@ -1369,6 +1779,82 @@ mod tests {
         )
         .bind(id)
         .bind(username)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_agent(db: &Db, id: &str, owner: &str, name: &str) {
+        let Db::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO agents (id, name, public_key, owner_user_id, created_at, updated_at) VALUES (?, ?, 'pk', ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(owner)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_service_with_servers(
+        db: &Db,
+        id: &str,
+        owner: &str,
+        server_ids: &[&str],
+        cover_mode: &str,
+    ) {
+        let Db::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        let primary = server_ids.first().copied();
+        sqlx::query(
+            "INSERT INTO services (id, owner_user_id, name, type, target, interval_seconds, timeout_seconds, enabled, server_id, cover_mode, created_at, updated_at) VALUES (?, ?, 'svc', 'http', 'https://example.com', 60, 10, 1, ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(owner)
+        .bind(primary)
+        .bind(cover_mode)
+        .execute(pool)
+        .await
+        .unwrap();
+        for server_id in server_ids {
+            sqlx::query(
+                "INSERT INTO service_servers (service_id, server_id, created_at) VALUES (?, ?, '2026-01-01T00:00:00Z')",
+            )
+            .bind(id)
+            .bind(server_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn seed_service_result(
+        db: &Db,
+        id: &str,
+        service_id: &str,
+        server_id: &str,
+        status: &str,
+        delay_ms: Option<i64>,
+        cert_not_after: Option<&str>,
+        created_at: &str,
+    ) {
+        let Db::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO service_results (id, service_id, server_id, status, delay_ms, cert_not_after, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(service_id)
+        .bind((!server_id.is_empty()).then_some(server_id))
+        .bind(status)
+        .bind(delay_ms)
+        .bind(cert_not_after)
+        .bind(created_at)
         .execute(pool)
         .await
         .unwrap();

@@ -125,7 +125,7 @@ Enrollment token 创建请求体上限为 4KiB，`expires_in_hours` 必须在 1 
 | `DELETE` | `/api/v1/alert-rules/:id` | 删除告警规则 |
 | `GET` | `/api/v1/alert-events` | 告警事件 |
 
-告警规则创建请求体上限为 64KiB。规则名称最长 128 字节，单条规则最多 32 个条件、单个条件 JSON 最长 4KiB，失败/恢复触发任务各最多 32 个 UUID；引用的触发任务必须属于当前用户，且其任务选择器也必须对当前凭据可见。
+告警规则创建请求体上限为 64KiB。规则名称最长 128 字节，单条规则最多 32 个条件、单个条件 JSON 最长 4KiB，失败/恢复触发任务各最多 32 个 UUID；引用的触发任务必须属于当前用户，且其任务选择器也必须对当前凭据可见。后台评估 `ServiceDown`、`ServiceLatency` 和 `CertificateExpiry` 服务类条件时，会按服务当前覆盖范围读取 `service_results.server_id`：`specific` 只读取当前绑定服务器，`local` 只读取 `server_id IS NULL` 的本地主控结果，`all` / `exclude` 只读取当前未撤销 Agent 集合及其排除集，不会使用已移除服务器或历史脏全局结果。
 
 `GET /api/v1/alert-events` 会按规则 owner 与 PAT server allowlist 在 SQL 层过滤后再应用 `limit`。非管理员只能读取自己规则产生的事件；带 server allowlist 的 PAT 只能读取 `agent_id` 命中 allowlist 的事件，服务类事件如果没有可推断的唯一 `agent_id` 会保守隐藏。
 
