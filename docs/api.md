@@ -120,7 +120,7 @@ Enrollment token 创建请求体上限为 4KiB，`expires_in_hours` 必须在 1 
 | `GET` | `/api/v1/services/:id/history` | 历史结果 |
 | `GET` | `/api/v1/services/:id/uptime` | 可用率 |
 
-服务创建、更新和测试探测请求体上限为 128KiB。服务名称最长 128 字节，target 最长 2048 字节，`interval_seconds` 必须在 10 到 86400 秒之间，`timeout_seconds` 必须在 1 到 30 秒之间。单个服务最多关联或排除 64 台服务器，失败/恢复触发任务各最多 32 个；创建或更新服务时，显式关联和排除的服务器必须存在且未撤销；引用的触发任务必须属于当前用户，且其任务选择器也必须对当前凭据可见。后台一次服务探测最多下发到 64 台 Agent；`specific`、`all` 和 `exclude` 覆盖模式只会在服务 owner 拥有的未撤销 Agent 集合内展开，缺少有效 owner 的历史远端服务不会全局展开。服务列表会在 SQL 层按当前凭据可见服务器过滤后再分页/count；服务列表和详情中的 `last_status`、`last_check_at`、证书摘要字段只从当前凭据可见服务器的 `service_results.server_id` 派生；服务历史和 uptime 会在 SQL 层按当前凭据可见的 `service_results.server_id` 过滤后再应用 `limit` / `offset` 或聚合。
+服务创建、更新和测试探测请求体上限为 128KiB。服务名称最长 128 字节，target 最长 2048 字节，`interval_seconds` 必须在 10 到 86400 秒之间，`timeout_seconds` 必须在 1 到 30 秒之间。单个服务最多关联或排除 64 台服务器，失败/恢复触发任务各最多 32 个；创建或更新服务时，显式关联和排除的服务器必须存在且未撤销；引用的触发任务 ID 必须是 36 字节 canonical UUID 文本，且任务必须属于当前用户、任务选择器也必须对当前凭据可见。后台一次服务探测最多下发到 64 台 Agent；`specific`、`all` 和 `exclude` 覆盖模式只会在服务 owner 拥有的未撤销 Agent 集合内展开，缺少有效 owner 的历史远端服务不会全局展开。服务列表会在 SQL 层按当前凭据可见服务器过滤后再分页/count；服务列表和详情中的 `last_status`、`last_check_at`、证书摘要字段只从当前凭据可见服务器的 `service_results.server_id` 派生；服务历史和 uptime 会在 SQL 层按当前凭据可见的 `service_results.server_id` 过滤后再应用 `limit` / `offset` 或聚合。
 
 ### 告警
 
@@ -149,7 +149,7 @@ Enrollment token 创建请求体上限为 4KiB，`expires_in_hours` 必须在 1 
 | `POST` | `/api/v1/tasks/:id/run` | 手动运行任务 |
 | `GET` | `/api/v1/tasks/:id/runs` | 任务运行记录 |
 
-任务创建/更新请求体上限为 256KiB。任务名称最长 128 字节，Shell 命令最长 8192 字节，`payload_json` 最长 64KiB，`server_selector_json` 最长 16KiB。选择器中每类显式 ID 最多 64 项、标签最多 32 项；显式 `server_ids` 和 `exclude_server_ids` 必须是任务 owner 名下未撤销服务器。一次任务执行最多解析并下发到 64 台服务器。任务执行时，group selector 只展开任务 owner 名下未撤销 Agent 成员，历史跨 owner、已删除或已撤销分组成员不会进入目标集合。任务列表和任务运行记录的 `limit` 会限制在 1 到 500；带 server allowlist 的 PAT 会先按任务选择器或运行记录 `server_id` 过滤，再应用 `offset` / `limit`。任务运行历史持久化前会把 Agent 返回的 stdout/stderr 分别截断到 64KiB、error 截断到 16KiB，并标记 `output_truncated`。
+任务创建/更新请求体上限为 256KiB。任务名称最长 128 字节，Shell 命令最长 8192 字节，`payload_json` 最长 64KiB，`server_selector_json` 最长 16KiB。任务详情、更新、删除、手动运行和运行历史 path `:id` 必须是 36 字节 canonical UUID 文本；非法、simple、大写或带空格 UUID 会在 repository/调度前返回 400。选择器中每类显式 ID 最多 64 项、标签最多 32 项；显式 `server_ids` 和 `exclude_server_ids` 必须是任务 owner 名下未撤销服务器。一次任务执行最多解析并下发到 64 台服务器。任务执行时，group selector 只展开任务 owner 名下未撤销 Agent 成员，历史跨 owner、已删除或已撤销分组成员不会进入目标集合。任务列表和任务运行记录的 `limit` 会限制在 1 到 500；带 server allowlist 的 PAT 会先按任务选择器或运行记录 `server_id` 过滤，再应用 `offset` / `limit`。任务运行历史持久化前会把 Agent 返回的 stdout/stderr 分别截断到 64KiB、error 截断到 16KiB，并标记 `output_truncated`。
 
 ### 文件、配置和终端
 

@@ -2,7 +2,7 @@ use crate::api::types::*;
 use crate::api::v1::auth::{AppError, AppState};
 use crate::api::v1::notifications::ensure_notification_group_owned_by;
 use crate::api::v1::servers::agent_visible;
-use crate::api::v1::tasks::ensure_task_ids_visible_to_auth_session;
+use crate::api::v1::tasks::{ensure_task_ids_visible_to_auth_session, require_task_uuid_text};
 use crate::auth::middleware::AuthSession;
 use crate::auth::rbac::has_scope;
 use crate::db::AgentRepository;
@@ -727,7 +727,7 @@ fn ensure_list_len<T>(values: &[T], max_len: usize, field: &str) -> Result<(), A
 
 fn validate_task_id_list(task_ids: &[String]) -> Result<(), AppError> {
     for task_id in task_ids {
-        ensure_byte_len(task_id, 128, "task_id")?;
+        require_task_uuid_text(task_id, "task_id")?;
     }
     Ok(())
 }
@@ -1544,9 +1544,8 @@ fn parse_task_ids_json(value: Option<String>) -> Vec<String> {
 fn normalize_id_list(values: Vec<String>) -> Vec<String> {
     let mut out = Vec::new();
     for value in values {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() && !out.iter().any(|existing| existing == trimmed) {
-            out.push(trimmed.to_string());
+        if !value.is_empty() && !out.iter().any(|existing| existing == &value) {
+            out.push(value);
         }
     }
     out
@@ -1977,12 +1976,55 @@ mod tests {
             exclude_server_ids: Vec::new(),
             notification_group_id: None,
             failure_task_ids: (0..=SERVICE_MAX_TASK_IDS)
-                .map(|idx| format!("task-{idx}"))
+                .map(|idx| format!("00000000-0000-4000-8000-{idx:012}"))
                 .collect(),
             recovery_task_ids: Vec::new(),
         };
         let err = validate_service_request(req).await.unwrap_err();
         assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn service_trigger_task_ids_require_canonical_uuid_text() {
+        fn request_with_task_id(task_id: &str) -> CreateServiceRequest {
+            CreateServiceRequest {
+                name: "svc".into(),
+                service_type: "tcp".into(),
+                target: "8.8.8.8:53".into(),
+                interval_seconds: Some(60),
+                timeout_seconds: Some(10),
+                enabled: Some(true),
+                server_id: None,
+                server_ids: Vec::new(),
+                cover_mode: Some("local".into()),
+                exclude_server_ids: Vec::new(),
+                notification_group_id: None,
+                failure_task_ids: vec![task_id.into()],
+                recovery_task_ids: Vec::new(),
+            }
+        }
+
+        assert!(validate_service_request(request_with_task_id(
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        ))
+        .await
+        .is_ok());
+
+        for task_id in [
+            "task-a",
+            " aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa ",
+            "aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaaaaaa",
+            "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaax",
+        ] {
+            assert!(
+                validate_service_request(request_with_task_id(task_id))
+                    .await
+                    .is_err(),
+                "{task_id:?} should be rejected"
+            );
+        }
     }
 
     async fn test_db() -> DatabaseBackend {

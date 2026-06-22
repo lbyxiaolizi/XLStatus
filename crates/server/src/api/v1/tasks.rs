@@ -24,6 +24,7 @@ use xlstatus_shared::tasks::*;
 
 const TASK_LIST_MAX_LIMIT: i64 = 500;
 const TASK_LIST_SCAN_BATCH: i64 = 500;
+const TASK_UUID_TEXT_LEN: usize = 36;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateTaskRequest {
@@ -178,6 +179,7 @@ pub async fn get_task(
     let db = state.db.clone();
 
     require_scope_or_403(&auth_user, "task:read")?;
+    let task_id = normalize_task_resource_id(task_id, "task_id")?;
     let task = TaskRepository::get_by_id(&db, &task_id)
         .await
         .map_err(|e| {
@@ -231,6 +233,7 @@ pub async fn update_task(
     let db = state.db.clone();
 
     require_scope_or_403(&auth_user, "task:write")?;
+    let task_id = normalize_task_resource_id(task_id, "task_id")?;
     let mut task = TaskRepository::get_by_id(&db, &task_id)
         .await
         .map_err(|e| {
@@ -340,6 +343,7 @@ pub async fn delete_task(
     let db = state.db.clone();
 
     require_scope_or_403(&auth_user, "task:delete")?;
+    let task_id = normalize_task_resource_id(task_id, "task_id")?;
     let task = TaskRepository::get_by_id(&db, &task_id)
         .await
         .map_err(|e| {
@@ -412,6 +416,7 @@ pub async fn run_task(
     let db = state.db.clone();
 
     require_scope_or_403(&auth_user, "task:exec")?;
+    let task_id = normalize_task_resource_id(task_id, "task_id")?;
     let task = TaskRepository::get_by_id(&db, &task_id)
         .await
         .map_err(|e| {
@@ -484,6 +489,7 @@ pub async fn get_task_runs(
     let db = state.db.clone();
 
     require_scope_or_403(&auth_user, "task:read")?;
+    let task_id = normalize_task_resource_id(task_id, "task_id")?;
     let task = TaskRepository::get_by_id(&db, &task_id)
         .await
         .map_err(|e| {
@@ -559,7 +565,8 @@ pub(crate) async fn ensure_task_ids_visible_to_auth_session(
 ) -> Result<(), AppError> {
     let owner_user_id = auth.user_id.0.to_string();
     for task_id in task_ids {
-        let task = TaskRepository::get_by_id(db, task_id)
+        let task_id = require_task_uuid_text(task_id, "task_id")?;
+        let task = TaskRepository::get_by_id(db, &task_id)
             .await
             .map_err(AppError::Database)?
             .ok_or_else(|| {
@@ -643,6 +650,32 @@ fn normalize_list_limit(limit: i64) -> i64 {
 
 fn normalize_list_offset(offset: i64) -> i64 {
     offset.max(0)
+}
+
+fn normalize_task_resource_id(
+    value: String,
+    field: &str,
+) -> Result<String, (StatusCode, Json<ApiResponse<()>>)> {
+    require_task_uuid_text(&value, field).map_err(app_error_to_api)
+}
+
+pub(crate) fn require_task_uuid_text(value: &str, field: &str) -> Result<String, AppError> {
+    if value.is_empty() {
+        return Err(AppError::BadRequest(format!("{field} is required")));
+    }
+    if value.len() != TASK_UUID_TEXT_LEN {
+        return Err(AppError::BadRequest(format!(
+            "{field} must be a canonical UUID"
+        )));
+    }
+    let parsed = uuid::Uuid::parse_str(value)
+        .map_err(|_| AppError::BadRequest(format!("{field} must be a canonical UUID")))?;
+    if parsed.to_string() != value {
+        return Err(AppError::BadRequest(format!(
+            "{field} must be a canonical UUID"
+        )));
+    }
+    Ok(value.to_string())
 }
 
 fn require_scope_or_403(
@@ -900,6 +933,30 @@ mod tests {
         let selector = json!({ "server_ids": ["server-a"] }).to_string();
 
         assert!(validate_task_selector_or_403(&auth, &selector).is_ok());
+    }
+
+    #[test]
+    fn task_resource_ids_require_canonical_uuid_text() {
+        let canonical = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        assert_eq!(
+            require_task_uuid_text(canonical, "task_id").unwrap(),
+            canonical
+        );
+
+        for value in [
+            "",
+            "task-a",
+            " aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa ",
+            "aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaaaaaa",
+            "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaax",
+        ] {
+            assert!(
+                require_task_uuid_text(value, "task_id").is_err(),
+                "{value:?} should be rejected"
+            );
+        }
     }
 
     #[test]
