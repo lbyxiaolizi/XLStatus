@@ -160,6 +160,9 @@ curl -fsS http://localhost:8080/healthz
 ```
 
 脚本会把 `CORS_ALLOWED_ORIGINS` 写入 TOML 的 `server.cors_allowed_origins`，启动失败时会打印最近的 systemd 日志。
+如果提供 `ADMIN_PASSWORD`，安装脚本只会把首次管理员初始化密码写入
+root-only 的 `/run/xlstatus/bootstrap.env` 临时文件；服务通过 `/healthz` 后脚本会删除该文件并重启一次，避免密码长期保存在 systemd unit 或运行中进程环境里。
+如果设置 `START_SERVICE=false`，脚本不会持久保存 `ADMIN_PASSWORD`；需要首次手动启动时再通过受控环境传入初始化密码。
 
 ## 自定义安装参数
 

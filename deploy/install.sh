@@ -9,6 +9,7 @@ INSTALL_DIR="${INSTALL_DIR:-/opt/xlstatus}"
 DATA_DIR="${DATA_DIR:-/var/lib/xlstatus}"
 BINARY_PATH="${BINARY_PATH:-}"  # User can provide compiled binary path
 CONFIG_FILE="${CONFIG_FILE:-/etc/xlstatus/server.toml}"
+BOOTSTRAP_ENV_FILE="/run/xlstatus/bootstrap.env"
 HTTP_BIND="${HTTP_BIND:-127.0.0.1:8080}"
 GRPC_BIND="${GRPC_BIND:-127.0.0.1:50051}"
 DATABASE_URL="${DATABASE_URL:-sqlite://$DATA_DIR/xlstatus.db?mode=rwc}"
@@ -58,6 +59,10 @@ toml_escape() {
 
 systemd_env_escape() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/%/%%/g'
+}
+
+systemd_env_file_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
 reject_multiline_value() {
@@ -125,6 +130,65 @@ warn_if_port_busy() {
   if command -v ss >/dev/null 2>&1 && ss -tlnp 2>/dev/null | grep -Eq ":${port}[[:space:]]"; then
     echo "⚠️  $name port $port appears to be in use. XLStatus may fail to start."
     ss -tlnp 2>/dev/null | grep -E ":${port}[[:space:]]" || true
+  fi
+}
+
+wait_for_healthz() {
+  local http_port
+  http_port="$(bind_port "$HTTP_BIND")"
+
+  if ! command -v curl >/dev/null 2>&1; then
+    return 2
+  fi
+
+  for _ in {1..80}; do
+    if curl -fsS "http://127.0.0.1:${http_port}/healthz" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.5
+  done
+
+  return 1
+}
+
+write_bootstrap_env_file() {
+  if [ -z "$ADMIN_PASSWORD" ]; then
+    rm -f "$BOOTSTRAP_ENV_FILE" 2>/dev/null || true
+    return
+  fi
+
+  local bootstrap_dir
+  bootstrap_dir="$(dirname "$BOOTSTRAP_ENV_FILE")"
+  mkdir -p "$bootstrap_dir"
+  chmod 700 "$bootstrap_dir"
+  {
+    printf 'XLSTATUS_SEED_ADMIN_USERNAME="%s"\n' "$(systemd_env_file_escape "$ADMIN_USERNAME")"
+    printf 'XLSTATUS_SEED_ADMIN_PASSWORD="%s"\n' "$(systemd_env_file_escape "$ADMIN_PASSWORD")"
+  } > "$BOOTSTRAP_ENV_FILE"
+  chown root:root "$BOOTSTRAP_ENV_FILE"
+  chmod 600 "$BOOTSTRAP_ENV_FILE"
+}
+
+clear_bootstrap_env_after_seed() {
+  if [ -z "$ADMIN_PASSWORD" ]; then
+    return
+  fi
+
+  rm -f "$BOOTSTRAP_ENV_FILE" 2>/dev/null || true
+  rmdir "$(dirname "$BOOTSTRAP_ENV_FILE")" 2>/dev/null || true
+  echo "✓ Removed temporary admin bootstrap environment"
+
+  echo "↻ Restarting XLStatus to clear bootstrap secrets from the process environment..."
+  systemctl restart xlstatus
+  if systemctl is-active --quiet xlstatus && wait_for_healthz; then
+    echo "✓ XLStatus restarted without bootstrap secrets"
+  else
+    echo "❌ XLStatus failed after clearing bootstrap secrets"
+    echo ""
+    systemctl status xlstatus --no-pager || true
+    echo ""
+    journalctl -u xlstatus -n 80 --no-pager || true
+    exit 1
   fi
 }
 
@@ -400,6 +464,7 @@ reject_multiline_value DATA_DIR "$DATA_DIR"
 reject_multiline_value CONFIG_FILE "$CONFIG_FILE"
 reject_multiline_value ADMIN_USERNAME "$ADMIN_USERNAME"
 reject_multiline_value ADMIN_PASSWORD "$ADMIN_PASSWORD"
+reject_multiline_value BOOTSTRAP_ENV_FILE "$BOOTSTRAP_ENV_FILE"
 CORS_ALLOWED_ORIGINS_TOML="$(cors_origins_toml "$CORS_ALLOWED_ORIGINS")"
 DATABASE_URL_TOML="$(toml_escape "$DATABASE_URL")"
 HTTP_BIND_TOML="$(toml_escape "$HTTP_BIND")"
@@ -409,7 +474,6 @@ SECRET_ENCRYPTION_KEY_TOML="$(toml_escape "$SECRET_ENCRYPTION_KEY")"
 DATA_DIR_SYSTEMD="$(systemd_env_escape "$DATA_DIR")"
 CONFIG_FILE_SYSTEMD="$(systemd_env_escape "$CONFIG_FILE")"
 ADMIN_USERNAME_SYSTEMD="$(systemd_env_escape "$ADMIN_USERNAME")"
-ADMIN_PASSWORD_SYSTEMD="$(systemd_env_escape "$ADMIN_PASSWORD")"
 
 cat > "$CONFIG_FILE" << EOF
 [database]
@@ -451,7 +515,7 @@ RestartSec=5s
 Environment="CONFIG_FILE=$CONFIG_FILE_SYSTEMD"
 Environment="RUST_LOG=info"
 Environment="XLSTATUS_SEED_ADMIN_USERNAME=$ADMIN_USERNAME_SYSTEMD"
-$(if [ -n "$ADMIN_PASSWORD" ]; then printf 'Environment="XLSTATUS_SEED_ADMIN_PASSWORD=%s"\n' "$ADMIN_PASSWORD_SYSTEMD"; fi)
+EnvironmentFile=-$BOOTSTRAP_ENV_FILE
 
 StandardOutput=journal
 StandardError=journal
@@ -468,15 +532,25 @@ echo "✓ Systemd service installed"
 echo ""
 if is_truthy_value "$START_SERVICE"; then
   echo "🚀 Starting XLStatus..."
+  if [ -n "$ADMIN_PASSWORD" ] && ! command -v curl >/dev/null 2>&1; then
+    echo "❌ curl is required when ADMIN_PASSWORD is provided so the installer can verify bootstrap completion before clearing secrets"
+    exit 1
+  fi
+  write_bootstrap_env_file
   warn_if_port_busy "HTTP" "$HTTP_BIND"
   warn_if_port_busy "gRPC" "$GRPC_BIND"
   systemctl start xlstatus
 
-  # Wait for service to be ready
-  sleep 3
-
   if systemctl is-active --quiet xlstatus; then
     echo "✓ XLStatus is running"
+    if [ -n "$ADMIN_PASSWORD" ]; then
+      if wait_for_healthz; then
+        clear_bootstrap_env_after_seed
+      else
+        echo "❌ XLStatus is active, but /healthz did not respond; keeping bootstrap secret root-only in $BOOTSTRAP_ENV_FILE"
+        exit 1
+      fi
+    fi
   else
     echo "❌ Failed to start XLStatus"
     echo ""
@@ -487,6 +561,10 @@ if is_truthy_value "$START_SERVICE"; then
   fi
 else
   echo "🚀 Skipping service start"
+  if [ -n "$ADMIN_PASSWORD" ]; then
+    rm -f "$BOOTSTRAP_ENV_FILE" 2>/dev/null || true
+    echo "⚠️  ADMIN_PASSWORD was not persisted because START_SERVICE=false; provide it again for the first service start if admin bootstrap is still needed."
+  fi
 fi
 
 HTTP_PORT="$(bind_port "$HTTP_BIND")"

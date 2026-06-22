@@ -1615,4 +1615,19 @@ mod tests {
         let err = build_install_agent_script(&headers, install_query(None, None)).unwrap_err();
         assert!(err.contains("Host header must be between"));
     }
+
+    #[test]
+    fn server_install_script_does_not_persist_seed_admin_password_in_systemd_unit() {
+        let script = include_str!("../../../deploy/install.sh");
+
+        assert!(script.contains("BOOTSTRAP_ENV_FILE=\"/run/xlstatus/bootstrap.env\""));
+        assert!(script.contains("EnvironmentFile=-$BOOTSTRAP_ENV_FILE"));
+        assert!(script.contains("write_bootstrap_env_file"));
+        assert!(script.contains("clear_bootstrap_env_after_seed"));
+        assert!(script.contains("wait_for_healthz"));
+        assert!(script.contains("before clearing secrets"));
+        assert!(script.contains("systemctl restart xlstatus"));
+        assert!(!script.contains("Environment=\"XLSTATUS_SEED_ADMIN_PASSWORD="));
+        assert!(!script.contains("ADMIN_PASSWORD_SYSTEMD"));
+    }
 }
