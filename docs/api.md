@@ -167,7 +167,7 @@ Enrollment token 创建请求体上限为 4KiB，`expires_in_hours` 必须在 1 
 | `POST` | `/api/v1/terminal/sessions` | 创建终端会话 |
 | `GET` | `/ws/terminal/:session_id` | 终端 WebSocket |
 
-服务器文件、临时 URL、配置应用和强制更新 POST 请求体上限为 3MiB。文件路径最长 4096 字节；直接文件写入解码后最多 2MiB，大文件应使用临时上传 URL；文件读取单次最多 2MiB，Agent 返回的文件读取结果按对应 base64 文本预算校验，文件列表 Agent 返回 JSON 最长 2MiB，写入/删除等小结果最长 4KiB；临时下载/上传 URL 签发要求目标 Agent 未撤销，撤销后的历史服务器只能继续在管理视图中清理旧记录，不能签发新的公开 bearer URL；配置 patch 序列化后最多 128KiB。强制更新下载 URL 最长 2048 字节。
+服务器文件、临时 URL、配置应用和强制更新 POST 请求体上限为 3MiB。文件路径最长 4096 字节；直接文件写入解码后最多 2MiB，大文件应使用临时上传 URL；文件读取单次最多 2MiB，Agent 返回的文件读取结果按对应 base64 文本预算校验，文件列表 Agent 返回 JSON 最长 2MiB，写入/删除等小结果最长 4KiB；临时下载/上传 URL 签发、配置应用和强制更新都要求目标 Agent 未撤销，撤销后的历史服务器只能继续在管理视图中清理旧记录，不能签发新的公开 bearer URL 或下发新的配置/更新消息；配置 patch 序列化后最多 128KiB。强制更新下载 URL 最长 2048 字节。
 
 终端 session 创建请求体上限为 4KiB，创建和 WebSocket 升级前都会重新校验目标 Agent 当前未撤销。终端 WebSocket 单条浏览器文本消息最多 16KiB，单次输入转发给 Agent 前最多保留 8KiB；Agent 终端输出单帧最多 64KiB，关闭原因最多 1024 字节，错误消息最多 4096 字节。
 

@@ -535,7 +535,7 @@ async fn ensure_server_online(
     auth: &AuthSession,
     server_id: &str,
 ) -> Result<AgentId, AppError> {
-    let agent_id = ensure_server_visible(state, auth, server_id).await?;
+    let agent_id = ensure_server_active(state, auth, server_id).await?;
     if !state.session_registry.is_online(&agent_id).await {
         return Err(AppError::BadRequest("agent is offline".into()));
     }
@@ -1156,6 +1156,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(total, 0);
+    }
+
+    #[tokio::test]
+    async fn online_agent_operations_reject_revoked_agent_before_online_check() {
+        let state = test_state().await;
+        let user = UserRepository::new(state.db.clone())
+            .create(CreateUserInput {
+                username: "owner".into(),
+                password: "secret-password".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        let agent_repo = AgentRepository::new(state.db.clone());
+        let agent = agent_repo
+            .create(CreateAgentInput {
+                name: "revoked-online-agent".into(),
+                public_key: "public".into(),
+                owner_user_id: user.id,
+            })
+            .await
+            .unwrap();
+        assert!(agent_repo.revoke(agent.id).await.unwrap());
+        let auth = AuthSession {
+            session_id: "sess".into(),
+            user_id: user.id,
+            username: user.username,
+            role: user.role,
+            csrf_token: "csrf".into(),
+            auth_kind: AuthKind::Session,
+            scopes: Vec::new(),
+            server_ids: None,
+            pat_id: None,
+        };
+
+        let err = ensure_server_online(&state, &auth, &agent.id.0.to_string())
+            .await
+            .unwrap_err();
+
+        assert!(app_error_message(&err).contains("agent has been revoked"));
     }
 
     async fn test_state() -> AppState {
