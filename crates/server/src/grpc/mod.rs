@@ -22,6 +22,10 @@ const AGENT_TELEMETRY_MAX_ITEMS: usize = 64;
 const AGENT_TELEMETRY_MAX_STRING_BYTES: usize = 128;
 const AGENT_TELEMETRY_MAX_JSON_BYTES: usize = 256 * 1024;
 const AGENT_GEO_IP_MAX_TEXT_BYTES: usize = 64;
+const AGENT_GRPC_BEARER_TOKEN_MAX_BYTES: usize = 4096;
+const AGENT_GRPC_AUTHORIZATION_METADATA_MAX_BYTES: usize =
+    "Bearer ".len() + AGENT_GRPC_BEARER_TOKEN_MAX_BYTES;
+const AGENT_GRPC_FORWARDED_METADATA_MAX_BYTES: usize = 1024;
 
 pub struct AgentServiceImpl {
     db: DatabaseBackend,
@@ -64,7 +68,8 @@ impl AgentService for AgentServiceImpl {
         request: Request<tonic::Streaming<AgentMessage>>,
     ) -> Result<Response<Self::SessionStream>, Status> {
         let client_ip = client_ip_from_grpc_request(&request);
-        let bearer_token = bearer_token_from_grpc_request(&request).map(ToString::to_string);
+        let bearer_token =
+            bearer_token_from_grpc_request(&request).map(|token| token.map(ToString::to_string));
         let agent_id = authenticate_agent_request(
             &self.db,
             &self.jwt_secret,
@@ -216,7 +221,8 @@ impl AgentService for AgentServiceImpl {
         request: Request<tonic::Streaming<IoFrame>>,
     ) -> Result<Response<Self::IoStreamStream>, Status> {
         let client_ip = client_ip_from_grpc_request(&request);
-        let bearer_token = bearer_token_from_grpc_request(&request).map(ToString::to_string);
+        let bearer_token =
+            bearer_token_from_grpc_request(&request).map(|token| token.map(ToString::to_string));
         let agent_id = authenticate_agent_request(
             &self.db,
             &self.jwt_secret,
@@ -252,7 +258,7 @@ async fn authenticate_agent_request(
     db: &DatabaseBackend,
     jwt_secret: &str,
     client_ip: String,
-    bearer_token: Option<String>,
+    bearer_token: Result<Option<String>, GrpcBearerTokenError>,
     stream_name: &str,
 ) -> Result<AgentId, Status> {
     if active_waf_ban(db, &client_ip)
@@ -272,11 +278,28 @@ async fn authenticate_agent_request(
         return Err(Status::permission_denied("IP temporarily blocked by WAF"));
     }
 
-    let Some(token) = bearer_token else {
-        let _ =
-            register_agent_auth_failure(db, &client_ip, Some(stream_name), "missing bearer token")
-                .await;
-        return Err(Status::unauthenticated("missing bearer token"));
+    let token = match bearer_token {
+        Ok(Some(token)) => token,
+        Ok(None) => {
+            let _ = register_agent_auth_failure(
+                db,
+                &client_ip,
+                Some(stream_name),
+                "missing bearer token",
+            )
+            .await;
+            return Err(Status::unauthenticated("missing bearer token"));
+        }
+        Err(err) => {
+            let _ = register_agent_auth_failure(
+                db,
+                &client_ip,
+                Some(stream_name),
+                err.auth_failure_reason(),
+            )
+            .await;
+            return Err(Status::unauthenticated(err.status_message()));
+        }
     };
     let claims = match verify_agent_jwt(&token, jwt_secret) {
         Ok(claims) => claims,
@@ -326,18 +349,88 @@ async fn authenticate_agent_request(
     Ok(agent_id)
 }
 
-fn bearer_token_from_grpc_request<T>(request: &Request<T>) -> Option<&str> {
-    request
-        .metadata()
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| {
-            value
-                .strip_prefix("bearer ")
-                .or_else(|| value.strip_prefix("Bearer "))
-        })
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrpcBearerTokenError {
+    TooLong,
+    Malformed,
+}
+
+impl GrpcBearerTokenError {
+    fn auth_failure_reason(self) -> &'static str {
+        match self {
+            Self::TooLong => "bearer token too long",
+            Self::Malformed => "malformed bearer token",
+        }
+    }
+
+    fn status_message(self) -> &'static str {
+        match self {
+            Self::TooLong => "bearer token too long",
+            Self::Malformed => "invalid bearer token",
+        }
+    }
+}
+
+fn bearer_token_from_grpc_request<T>(
+    request: &Request<T>,
+) -> Result<Option<&str>, GrpcBearerTokenError> {
+    let Some(value) = request.metadata().get("authorization") else {
+        return Ok(None);
+    };
+    if value.as_encoded_bytes().len() > AGENT_GRPC_AUTHORIZATION_METADATA_MAX_BYTES {
+        return Err(GrpcBearerTokenError::TooLong);
+    }
+    let value = value
+        .to_str()
+        .map_err(|_| GrpcBearerTokenError::Malformed)?
+        .trim();
+    let Some(token) = value
+        .strip_prefix("bearer ")
+        .or_else(|| value.strip_prefix("Bearer "))
+    else {
+        return Err(GrpcBearerTokenError::Malformed);
+    };
+    let token = token.trim();
+    if token.is_empty() {
+        return Ok(None);
+    }
+    validate_agent_bearer_token(token)?;
+    Ok(Some(token))
+}
+
+fn validate_agent_bearer_token(token: &str) -> Result<(), GrpcBearerTokenError> {
+    if token.len() > AGENT_GRPC_BEARER_TOKEN_MAX_BYTES {
+        return Err(GrpcBearerTokenError::TooLong);
+    }
+    if !token.is_ascii() {
+        return Err(GrpcBearerTokenError::Malformed);
+    }
+
+    let mut segments = token.split('.');
+    let Some(header) = segments.next() else {
+        return Err(GrpcBearerTokenError::Malformed);
+    };
+    let Some(payload) = segments.next() else {
+        return Err(GrpcBearerTokenError::Malformed);
+    };
+    let Some(signature) = segments.next() else {
+        return Err(GrpcBearerTokenError::Malformed);
+    };
+    if segments.next().is_some()
+        || !valid_jwt_segment(header)
+        || !valid_jwt_segment(payload)
+        || !valid_jwt_segment(signature)
+    {
+        return Err(GrpcBearerTokenError::Malformed);
+    }
+    Ok(())
+}
+
+fn valid_jwt_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn client_ip_from_grpc_request<T>(request: &Request<T>) -> String {
@@ -349,10 +442,13 @@ fn client_ip_from_grpc_request<T>(request: &Request<T>) -> String {
 }
 
 fn grpc_metadata_value<T>(request: &Request<T>, name: &str) -> Option<String> {
-    request
-        .metadata()
-        .get(name)
-        .and_then(|value| value.to_str().ok())
+    let value = request.metadata().get(name)?;
+    if value.as_encoded_bytes().len() > AGENT_GRPC_FORWARDED_METADATA_MAX_BYTES {
+        return None;
+    }
+    value
+        .to_str()
+        .ok()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
@@ -681,6 +777,63 @@ mod tests {
     #[test]
     fn host_info_without_payload_remains_empty() {
         assert_eq!(info_to_json(&HostInfoUpdate { host_info: None }), "");
+    }
+
+    #[test]
+    fn grpc_bearer_metadata_is_bounded_and_shape_checked() {
+        let mut request = Request::new(());
+        request
+            .metadata_mut()
+            .insert("authorization", "Bearer abc.def.ghi".parse().unwrap());
+        assert_eq!(
+            bearer_token_from_grpc_request(&request).unwrap(),
+            Some("abc.def.ghi")
+        );
+
+        let mut request = Request::new(());
+        request
+            .metadata_mut()
+            .insert("authorization", "Bearer not-a-jwt".parse().unwrap());
+        assert_eq!(
+            bearer_token_from_grpc_request(&request),
+            Err(GrpcBearerTokenError::Malformed)
+        );
+
+        let mut request = Request::new(());
+        let oversized = format!(
+            "Bearer {}.{}.{}",
+            "a".repeat(AGENT_GRPC_BEARER_TOKEN_MAX_BYTES),
+            "b",
+            "c"
+        );
+        request
+            .metadata_mut()
+            .insert("authorization", oversized.parse().unwrap());
+        assert_eq!(
+            bearer_token_from_grpc_request(&request),
+            Err(GrpcBearerTokenError::TooLong)
+        );
+    }
+
+    #[test]
+    fn grpc_forwarded_metadata_is_ignored_when_oversized() {
+        let mut request = Request::new(());
+        request
+            .metadata_mut()
+            .insert("x-forwarded-for", "203.0.113.10".parse().unwrap());
+        assert_eq!(
+            grpc_metadata_value(&request, "x-forwarded-for").as_deref(),
+            Some("203.0.113.10")
+        );
+
+        let mut request = Request::new(());
+        request.metadata_mut().insert(
+            "x-forwarded-for",
+            "1".repeat(AGENT_GRPC_FORWARDED_METADATA_MAX_BYTES + 1)
+                .parse()
+                .unwrap(),
+        );
+        assert!(grpc_metadata_value(&request, "x-forwarded-for").is_none());
     }
 
     #[test]
