@@ -871,12 +871,13 @@ async fn list_notification_channels_for_group(
                 FROM notifications n
                 JOIN notification_group_members ngm ON ngm.notification_id = n.id
                 JOIN notification_groups ng ON ng.id = ngm.group_id
-                WHERE ng.id = ? AND ng.owner_user_id = ?
+                WHERE ng.id = ? AND ng.owner_user_id = ? AND n.owner_user_id = ?
                 ORDER BY n.created_at ASC
                 LIMIT ?
                 "#,
             )
             .bind(group_id)
+            .bind(owner_user_id.0.to_string())
             .bind(owner_user_id.0.to_string())
             .bind((NOTIFICATION_MAX_GROUP_CHANNELS + 1) as i64)
             .fetch_all(pool)
@@ -891,7 +892,7 @@ async fn list_notification_channels_for_group(
                 FROM notifications n
                 JOIN notification_group_members ngm ON ngm.notification_id = n.id
                 JOIN notification_groups ng ON ng.id = ngm.group_id
-                WHERE ng.id = $1 AND ng.owner_user_id = $2
+                WHERE ng.id = $1 AND ng.owner_user_id = $2 AND n.owner_user_id = $2
                 ORDER BY n.created_at ASC
                 LIMIT $3
                 "#,
@@ -1304,6 +1305,32 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn geoip_notification_group_filters_member_channels_by_owner() {
+        let db = test_db().await;
+        let owner = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let other = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let group_id = "00000000-0000-0000-0000-000000000101";
+        let owner_notification = "00000000-0000-0000-0000-000000000201";
+        let other_notification = "00000000-0000-0000-0000-000000000202";
+
+        seed_user(&db, owner, "owner").await;
+        seed_user(&db, other, "other").await;
+        seed_notification_group(&db, group_id, owner, "owner-group").await;
+        seed_notification(&db, owner_notification, owner, "owner-channel").await;
+        seed_notification(&db, other_notification, other, "other-channel").await;
+        seed_notification_group_member(&db, group_id, owner_notification).await;
+        seed_notification_group_member(&db, group_id, other_notification).await;
+
+        let channels =
+            list_notification_channels_for_group(&db, xlstatus_shared::UserId(owner), group_id)
+                .await
+                .unwrap();
+
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0].id, owner_notification);
+    }
+
     fn auth_session(auth_kind: AuthKind) -> AuthSession {
         AuthSession {
             session_id: "sess".into(),
@@ -1316,5 +1343,80 @@ mod tests {
             server_ids: None,
             pat_id: None,
         }
+    }
+
+    async fn test_db() -> DatabaseBackend {
+        let db = DatabaseBackend::connect("sqlite::memory:", true)
+            .await
+            .unwrap();
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    async fn seed_user(db: &DatabaseBackend, id: uuid::Uuid, username: &str) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, role, created_at, updated_at) VALUES (?, ?, 'hash', 'member', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id.to_string())
+        .bind(username)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_notification_group(
+        db: &DatabaseBackend,
+        id: &str,
+        owner: uuid::Uuid,
+        name: &str,
+    ) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO notification_groups (id, owner_user_id, name, created_at, updated_at) VALUES (?, ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(owner.to_string())
+        .bind(name)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_notification(db: &DatabaseBackend, id: &str, owner: uuid::Uuid, name: &str) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO notifications (id, owner_user_id, name, url, request_method, request_type, verify_tls, format_metric_units, created_at, updated_at) VALUES (?, ?, ?, 'https://example.com/hook', 'POST', 'json', 1, 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(owner.to_string())
+        .bind(name)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_notification_group_member(
+        db: &DatabaseBackend,
+        group_id: &str,
+        notification_id: &str,
+    ) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO notification_group_members (group_id, notification_id) VALUES (?, ?)",
+        )
+        .bind(group_id)
+        .bind(notification_id)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 }
