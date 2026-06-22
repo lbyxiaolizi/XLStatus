@@ -40,6 +40,7 @@ const AUTH_MAX_WAF_BAN_IPS: usize = 128;
 const AUTH_MAX_WAF_IP_FIELD_BYTES: usize = 4096;
 const AUTH_MAX_WAF_REASON_BYTES: usize = 255;
 const AUTH_MAX_WAF_BAN_MINUTES: i64 = 43_200;
+const AUTH_UUID_TEXT_LEN: usize = 36;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -682,16 +683,17 @@ pub async fn delete_session(
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     require_cookie_session(&auth_user)?;
-    if !auth_user.user.role.is_admin() && id != auth_user.session_id {
+    let session_id = normalize_auth_resource_uuid(&id, "session id")?;
+    if !auth_user.user.role.is_admin() && session_id != auth_user.session_id {
         return Err(AppError::Forbidden(
             "cannot delete another user's session".into(),
         ));
     }
     require_sensitive_totp(&state.db, auth_user.user.id, &headers).await?;
     let session_repo = crate::auth::SessionRepository::new(state.db.clone());
-    session_repo.delete(&id).await?;
+    session_repo.delete(&session_id).await?;
     Ok(Json(ApiResponse::success(
-        serde_json::json!({"id": id, "deleted": true}),
+        serde_json::json!({"id": session_id, "deleted": true}),
     )))
 }
 
@@ -841,14 +843,15 @@ pub async fn delete_waf_ban(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     require_admin_cookie_session(&auth_user)?;
     require_sensitive_totp(&state.db, auth_user.user.id, &headers).await?;
+    let ban_id = normalize_auth_resource_uuid(&id, "WAF ban id")?;
     let affected = match &state.db {
         DatabaseBackend::Sqlite(pool) => sqlx::query("DELETE FROM waf_bans WHERE id = ?")
-            .bind(&id)
+            .bind(&ban_id)
             .execute(pool)
             .await?
             .rows_affected(),
         DatabaseBackend::Postgres(pool) => sqlx::query("DELETE FROM waf_bans WHERE id = $1")
-            .bind(&id)
+            .bind(&ban_id)
             .execute(pool)
             .await?
             .rows_affected(),
@@ -857,7 +860,7 @@ pub async fn delete_waf_ban(
         return Err(AppError::NotFound("WAF ban not found".into()));
     }
     Ok(Json(ApiResponse::success(
-        serde_json::json!({"id": id, "deleted": true}),
+        serde_json::json!({"id": ban_id, "deleted": true}),
     )))
 }
 
@@ -939,9 +942,26 @@ fn session_info_from_sqlite(
 }
 
 fn parse_user_id(id: &str) -> Result<UserId, AppError> {
-    uuid::Uuid::parse_str(id)
-        .map(UserId)
-        .map_err(|e| AppError::BadRequest(format!("invalid user id: {e}")))
+    normalize_auth_resource_uuid(id, "user id").map(|id| {
+        UserId(uuid::Uuid::parse_str(&id).expect("canonical UUID must parse after validation"))
+    })
+}
+
+fn normalize_auth_resource_uuid(id: &str, field: &str) -> Result<String, AppError> {
+    if id.len() != AUTH_UUID_TEXT_LEN {
+        return Err(AppError::BadRequest(format!(
+            "{field} must be a canonical UUID"
+        )));
+    }
+    let parsed = uuid::Uuid::parse_str(id)
+        .map_err(|_| AppError::BadRequest(format!("{field} must be a canonical UUID")))?;
+    let canonical = parsed.to_string();
+    if canonical != id {
+        return Err(AppError::BadRequest(format!(
+            "{field} must be a canonical UUID"
+        )));
+    }
+    Ok(canonical)
 }
 
 fn normalize_username(value: String) -> Result<String, AppError> {
@@ -1093,14 +1113,14 @@ fn truncate_utf8_to_bytes(value: &str, max_bytes: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_new_password, normalize_optional_totp_code, normalize_role, normalize_username,
-        normalize_waf_minutes, normalize_waf_reason, parse_manual_ban_ips,
-        require_admin_cookie_session, revoke_user_credentials, sensitive_totp_code_from_headers,
-        AppError, AUTH_API_MAX_BODY_BYTES, AUTH_LOGIN_MAX_BODY_BYTES, AUTH_MAX_PASSWORD_BYTES,
-        AUTH_MAX_ROLE_BYTES, AUTH_MAX_USERNAME_BYTES, AUTH_MAX_WAF_BAN_IPS,
-        AUTH_MAX_WAF_BAN_MINUTES, AUTH_MAX_WAF_IP_FIELD_BYTES, AUTH_MAX_WAF_REASON_BYTES,
-        AUTH_MIN_PASSWORD_BYTES, AUTH_TOTP_CODE_BYTES, AUTH_TOTP_MAX_BODY_BYTES,
-        SENSITIVE_TOTP_HEADER,
+        normalize_auth_resource_uuid, normalize_new_password, normalize_optional_totp_code,
+        normalize_role, normalize_username, normalize_waf_minutes, normalize_waf_reason,
+        parse_manual_ban_ips, parse_user_id, require_admin_cookie_session, revoke_user_credentials,
+        sensitive_totp_code_from_headers, AppError, AUTH_API_MAX_BODY_BYTES,
+        AUTH_LOGIN_MAX_BODY_BYTES, AUTH_MAX_PASSWORD_BYTES, AUTH_MAX_ROLE_BYTES,
+        AUTH_MAX_USERNAME_BYTES, AUTH_MAX_WAF_BAN_IPS, AUTH_MAX_WAF_BAN_MINUTES,
+        AUTH_MAX_WAF_IP_FIELD_BYTES, AUTH_MAX_WAF_REASON_BYTES, AUTH_MIN_PASSWORD_BYTES,
+        AUTH_TOTP_CODE_BYTES, AUTH_TOTP_MAX_BODY_BYTES, AUTH_UUID_TEXT_LEN, SENSITIVE_TOTP_HEADER,
     };
     use crate::api::types::{ApiResponse, LoginResponse, UserInfo};
     use crate::auth::middleware::{AuthKind, AuthUser};
@@ -1143,6 +1163,25 @@ mod tests {
         assert_eq!(AUTH_MAX_WAF_IP_FIELD_BYTES, 4096);
         assert_eq!(AUTH_MAX_WAF_REASON_BYTES, 255);
         assert_eq!(AUTH_MAX_WAF_BAN_MINUTES, 43_200);
+        assert_eq!(AUTH_UUID_TEXT_LEN, 36);
+    }
+
+    #[test]
+    fn auth_resource_ids_require_canonical_uuid_text() {
+        let id = uuid::Uuid::now_v7();
+        let canonical = id.to_string();
+
+        assert_eq!(
+            normalize_auth_resource_uuid(&canonical, "resource id").unwrap(),
+            canonical
+        );
+        assert_eq!(parse_user_id(&canonical).unwrap().0, id);
+        assert!(
+            normalize_auth_resource_uuid(&"a".repeat(AUTH_UUID_TEXT_LEN + 1), "resource id")
+                .is_err()
+        );
+        assert!(normalize_auth_resource_uuid(&id.simple().to_string(), "resource id").is_err());
+        assert!(normalize_auth_resource_uuid(&canonical.to_uppercase(), "resource id").is_err());
     }
 
     #[test]
