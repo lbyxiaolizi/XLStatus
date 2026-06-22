@@ -165,7 +165,7 @@ Enrollment token 创建请求体上限为 4KiB，`expires_in_hours` 必须在 1 
 | `POST` | `/api/v1/terminal/sessions` | 创建终端会话 |
 | `GET` | `/ws/terminal/:session_id` | 终端 WebSocket |
 
-服务器文件、临时 URL、配置应用和强制更新 POST 请求体上限为 3MiB。文件路径最长 4096 字节；直接文件写入解码后最多 2MiB，大文件应使用临时上传 URL；文件读取单次最多 2MiB，Agent 返回的文件读取结果按对应 base64 文本预算校验，文件列表 Agent 返回 JSON 最长 2MiB，写入/删除等小结果最长 4KiB；配置 patch 序列化后最多 128KiB。强制更新下载 URL 最长 2048 字节。
+服务器文件、临时 URL、配置应用和强制更新 POST 请求体上限为 3MiB。文件路径最长 4096 字节；直接文件写入解码后最多 2MiB，大文件应使用临时上传 URL；文件读取单次最多 2MiB，Agent 返回的文件读取结果按对应 base64 文本预算校验，文件列表 Agent 返回 JSON 最长 2MiB，写入/删除等小结果最长 4KiB；临时下载/上传 URL 签发要求目标 Agent 未撤销，撤销后的历史服务器只能继续在管理视图中清理旧记录，不能签发新的公开 bearer URL；配置 patch 序列化后最多 128KiB。强制更新下载 URL 最长 2048 字节。
 
 终端 session 创建请求体上限为 4KiB。终端 WebSocket 单条浏览器文本消息最多 16KiB，单次输入转发给 Agent 前最多保留 8KiB；Agent 终端输出单帧最多 64KiB，关闭原因最多 1024 字节，错误消息最多 4096 字节。
 
@@ -198,7 +198,7 @@ NAT 创建/更新请求体上限为 64KiB，并支持安全策略字段：`allow
 
 DDNS 配置创建请求体上限为 64KiB。`provider` 只允许 `cloudflare`、`tencent_cloud`、`he`、`webhook`、`dummy`；`agent_id` 必须是 UUID 并会规范化为 canonical 文本。名称最长 128 字节，域名最长 253 字节，`record_id` / `zone_id` 各最长 128 字节，`api_token` / `api_key` / `api_secret` 各最长 4096 字节，`webhook_url` 最长 2048 字节且 webhook provider 必填并继续执行出站 SSRF 校验。后台 DDNS 执行时会重新校验历史配置中的 `agent_id` 必须解析为现存未撤销 Agent，且配置 owner 必须与 Agent owner 一致；不满足的历史配置会被跳过。
 
-MCP POST 入口请求体上限为 1MiB。`/mcp` JSON-RPC batch 最多 16 项，空 batch 或超过上限会返回 `Invalid Request`。`server.list` 会先按 owner/admin 与 PAT server allowlist 过滤后再应用 `limit` / `offset`；管理员 PAT 可列出 allowlist 命中的跨 owner 服务器，非管理员 PAT 仍只列出自己拥有且 allowlist 命中的服务器。`server.exec` 命令最长 8192 字节，timeout 被限制在 1 到 60 秒，默认 30 秒；Agent 返回的 exec stdout/stderr 各最多 64KiB、error 最多 4KiB。MCP `fs.read` 单次最多读取 1MiB，返回 base64 文本按该预算校验；`fs.list` Agent 返回 JSON 最长 1MiB，`fs.write/delete` 小结果最长 4KiB。
+MCP POST 入口请求体上限为 1MiB。`/mcp` JSON-RPC batch 最多 16 项，空 batch 或超过上限会返回 `Invalid Request`。`server.list` 会先按 owner/admin 与 PAT server allowlist 过滤后再应用 `limit` / `offset`；管理员 PAT 可列出 allowlist 命中的跨 owner 服务器，非管理员 PAT 仍只列出自己拥有且 allowlist 命中的服务器。`server.exec` 命令最长 8192 字节，timeout 被限制在 1 到 60 秒，默认 30 秒；Agent 返回的 exec stdout/stderr 各最多 64KiB、error 最多 4KiB。MCP `fs.*` 文件任务和 `fs.download_url` / `fs.upload_url` 签发临时 URL 都要求目标 Agent 当前未撤销；`fs.read` 单次最多读取 1MiB，返回 base64 文本按该预算校验；`fs.list` Agent 返回 JSON 最长 1MiB，`fs.write/delete` 小结果最长 4KiB。
 
 GeoIP 测试接口请求体上限为 4KiB。GeoIP MMDB update 请求体上限为 16KiB，`source_url` 最长 2048 字节，`source_path` 最长 4096 字节；本地 `source_path` 必须是普通文件，读取前会按 128MiB 上限检查文件大小。GeoIP JSON provider 响应最多读取 16KiB，返回的 `raw` JSON 会限制字符串长度、数组项数、对象字段数和嵌套深度；MMDB 下载和上传文件上限均为 128MiB，下载路径会在读取过程中按上限中止。
 

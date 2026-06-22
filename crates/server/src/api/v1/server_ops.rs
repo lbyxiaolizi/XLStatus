@@ -465,7 +465,7 @@ async fn build_temp_url(
         "transfer:write"
     };
     require_transfer_scope(&auth, scope)?;
-    ensure_server_visible(&state, &auth, &server_id).await?;
+    ensure_server_active(&state, &auth, &server_id).await?;
     let path = validate_abs_path(&req.path)?;
     let expires_in = temporary_url_expires_in(req.expires_in);
     let expires_at = temporary_url_expires_at(expires_in);
@@ -538,6 +538,22 @@ async fn ensure_server_online(
     let agent_id = ensure_server_visible(state, auth, server_id).await?;
     if !state.session_registry.is_online(&agent_id).await {
         return Err(AppError::BadRequest("agent is offline".into()));
+    }
+    Ok(agent_id)
+}
+
+async fn ensure_server_active(
+    state: &AppState,
+    auth: &AuthSession,
+    server_id: &str,
+) -> Result<AgentId, AppError> {
+    let agent_id = ensure_server_visible(state, auth, server_id).await?;
+    let agent = AgentRepository::new(state.db.clone())
+        .find_by_id(agent_id)
+        .await?
+        .ok_or(AppError::NotFound("agent not found".into()))?;
+    if agent.revoked_at.is_some() {
+        return Err(AppError::Forbidden("agent has been revoked".into()));
     }
     Ok(agent_id)
 }
@@ -860,6 +876,13 @@ fn default_temp_url_expires() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use crate::db::{
+        CreateAgentInput, CreateUserInput, DatabaseBackend, TemporaryTransferTokenRepository,
+        UserRepository,
+    };
+    use xlstatus_shared::UserRole;
 
     fn valid_checksum() -> String {
         "a".repeat(64)
@@ -1078,6 +1101,81 @@ mod tests {
         )
         .unwrap_err();
         assert!(app_error_message(&err).contains("https"));
+    }
+
+    #[tokio::test]
+    async fn temp_url_signing_rejects_revoked_agent_before_creating_token() {
+        let state = test_state().await;
+        let user = UserRepository::new(state.db.clone())
+            .create(CreateUserInput {
+                username: "owner".into(),
+                password: "secret-password".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        let agent_repo = AgentRepository::new(state.db.clone());
+        let agent = agent_repo
+            .create(CreateAgentInput {
+                name: "revoked-temp-url-agent".into(),
+                public_key: "public".into(),
+                owner_user_id: user.id,
+            })
+            .await
+            .unwrap();
+        assert!(agent_repo.revoke(agent.id).await.unwrap());
+        let auth = AuthSession {
+            session_id: "sess".into(),
+            user_id: user.id,
+            username: user.username,
+            role: user.role,
+            csrf_token: "csrf".into(),
+            auth_kind: AuthKind::Session,
+            scopes: Vec::new(),
+            server_ids: None,
+            pat_id: None,
+        };
+
+        let err = build_temp_url(
+            state.clone(),
+            auth,
+            agent.id.0.to_string(),
+            TempUrlRequest {
+                path: "/tmp/file.txt".into(),
+                expires_in: 300,
+            },
+            "download",
+            "GET",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(app_error_message(&err).contains("agent has been revoked"));
+        let (_, total) = TemporaryTransferTokenRepository::new(state.db.clone())
+            .list(10, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 0);
+    }
+
+    async fn test_state() -> AppState {
+        let db = DatabaseBackend::connect("sqlite::memory:", true)
+            .await
+            .unwrap();
+        db.run_migrations().await.unwrap();
+
+        AppState {
+            db,
+            config: Arc::new(crate::config::Config::default()),
+            agent_jwt_challenges: Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            metrics: xlstatus_tsdb::MetricStore::in_memory(),
+            realtime: crate::realtime::BroadcastHub::new(),
+            session_registry: crate::grpc::SessionRegistry::new(),
+            terminal_sessions: crate::api::v1::terminal::TerminalSessionRegistry::new(),
+            io_registry: crate::grpc::IoRegistry::new(),
+        }
     }
 
     fn app_error_message(err: &AppError) -> String {

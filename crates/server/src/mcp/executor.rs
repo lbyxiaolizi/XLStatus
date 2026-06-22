@@ -230,7 +230,7 @@ impl McpExecutor {
         args: &serde_json::Value,
     ) -> Result<serde_json::Value> {
         let server_id = args["server_id"].as_str().context("Missing server_id")?;
-        self.ensure_agent_visible(auth, server_id).await?;
+        self.ensure_agent_active(auth, server_id).await?;
         let path = validate_abs_path(args["path"].as_str().context("Missing path")?)?;
         let result = self
             .dispatch_file_task(
@@ -261,7 +261,7 @@ impl McpExecutor {
         args: &serde_json::Value,
     ) -> Result<serde_json::Value> {
         let server_id = args["server_id"].as_str().context("Missing server_id")?;
-        self.ensure_agent_visible(auth, server_id).await?;
+        self.ensure_agent_active(auth, server_id).await?;
         let path = validate_abs_path(args["path"].as_str().context("Missing path")?)?;
         let max_size = args["max_size"]
             .as_u64()
@@ -311,7 +311,7 @@ impl McpExecutor {
         args: &serde_json::Value,
     ) -> Result<serde_json::Value> {
         let server_id = args["server_id"].as_str().context("Missing server_id")?;
-        self.ensure_agent_visible(auth, server_id).await?;
+        self.ensure_agent_active(auth, server_id).await?;
         let path = validate_abs_path(args["path"].as_str().context("Missing path")?)?;
         let content = args["content"].as_str().context("Missing content")?;
         let mode = args["mode"].as_str().unwrap_or("overwrite");
@@ -351,7 +351,7 @@ impl McpExecutor {
         args: &serde_json::Value,
     ) -> Result<serde_json::Value> {
         let server_id = args["server_id"].as_str().context("Missing server_id")?;
-        self.ensure_agent_visible(auth, server_id).await?;
+        self.ensure_agent_active(auth, server_id).await?;
         let path = validate_abs_path(args["path"].as_str().context("Missing path")?)?;
         if path == "/" {
             anyhow::bail!("refusing to delete filesystem root");
@@ -386,7 +386,7 @@ impl McpExecutor {
         args: &serde_json::Value,
     ) -> Result<serde_json::Value> {
         let server_id = args["server_id"].as_str().context("Missing server_id")?;
-        self.ensure_agent_visible(auth, server_id).await?;
+        self.ensure_agent_active(auth, server_id).await?;
         let path = validate_abs_path(args["path"].as_str().context("Missing path")?)?;
         let expires_in = temporary_url_expires_in(
             args["expires_in"]
@@ -427,7 +427,7 @@ impl McpExecutor {
         args: &serde_json::Value,
     ) -> Result<serde_json::Value> {
         let server_id = args["server_id"].as_str().context("Missing server_id")?;
-        self.ensure_agent_visible(auth, server_id).await?;
+        self.ensure_agent_active(auth, server_id).await?;
         let path = validate_abs_path(args["path"].as_str().context("Missing path")?)?;
         let expires_in = temporary_url_expires_in(
             args["expires_in"]
@@ -512,6 +512,18 @@ impl McpExecutor {
         } else {
             anyhow::bail!("Server not allowed")
         }
+    }
+
+    async fn ensure_agent_active(
+        &self,
+        auth: &AuthSession,
+        server_id: &str,
+    ) -> Result<crate::db::Agent> {
+        let agent = self.ensure_agent_visible(auth, server_id).await?;
+        if agent.revoked_at.is_some() {
+            anyhow::bail!("agent has been revoked");
+        }
+        Ok(agent)
     }
 }
 
@@ -869,7 +881,7 @@ fn agent_visible_to_auth(auth: &AuthSession, agent: &crate::db::Agent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{CreateAgentInput, DatabaseBackend};
+    use crate::db::{CreateAgentInput, DatabaseBackend, TemporaryTransferTokenRepository};
     use serde_json::json;
     use xlstatus_shared::UserRole;
 
@@ -1026,6 +1038,50 @@ mod tests {
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0]["server_id"], other_agent.id.0.to_string());
         assert_eq!(result["total"], 1);
+    }
+
+    #[tokio::test]
+    async fn mcp_temp_url_signing_rejects_revoked_agent_before_creating_token() {
+        let db = test_db().await;
+        let owner = UserId(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap());
+        seed_user(&db, owner, "owner", "admin").await;
+        let agent_repo = AgentRepository::new(db.clone());
+        let agent = agent_repo
+            .create(CreateAgentInput {
+                name: "revoked-temp-url-agent".into(),
+                public_key: "pk".into(),
+                owner_user_id: owner,
+            })
+            .await
+            .unwrap();
+        assert!(agent_repo.revoke(agent.id).await.unwrap());
+        let executor = test_executor(db.clone());
+        let auth = pat_auth(owner, UserRole::Admin, vec![agent.id.0.to_string()]);
+
+        let response = executor
+            .execute(
+                &auth,
+                McpToolRequest {
+                    tool: "fs.download_url".into(),
+                    arguments: json!({
+                        "server_id": agent.id.0.to_string(),
+                        "path": "/tmp/file.txt"
+                    }),
+                },
+            )
+            .await;
+
+        assert!(!response.success);
+        assert!(response
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("agent has been revoked"));
+        let (_, total) = TemporaryTransferTokenRepository::new(db)
+            .list(10, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 0);
     }
 
     #[test]
