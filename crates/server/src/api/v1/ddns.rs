@@ -3,7 +3,7 @@
 
 use axum::{
     extract::{DefaultBodyLimit, Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -11,11 +11,11 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::api::types::ApiResponse;
-use crate::api::v1::auth::AppState;
+use crate::api::v1::auth::{require_sensitive_totp, AppError, AppState};
 use crate::auth::middleware::{AuthKind, AuthSession, AuthUser};
 use crate::auth::rbac::has_scope;
 use crate::db::repository::ddns::{DdnsConfigRepository, DdnsConfigRow, DdnsHistoryRepository};
-use crate::db::AgentRepository;
+use crate::db::{AgentRepository, DatabaseBackend};
 use crate::security::validate_outbound_url;
 use xlstatus_shared::ddns::{DdnsHistoryEntry, ProviderType};
 use xlstatus_shared::AgentId;
@@ -100,13 +100,14 @@ pub fn ddns_body_limit() -> DefaultBodyLimit {
 pub async fn create_ddns_config(
     State(state): State<AppState>,
     auth_user: AuthUser,
+    headers: HeaderMap,
     Json(req): Json<CreateDdnsConfigRequest>,
 ) -> Result<
     Json<ApiResponse<DdnsConfigResponse>>,
     (StatusCode, Json<ApiResponse<DdnsConfigResponse>>),
 > {
     let db = state.db.clone();
-    require_ddns_scope(&auth_user, "ddns:write")?;
+    require_ddns_sensitive_admin(&db, &auth_user, &headers, "ddns:write").await?;
     let req = normalize_create_ddns_request(req)
         .map_err(|message| api_error::<DdnsConfigResponse>(StatusCode::BAD_REQUEST, message))?;
     ensure_ddns_agent_scope(&auth_user, req.agent_id.as_deref())?;
@@ -345,10 +346,11 @@ fn normalize_ddns_resource_uuid(value: String, field: &str) -> Result<String, St
 pub async fn delete_ddns_config(
     State(state): State<AppState>,
     auth_user: AuthUser,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<serde_json::Value>>)>
 {
-    require_ddns_scope_json(&auth_user, "ddns:delete")?;
+    require_ddns_sensitive_admin(&state.db, &auth_user, &headers, "ddns:delete").await?;
     let id = normalize_ddns_resource_uuid(id, "config_id")
         .map_err(|message| api_error::<serde_json::Value>(StatusCode::BAD_REQUEST, message))?;
     let Some(config) = DdnsConfigRepository::get_by_id(&state.db, &id)
@@ -459,11 +461,12 @@ pub async fn list_ddns_history(
 /// M6: hot-reload DDNS providers from the database. Useful after
 /// adding a new config without restarting the server.
 pub async fn reload_ddns_providers(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     auth_user: AuthUser,
+    headers: HeaderMap,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<serde_json::Value>>)>
 {
-    require_ddns_global_admin(&auth_user, "ddns:write")?;
+    require_ddns_sensitive_admin(&state.db, &auth_user, &headers, "ddns:write").await?;
     let mgr = match crate::current_ddns_manager() {
         Some(m) => m,
         None => {
@@ -496,11 +499,12 @@ pub async fn reload_ddns_providers(
 
 /// M6: run one DDNS provider check immediately.
 pub async fn check_ddns_now(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     auth_user: AuthUser,
+    headers: HeaderMap,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<serde_json::Value>>)>
 {
-    require_ddns_global_admin(&auth_user, "ddns:write")?;
+    require_ddns_sensitive_admin(&state.db, &auth_user, &headers, "ddns:write").await?;
     let mgr = match crate::current_ddns_manager() {
         Some(m) => m,
         None => {
@@ -566,6 +570,24 @@ fn require_ddns_global_admin(
         ));
     }
     Ok(())
+}
+
+async fn require_ddns_sensitive_admin<T>(
+    db: &DatabaseBackend,
+    auth_user: &AuthUser,
+    headers: &HeaderMap,
+    scope: &str,
+) -> Result<(), (StatusCode, Json<ApiResponse<T>>)> {
+    require_ddns_scope(auth_user, scope)?;
+    if auth_user.is_pat() {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "DDNS sensitive action requires an admin cookie session",
+        ));
+    }
+    require_sensitive_totp(db, auth_user.user.id, headers)
+        .await
+        .map_err(app_error_to_api)
 }
 
 fn ensure_ddns_agent_scope<T>(
@@ -690,6 +712,20 @@ fn api_error<T>(
     )
 }
 
+fn app_error_to_api<T>(err: AppError) -> (StatusCode, Json<ApiResponse<T>>) {
+    match err {
+        AppError::Database(e) => {
+            tracing::error!("Database error: {}", e);
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+        }
+        AppError::Unauthorized(message) => api_error(StatusCode::UNAUTHORIZED, message),
+        AppError::Forbidden(message) => api_error(StatusCode::FORBIDDEN, message),
+        AppError::BadRequest(message) => api_error(StatusCode::BAD_REQUEST, message),
+        AppError::TooManyRequests(message) => api_error(StatusCode::TOO_MANY_REQUESTS, message),
+        AppError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -748,6 +784,60 @@ mod tests {
         let err = require_ddns_global_admin(&auth, "ddns:write").unwrap_err();
 
         assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn ddns_sensitive_actions_reject_admin_pat() {
+        let db = test_db().await;
+        let auth = admin_pat(vec!["ddns:write"], None);
+
+        let err = require_ddns_sensitive_admin::<DdnsConfigResponse>(
+            &db,
+            &auth,
+            &HeaderMap::new(),
+            "ddns:write",
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn ddns_sensitive_actions_require_totp_when_enabled() {
+        let db = test_db().await;
+        let user_id = uuid::Uuid::from_bytes([1; 16]);
+        seed_user(&db, user_id).await;
+        seed_totp_enabled_user(&db, user_id).await;
+        let auth = admin_cookie_for(UserId(user_id));
+
+        let err = require_ddns_sensitive_admin::<DdnsConfigResponse>(
+            &db,
+            &auth,
+            &HeaderMap::new(),
+            "ddns:write",
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn ddns_sensitive_actions_allow_cookie_session_without_totp() {
+        let db = test_db().await;
+        let user_id = uuid::Uuid::from_bytes([1; 16]);
+        seed_user(&db, user_id).await;
+        let auth = admin_cookie_for(UserId(user_id));
+
+        require_ddns_sensitive_admin::<DdnsConfigResponse>(
+            &db,
+            &auth,
+            &HeaderMap::new(),
+            "ddns:write",
+        )
+        .await
+        .unwrap();
     }
 
     #[test]
@@ -1018,6 +1108,40 @@ mod tests {
         let db = DatabaseBackend::connect(&url, true).await.unwrap();
         db.run_migrations().await.unwrap();
         db
+    }
+
+    async fn seed_user(db: &DatabaseBackend, id: uuid::Uuid) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            INSERT INTO users (id, username, password_hash, role, token_version, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 0, ?, ?)
+            "#,
+        )
+        .bind(id.to_string())
+        .bind(format!("ddns-sensitive-{id}"))
+        .bind("hash")
+        .bind(UserRole::Admin.to_string())
+        .bind(&now)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_totp_enabled_user(db: &DatabaseBackend, id: uuid::Uuid) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query("UPDATE users SET totp_secret = ?, totp_enabled = 1 WHERE id = ?")
+            .bind("totp-secret")
+            .bind(id.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
     }
 
     fn ddns_config(agent_id: Option<&str>) -> DdnsConfigRow {

@@ -34,6 +34,7 @@ export default function DdnsPage() {
   const [history, setHistory] = useState<DdnsHistory[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [totpStatus, setTotpStatus] = useState<{ enabled?: boolean } | null>(null);
   const [modal, setModal] = useState(false);
   const [form, setForm] = useState({
     agent_id: "",
@@ -64,6 +65,28 @@ export default function DdnsPage() {
     return () => window.clearTimeout(timeoutId);
   }, [load]);
 
+  async function sensitiveTotpCode(): Promise<string | undefined | null> {
+    let enabled = totpStatus?.enabled;
+    if (totpStatus === null) {
+      const response = await apiClient.getTotpStatus();
+      if (!response.success || !response.data) {
+        setError(responseError(response));
+        return null;
+      }
+      setTotpStatus(response.data);
+      enabled = response.data.enabled;
+    }
+    if (!enabled) return undefined;
+    const code = window.prompt("请输入 6 位 TOTP 验证码");
+    if (code === null) return null;
+    const trimmed = code.trim();
+    if (!/^\d{6}$/.test(trimmed)) {
+      setError("请输入 6 位 TOTP 验证码。");
+      return null;
+    }
+    return trimmed;
+  }
+
   async function submit(event: FormEvent) {
     event.preventDefault();
     const payload: JsonObject = {
@@ -79,7 +102,9 @@ export default function DdnsPage() {
       webhook_url: form.webhook_url.trim() || null,
       enabled: true,
     };
-    const response = await apiClient.createDdnsConfig(payload);
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
+    const response = await apiClient.createDdnsConfig(payload, totpCode);
     if (response.success) {
       setNotice("DDNS 配置已创建。");
       setModal(false);
@@ -90,8 +115,18 @@ export default function DdnsPage() {
   }
 
   async function reload() {
-    const response = await apiClient.reloadDdnsProviders();
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
+    const response = await apiClient.reloadDdnsProviders(totpCode);
     if (response.success) setNotice("DDNS Provider 已重载。");
+    else setError(responseError(response));
+  }
+
+  async function checkNow() {
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
+    const response = await apiClient.checkDdnsNow(totpCode);
+    if (response.success) setNotice("DDNS 检查已触发。");
     else setError(responseError(response));
   }
 
@@ -107,7 +142,9 @@ export default function DdnsPage() {
 
   async function deleteConfig(config: DdnsConfig) {
     if (!confirm(`确定删除 DDNS 配置「${config.name || config.domain || config.id}」？`)) return;
-    const response = await apiClient.deleteDdnsConfig(config.id);
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
+    const response = await apiClient.deleteDdnsConfig(config.id, totpCode);
     if (response.success) {
       setNotice("DDNS 配置已删除。");
       await load();
@@ -127,6 +164,7 @@ export default function DdnsPage() {
           actions={
             <>
               <button className={buttonClass("secondary")} onClick={() => void reload()}>重载</button>
+              <button className={buttonClass("secondary")} onClick={() => void checkNow()}>立即检查</button>
               <button className={buttonClass("primary")} onClick={() => setModal(true)}>新增配置</button>
             </>
           }

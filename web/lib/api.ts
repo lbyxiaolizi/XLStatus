@@ -1399,28 +1399,40 @@ class ApiClient {
     return this.request<DdnsConfigListResponse>("/api/v1/ddns/configs");
   }
 
-  async createDdnsConfig(config: JsonObject): Promise<ApiResponse<JsonObject>> {
+  async createDdnsConfig(
+    config: JsonObject,
+    totpCode?: string,
+  ): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>("/api/v1/ddns/configs", {
       method: "POST",
       body: JSON.stringify(config),
+      headers: this.sensitiveHeaders(totpCode),
     });
   }
 
   async updateDdnsConfig(
     id: string,
     config: JsonObject,
+    totpCode?: string,
   ): Promise<ApiResponse<JsonObject>> {
     return this.requestWithFallback<JsonObject>(
       `/api/v1/ddns/configs/${encodeURIComponent(id)}`,
       config,
       ["PATCH", "POST", "PUT"],
+      { headers: this.sensitiveHeaders(totpCode) },
     );
   }
 
-  async deleteDdnsConfig(id: string): Promise<ApiResponse<JsonObject>> {
+  async deleteDdnsConfig(
+    id: string,
+    totpCode?: string,
+  ): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
       `/api/v1/ddns/configs/${encodeURIComponent(id)}`,
-      { method: "DELETE" },
+      {
+        method: "DELETE",
+        headers: this.sensitiveHeaders(totpCode),
+      },
     );
   }
 
@@ -1432,9 +1444,17 @@ class ApiClient {
     );
   }
 
-  async reloadDdnsProviders(): Promise<ApiResponse<JsonObject>> {
+  async reloadDdnsProviders(totpCode?: string): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>("/api/v1/ddns/reload", {
       method: "POST",
+      headers: this.sensitiveHeaders(totpCode),
+    });
+  }
+
+  async checkDdnsNow(totpCode?: string): Promise<ApiResponse<JsonObject>> {
+    return this.request<JsonObject>("/api/v1/ddns/check-now", {
+      method: "POST",
+      headers: this.sensitiveHeaders(totpCode),
     });
   }
 
