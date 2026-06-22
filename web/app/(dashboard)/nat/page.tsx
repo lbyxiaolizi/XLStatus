@@ -18,7 +18,7 @@ import {
   tdClass,
   thClass,
 } from "@/app/components/M7Primitives";
-import { apiClient, type JsonObject, type NatMapping } from "@/lib/api";
+import { apiClient, type JsonObject, type NatMapping, type TotpStatusResponse } from "@/lib/api";
 
 interface Server {
   id: string;
@@ -31,6 +31,7 @@ export default function NatPage() {
   const [servers, setServers] = useState<Server[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [totpStatus, setTotpStatus] = useState<TotpStatusResponse | null>(null);
   const [modal, setModal] = useState(false);
   const [form, setForm] = useState({ agent_id: "", description: "", protocol: "tcp", local_host: "127.0.0.1", local_port: "80", public_port: "10080", allowed_sources: "", max_active_tunnels: "", idle_timeout_seconds: "", max_bytes_per_tunnel: "", max_bandwidth_bytes_per_second: "", rate_limit_window_seconds: "", max_connections_per_window: "", max_bytes_per_window: "" });
 
@@ -73,7 +74,9 @@ export default function NatPage() {
       max_connections_per_window: form.max_connections_per_window.trim() ? Number(form.max_connections_per_window) : null,
       max_bytes_per_window: form.max_bytes_per_window.trim() ? Number(form.max_bytes_per_window) : null,
     };
-    const response = await apiClient.createNatMapping(payload);
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
+    const response = await apiClient.createNatMapping(payload, totpCode);
     if (response.success) {
       setNotice("NAT 映射已创建。");
       setModal(false);
@@ -85,13 +88,37 @@ export default function NatPage() {
 
   async function deleteMapping(mapping: NatMapping) {
     if (!confirm(`确定删除 NAT 映射「${mapping.description || mapping.id}」？`)) return;
-    const response = await apiClient.deleteNatMapping(mapping.id);
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
+    const response = await apiClient.deleteNatMapping(mapping.id, totpCode);
     if (response.success) {
       setNotice("NAT 映射已删除。");
       await load();
     } else {
       setError(responseError(response));
     }
+  }
+
+  async function sensitiveTotpCode(): Promise<string | undefined | null> {
+    let enabled = totpStatus?.enabled;
+    if (totpStatus === null) {
+      const response = await apiClient.getTotpStatus();
+      if (!response.success || !response.data) {
+        setError(responseError(response));
+        return null;
+      }
+      setTotpStatus(response.data);
+      enabled = response.data.enabled;
+    }
+    if (!enabled) return undefined;
+    const code = window.prompt("请输入 6 位 TOTP 验证码");
+    if (code === null) return null;
+    const trimmed = code.trim();
+    if (!/^\d{6}$/.test(trimmed)) {
+      setError("请输入 6 位 TOTP 验证码。");
+      return null;
+    }
+    return trimmed;
   }
 
   return (

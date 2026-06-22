@@ -1402,9 +1402,10 @@ class ApiClient {
     );
   }
 
-  async createNatMapping(mapping: JsonObject): Promise<ApiResponse<JsonObject>> {
+  async createNatMapping(mapping: JsonObject, totpCode?: string): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>("/api/v1/nat/mappings", {
       method: "POST",
+      headers: this.sensitiveHeaders(totpCode),
       body: JSON.stringify(mapping),
     });
   }
@@ -1412,18 +1413,20 @@ class ApiClient {
   async updateNatMapping(
     id: string,
     mapping: JsonObject,
+    totpCode?: string,
   ): Promise<ApiResponse<JsonObject>> {
     return this.requestWithFallback<JsonObject>(
       `/api/v1/nat/mappings/${encodeURIComponent(id)}`,
       mapping,
       ["POST", "PATCH", "PUT"],
+      { headers: this.sensitiveHeaders(totpCode) },
     );
   }
 
-  async deleteNatMapping(id: string): Promise<ApiResponse<JsonObject>> {
+  async deleteNatMapping(id: string, totpCode?: string): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
       `/api/v1/nat/mappings/${encodeURIComponent(id)}`,
-      { method: "DELETE" },
+      { method: "DELETE", headers: this.sensitiveHeaders(totpCode) },
     );
   }
 

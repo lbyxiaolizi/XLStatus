@@ -3,7 +3,7 @@
 
 use axum::{
     extract::{DefaultBodyLimit, Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -11,7 +11,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::api::types::ApiResponse;
-use crate::api::v1::auth::AppState;
+use crate::api::v1::auth::{require_sensitive_totp, AppError, AppState};
 use crate::auth::middleware::{AuthKind, AuthSession, AuthUser};
 use crate::auth::rbac::has_scope;
 use crate::db::repository::NatMappingRepository;
@@ -128,11 +128,12 @@ pub fn nat_body_limit() -> DefaultBodyLimit {
 pub async fn create_nat_mapping(
     State(state): State<AppState>,
     auth_user: AuthUser,
+    headers: HeaderMap,
     Json(req): Json<CreateNatMappingRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     let db = state.db.clone();
 
-    require_scope_or_403(&auth_user, "nat:write")?;
+    require_nat_sensitive_scope_or_403(&db, &auth_user, "nat:write", &headers).await?;
     let req = normalize_create_nat_mapping_request(req).map_err(bad_request_with)?;
     require_active_nat_agent_or_403(&db, &auth_user, &req.agent_id).await?;
     validate_nat_local_target_or_403(&req.local_host)?;
@@ -318,12 +319,13 @@ async fn list_runtime_nat_mappings(
 pub async fn update_nat_mapping(
     State(state): State<AppState>,
     auth_user: AuthUser,
+    headers: HeaderMap,
     Path(mapping_id): Path<String>,
     Json(req): Json<UpdateNatMappingRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     let db = state.db.clone();
 
-    require_scope_or_403(&auth_user, "nat:write")?;
+    require_nat_sensitive_scope_or_403(&db, &auth_user, "nat:write", &headers).await?;
     let mapping_id =
         normalize_nat_resource_uuid(mapping_id, "mapping_id").map_err(bad_request_with)?;
     let req = normalize_update_nat_mapping_request(req).map_err(bad_request_with)?;
@@ -447,11 +449,12 @@ pub async fn update_nat_mapping(
 pub async fn delete_nat_mapping(
     State(state): State<AppState>,
     auth_user: AuthUser,
+    headers: HeaderMap,
     Path(mapping_id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     let db = state.db.clone();
 
-    require_scope_or_403(&auth_user, "nat:delete")?;
+    require_nat_sensitive_scope_or_403(&db, &auth_user, "nat:delete", &headers).await?;
     let mapping_id =
         normalize_nat_resource_uuid(mapping_id, "mapping_id").map_err(bad_request_with)?;
     // Check if mapping exists
@@ -537,6 +540,23 @@ fn require_scope_or_403(
     }
 }
 
+async fn require_nat_sensitive_scope_or_403(
+    db: &Db,
+    auth_user: &AuthUser,
+    required_scope: &str,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
+    require_scope_or_403(auth_user, required_scope)?;
+    if matches!(auth_user.auth_kind, AuthKind::PersonalAccessToken) {
+        return Err(forbidden_with(
+            "NAT mapping changes require a cookie session".to_string(),
+        ));
+    }
+    require_sensitive_totp(db, auth_user.user.id, headers)
+        .await
+        .map_err(app_error_to_api)
+}
+
 fn session_of(auth_user: &AuthUser) -> AuthSession {
     AuthSession {
         session_id: auth_user.session_id.clone(),
@@ -567,6 +587,38 @@ fn require_admin_cookie_session_or_403(
         return Err(forbidden_with("Cookie session required".to_string()));
     }
     Ok(())
+}
+
+fn app_error_to_api(err: AppError) -> (StatusCode, Json<ApiResponse<()>>) {
+    match err {
+        AppError::Database(err) => internal_with(err.to_string()),
+        AppError::Unauthorized(message) => (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiResponse {
+                success: false,
+                data: None,
+                error: Some(message),
+            }),
+        ),
+        AppError::Forbidden(message) => forbidden_with(message),
+        AppError::BadRequest(message) => bad_request_with(message),
+        AppError::TooManyRequests(message) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ApiResponse {
+                success: false,
+                data: None,
+                error: Some(message),
+            }),
+        ),
+        AppError::NotFound(message) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse {
+                success: false,
+                data: None,
+                error: Some(message),
+            }),
+        ),
+    }
 }
 
 fn validate_public_port_or_403(port: u16) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
@@ -970,6 +1022,78 @@ mod tests {
         assert!(require_admin_cookie_session_or_403(&auth).is_ok());
     }
 
+    #[tokio::test]
+    async fn nat_mapping_changes_reject_pat_session() {
+        let db = test_db().await;
+        let auth = auth_user_with_scopes(
+            UserId(uuid::Uuid::from_bytes([8; 16])),
+            AuthKind::PersonalAccessToken,
+            UserRole::Admin,
+            vec!["nat:write"],
+        );
+
+        let err = require_nat_sensitive_scope_or_403(&db, &auth, "nat:write", &HeaderMap::new())
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(err
+            .1
+             .0
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("cookie session"));
+    }
+
+    #[tokio::test]
+    async fn nat_mapping_changes_require_totp_when_enabled() {
+        let db = test_db().await;
+        let user = UserRepository::new(db.clone())
+            .create(CreateUserInput {
+                username: format!("nat-sensitive-owner-{}", uuid::Uuid::now_v7()),
+                password: "password123".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        seed_totp_enabled_user(&db, user.id).await;
+        let auth = auth_user_with_scopes(user.id, AuthKind::Session, UserRole::Admin, Vec::new());
+
+        let err = require_nat_sensitive_scope_or_403(&db, &auth, "nat:write", &HeaderMap::new())
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(err
+            .1
+             .0
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("TOTP"));
+    }
+
+    #[tokio::test]
+    async fn nat_mapping_changes_allow_cookie_without_totp() {
+        let db = test_db().await;
+        let user = UserRepository::new(db.clone())
+            .create(CreateUserInput {
+                username: format!("nat-sensitive-owner-{}", uuid::Uuid::now_v7()),
+                password: "password123".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        let auth = auth_user_with_scopes(user.id, AuthKind::Session, UserRole::Admin, Vec::new());
+
+        assert!(
+            require_nat_sensitive_scope_or_403(&db, &auth, "nat:delete", &HeaderMap::new())
+                .await
+                .is_ok()
+        );
+    }
+
     #[test]
     fn nat_allowed_sources_normalizes_valid_entries() {
         let normalized =
@@ -1342,6 +1466,15 @@ mod tests {
     }
 
     fn auth_user_for(user_id: UserId, auth_kind: AuthKind, role: UserRole) -> AuthUser {
+        auth_user_with_scopes(user_id, auth_kind, role, vec!["nat:read"])
+    }
+
+    fn auth_user_with_scopes(
+        user_id: UserId,
+        auth_kind: AuthKind,
+        role: UserRole,
+        scopes: Vec<&str>,
+    ) -> AuthUser {
         AuthUser {
             user: crate::db::User {
                 id: user_id,
@@ -1355,7 +1488,7 @@ mod tests {
             session_id: "session".into(),
             csrf_token: "csrf".into(),
             auth_kind,
-            scopes: vec!["nat:read".into()],
+            scopes: scopes.into_iter().map(str::to_string).collect(),
             server_ids: None,
             pat_id: None,
         }
@@ -1442,6 +1575,18 @@ mod tests {
             max_connections_per_window: None,
             max_bytes_per_window: None,
         }
+    }
+
+    async fn seed_totp_enabled_user(db: &DatabaseBackend, id: UserId) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query("UPDATE users SET totp_secret = ?, totp_enabled = 1 WHERE id = ?")
+            .bind("totp-secret")
+            .bind(id.0.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
     }
 }
 
