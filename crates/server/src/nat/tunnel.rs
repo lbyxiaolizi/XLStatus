@@ -1,10 +1,11 @@
 use crate::db::repository::NatMappingRepository;
 use crate::db::Db;
 use crate::grpc::IoRegistry;
+use crate::nat::policy::nat_source_list_allows;
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -14,7 +15,6 @@ use xlstatus_proto_gen::xlstatus::v1::{io_frame, IoClose, IoData, IoError, IoFra
 use xlstatus_shared::nat::{NatMapping, NatTunnelControlMessage, Protocol, TunnelStats};
 
 const DEFAULT_NAT_MAX_ACTIVE_TUNNELS: usize = 128;
-const DEFAULT_NAT_MIN_PUBLIC_PORT: u16 = 1024;
 
 /// Active tunnel connection
 #[derive(Debug)]
@@ -764,18 +764,6 @@ fn nat_bind_addr(port: u16) -> String {
     format!("{host}:{port}")
 }
 
-pub fn nat_public_port_allowed(port: u16) -> bool {
-    let min = nat_public_port_min();
-    port >= min
-}
-
-fn nat_public_port_min() -> u16 {
-    std::env::var("XLSTATUS_NAT_PUBLIC_PORT_MIN")
-        .ok()
-        .and_then(|value| value.trim().parse::<u16>().ok())
-        .unwrap_or(DEFAULT_NAT_MIN_PUBLIC_PORT)
-}
-
 fn nat_max_active_tunnels() -> usize {
     std::env::var("XLSTATUS_NAT_MAX_ACTIVE_TUNNELS")
         .ok()
@@ -798,73 +786,6 @@ fn nat_mapping_source_allowed(mapping: &NatMapping, peer_addr: SocketAddr) -> bo
     nat_source_list_allows(raw, peer_addr.ip())
 }
 
-fn nat_source_list_allows(raw: &str, peer_ip: IpAddr) -> bool {
-    raw.split([',', ' ', '\n', '\t'])
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-        .any(|item| nat_source_entry_matches(item, peer_ip))
-}
-
-pub fn nat_source_entry_valid(entry: &str) -> bool {
-    if entry.parse::<IpAddr>().is_ok() {
-        return true;
-    }
-    let Some((network, prefix)) = entry.split_once('/') else {
-        return false;
-    };
-    let Ok(network) = network.parse::<IpAddr>() else {
-        return false;
-    };
-    let Ok(prefix) = prefix.parse::<u8>() else {
-        return false;
-    };
-    matches!(
-        network,
-        IpAddr::V4(_) if prefix <= 32
-    ) || matches!(
-        network,
-        IpAddr::V6(_) if prefix <= 128
-    )
-}
-
-fn nat_source_entry_matches(entry: &str, ip: IpAddr) -> bool {
-    if let Ok(exact) = entry.parse::<IpAddr>() {
-        return exact == ip;
-    }
-    let Some((network, prefix)) = entry.split_once('/') else {
-        return false;
-    };
-    let Ok(network) = network.parse::<IpAddr>() else {
-        return false;
-    };
-    let Ok(prefix) = prefix.parse::<u8>() else {
-        return false;
-    };
-    nat_ip_in_cidr(ip, network, prefix)
-}
-
-fn nat_ip_in_cidr(ip: IpAddr, network: IpAddr, prefix: u8) -> bool {
-    match (ip, network) {
-        (IpAddr::V4(ip), IpAddr::V4(network)) if prefix <= 32 => {
-            let mask = if prefix == 0 {
-                0
-            } else {
-                u32::MAX << (32 - prefix)
-            };
-            (u32::from(ip) & mask) == (u32::from(network) & mask)
-        }
-        (IpAddr::V6(ip), IpAddr::V6(network)) if prefix <= 128 => {
-            let mask = if prefix == 0 {
-                0
-            } else {
-                u128::MAX << (128 - prefix)
-            };
-            (u128::from(ip) & mask) == (u128::from(network) & mask)
-        }
-        _ => false,
-    }
-}
-
 impl Clone for NatTunnelManager {
     fn clone(&self) -> Self {
         Self {
@@ -879,6 +800,7 @@ impl Clone for NatTunnelManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nat::policy::{nat_public_port_allowed, nat_source_entry_valid};
 
     #[test]
     fn nat_listener_binds_loopback_by_default() {

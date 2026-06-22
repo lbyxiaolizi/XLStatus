@@ -2,6 +2,7 @@
 #![allow(unused)]
 
 use crate::db::Db;
+use crate::nat::policy::validate_nat_mapping_runtime_policy;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use sqlx::postgres::PgRow;
@@ -102,14 +103,14 @@ impl NatMappingRepository {
                     .bind(id)
                     .fetch_optional(pool)
                     .await?;
-                row_opt.map(Self::sqlite_row_to_mapping).transpose()?
+                Self::optional_sqlite_mapping(row_opt)?
             }
             crate::db::DatabaseBackend::Postgres(pool) => {
                 let row_opt = sqlx::query(NAT_MAPPING_SELECT_POSTGRES_BY_ID)
                     .bind(parse_uuid(id, "id")?)
                     .fetch_optional(pool)
                     .await?;
-                row_opt.map(Self::postgres_row_to_mapping).transpose()?
+                Self::optional_postgres_mapping(row_opt)?
             }
         };
 
@@ -124,14 +125,14 @@ impl NatMappingRepository {
                     .bind(port as i32)
                     .fetch_optional(pool)
                     .await?;
-                row_opt.map(Self::sqlite_row_to_mapping).transpose()?
+                Self::optional_sqlite_mapping(row_opt)?
             }
             crate::db::DatabaseBackend::Postgres(pool) => {
                 let row_opt = sqlx::query(NAT_MAPPING_SELECT_POSTGRES_BY_PUBLIC_PORT)
                     .bind(port as i32)
                     .fetch_optional(pool)
                     .await?;
-                row_opt.map(Self::postgres_row_to_mapping).transpose()?
+                Self::optional_postgres_mapping(row_opt)?
             }
         };
 
@@ -146,14 +147,14 @@ impl NatMappingRepository {
                     .bind(port as i32)
                     .fetch_optional(pool)
                     .await?;
-                row_opt.map(Self::sqlite_row_to_mapping).transpose()?
+                Self::optional_sqlite_mapping(row_opt)?
             }
             crate::db::DatabaseBackend::Postgres(pool) => {
                 let row_opt = sqlx::query(NAT_MAPPING_SELECT_POSTGRES_ACTIVE_BY_PUBLIC_PORT)
                     .bind(port as i32)
                     .fetch_optional(pool)
                     .await?;
-                row_opt.map(Self::postgres_row_to_mapping).transpose()?
+                Self::optional_postgres_mapping(row_opt)?
             }
         };
 
@@ -168,18 +169,14 @@ impl NatMappingRepository {
                     .bind(agent_id)
                     .fetch_all(pool)
                     .await?;
-                rows.into_iter()
-                    .map(Self::sqlite_row_to_mapping)
-                    .collect::<Result<Vec<_>>>()?
+                Self::sqlite_rows_to_mappings(rows)
             }
             crate::db::DatabaseBackend::Postgres(pool) => {
                 let rows = sqlx::query(NAT_MAPPING_SELECT_POSTGRES_BY_AGENT)
                     .bind(parse_uuid(agent_id, "agent_id")?)
                     .fetch_all(pool)
                     .await?;
-                rows.into_iter()
-                    .map(Self::postgres_row_to_mapping)
-                    .collect::<Result<Vec<_>>>()?
+                Self::postgres_rows_to_mappings(rows)
             }
         };
 
@@ -193,17 +190,13 @@ impl NatMappingRepository {
                 let rows = sqlx::query(NAT_MAPPING_SELECT_SQLITE_ENABLED)
                     .fetch_all(pool)
                     .await?;
-                rows.into_iter()
-                    .map(Self::sqlite_row_to_mapping)
-                    .collect::<Result<Vec<_>>>()?
+                Self::sqlite_rows_to_mappings(rows)
             }
             crate::db::DatabaseBackend::Postgres(pool) => {
                 let rows = sqlx::query(NAT_MAPPING_SELECT_POSTGRES_ENABLED)
                     .fetch_all(pool)
                     .await?;
-                rows.into_iter()
-                    .map(Self::postgres_row_to_mapping)
-                    .collect::<Result<Vec<_>>>()?
+                Self::postgres_rows_to_mappings(rows)
             }
         };
 
@@ -217,17 +210,13 @@ impl NatMappingRepository {
                 let rows = sqlx::query(NAT_MAPPING_SELECT_SQLITE_ENABLED_ACTIVE_AGENTS)
                     .fetch_all(pool)
                     .await?;
-                rows.into_iter()
-                    .map(Self::sqlite_row_to_mapping)
-                    .collect::<Result<Vec<_>>>()?
+                Self::sqlite_rows_to_mappings(rows)
             }
             crate::db::DatabaseBackend::Postgres(pool) => {
                 let rows = sqlx::query(NAT_MAPPING_SELECT_POSTGRES_ENABLED_ACTIVE_AGENTS)
                     .fetch_all(pool)
                     .await?;
-                rows.into_iter()
-                    .map(Self::postgres_row_to_mapping)
-                    .collect::<Result<Vec<_>>>()?
+                Self::postgres_rows_to_mappings(rows)
             }
         };
 
@@ -339,87 +328,155 @@ impl NatMappingRepository {
     /// Helper to convert SQLite row to NatMapping
     fn sqlite_row_to_mapping(row: SqliteRow) -> Result<NatMapping> {
         let protocol_str: String = row.try_get("protocol")?;
-        let protocol = Protocol::from_str(&protocol_str).unwrap_or(Protocol::Tcp);
+        let protocol = Protocol::from_str(&protocol_str)
+            .with_context(|| format!("invalid NAT mapping protocol: {protocol_str}"))?;
 
-        Ok(NatMapping {
+        let mapping = NatMapping {
             id: row.try_get("id")?,
             agent_id: row.try_get("agent_id")?,
             local_host: row.try_get("local_host")?,
-            local_port: row.try_get::<i32, _>("local_port")? as u16,
-            public_port: row.try_get::<i32, _>("public_port")? as u16,
+            local_port: parse_i32_u16(row.try_get("local_port")?, "local_port")?,
+            public_port: parse_i32_u16(row.try_get("public_port")?, "public_port")?,
             protocol,
             enabled: row.try_get("enabled")?,
             description: row.try_get("description")?,
             allowed_sources: row.try_get("allowed_sources")?,
             max_active_tunnels: row
                 .try_get::<Option<i32>, _>("max_active_tunnels")?
-                .map(|value| value as u32),
+                .map(|value| parse_i32_u32(value, "max_active_tunnels"))
+                .transpose()?,
             idle_timeout_seconds: row
                 .try_get::<Option<i32>, _>("idle_timeout_seconds")?
-                .map(|value| value as u32),
+                .map(|value| parse_i32_u32(value, "idle_timeout_seconds"))
+                .transpose()?,
             max_bytes_per_tunnel: row
                 .try_get::<Option<i64>, _>("max_bytes_per_tunnel")?
-                .map(|value| value as u64),
+                .map(|value| parse_i64_u64(value, "max_bytes_per_tunnel"))
+                .transpose()?,
             max_bandwidth_bytes_per_second: row
                 .try_get::<Option<i64>, _>("max_bandwidth_bytes_per_second")?
-                .map(|value| value as u64),
+                .map(|value| parse_i64_u64(value, "max_bandwidth_bytes_per_second"))
+                .transpose()?,
             rate_limit_window_seconds: row
                 .try_get::<Option<i32>, _>("rate_limit_window_seconds")?
-                .map(|value| value as u32),
+                .map(|value| parse_i32_u32(value, "rate_limit_window_seconds"))
+                .transpose()?,
             max_connections_per_window: row
                 .try_get::<Option<i32>, _>("max_connections_per_window")?
-                .map(|value| value as u32),
+                .map(|value| parse_i32_u32(value, "max_connections_per_window"))
+                .transpose()?,
             max_bytes_per_window: row
                 .try_get::<Option<i64>, _>("max_bytes_per_window")?
-                .map(|value| value as u64),
+                .map(|value| parse_i64_u64(value, "max_bytes_per_window"))
+                .transpose()?,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
-        })
+        };
+        validate_nat_mapping_runtime_policy(mapping).map_err(anyhow::Error::msg)
     }
 
     /// Helper to convert Postgres row to NatMapping
     fn postgres_row_to_mapping(row: PgRow) -> Result<NatMapping> {
         let protocol_str: String = row.try_get("protocol")?;
-        let protocol = Protocol::from_str(&protocol_str).unwrap_or(Protocol::Tcp);
+        let protocol = Protocol::from_str(&protocol_str)
+            .with_context(|| format!("invalid NAT mapping protocol: {protocol_str}"))?;
         let id: uuid::Uuid = row.try_get("id")?;
         let agent_id: uuid::Uuid = row.try_get("agent_id")?;
         let created_at: DateTime<Utc> = row.try_get("created_at")?;
         let updated_at: DateTime<Utc> = row.try_get("updated_at")?;
 
-        Ok(NatMapping {
+        let mapping = NatMapping {
             id: id.to_string(),
             agent_id: agent_id.to_string(),
             local_host: row.try_get("local_host")?,
-            local_port: row.try_get::<i32, _>("local_port")? as u16,
-            public_port: row.try_get::<i32, _>("public_port")? as u16,
+            local_port: parse_i32_u16(row.try_get("local_port")?, "local_port")?,
+            public_port: parse_i32_u16(row.try_get("public_port")?, "public_port")?,
             protocol,
             enabled: row.try_get("enabled")?,
             description: row.try_get("description")?,
             allowed_sources: row.try_get("allowed_sources")?,
             max_active_tunnels: row
                 .try_get::<Option<i32>, _>("max_active_tunnels")?
-                .map(|value| value as u32),
+                .map(|value| parse_i32_u32(value, "max_active_tunnels"))
+                .transpose()?,
             idle_timeout_seconds: row
                 .try_get::<Option<i32>, _>("idle_timeout_seconds")?
-                .map(|value| value as u32),
+                .map(|value| parse_i32_u32(value, "idle_timeout_seconds"))
+                .transpose()?,
             max_bytes_per_tunnel: row
                 .try_get::<Option<i64>, _>("max_bytes_per_tunnel")?
-                .map(|value| value as u64),
+                .map(|value| parse_i64_u64(value, "max_bytes_per_tunnel"))
+                .transpose()?,
             max_bandwidth_bytes_per_second: row
                 .try_get::<Option<i64>, _>("max_bandwidth_bytes_per_second")?
-                .map(|value| value as u64),
+                .map(|value| parse_i64_u64(value, "max_bandwidth_bytes_per_second"))
+                .transpose()?,
             rate_limit_window_seconds: row
                 .try_get::<Option<i32>, _>("rate_limit_window_seconds")?
-                .map(|value| value as u32),
+                .map(|value| parse_i32_u32(value, "rate_limit_window_seconds"))
+                .transpose()?,
             max_connections_per_window: row
                 .try_get::<Option<i32>, _>("max_connections_per_window")?
-                .map(|value| value as u32),
+                .map(|value| parse_i32_u32(value, "max_connections_per_window"))
+                .transpose()?,
             max_bytes_per_window: row
                 .try_get::<Option<i64>, _>("max_bytes_per_window")?
-                .map(|value| value as u64),
+                .map(|value| parse_i64_u64(value, "max_bytes_per_window"))
+                .transpose()?,
             created_at: created_at.to_rfc3339(),
             updated_at: updated_at.to_rfc3339(),
-        })
+        };
+        validate_nat_mapping_runtime_policy(mapping).map_err(anyhow::Error::msg)
+    }
+
+    fn optional_sqlite_mapping(row: Option<SqliteRow>) -> Result<Option<NatMapping>> {
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        match Self::sqlite_row_to_mapping(row) {
+            Ok(mapping) => Ok(Some(mapping)),
+            Err(err) => {
+                tracing::warn!("treating invalid NAT mapping row as not found: {err}");
+                Ok(None)
+            }
+        }
+    }
+
+    fn optional_postgres_mapping(row: Option<PgRow>) -> Result<Option<NatMapping>> {
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        match Self::postgres_row_to_mapping(row) {
+            Ok(mapping) => Ok(Some(mapping)),
+            Err(err) => {
+                tracing::warn!("treating invalid NAT mapping row as not found: {err}");
+                Ok(None)
+            }
+        }
+    }
+
+    fn sqlite_rows_to_mappings(rows: Vec<SqliteRow>) -> Vec<NatMapping> {
+        rows.into_iter()
+            .filter_map(|row| match Self::sqlite_row_to_mapping(row) {
+                Ok(mapping) => Some(mapping),
+                Err(err) => {
+                    tracing::warn!("skipping invalid NAT mapping row: {err}");
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn postgres_rows_to_mappings(rows: Vec<PgRow>) -> Vec<NatMapping> {
+        rows.into_iter()
+            .filter_map(|row| match Self::postgres_row_to_mapping(row) {
+                Ok(mapping) => Some(mapping),
+                Err(err) => {
+                    tracing::warn!("skipping invalid NAT mapping row: {err}");
+                    None
+                }
+            })
+            .collect()
     }
 }
 
@@ -508,6 +565,18 @@ fn parse_timestamp(value: &str, field: &str) -> Result<DateTime<Utc>> {
         .with_context(|| format!("invalid NAT mapping {field} timestamp"))
 }
 
+fn parse_i32_u16(value: i32, field: &str) -> Result<u16> {
+    u16::try_from(value).with_context(|| format!("invalid NAT mapping {field} value"))
+}
+
+fn parse_i32_u32(value: i32, field: &str) -> Result<u32> {
+    u32::try_from(value).with_context(|| format!("invalid NAT mapping {field} value"))
+}
+
+fn parse_i64_u64(value: i64, field: &str) -> Result<u64> {
+    u64::try_from(value).with_context(|| format!("invalid NAT mapping {field} value"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,6 +651,61 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn invalid_historical_nat_policy_rows_are_not_loaded() {
+        let db = test_db().await;
+        let valid_mapping = create_test_mapping_with_port(&db, 12090, false).await;
+        insert_raw_nat_mapping(&db, 12091, "127.0.0.1", "tcp", None, Some(-1), None).await;
+        insert_raw_nat_mapping(
+            &db,
+            12092,
+            "127.0.0.1",
+            "tcp",
+            Some("127.0.0.1,".repeat(crate::nat::policy::NAT_MAX_ALLOWED_SOURCE_ENTRIES + 1)),
+            None,
+            None,
+        )
+        .await;
+        insert_raw_nat_mapping(
+            &db,
+            i32::from(u16::MAX) + 1,
+            "127.0.0.1",
+            "tcp",
+            None,
+            None,
+            None,
+        )
+        .await;
+        insert_raw_nat_mapping(&db, 12093, "192.168.1.10", "tcp", None, None, None).await;
+        insert_raw_nat_mapping(&db, 12094, "127.0.0.1", "icmp", None, None, None).await;
+
+        let mappings = NatMappingRepository::list_enabled_for_active_agents(&db)
+            .await
+            .unwrap();
+        let ids = mappings
+            .iter()
+            .map(|mapping| mapping.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(ids.contains(&valid_mapping.id.as_str()));
+        assert!(NatMappingRepository::get_active_by_public_port(&db, 12091)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(NatMappingRepository::get_active_by_public_port(&db, 12092)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(NatMappingRepository::get_active_by_public_port(&db, 12093)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(NatMappingRepository::get_active_by_public_port(&db, 12094)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
     async fn create_test_mapping(db: &DatabaseBackend) -> NatMapping {
         create_test_mapping_with_port(db, 12080, false).await
     }
@@ -640,6 +764,63 @@ mod tests {
         };
         NatMappingRepository::create(db, &mapping).await.unwrap();
         mapping
+    }
+
+    async fn insert_raw_nat_mapping(
+        db: &DatabaseBackend,
+        public_port: i32,
+        local_host: &str,
+        protocol: &str,
+        allowed_sources: Option<String>,
+        max_active_tunnels: Option<i32>,
+        max_bytes_per_tunnel: Option<i64>,
+    ) {
+        let user = UserRepository::new(db.clone())
+            .create(CreateUserInput {
+                username: format!("raw-nat-owner-{}", uuid::Uuid::now_v7()),
+                password: "password123".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        let agent_id = AgentId(uuid::Uuid::now_v7());
+        crate::db::repository::AgentRepository::new(db.clone())
+            .create_with_id(
+                agent_id,
+                CreateAgentInput {
+                    name: "raw-nat-agent".into(),
+                    public_key: "public-key".into(),
+                    owner_user_id: user.id,
+                },
+            )
+            .await
+            .unwrap();
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            INSERT INTO nat_mappings (
+                id, agent_id, local_host, local_port, public_port, protocol, enabled,
+                description, allowed_sources, max_active_tunnels, max_bytes_per_tunnel,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, 80, ?, ?, 1, NULL, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(uuid::Uuid::now_v7().to_string())
+        .bind(agent_id.0.to_string())
+        .bind(local_host)
+        .bind(public_port)
+        .bind(protocol)
+        .bind(allowed_sources)
+        .bind(max_active_tunnels)
+        .bind(max_bytes_per_tunnel)
+        .bind(&now)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     async fn test_db() -> DatabaseBackend {

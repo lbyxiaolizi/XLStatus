@@ -17,25 +17,18 @@ use crate::auth::rbac::has_scope;
 use crate::db::repository::NatMappingRepository;
 use crate::db::AgentRepository;
 use crate::db::Db;
-use crate::nat::tunnel::nat_public_port_allowed;
-use std::net::IpAddr;
+use crate::nat::policy::{
+    nat_local_target_allowed, nat_public_port_allowed, normalize_nat_allowed_sources,
+    NAT_MAX_ACTIVE_TUNNELS_PER_MAPPING, NAT_MAX_ALLOWED_SOURCES_BYTES,
+    NAT_MAX_ALLOWED_SOURCE_ENTRIES, NAT_MAX_ALLOWED_SOURCE_ENTRY_BYTES,
+    NAT_MAX_BANDWIDTH_BYTES_PER_SECOND, NAT_MAX_BYTES_PER_TUNNEL, NAT_MAX_BYTES_PER_WINDOW,
+    NAT_MAX_CONNECTIONS_PER_WINDOW, NAT_MAX_DESCRIPTION_BYTES, NAT_MAX_IDLE_TIMEOUT_SECONDS,
+    NAT_MAX_LOCAL_HOST_BYTES, NAT_MAX_PROTOCOL_BYTES, NAT_MAX_RATE_LIMIT_WINDOW_SECONDS,
+    NAT_UUID_TEXT_LEN,
+};
 use xlstatus_shared::nat::*;
 
 const NAT_API_MAX_BODY_BYTES: usize = 64 * 1024;
-const NAT_UUID_TEXT_LEN: usize = 36;
-const NAT_MAX_LOCAL_HOST_BYTES: usize = 253;
-const NAT_MAX_PROTOCOL_BYTES: usize = 16;
-const NAT_MAX_DESCRIPTION_BYTES: usize = 1024;
-const NAT_MAX_ALLOWED_SOURCES_BYTES: usize = 4096;
-const NAT_MAX_ALLOWED_SOURCE_ENTRIES: usize = 64;
-const NAT_MAX_ALLOWED_SOURCE_ENTRY_BYTES: usize = 128;
-const NAT_MAX_ACTIVE_TUNNELS_PER_MAPPING: u32 = 1024;
-const NAT_MAX_IDLE_TIMEOUT_SECONDS: u32 = 24 * 60 * 60;
-const NAT_MAX_BYTES_PER_TUNNEL: u64 = 1024 * 1024 * 1024 * 1024;
-const NAT_MAX_BANDWIDTH_BYTES_PER_SECOND: u64 = 1024 * 1024 * 1024;
-const NAT_MAX_RATE_LIMIT_WINDOW_SECONDS: u32 = 24 * 60 * 60;
-const NAT_MAX_CONNECTIONS_PER_WINDOW: u32 = 100_000;
-const NAT_MAX_BYTES_PER_WINDOW: u64 = 1024 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateNatMappingRequest {
@@ -648,38 +641,12 @@ fn validate_local_port_or_403(port: u16) -> Result<(), (StatusCode, Json<ApiResp
 }
 
 fn validate_nat_local_target_or_403(host: &str) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
-    if nat_private_targets_allowed() || nat_local_target_is_loopback(host) {
+    if nat_local_target_allowed(host) {
         return Ok(());
     }
     Err(bad_request_with(
         "NAT local_host must resolve to the Agent loopback interface unless private NAT targets are explicitly enabled".to_string(),
     ))
-}
-
-fn nat_local_target_is_loopback(host: &str) -> bool {
-    let host = host.trim();
-    if host.is_empty() {
-        return false;
-    }
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    host.parse::<IpAddr>()
-        .map(|ip| ip.is_loopback())
-        .unwrap_or(false)
-}
-
-fn nat_private_targets_allowed() -> bool {
-    [
-        "XLSTATUS_ALLOW_PRIVATE_NAT_TARGETS",
-        "XLSTATUS_ALLOW_PRIVATE_OUTBOUND",
-    ]
-    .iter()
-    .any(|name| {
-        std::env::var(name)
-            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-            .unwrap_or(false)
-    })
 }
 
 fn normalize_create_nat_mapping_request(
@@ -897,42 +864,7 @@ fn normalize_bounded_u64(
 }
 
 fn normalize_allowed_sources(value: Option<&str>) -> Result<Option<String>, String> {
-    let Some(value) = value.map(str::trim) else {
-        return Ok(None);
-    };
-    if value.is_empty() {
-        return Ok(None);
-    }
-    if value.len() > NAT_MAX_ALLOWED_SOURCES_BYTES {
-        return Err(format!(
-            "allowed_sources must be at most {NAT_MAX_ALLOWED_SOURCES_BYTES} bytes"
-        ));
-    }
-    let entries: Vec<String> = value
-        .split([',', ' ', '\n', '\t'])
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-        .map(str::to_string)
-        .collect();
-    if entries.is_empty() {
-        return Ok(None);
-    }
-    if entries.len() > NAT_MAX_ALLOWED_SOURCE_ENTRIES {
-        return Err(format!(
-            "allowed_sources must contain at most {NAT_MAX_ALLOWED_SOURCE_ENTRIES} entries"
-        ));
-    }
-    for entry in &entries {
-        if entry.len() > NAT_MAX_ALLOWED_SOURCE_ENTRY_BYTES {
-            return Err(format!(
-                "allowed source entry must be at most {NAT_MAX_ALLOWED_SOURCE_ENTRY_BYTES} bytes"
-            ));
-        }
-        if !crate::nat::tunnel::nat_source_entry_valid(entry) {
-            return Err(format!("invalid NAT allowed source CIDR or IP: {entry}"));
-        }
-    }
-    Ok(Some(entries.join(",")))
+    normalize_nat_allowed_sources(value)
 }
 
 async fn load_authorized_nat_agent_or_403(
