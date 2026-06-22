@@ -2,12 +2,18 @@
 #![allow(unused)]
 
 use crate::db::Db;
+use crate::ddns::policy::{
+    normalize_ddns_provider, normalize_optional_ddns_text, normalize_required_ddns_text,
+    DDNS_MAX_DOMAIN_BYTES, DDNS_MAX_NAME_BYTES, DDNS_MAX_RECORD_ID_BYTES, DDNS_MAX_SECRET_BYTES,
+    DDNS_MAX_WEBHOOK_URL_BYTES, DDNS_MAX_ZONE_ID_BYTES,
+};
 use crate::secrets::{decrypt_optional_secret, encrypt_optional_secret};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use sqlx::postgres::PgRow;
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
+use tracing::warn;
 use xlstatus_shared::ddns::*;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -43,8 +49,20 @@ impl DdnsConfigRepository {
                     .await?;
                 Ok(rows
                     .into_iter()
-                    .map(sqlite_config_row_to_ddns)
-                    .collect::<Result<Vec<_>>>()?)
+                    .filter_map(|row| match sqlite_config_row_to_ddns(row) {
+                        Ok(row) => match validate_runtime_ddns_config(row) {
+                            Ok(row) => Some(row),
+                            Err(err) => {
+                                warn!("skipping invalid historical DDNS config: {err:#}");
+                                None
+                            }
+                        },
+                        Err(err) => {
+                            warn!("skipping unreadable historical DDNS config: {err:#}");
+                            None
+                        }
+                    })
+                    .collect())
             }
             crate::db::DatabaseBackend::Postgres(pool) => {
                 let rows = sqlx::query(DDNS_CONFIG_SELECT_POSTGRES_ENABLED)
@@ -52,8 +70,20 @@ impl DdnsConfigRepository {
                     .await?;
                 Ok(rows
                     .into_iter()
-                    .map(postgres_config_row_to_ddns)
-                    .collect::<Result<Vec<_>>>()?)
+                    .filter_map(|row| match postgres_config_row_to_ddns(row) {
+                        Ok(row) => match validate_runtime_ddns_config(row) {
+                            Ok(row) => Some(row),
+                            Err(err) => {
+                                warn!("skipping invalid historical DDNS config: {err:#}");
+                                None
+                            }
+                        },
+                        Err(err) => {
+                            warn!("skipping unreadable historical DDNS config: {err:#}");
+                            None
+                        }
+                    })
+                    .collect())
             }
         }
     }
@@ -340,6 +370,103 @@ fn postgres_config_row_to_ddns(row: PgRow) -> Result<DdnsConfigRow> {
     })
 }
 
+fn validate_runtime_ddns_config(row: DdnsConfigRow) -> Result<DdnsConfigRow> {
+    let id = require_runtime_uuid_text(&row.id, "id")?;
+    let owner_user_id = normalize_runtime_uuid_text(&row.owner_user_id, "owner_user_id")?;
+    let agent_id = normalize_optional_runtime_uuid(row.agent_id, "agent_id")?;
+    let name = normalize_required_ddns_text(row.name, DDNS_MAX_NAME_BYTES, "name")
+        .map_err(|err| anyhow::anyhow!("invalid historical DDNS name: {err}"))?;
+    let provider = normalize_ddns_provider(&row.provider)
+        .map_err(|err| anyhow::anyhow!("invalid historical DDNS provider: {err}"))?;
+    let domain = normalize_required_ddns_text(row.domain, DDNS_MAX_DOMAIN_BYTES, "domain")
+        .map_err(|err| anyhow::anyhow!("invalid historical DDNS domain: {err}"))?;
+    let record_id =
+        normalize_optional_ddns_text(row.record_id, DDNS_MAX_RECORD_ID_BYTES, "record_id")
+            .map_err(|err| anyhow::anyhow!("invalid historical DDNS record_id: {err}"))?;
+    let zone_id = normalize_optional_ddns_text(row.zone_id, DDNS_MAX_ZONE_ID_BYTES, "zone_id")
+        .map_err(|err| anyhow::anyhow!("invalid historical DDNS zone_id: {err}"))?;
+    let api_token = normalize_optional_ddns_text(row.api_token, DDNS_MAX_SECRET_BYTES, "api_token")
+        .map_err(|err| anyhow::anyhow!("invalid historical DDNS api_token: {err}"))?;
+    let api_key = normalize_optional_ddns_text(row.api_key, DDNS_MAX_SECRET_BYTES, "api_key")
+        .map_err(|err| anyhow::anyhow!("invalid historical DDNS api_key: {err}"))?;
+    let api_secret =
+        normalize_optional_ddns_text(row.api_secret, DDNS_MAX_SECRET_BYTES, "api_secret")
+            .map_err(|err| anyhow::anyhow!("invalid historical DDNS api_secret: {err}"))?;
+    let webhook_url =
+        normalize_optional_ddns_text(row.webhook_url, DDNS_MAX_WEBHOOK_URL_BYTES, "webhook_url")
+            .map_err(|err| anyhow::anyhow!("invalid historical DDNS webhook_url: {err}"))?;
+    if provider == ProviderType::Webhook.as_str() && webhook_url.is_none() {
+        anyhow::bail!("invalid historical DDNS webhook_url: webhook_url is required");
+    }
+    let current_ip = normalize_optional_runtime_ip(row.current_ip, "current_ip")?;
+    let last_applied_ip = normalize_optional_runtime_ip(row.last_applied_ip, "last_applied_ip")?;
+    if let Some(value) = row.last_applied_at.as_deref() {
+        parse_timestamp(value, "last_applied_at")?;
+    }
+
+    Ok(DdnsConfigRow {
+        id,
+        owner_user_id,
+        agent_id,
+        name,
+        provider,
+        domain,
+        record_id,
+        zone_id,
+        api_token,
+        api_key,
+        api_secret,
+        webhook_url,
+        current_ip,
+        last_applied_ip,
+        last_applied_at: row.last_applied_at,
+        enabled: row.enabled,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    })
+}
+
+fn require_runtime_uuid_text(value: &str, field: &str) -> Result<String> {
+    let value = value.trim();
+    let parsed = uuid::Uuid::parse_str(value)
+        .with_context(|| format!("{field} must be a parseable UUID"))?;
+    if value.len() != 36 {
+        anyhow::bail!("{field} must be a 36 byte UUID");
+    }
+    Ok(value.to_string())
+}
+
+fn normalize_runtime_uuid_text(value: &str, field: &str) -> Result<String> {
+    let parsed = uuid::Uuid::parse_str(value.trim())
+        .with_context(|| format!("{field} must be a parseable UUID"))?;
+    Ok(parsed.to_string())
+}
+
+fn normalize_optional_runtime_uuid(value: Option<String>, field: &str) -> Result<Option<String>> {
+    value
+        .map(|value| normalize_runtime_uuid_text(&value, field))
+        .transpose()
+}
+
+fn normalize_optional_runtime_ip(value: Option<String>, field: &str) -> Result<Option<String>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() > 64 {
+        anyhow::bail!("{field} must be at most 64 bytes");
+    }
+    Ok(Some(
+        value
+            .parse::<std::net::IpAddr>()
+            .with_context(|| format!("{field} must be an IP address"))?
+            .to_string(),
+    ))
+}
+
 fn sqlite_history_row_to_entry(row: SqliteRow) -> Result<DdnsHistoryEntry> {
     Ok(DdnsHistoryEntry {
         id: row.try_get("id")?,
@@ -447,6 +574,97 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn invalid_historical_ddns_runtime_rows_are_skipped() {
+        let db = test_db().await;
+        let user = UserRepository::new(db.clone())
+            .create(CreateUserInput {
+                username: "runtime-owner".into(),
+                password: "secret".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        let owner_id = user.id.0.to_string();
+        let valid_id = uuid::Uuid::now_v7().to_string();
+        insert_raw_config(
+            &db,
+            RawDdnsConfig {
+                id: valid_id.clone(),
+                owner_user_id: owner_id.clone(),
+                name: "valid",
+                provider: "dummy",
+                domain: "valid.example.com",
+                api_token: None,
+                webhook_url: None,
+                last_applied_ip: Some("198.51.100.10"),
+            },
+        )
+        .await;
+        insert_raw_config(
+            &db,
+            RawDdnsConfig {
+                id: uuid::Uuid::now_v7().to_string(),
+                owner_user_id: owner_id.clone(),
+                name: "bad-provider",
+                provider: "route53",
+                domain: "bad-provider.example.com",
+                api_token: None,
+                webhook_url: None,
+                last_applied_ip: None,
+            },
+        )
+        .await;
+        insert_raw_config(
+            &db,
+            RawDdnsConfig {
+                id: uuid::Uuid::now_v7().to_string(),
+                owner_user_id: owner_id.clone(),
+                name: "oversized-secret",
+                provider: "cloudflare",
+                domain: "oversized-secret.example.com",
+                api_token: Some("s".repeat(DDNS_MAX_SECRET_BYTES + 1)),
+                webhook_url: None,
+                last_applied_ip: None,
+            },
+        )
+        .await;
+        insert_raw_config(
+            &db,
+            RawDdnsConfig {
+                id: uuid::Uuid::now_v7().to_string(),
+                owner_user_id: owner_id.clone(),
+                name: "missing-webhook",
+                provider: "webhook",
+                domain: "missing-webhook.example.com",
+                api_token: None,
+                webhook_url: None,
+                last_applied_ip: None,
+            },
+        )
+        .await;
+        insert_raw_config(
+            &db,
+            RawDdnsConfig {
+                id: uuid::Uuid::now_v7().to_string(),
+                owner_user_id: owner_id,
+                name: "bad-ip",
+                provider: "dummy",
+                domain: "bad-ip.example.com",
+                api_token: None,
+                webhook_url: None,
+                last_applied_ip: Some("not-an-ip"),
+            },
+        )
+        .await;
+
+        let configs = DdnsConfigRepository::list_enabled(&db).await.unwrap();
+
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].id, valid_id);
+        assert_eq!(configs[0].last_applied_ip.as_deref(), Some("198.51.100.10"));
+    }
+
     async fn test_db() -> DatabaseBackend {
         let path = std::env::temp_dir().join(format!(
             "xlstatus-ddns-secret-test-{}.db",
@@ -456,6 +674,40 @@ mod tests {
         let db = DatabaseBackend::connect(&url, true).await.unwrap();
         db.run_migrations().await.unwrap();
         db
+    }
+
+    struct RawDdnsConfig {
+        id: String,
+        owner_user_id: String,
+        name: &'static str,
+        provider: &'static str,
+        domain: &'static str,
+        api_token: Option<String>,
+        webhook_url: Option<String>,
+        last_applied_ip: Option<&'static str>,
+    }
+
+    async fn insert_raw_config(db: &DatabaseBackend, config: RawDdnsConfig) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO ddns_configs (id, owner_user_id, name, provider, domain, api_token, webhook_url, last_applied_ip, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+        )
+        .bind(config.id)
+        .bind(config.owner_user_id)
+        .bind(config.name)
+        .bind(config.provider)
+        .bind(config.domain)
+        .bind(config.api_token)
+        .bind(config.webhook_url)
+        .bind(config.last_applied_ip)
+        .bind(&now)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     #[derive(Debug)]

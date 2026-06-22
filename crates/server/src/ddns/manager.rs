@@ -613,6 +613,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ddns_manager_skips_unreadable_historical_runtime_config() {
+        let db = test_db().await;
+        let fixture = create_fixture(&db).await;
+        let valid_config_id = create_ddns_config(
+            &db,
+            fixture.owner.id.0.to_string(),
+            Some(fixture.agent.id.0.to_string()),
+            "valid-after-dirty.example.com",
+        )
+        .await;
+        insert_raw_ddns_config_with_secret(
+            &db,
+            &fixture.owner.id.0.to_string(),
+            &fixture.agent.id.0.to_string(),
+            "dirty-secret.example.com",
+            "cloudflare",
+            Some("xlsec:v1:not-hex:not-hex"),
+        )
+        .await;
+        AgentRepository::new(db.clone())
+            .update_last_state(fixture.agent.id, r#"{"primary_ip":"203.0.113.60"}"#)
+            .await
+            .unwrap();
+
+        let manager = DdnsManager::new(db.clone());
+        manager.reload_providers().await.unwrap();
+        manager.check_now().await.unwrap();
+
+        let config = DdnsConfigRepository::get_by_id(&db, &valid_config_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.last_applied_ip.as_deref(), Some("203.0.113.60"));
+        assert_eq!(
+            DdnsHistoryRepository::list_for_config(&db, &valid_config_id, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn ddns_agent_ip_report_matches_agent_id_by_uuid_semantics() {
         let db = test_db().await;
         let fixture = create_fixture(&db).await;
@@ -823,6 +866,39 @@ mod tests {
                 .bind(agent_id)
                 .bind(domain)
                 .bind(domain)
+                .bind(&now)
+                .bind(&now)
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+            DatabaseBackend::Postgres(_) => unreachable!(),
+        }
+        id
+    }
+
+    async fn insert_raw_ddns_config_with_secret(
+        db: &DatabaseBackend,
+        owner_user_id: &str,
+        agent_id: &str,
+        domain: &str,
+        provider: &str,
+        api_token: Option<&str>,
+    ) -> String {
+        let id = uuid::Uuid::now_v7().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        match db {
+            DatabaseBackend::Sqlite(pool) => {
+                sqlx::query(
+                    "INSERT INTO ddns_configs (id, owner_user_id, agent_id, name, provider, domain, api_token, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                )
+                .bind(&id)
+                .bind(owner_user_id)
+                .bind(agent_id)
+                .bind(domain)
+                .bind(provider)
+                .bind(domain)
+                .bind(api_token)
                 .bind(&now)
                 .bind(&now)
                 .execute(pool)

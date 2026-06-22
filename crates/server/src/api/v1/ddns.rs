@@ -16,19 +16,15 @@ use crate::auth::middleware::{AuthKind, AuthSession, AuthUser};
 use crate::auth::rbac::has_scope;
 use crate::db::repository::ddns::{DdnsConfigRepository, DdnsConfigRow, DdnsHistoryRepository};
 use crate::db::{AgentRepository, DatabaseBackend};
+use crate::ddns::policy::{
+    normalize_ddns_agent_id, normalize_ddns_provider, normalize_ddns_resource_uuid,
+    normalize_optional_ddns_text, normalize_required_ddns_text, DDNS_API_MAX_BODY_BYTES,
+    DDNS_MAX_DOMAIN_BYTES, DDNS_MAX_NAME_BYTES, DDNS_MAX_PROVIDER_BYTES, DDNS_MAX_RECORD_ID_BYTES,
+    DDNS_MAX_SECRET_BYTES, DDNS_MAX_WEBHOOK_URL_BYTES, DDNS_MAX_ZONE_ID_BYTES, DDNS_UUID_TEXT_LEN,
+};
 use crate::security::validate_outbound_url;
 use xlstatus_shared::ddns::{DdnsHistoryEntry, ProviderType};
 use xlstatus_shared::AgentId;
-
-const DDNS_API_MAX_BODY_BYTES: usize = 64 * 1024;
-const DDNS_MAX_NAME_BYTES: usize = 128;
-const DDNS_MAX_PROVIDER_BYTES: usize = 64;
-const DDNS_MAX_DOMAIN_BYTES: usize = 253;
-const DDNS_UUID_TEXT_LEN: usize = 36;
-const DDNS_MAX_RECORD_ID_BYTES: usize = 128;
-const DDNS_MAX_ZONE_ID_BYTES: usize = 128;
-const DDNS_MAX_SECRET_BYTES: usize = 4096;
-const DDNS_MAX_WEBHOOK_URL_BYTES: usize = 2048;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateDdnsConfigRequest {
@@ -273,74 +269,6 @@ fn normalize_create_ddns_request(
         webhook_url,
         enabled: req.enabled.unwrap_or(true),
     })
-}
-
-fn normalize_required_ddns_text(
-    value: String,
-    max_bytes: usize,
-    field: &str,
-) -> Result<String, String> {
-    let value = value.trim().to_string();
-    if value.is_empty() {
-        return Err(format!("{field} is required"));
-    }
-    if value.len() > max_bytes {
-        return Err(format!("{field} must be at most {max_bytes} bytes"));
-    }
-    Ok(value)
-}
-
-fn normalize_optional_ddns_text(
-    value: Option<String>,
-    max_bytes: usize,
-    field: &str,
-) -> Result<Option<String>, String> {
-    let Some(value) = value.map(|value| value.trim().to_string()) else {
-        return Ok(None);
-    };
-    if value.is_empty() {
-        return Ok(None);
-    }
-    if value.len() > max_bytes {
-        return Err(format!("{field} must be at most {max_bytes} bytes"));
-    }
-    Ok(Some(value))
-}
-
-fn normalize_ddns_provider(value: &str) -> Result<String, String> {
-    let provider =
-        normalize_required_ddns_text(value.to_string(), DDNS_MAX_PROVIDER_BYTES, "provider")?;
-    ProviderType::from_str(&provider)
-        .map(|provider| provider.as_str().to_string())
-        .ok_or_else(|| {
-            "provider must be one of: cloudflare, tencent_cloud, he, webhook, dummy".to_string()
-        })
-}
-
-fn normalize_ddns_agent_id(value: Option<String>) -> Result<Option<String>, String> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    if value.is_empty() {
-        return Ok(None);
-    }
-    normalize_ddns_resource_uuid(value, "agent_id").map(Some)
-}
-
-fn normalize_ddns_resource_uuid(value: String, field: &str) -> Result<String, String> {
-    if value.is_empty() {
-        return Err(format!("{field} is required"));
-    }
-    if value.len() != DDNS_UUID_TEXT_LEN {
-        return Err(format!("{field} must be a canonical UUID"));
-    }
-    let parsed =
-        uuid::Uuid::parse_str(&value).map_err(|_| format!("{field} must be a canonical UUID"))?;
-    let canonical = parsed.to_string();
-    if canonical != value {
-        return Err(format!("{field} must be a canonical UUID"));
-    }
-    Ok(canonical)
 }
 
 pub async fn delete_ddns_config(
