@@ -20,7 +20,7 @@ import {
   textareaClass,
   thClass,
 } from "@/app/components/M7Primitives";
-import { apiClient, type JsonObject } from "@/lib/api";
+import { apiClient, type JsonObject, type TotpStatusResponse } from "@/lib/api";
 
 interface NotificationChannel {
   id: string;
@@ -126,6 +126,7 @@ export default function NotificationsPage() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [modal, setModal] = useState<ModalState>(null);
+  const [totpStatus, setTotpStatus] = useState<TotpStatusResponse | null>(null);
   const [notificationForm, setNotificationForm] = useState(emptyNotificationForm);
   const [notificationOriginals, setNotificationOriginals] = useState({
     url: "",
@@ -224,9 +225,33 @@ export default function NotificationsPage() {
     }));
   }
 
+  async function sensitiveTotpCode(): Promise<string | undefined | null> {
+    let enabled = totpStatus?.enabled;
+    if (totpStatus === null) {
+      const response = await apiClient.getTotpStatus();
+      if (!response.success || !response.data) {
+        setError(responseError(response));
+        return null;
+      }
+      setTotpStatus(response.data);
+      enabled = response.data.enabled;
+    }
+    if (!enabled) return undefined;
+    const code = window.prompt("请输入 6 位 TOTP 验证码");
+    if (code === null) return null;
+    const trimmed = code.trim();
+    if (!/^\d{6}$/.test(trimmed)) {
+      setError("请输入 6 位 TOTP 验证码。");
+      return null;
+    }
+    return trimmed;
+  }
+
   async function submitNotification(event: FormEvent) {
     event.preventDefault();
     setError(null);
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
     const editingItem = modal?.type === "notification" ? modal.item : undefined;
     const payload: JsonObject = {
       name: notificationForm.name.trim(),
@@ -246,8 +271,8 @@ export default function NotificationsPage() {
     }
     const response =
       editingItem
-        ? await apiClient.updateNotification(editingItem.id, payload)
-        : await apiClient.createNotification(payload);
+        ? await apiClient.updateNotification(editingItem.id, payload, totpCode)
+        : await apiClient.createNotification(payload, totpCode);
 
     if (response.success) {
       setNotice(modal?.type === "notification" && modal.item ? "通知渠道已更新。" : "通知渠道已创建。");
@@ -261,11 +286,13 @@ export default function NotificationsPage() {
   async function submitGroup(event: FormEvent) {
     event.preventDefault();
     setError(null);
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
     const payload: JsonObject = { name: groupForm.name.trim() };
     const response =
       modal?.type === "group" && modal.item
-        ? await apiClient.updateNotificationGroup(modal.item.id, payload)
-        : await apiClient.createNotificationGroup(payload);
+        ? await apiClient.updateNotificationGroup(modal.item.id, payload, totpCode)
+        : await apiClient.createNotificationGroup(payload, totpCode);
 
     if (response.success) {
       setNotice(modal?.type === "group" && modal.item ? "通知组已更新。" : "通知组已创建。");
@@ -278,7 +305,9 @@ export default function NotificationsPage() {
 
   async function testNotification(item: NotificationChannel) {
     setError(null);
-    const response = await apiClient.testNotification(item.id);
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
+    const response = await apiClient.testNotification(item.id, totpCode);
     if (response.success) {
       setNotice(`测试通知已发送：${item.name}`);
     } else {
@@ -289,7 +318,9 @@ export default function NotificationsPage() {
   async function deleteNotification(item: NotificationChannel) {
     if (!confirm(`确定删除通知渠道「${item.name}」？`)) return;
     setError(null);
-    const response = await apiClient.deleteNotification(item.id);
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
+    const response = await apiClient.deleteNotification(item.id, totpCode);
     if (response.success) {
       setNotice("通知渠道已删除。");
       await load();
@@ -301,7 +332,9 @@ export default function NotificationsPage() {
   async function deleteGroup(item: NotificationGroup) {
     if (!confirm(`确定删除通知组「${item.name}」？`)) return;
     setError(null);
-    const response = await apiClient.deleteNotificationGroup(item.id);
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
+    const response = await apiClient.deleteNotificationGroup(item.id, totpCode);
     if (response.success) {
       setNotice("通知组已删除。");
       await load();
@@ -314,7 +347,9 @@ export default function NotificationsPage() {
     const notificationId = selectedMembers[group.id];
     if (!notificationId) return;
     setError(null);
-    const response = await apiClient.addNotificationGroupMember(group.id, notificationId);
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
+    const response = await apiClient.addNotificationGroupMember(group.id, notificationId, totpCode);
     if (response.success) {
       const notification = notificationById.get(notificationId);
       setNotice(`已加入通知组：${notification?.name || notificationId}`);
@@ -327,7 +362,9 @@ export default function NotificationsPage() {
 
   async function removeMember(group: NotificationGroup, member: NotificationGroupMember) {
     setError(null);
-    const response = await apiClient.deleteNotificationGroupMember(group.id, member.id);
+    const totpCode = await sensitiveTotpCode();
+    if (totpCode === null) return;
+    const response = await apiClient.deleteNotificationGroupMember(group.id, member.id, totpCode);
     if (response.success) {
       setNotice(`已移出通知组：${member.name}`);
       await load();

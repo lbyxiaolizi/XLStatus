@@ -1,8 +1,8 @@
 //! Notification channel and group management API.
 
 use crate::api::types::ApiResponse;
-use crate::api::v1::auth::{AppError, AppState};
-use crate::auth::middleware::AuthSession;
+use crate::api::v1::auth::{require_sensitive_totp, AppError, AppState};
+use crate::auth::middleware::{AuthKind, AuthSession};
 use crate::auth::rbac::has_scope;
 use crate::db::DatabaseBackend;
 use crate::notifications::sender::{
@@ -13,6 +13,7 @@ use crate::notifications::sender::{
 use crate::security::validate_outbound_url;
 use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
+    http::HeaderMap,
     Json,
 };
 use chrono::{DateTime, Utc};
@@ -244,9 +245,10 @@ pub async fn list_notifications(
 pub async fn create_notification(
     State(state): State<AppState>,
     auth: AuthSession,
+    headers: HeaderMap,
     Json(req): Json<CreateNotificationRequest>,
 ) -> Result<Json<ApiResponse<NotificationView>>, AppError> {
-    require_scope(&auth, "notification:write")?;
+    require_notification_sensitive_scope(&state.db, &auth, "notification:write", &headers).await?;
     let input = build_create_notification_input(req).await?;
     let id = Uuid::now_v7().to_string();
     let owner = auth.user_id.0;
@@ -318,9 +320,10 @@ pub async fn update_notification(
     State(state): State<AppState>,
     auth: AuthSession,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(req): Json<UpdateNotificationRequest>,
 ) -> Result<Json<ApiResponse<NotificationView>>, AppError> {
-    require_scope(&auth, "notification:write")?;
+    require_notification_sensitive_scope(&state.db, &auth, "notification:write", &headers).await?;
     let id = require_uuid_text(id, "notification_id")?;
     let owner = auth.user_id.0;
     let existing = load_notification_record_for_owner(&state.db, &id, owner).await?;
@@ -391,8 +394,9 @@ pub async fn delete_notification(
     State(state): State<AppState>,
     auth: AuthSession,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
-    require_scope(&auth, "notification:delete")?;
+    require_notification_sensitive_scope(&state.db, &auth, "notification:delete", &headers).await?;
     let id = require_uuid_text(id, "notification_id")?;
     let owner = auth.user_id.0;
     let affected = match &state.db {
@@ -427,8 +431,9 @@ pub async fn test_notification(
     State(state): State<AppState>,
     auth: AuthSession,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
-    require_scope(&auth, "notification:write")?;
+    require_notification_sensitive_scope(&state.db, &auth, "notification:write", &headers).await?;
     let id = require_uuid_text(id, "notification_id")?;
     let notification = load_notification_record_for_owner(&state.db, &id, auth.user_id.0).await?;
     check_notification_test_rate_limit(auth.user_id.0, &notification.id)?;
@@ -509,9 +514,10 @@ pub async fn list_notification_groups(
 pub async fn create_notification_group(
     State(state): State<AppState>,
     auth: AuthSession,
+    headers: HeaderMap,
     Json(req): Json<CreateNotificationGroupRequest>,
 ) -> Result<Json<ApiResponse<NotificationGroupView>>, AppError> {
-    require_scope(&auth, "notification:write")?;
+    require_notification_sensitive_scope(&state.db, &auth, "notification:write", &headers).await?;
     let name = require_name(req.name, "name")?;
     let id = Uuid::now_v7().to_string();
     let owner = auth.user_id.0;
@@ -554,9 +560,10 @@ pub async fn update_notification_group(
     State(state): State<AppState>,
     auth: AuthSession,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(req): Json<UpdateNotificationGroupRequest>,
 ) -> Result<Json<ApiResponse<NotificationGroupView>>, AppError> {
-    require_scope(&auth, "notification:write")?;
+    require_notification_sensitive_scope(&state.db, &auth, "notification:write", &headers).await?;
     let id = require_uuid_text(id, "group_id")?;
     let owner = auth.user_id.0;
     let name = require_name(req.name, "name")?;
@@ -597,8 +604,9 @@ pub async fn delete_notification_group(
     State(state): State<AppState>,
     auth: AuthSession,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
-    require_scope(&auth, "notification:delete")?;
+    require_notification_sensitive_scope(&state.db, &auth, "notification:delete", &headers).await?;
     let id = require_uuid_text(id, "group_id")?;
     let owner = auth.user_id.0;
     let affected = match &state.db {
@@ -633,9 +641,10 @@ pub async fn add_notification_group_member(
     State(state): State<AppState>,
     auth: AuthSession,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(req): Json<AddNotificationGroupMemberRequest>,
 ) -> Result<Json<ApiResponse<NotificationGroupView>>, AppError> {
-    require_scope(&auth, "notification:write")?;
+    require_notification_sensitive_scope(&state.db, &auth, "notification:write", &headers).await?;
     let owner = auth.user_id.0;
     let group_id = require_uuid_text(id, "group_id")?;
     ensure_group_exists(&state.db, &group_id, owner).await?;
@@ -678,8 +687,9 @@ pub async fn delete_notification_group_member(
     State(state): State<AppState>,
     auth: AuthSession,
     Path((id, notification_id)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Result<Json<ApiResponse<NotificationGroupView>>, AppError> {
-    require_scope(&auth, "notification:write")?;
+    require_notification_sensitive_scope(&state.db, &auth, "notification:write", &headers).await?;
     let owner = auth.user_id.0;
     let group_id = require_uuid_text(id, "group_id")?;
     let notification_id = require_uuid_text(notification_id, "notification_id")?;
@@ -1757,6 +1767,21 @@ fn require_scope(auth: &AuthSession, scope: &str) -> Result<(), AppError> {
     }
 }
 
+async fn require_notification_sensitive_scope(
+    db: &DatabaseBackend,
+    auth: &AuthSession,
+    scope: &str,
+    headers: &HeaderMap,
+) -> Result<(), AppError> {
+    require_scope(auth, scope)?;
+    if matches!(auth.auth_kind, AuthKind::PersonalAccessToken) {
+        return Err(AppError::Forbidden(
+            "notification changes require a cookie session".into(),
+        ));
+    }
+    require_sensitive_totp(db, auth.user_id, headers).await
+}
+
 fn db_err(err: sqlx::Error) -> AppError {
     AppError::Database(anyhow::anyhow!(err))
 }
@@ -1764,6 +1789,7 @@ fn db_err(err: sqlx::Error) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xlstatus_shared::{UserId, UserRole};
 
     #[test]
     fn parses_headers_from_json_object() {
@@ -2000,6 +2026,73 @@ mod tests {
         .is_ok());
     }
 
+    #[tokio::test]
+    async fn notification_sensitive_scope_rejects_pat_session() {
+        let db = test_db().await;
+        let auth = auth_session(
+            Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+            AuthKind::PersonalAccessToken,
+            vec!["notification:write".into()],
+        );
+
+        let err = require_notification_sensitive_scope(
+            &db,
+            &auth,
+            "notification:write",
+            &HeaderMap::new(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn notification_sensitive_scope_requires_totp_when_enabled() {
+        let db = test_db().await;
+        let owner = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        seed_user(&db, owner, "owner").await;
+        seed_totp_enabled_user(&db, owner).await;
+        let auth = auth_session(owner, AuthKind::Session, vec!["notification:write".into()]);
+
+        let err = require_notification_sensitive_scope(
+            &db,
+            &auth,
+            "notification:write",
+            &HeaderMap::new(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn notification_sensitive_scope_allows_cookie_session_without_totp() {
+        let db = test_db().await;
+        let owner = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        seed_user(&db, owner, "owner").await;
+        let auth = auth_session(owner, AuthKind::Session, vec!["notification:write".into()]);
+
+        require_notification_sensitive_scope(&db, &auth, "notification:write", &HeaderMap::new())
+            .await
+            .unwrap();
+    }
+
+    fn auth_session(user_id: Uuid, auth_kind: AuthKind, scopes: Vec<String>) -> AuthSession {
+        AuthSession {
+            session_id: "session".into(),
+            user_id: UserId(user_id),
+            username: "owner".into(),
+            role: UserRole::Admin,
+            csrf_token: "csrf".into(),
+            auth_kind,
+            scopes,
+            server_ids: None,
+            pat_id: None,
+        }
+    }
+
     async fn test_db() -> DatabaseBackend {
         let db = DatabaseBackend::connect("sqlite::memory:", true)
             .await
@@ -2020,6 +2113,18 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    async fn seed_totp_enabled_user(db: &DatabaseBackend, id: Uuid) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query("UPDATE users SET totp_secret = ?, totp_enabled = 1 WHERE id = ?")
+            .bind("totp-secret")
+            .bind(id.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
     }
 
     async fn seed_notification_group(db: &DatabaseBackend, id: &str, owner: Uuid, name: &str) {

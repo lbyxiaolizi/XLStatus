@@ -1202,9 +1202,11 @@ class ApiClient {
 
   async createNotification(
     notification: JsonObject,
+    totpCode?: string,
   ): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>("/api/v1/notifications", {
       method: "POST",
+      headers: this.sensitiveHeaders(totpCode),
       body: JSON.stringify(notification),
     });
   }
@@ -1212,25 +1214,27 @@ class ApiClient {
   async updateNotification(
     id: string,
     notification: JsonObject,
+    totpCode?: string,
   ): Promise<ApiResponse<JsonObject>> {
     return this.requestWithFallback<JsonObject>(
       `/api/v1/notifications/${encodeURIComponent(id)}`,
       notification,
       ["PATCH", "POST", "PUT"],
+      { headers: this.sensitiveHeaders(totpCode) },
     );
   }
 
-  async deleteNotification(id: string): Promise<ApiResponse<JsonObject>> {
+  async deleteNotification(id: string, totpCode?: string): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
       `/api/v1/notifications/${encodeURIComponent(id)}`,
-      { method: "DELETE" },
+      { method: "DELETE", headers: this.sensitiveHeaders(totpCode) },
     );
   }
 
-  async testNotification(id: string): Promise<ApiResponse<JsonObject>> {
+  async testNotification(id: string, totpCode?: string): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
       `/api/v1/notifications/${encodeURIComponent(id)}/test`,
-      { method: "POST" },
+      { method: "POST", headers: this.sensitiveHeaders(totpCode) },
     );
   }
 
@@ -1245,9 +1249,11 @@ class ApiClient {
 
   async createNotificationGroup(
     group: JsonObject,
+    totpCode?: string,
   ): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>("/api/v1/notification-groups", {
       method: "POST",
+      headers: this.sensitiveHeaders(totpCode),
       body: JSON.stringify(group),
     });
   }
@@ -1255,29 +1261,33 @@ class ApiClient {
   async updateNotificationGroup(
     id: string,
     group: JsonObject,
+    totpCode?: string,
   ): Promise<ApiResponse<JsonObject>> {
     return this.requestWithFallback<JsonObject>(
       `/api/v1/notification-groups/${encodeURIComponent(id)}`,
       group,
       ["PATCH", "POST", "PUT"],
+      { headers: this.sensitiveHeaders(totpCode) },
     );
   }
 
-  async deleteNotificationGroup(id: string): Promise<ApiResponse<JsonObject>> {
+  async deleteNotificationGroup(id: string, totpCode?: string): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
       `/api/v1/notification-groups/${encodeURIComponent(id)}`,
-      { method: "DELETE" },
+      { method: "DELETE", headers: this.sensitiveHeaders(totpCode) },
     );
   }
 
   async addNotificationGroupMember(
     id: string,
     notificationId: string,
+    totpCode?: string,
   ): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
       `/api/v1/notification-groups/${encodeURIComponent(id)}/members`,
       {
         method: "POST",
+        headers: this.sensitiveHeaders(totpCode),
         body: JSON.stringify({ notification_id: notificationId }),
       },
     );
@@ -1286,10 +1296,11 @@ class ApiClient {
   async deleteNotificationGroupMember(
     id: string,
     notificationId: string,
+    totpCode?: string,
   ): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
       `/api/v1/notification-groups/${encodeURIComponent(id)}/members/${encodeURIComponent(notificationId)}`,
-      { method: "DELETE" },
+      { method: "DELETE", headers: this.sensitiveHeaders(totpCode) },
     );
   }
 
