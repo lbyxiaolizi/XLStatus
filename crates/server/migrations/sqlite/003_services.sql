@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS services (
 );
 
 CREATE INDEX IF NOT EXISTS idx_services_enabled ON services(enabled);
-CREATE INDEX IF NOT EXISTS idx_services_owner ON services(owner_user_id);
+-- `idx_services_owner` is created from DatabaseBackend::run_migrations after
+-- the owner_user_id compatibility column has been added to legacy tables.
 
 CREATE TABLE IF NOT EXISTS service_results (
     id TEXT PRIMARY KEY NOT NULL,

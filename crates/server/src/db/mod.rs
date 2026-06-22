@@ -546,6 +546,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_migrations_add_service_owner_to_legacy_table_before_index() {
+        let db_path =
+            std::env::temp_dir().join(format!("xlstatus-legacy-services-{}.db", Uuid::now_v7()));
+        let url = format!("sqlite://{}?mode=rwc", db_path.to_string_lossy());
+        let db = DatabaseBackend::connect(&url, true).await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = &db else {
+            unreachable!();
+        };
+
+        sqlx::query(
+            r#"
+            CREATE TABLE services (
+                id TEXT PRIMARY KEY NOT NULL,
+                name TEXT NOT NULL,
+                type TEXT NOT NULL,
+                target TEXT NOT NULL,
+                interval_seconds INTEGER NOT NULL DEFAULT 60,
+                timeout_seconds INTEGER NOT NULL DEFAULT 10,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                notification_group_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        db.run_migrations().await.unwrap();
+        db.run_migrations().await.unwrap();
+
+        let columns = sqlx::query("PRAGMA table_info(services)")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+        assert!(columns.iter().any(|row| {
+            row.try_get::<String, _>("name")
+                .map(|name| name == "owner_user_id")
+                .unwrap_or(false)
+        }));
+
+        let indexes = sqlx::query("PRAGMA index_list(services)")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+        assert!(indexes.iter().any(|row| {
+            row.try_get::<String, _>("name")
+                .map(|name| name == "idx_services_owner")
+                .unwrap_or(false)
+        }));
+
+        drop(db);
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
     async fn sqlite_migration_backfills_legacy_pat_expiration() {
         let db_path =
             std::env::temp_dir().join(format!("xlstatus-pat-expiration-{}.db", Uuid::now_v7()));
