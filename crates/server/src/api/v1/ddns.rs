@@ -15,8 +15,10 @@ use crate::api::v1::auth::AppState;
 use crate::auth::middleware::{AuthKind, AuthSession, AuthUser};
 use crate::auth::rbac::has_scope;
 use crate::db::repository::ddns::{DdnsConfigRepository, DdnsConfigRow, DdnsHistoryRepository};
+use crate::db::AgentRepository;
 use crate::security::validate_outbound_url;
 use xlstatus_shared::ddns::{DdnsHistoryEntry, ProviderType};
+use xlstatus_shared::AgentId;
 
 const DDNS_API_MAX_BODY_BYTES: usize = 64 * 1024;
 const DDNS_MAX_NAME_BYTES: usize = 128;
@@ -108,6 +110,7 @@ pub async fn create_ddns_config(
     let req = normalize_create_ddns_request(req)
         .map_err(|message| api_error::<DdnsConfigResponse>(StatusCode::BAD_REQUEST, message))?;
     ensure_ddns_agent_scope(&auth_user, req.agent_id.as_deref())?;
+    ensure_ddns_agent_active_owner(&db, &auth_user, req.agent_id.as_deref()).await?;
     if req.provider == ProviderType::Webhook.as_str() {
         let url = req
             .webhook_url
@@ -574,6 +577,33 @@ fn ensure_ddns_agent_scope<T>(
     }
 }
 
+async fn ensure_ddns_agent_active_owner<T>(
+    db: &crate::db::Db,
+    auth_user: &AuthUser,
+    agent_id: Option<&str>,
+) -> Result<(), (StatusCode, Json<ApiResponse<T>>)> {
+    let Some(agent_id) = agent_id else {
+        return Ok(());
+    };
+    let agent_uuid = uuid::Uuid::parse_str(agent_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "agent_id must be a UUID"))?;
+    let agent = AgentRepository::new(db.clone())
+        .find_by_id(AgentId(agent_uuid))
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or_else(|| api_error(StatusCode::FORBIDDEN, "agent not found"))?;
+    if agent.owner_user_id != auth_user.user.id {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "DDNS config agent must be owned by the caller",
+        ));
+    }
+    if agent.revoked_at.is_some() {
+        return Err(api_error(StatusCode::FORBIDDEN, "agent has been revoked"));
+    }
+    Ok(())
+}
+
 fn ensure_ddns_config_visible<T>(
     auth_user: &AuthUser,
     config: &DdnsConfigRow,
@@ -649,7 +679,7 @@ fn api_error<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::User;
+    use crate::db::{CreateAgentInput, CreateUserInput, DatabaseBackend, User, UserRepository};
     use chrono::Utc;
     use xlstatus_shared::{UserId, UserRole};
 
@@ -823,6 +853,99 @@ mod tests {
         assert!(normalized.enabled);
     }
 
+    #[tokio::test]
+    async fn ddns_create_requires_active_owned_agent() {
+        let db = test_db().await;
+        let user_repo = UserRepository::new(db.clone());
+        let owner = user_repo
+            .create(CreateUserInput {
+                username: format!("ddns-api-owner-{}", uuid::Uuid::now_v7()),
+                password: "password123".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        let other_owner = user_repo
+            .create(CreateUserInput {
+                username: format!("ddns-api-other-{}", uuid::Uuid::now_v7()),
+                password: "password123".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        let agent_repo = AgentRepository::new(db.clone());
+        let active_agent = agent_repo
+            .create_with_id(
+                AgentId(uuid::Uuid::now_v7()),
+                CreateAgentInput {
+                    name: "active-ddns-agent".into(),
+                    public_key: "pk".into(),
+                    owner_user_id: owner.id,
+                },
+            )
+            .await
+            .unwrap();
+        let revoked_agent = agent_repo
+            .create_with_id(
+                AgentId(uuid::Uuid::now_v7()),
+                CreateAgentInput {
+                    name: "revoked-ddns-agent".into(),
+                    public_key: "pk".into(),
+                    owner_user_id: owner.id,
+                },
+            )
+            .await
+            .unwrap();
+        agent_repo.revoke(revoked_agent.id).await.unwrap();
+        let foreign_agent = agent_repo
+            .create_with_id(
+                AgentId(uuid::Uuid::now_v7()),
+                CreateAgentInput {
+                    name: "foreign-ddns-agent".into(),
+                    public_key: "pk".into(),
+                    owner_user_id: other_owner.id,
+                },
+            )
+            .await
+            .unwrap();
+        let auth = admin_cookie_for(owner.id);
+
+        assert!(ensure_ddns_agent_active_owner::<DdnsConfigResponse>(
+            &db,
+            &auth,
+            Some(&active_agent.id.0.to_string())
+        )
+        .await
+        .is_ok());
+
+        let err = ensure_ddns_agent_active_owner::<DdnsConfigResponse>(
+            &db,
+            &auth,
+            Some(&revoked_agent.id.0.to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+
+        let err = ensure_ddns_agent_active_owner::<DdnsConfigResponse>(
+            &db,
+            &auth,
+            Some(&foreign_agent.id.0.to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+
+        let err = ensure_ddns_agent_active_owner::<DdnsConfigResponse>(
+            &db,
+            &auth,
+            Some(&uuid::Uuid::now_v7().to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
     fn admin_pat(scopes: Vec<&str>, server_ids: Option<Vec<String>>) -> AuthUser {
         let now = Utc::now();
         AuthUser {
@@ -842,6 +965,38 @@ mod tests {
             server_ids,
             pat_id: Some("pat".into()),
         }
+    }
+
+    fn admin_cookie_for(user_id: UserId) -> AuthUser {
+        let now = Utc::now();
+        AuthUser {
+            user: User {
+                id: user_id,
+                username: "admin".into(),
+                password_hash: "x".into(),
+                role: UserRole::Admin,
+                token_version: 0,
+                created_at: now,
+                updated_at: now,
+            },
+            session_id: "cookie-session".into(),
+            csrf_token: "csrf".into(),
+            auth_kind: AuthKind::Session,
+            scopes: Vec::new(),
+            server_ids: None,
+            pat_id: None,
+        }
+    }
+
+    async fn test_db() -> DatabaseBackend {
+        let path = std::env::temp_dir().join(format!(
+            "xlstatus-ddns-api-test-{}.db",
+            uuid::Uuid::now_v7()
+        ));
+        let url = format!("sqlite://{}?mode=rwc", path.to_string_lossy());
+        let db = DatabaseBackend::connect(&url, true).await.unwrap();
+        db.run_migrations().await.unwrap();
+        db
     }
 
     fn ddns_config(agent_id: Option<&str>) -> DdnsConfigRow {
