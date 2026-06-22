@@ -125,7 +125,7 @@ pub async fn update_settings(
         set_string_setting(
             &state.db,
             PUBLIC_LOGO_URL,
-            &normalize_optional_text_setting(logo_url, 500, "public_logo_url")?,
+            &normalize_optional_public_asset_url(logo_url, "public_logo_url")?,
         )
         .await?;
     }
@@ -133,7 +133,7 @@ pub async fn update_settings(
         set_string_setting(
             &state.db,
             PUBLIC_FAVICON_URL,
-            &normalize_optional_text_setting(favicon_url, 500, "public_favicon_url")?,
+            &normalize_optional_public_asset_url(favicon_url, "public_favicon_url")?,
         )
         .await?;
     }
@@ -149,7 +149,7 @@ pub async fn update_settings(
         set_string_setting(
             &state.db,
             PUBLIC_BACKGROUND_URL,
-            &normalize_optional_text_setting(background_url, 500, "public_background_url")?,
+            &normalize_optional_public_background_url(background_url)?,
         )
         .await?;
     }
@@ -269,10 +269,24 @@ pub async fn public_site_branding(db: &DatabaseBackend) -> Result<PublicSiteBran
         site_name: get_string_setting(db, PUBLIC_SITE_NAME)
             .await?
             .unwrap_or_else(|| "XLStatus".to_string()),
-        logo_url: get_string_setting(db, PUBLIC_LOGO_URL).await?,
-        favicon_url: get_string_setting(db, PUBLIC_FAVICON_URL).await?,
+        logo_url: normalize_optional_public_asset_url(
+            get_string_setting(db, PUBLIC_LOGO_URL).await?,
+            PUBLIC_LOGO_URL,
+        )
+        .ok()
+        .filter(|value| !value.is_empty()),
+        favicon_url: normalize_optional_public_asset_url(
+            get_string_setting(db, PUBLIC_FAVICON_URL).await?,
+            PUBLIC_FAVICON_URL,
+        )
+        .ok()
+        .filter(|value| !value.is_empty()),
         theme_color: get_string_setting(db, PUBLIC_THEME_COLOR).await?,
-        background_url: get_string_setting(db, PUBLIC_BACKGROUND_URL).await?,
+        background_url: normalize_optional_public_background_url(
+            get_string_setting(db, PUBLIC_BACKGROUND_URL).await?,
+        )
+        .ok()
+        .filter(|value| !value.is_empty()),
         custom_head: None,
         custom_body: None,
     })
@@ -586,17 +600,23 @@ fn normalize_short_text(value: &str, max_len: usize, field: &str) -> Result<Stri
     Ok(value.to_string())
 }
 
-fn normalize_optional_text_setting(
+fn normalize_optional_public_asset_url(
     value: Option<String>,
-    max_len: usize,
     field: &str,
 ) -> Result<String, AppError> {
-    let value = value.unwrap_or_default();
-    let value = value.trim();
-    if value.len() > max_len {
-        return Err(AppError::BadRequest(format!("{field} is too long")));
+    normalize_optional_url_setting(value, 500, field)
+}
+
+fn normalize_optional_public_background_url(value: Option<String>) -> Result<String, AppError> {
+    let normalized = normalize_optional_public_asset_url(value, "public_background_url")?;
+    if normalized.contains(['"', '\'', '(', ')', '\\'])
+        || normalized.chars().any(|ch| ch.is_control())
+    {
+        return Err(AppError::BadRequest(
+            "public_background_url contains characters unsafe for CSS url()".into(),
+        ));
     }
-    Ok(value.to_string())
+    Ok(normalized)
 }
 
 fn default_public_site_enabled(value: Option<bool>) -> bool {
@@ -781,13 +801,17 @@ fn require_admin_cookie_session(auth: &AuthSession) -> Result<(), AppError> {
 mod tests {
     use super::{
         default_public_site_enabled, normalize_disabled_custom_html,
-        normalize_geoip_ip_change_server_ids, normalize_optional_secret_text,
-        normalize_optional_url_setting, normalize_optional_uuid_text, require_admin_cookie_session,
-        settings_body_limit, SETTINGS_MAX_BODY_BYTES, SETTINGS_MAX_CLOUDFLARED_TOKEN_BYTES,
-        SETTINGS_MAX_DISABLED_CUSTOM_HTML_BYTES, SETTINGS_MAX_GEOIP_IP_CHANGE_SERVERS,
-        SETTINGS_MAX_GEOIP_TOKEN_BYTES, SETTINGS_MAX_URL_BYTES,
+        normalize_geoip_ip_change_server_ids, normalize_optional_public_asset_url,
+        normalize_optional_public_background_url, normalize_optional_secret_text,
+        normalize_optional_url_setting, normalize_optional_uuid_text, public_site_branding,
+        require_admin_cookie_session, set_string_setting, settings_body_limit,
+        PUBLIC_BACKGROUND_URL, PUBLIC_FAVICON_URL, PUBLIC_LOGO_URL, SETTINGS_MAX_BODY_BYTES,
+        SETTINGS_MAX_CLOUDFLARED_TOKEN_BYTES, SETTINGS_MAX_DISABLED_CUSTOM_HTML_BYTES,
+        SETTINGS_MAX_GEOIP_IP_CHANGE_SERVERS, SETTINGS_MAX_GEOIP_TOKEN_BYTES,
+        SETTINGS_MAX_URL_BYTES,
     };
     use crate::auth::middleware::{AuthKind, AuthSession};
+    use crate::db::DatabaseBackend;
     use xlstatus_shared::{UserId, UserRole};
 
     #[test]
@@ -869,6 +893,73 @@ mod tests {
             "ddns_resolver_url",
         )
         .is_err());
+    }
+
+    #[test]
+    fn public_branding_urls_reject_unsafe_schemes_and_css_tokens() {
+        assert_eq!(
+            normalize_optional_public_asset_url(
+                Some(" https://cdn.example.com/logo.png ".into()),
+                "public_logo_url",
+            )
+            .unwrap(),
+            "https://cdn.example.com/logo.png"
+        );
+        assert!(normalize_optional_public_asset_url(
+            Some("javascript:alert(1)".into()),
+            "public_logo_url",
+        )
+        .is_err());
+        assert!(normalize_optional_public_asset_url(
+            Some("https://user:pass@example.com/logo.png".into()),
+            "public_logo_url",
+        )
+        .is_err());
+        assert!(normalize_optional_public_asset_url(
+            Some("https://example.com/logo.svg#frag".into()),
+            "public_logo_url",
+        )
+        .is_err());
+        assert!(normalize_optional_public_background_url(Some(
+            "https://example.com/bg.png\") , url(https://evil.example/pixel".into(),
+        ))
+        .is_err());
+        assert!(normalize_optional_public_background_url(Some(
+            "https://example.com/bg(1).png".into(),
+        ))
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn public_branding_filters_historical_unsafe_urls() {
+        let db = DatabaseBackend::connect("sqlite::memory:", true)
+            .await
+            .unwrap();
+        db.run_migrations().await.unwrap();
+
+        set_string_setting(&db, PUBLIC_LOGO_URL, "javascript:alert(1)")
+            .await
+            .unwrap();
+        set_string_setting(
+            &db,
+            PUBLIC_FAVICON_URL,
+            "https://user:pass@example.com/icon.png",
+        )
+        .await
+        .unwrap();
+        set_string_setting(
+            &db,
+            PUBLIC_BACKGROUND_URL,
+            "https://example.com/bg.png\") , url(https://evil.example/pixel",
+        )
+        .await
+        .unwrap();
+
+        let branding = public_site_branding(&db).await.unwrap();
+
+        assert!(branding.logo_url.is_none());
+        assert!(branding.favicon_url.is_none());
+        assert!(branding.background_url.is_none());
     }
 
     #[test]
