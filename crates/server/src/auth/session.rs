@@ -2,7 +2,7 @@
 #![allow(unused)]
 
 use crate::db::{CreateSessionInput, DatabaseBackend, Session};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use xlstatus_shared::UserId;
 
@@ -82,21 +82,24 @@ impl SessionRepository {
                 .fetch_optional(pool)
                 .await?;
 
-                Ok(row.map(
-                    |(id, user_id, token_hash, ip, user_agent, expires_at, created_at)| Session {
-                        id,
-                        user_id: UserId(uuid::Uuid::parse_str(&user_id).unwrap()),
-                        token_hash,
-                        ip,
-                        user_agent,
-                        expires_at: DateTime::parse_from_rfc3339(&expires_at)
-                            .unwrap()
-                            .with_timezone(&Utc),
-                        created_at: DateTime::parse_from_rfc3339(&created_at)
-                            .unwrap()
-                            .with_timezone(&Utc),
-                    },
-                ))
+                match row {
+                    Some((id, user_id, token_hash, ip, user_agent, expires_at, created_at)) => {
+                        let session_id = id.clone();
+                        match row_to_session_sqlite(
+                            id, user_id, token_hash, ip, user_agent, expires_at, created_at,
+                        ) {
+                            Ok(session) => Ok(Some(session)),
+                            Err(err) => {
+                                tracing::warn!(
+                                    session_id = %session_id,
+                                    "treating invalid session row as not found: {err}"
+                                );
+                                Ok(None)
+                            }
+                        }
+                    }
+                    None => Ok(None),
+                }
             }
             DatabaseBackend::Postgres(pool) => {
                 let row = sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid, String, Option<String>, Option<String>, DateTime<Utc>, DateTime<Utc>)>(
@@ -135,21 +138,24 @@ impl SessionRepository {
                 .fetch_optional(pool)
                 .await?;
 
-                Ok(row.map(
-                    |(id, user_id, token_hash, ip, user_agent, expires_at, created_at)| Session {
-                        id,
-                        user_id: UserId(uuid::Uuid::parse_str(&user_id).unwrap()),
-                        token_hash,
-                        ip,
-                        user_agent,
-                        expires_at: DateTime::parse_from_rfc3339(&expires_at)
-                            .unwrap()
-                            .with_timezone(&Utc),
-                        created_at: DateTime::parse_from_rfc3339(&created_at)
-                            .unwrap()
-                            .with_timezone(&Utc),
-                    },
-                ))
+                match row {
+                    Some((id, user_id, token_hash, ip, user_agent, expires_at, created_at)) => {
+                        let session_id = id.clone();
+                        match row_to_session_sqlite(
+                            id, user_id, token_hash, ip, user_agent, expires_at, created_at,
+                        ) {
+                            Ok(session) => Ok(Some(session)),
+                            Err(err) => {
+                                tracing::warn!(
+                                    session_id = %session_id,
+                                    "treating invalid session row as not found: {err}"
+                                );
+                                Ok(None)
+                            }
+                        }
+                    }
+                    None => Ok(None),
+                }
             }
             DatabaseBackend::Postgres(pool) => {
                 let session_uuid = uuid::Uuid::parse_str(session_id)
@@ -236,5 +242,181 @@ impl SessionRepository {
         };
 
         Ok(affected)
+    }
+}
+
+fn row_to_session_sqlite(
+    id: String,
+    user_id: String,
+    token_hash: String,
+    ip: Option<String>,
+    user_agent: Option<String>,
+    expires_at: String,
+    created_at: String,
+) -> Result<Session> {
+    uuid::Uuid::parse_str(&id).with_context(|| "invalid session id UUID")?;
+    Ok(Session {
+        id,
+        user_id: UserId(
+            uuid::Uuid::parse_str(&user_id).with_context(|| "invalid session user_id UUID")?,
+        ),
+        token_hash,
+        ip,
+        user_agent,
+        expires_at: parse_session_rfc3339(&expires_at, "expires_at")?,
+        created_at: parse_session_rfc3339(&created_at, "created_at")?,
+    })
+}
+
+fn parse_session_rfc3339(value: &str, field: &str) -> Result<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .with_context(|| format!("invalid session {field} timestamp"))
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::hash_token;
+    use crate::db::{CreateUserInput, UserRepository};
+    use xlstatus_shared::UserRole;
+
+    #[tokio::test]
+    async fn invalid_session_created_at_is_treated_as_missing() {
+        let db = test_db().await;
+        let user = UserRepository::new(db.clone())
+            .create(CreateUserInput {
+                username: "owner".into(),
+                password: "secret".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        let token_hash = hash_token("dirty-session");
+        insert_raw_session(
+            &db,
+            user.id.0.to_string().as_str(),
+            &token_hash,
+            &(Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+            "not-a-timestamp",
+        )
+        .await;
+        let repo = SessionRepository::new(db);
+
+        assert!(repo
+            .find_by_token_hash(&token_hash)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn invalid_session_timestamps_are_treated_as_missing() {
+        let db = test_db().await;
+        let user = UserRepository::new(db.clone())
+            .create(CreateUserInput {
+                username: "owner".into(),
+                password: "secret".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        let session_id = uuid::Uuid::now_v7().to_string();
+        let token_hash = hash_token("dirty-session-time");
+        insert_raw_session_with_id(
+            &db,
+            &session_id,
+            user.id.0.to_string().as_str(),
+            &token_hash,
+            "9999-99-99T99:99:99Z",
+            &Utc::now().to_rfc3339(),
+        )
+        .await;
+        let repo = SessionRepository::new(db);
+
+        assert!(repo.find_by_id(&session_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn non_uuid_session_id_is_treated_as_missing_by_token_hash() {
+        let db = test_db().await;
+        let user = UserRepository::new(db.clone())
+            .create(CreateUserInput {
+                username: "owner".into(),
+                password: "secret".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        let token_hash = hash_token("dirty-session-id");
+        insert_raw_session_with_id(
+            &db,
+            "not-a-uuid",
+            user.id.0.to_string().as_str(),
+            &token_hash,
+            &(Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+            &Utc::now().to_rfc3339(),
+        )
+        .await;
+        let repo = SessionRepository::new(db);
+
+        assert!(repo
+            .find_by_token_hash(&token_hash)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    async fn insert_raw_session(
+        db: &DatabaseBackend,
+        user_id: &str,
+        token_hash: &str,
+        expires_at: &str,
+        created_at: &str,
+    ) {
+        insert_raw_session_with_id(
+            db,
+            &uuid::Uuid::now_v7().to_string(),
+            user_id,
+            token_hash,
+            expires_at,
+            created_at,
+        )
+        .await;
+    }
+
+    async fn insert_raw_session_with_id(
+        db: &DatabaseBackend,
+        id: &str,
+        user_id: &str,
+        token_hash: &str,
+        expires_at: &str,
+        created_at: &str,
+    ) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            r#"
+            INSERT INTO sessions (id, user_id, token_hash, expires_at, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(id)
+        .bind(user_id)
+        .bind(token_hash)
+        .bind(expires_at)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn test_db() -> DatabaseBackend {
+        let db = DatabaseBackend::connect("sqlite::memory:", true)
+            .await
+            .unwrap();
+        db.run_migrations().await.unwrap();
+        db
     }
 }
