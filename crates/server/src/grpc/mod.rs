@@ -18,6 +18,10 @@ use xlstatus_proto_gen::xlstatus::v1::agent_service_server::AgentService;
 use xlstatus_proto_gen::xlstatus::v1::{agent_message, AgentMessage, IoFrame, ServerMessage};
 use xlstatus_shared::AgentId;
 
+const AGENT_TELEMETRY_MAX_ITEMS: usize = 64;
+const AGENT_TELEMETRY_MAX_STRING_BYTES: usize = 128;
+const AGENT_TELEMETRY_MAX_JSON_BYTES: usize = 256 * 1024;
+
 pub struct AgentServiceImpl {
     db: DatabaseBackend,
     session_registry: SessionRegistry,
@@ -372,22 +376,43 @@ fn grpc_metadata_value<T>(request: &Request<T>, name: &str) -> Option<String> {
 /// this with a typed schema in M8 per plan/08-roadmap.md.
 fn state_to_json(s: &xlstatus_proto_gen::xlstatus::v1::HostState) -> String {
     use serde_json::json;
-    let disks: Vec<serde_json::Value> = s
-        .disks
-        .iter()
-        .map(|d| json!({ "mount_point": d.mount_point, "used": d.used, "total": d.total }))
-        .collect();
-    let net_io: Vec<serde_json::Value> = s
-        .net_io
-        .iter()
-        .map(|n| json!({ "interface": n.interface, "bytes_sent": n.bytes_sent, "bytes_recv": n.bytes_recv }))
-        .collect();
-    let temperatures: Vec<serde_json::Value> = s
-        .temperatures
-        .iter()
-        .map(|t| json!({ "label": t.label, "temperature": t.temperature }))
-        .collect();
-    serde_json::to_string(&json!({
+    let mut telemetry_truncated = false;
+    telemetry_truncated |= s.disks.len() > AGENT_TELEMETRY_MAX_ITEMS;
+    telemetry_truncated |= s.net_io.len() > AGENT_TELEMETRY_MAX_ITEMS;
+    telemetry_truncated |= s.temperatures.len() > AGENT_TELEMETRY_MAX_ITEMS;
+    telemetry_truncated |= !s.gpus.is_empty();
+
+    let mut disks = Vec::with_capacity(s.disks.len().min(AGENT_TELEMETRY_MAX_ITEMS));
+    for d in s.disks.iter().take(AGENT_TELEMETRY_MAX_ITEMS) {
+        disks.push(json!({
+            "mount_point": bounded_telemetry_string(&d.mount_point, &mut telemetry_truncated),
+            "used": d.used,
+            "total": d.total
+        }));
+    }
+
+    let mut net_io = Vec::with_capacity(s.net_io.len().min(AGENT_TELEMETRY_MAX_ITEMS));
+    let mut network_in_total = 0_u64;
+    let mut network_out_total = 0_u64;
+    for n in s.net_io.iter().take(AGENT_TELEMETRY_MAX_ITEMS) {
+        network_in_total = network_in_total.saturating_add(n.bytes_recv);
+        network_out_total = network_out_total.saturating_add(n.bytes_sent);
+        net_io.push(json!({
+            "interface": bounded_telemetry_string(&n.interface, &mut telemetry_truncated),
+            "bytes_sent": n.bytes_sent,
+            "bytes_recv": n.bytes_recv
+        }));
+    }
+
+    let mut temperatures = Vec::with_capacity(s.temperatures.len().min(AGENT_TELEMETRY_MAX_ITEMS));
+    for t in s.temperatures.iter().take(AGENT_TELEMETRY_MAX_ITEMS) {
+        temperatures.push(json!({
+            "label": bounded_telemetry_string(&t.label, &mut telemetry_truncated),
+            "temperature": t.temperature
+        }));
+    }
+
+    let value = json!({
         "cpu_percent": s.cpu_percent,
         "memory_used": s.memory_used,
         "memory_total": s.memory_total,
@@ -401,12 +426,34 @@ fn state_to_json(s: &xlstatus_proto_gen::xlstatus::v1::HostState) -> String {
         "process_count": s.process_count,
         "disks": disks,
         "net_io": net_io,
-        "network_in_total": s.net_io.iter().map(|n| n.bytes_recv).sum::<u64>(),
-        "network_out_total": s.net_io.iter().map(|n| n.bytes_sent).sum::<u64>(),
+        "network_in_total": network_in_total,
+        "network_out_total": network_out_total,
         "uptime_seconds": s.uptime_seconds,
         "temperatures": temperatures,
-    }))
-    .unwrap_or_else(|_| String::new())
+        "telemetry_truncated": telemetry_truncated,
+    });
+    serialize_telemetry_json(value, || {
+        json!({
+            "cpu_percent": s.cpu_percent,
+            "memory_used": s.memory_used,
+            "memory_total": s.memory_total,
+            "swap_used": s.swap_used,
+            "swap_total": s.swap_total,
+            "load_1": s.load_1,
+            "load_5": s.load_5,
+            "load_15": s.load_15,
+            "tcp_connections": s.tcp_connections,
+            "udp_connections": s.udp_connections,
+            "process_count": s.process_count,
+            "network_in_total": network_in_total,
+            "network_out_total": network_out_total,
+            "uptime_seconds": s.uptime_seconds,
+            "disks": [],
+            "net_io": [],
+            "temperatures": [],
+            "telemetry_truncated": true,
+        })
+    })
 }
 
 fn info_to_json(info: &xlstatus_proto_gen::xlstatus::v1::HostInfoUpdate) -> String {
@@ -415,29 +462,215 @@ fn info_to_json(info: &xlstatus_proto_gen::xlstatus::v1::HostInfoUpdate) -> Stri
         Some(h) => h,
         None => return String::new(),
     };
-    let disks: Vec<serde_json::Value> = h
-        .disks
-        .iter()
-        .map(|d| {
-            json!({
-                "device": d.device,
-                "mount_point": d.mount_point,
-                "fs_type": d.fs_type,
-                "total": d.total,
-            })
-        })
-        .collect();
-    serde_json::to_string(&json!({
-        "hostname": h.hostname,
-        "os": h.os,
-        "platform": h.platform,
-        "platform_version": h.platform_version,
-        "kernel_version": h.kernel_version,
-        "arch": h.arch,
+    let mut telemetry_truncated = h.disks.len() > AGENT_TELEMETRY_MAX_ITEMS;
+    let mut disks = Vec::with_capacity(h.disks.len().min(AGENT_TELEMETRY_MAX_ITEMS));
+    for d in h.disks.iter().take(AGENT_TELEMETRY_MAX_ITEMS) {
+        disks.push(json!({
+            "device": bounded_telemetry_string(&d.device, &mut telemetry_truncated),
+            "mount_point": bounded_telemetry_string(&d.mount_point, &mut telemetry_truncated),
+            "fs_type": bounded_telemetry_string(&d.fs_type, &mut telemetry_truncated),
+            "total": d.total,
+        }));
+    }
+    let value = json!({
+        "hostname": bounded_telemetry_string(&h.hostname, &mut telemetry_truncated),
+        "os": bounded_telemetry_string(&h.os, &mut telemetry_truncated),
+        "platform": bounded_telemetry_string(&h.platform, &mut telemetry_truncated),
+        "platform_version": bounded_telemetry_string(&h.platform_version, &mut telemetry_truncated),
+        "kernel_version": bounded_telemetry_string(&h.kernel_version, &mut telemetry_truncated),
+        "arch": bounded_telemetry_string(&h.arch, &mut telemetry_truncated),
         "cpu_cores": h.cpu_cores,
         "total_memory": h.total_memory,
         "total_swap": h.total_swap,
         "disks": disks,
-    }))
-    .unwrap_or_else(|_| String::new())
+        "telemetry_truncated": telemetry_truncated,
+    });
+    serialize_telemetry_json(value, || {
+        json!({
+            "hostname": forced_bounded_telemetry_string(&h.hostname),
+            "os": forced_bounded_telemetry_string(&h.os),
+            "platform": forced_bounded_telemetry_string(&h.platform),
+            "platform_version": forced_bounded_telemetry_string(&h.platform_version),
+            "kernel_version": forced_bounded_telemetry_string(&h.kernel_version),
+            "arch": forced_bounded_telemetry_string(&h.arch),
+            "cpu_cores": h.cpu_cores,
+            "total_memory": h.total_memory,
+            "total_swap": h.total_swap,
+            "disks": [],
+            "telemetry_truncated": true,
+        })
+    })
+}
+
+fn bounded_telemetry_string(value: &str, telemetry_truncated: &mut bool) -> String {
+    if value.len() <= AGENT_TELEMETRY_MAX_STRING_BYTES {
+        return value.to_string();
+    }
+    *telemetry_truncated = true;
+    let mut end = AGENT_TELEMETRY_MAX_STRING_BYTES;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
+fn forced_bounded_telemetry_string(value: &str) -> String {
+    let mut telemetry_truncated = true;
+    bounded_telemetry_string(value, &mut telemetry_truncated)
+}
+
+fn serialize_telemetry_json<F>(value: serde_json::Value, fallback: F) -> String
+where
+    F: FnOnce() -> serde_json::Value,
+{
+    let serialized = serde_json::to_string(&value).unwrap_or_else(|_| String::new());
+    if serialized.len() <= AGENT_TELEMETRY_MAX_JSON_BYTES {
+        return serialized;
+    }
+
+    let fallback = serde_json::to_string(&fallback()).unwrap_or_else(|_| String::new());
+    if fallback.len() <= AGENT_TELEMETRY_MAX_JSON_BYTES {
+        fallback
+    } else {
+        "{\"telemetry_truncated\":true}".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xlstatus_proto_gen::xlstatus::v1::{
+        DiskInfo, DiskState, GpuState, HostInfo, HostInfoUpdate, HostState, NetStat, TempSensor,
+    };
+
+    fn parse_json(value: &str) -> serde_json::Value {
+        serde_json::from_str(value).expect("telemetry JSON should parse")
+    }
+
+    #[test]
+    fn host_state_json_bounds_repeated_and_string_fields() {
+        let long_ascii = "x".repeat(AGENT_TELEMETRY_MAX_STRING_BYTES + 64);
+        let mut state = HostState {
+            cpu_percent: 42.0,
+            memory_used: 1024,
+            memory_total: 2048,
+            swap_used: 1,
+            swap_total: 2,
+            load_1: 0.1,
+            load_5: 0.2,
+            load_15: 0.3,
+            tcp_connections: 4,
+            udp_connections: 5,
+            process_count: 6,
+            uptime_seconds: 7,
+            ..Default::default()
+        };
+        state.disks = (0..AGENT_TELEMETRY_MAX_ITEMS + 8)
+            .map(|index| DiskState {
+                mount_point: format!("{long_ascii}-{index}"),
+                used: index as u64,
+                total: 10_000 + index as u64,
+            })
+            .collect();
+        state.net_io = (0..AGENT_TELEMETRY_MAX_ITEMS + 8)
+            .map(|index| NetStat {
+                interface: format!("{long_ascii}-{index}"),
+                bytes_sent: 100 + index as u64,
+                bytes_recv: 200 + index as u64,
+            })
+            .collect();
+        state.temperatures = (0..AGENT_TELEMETRY_MAX_ITEMS + 8)
+            .map(|index| TempSensor {
+                label: format!("{long_ascii}-{index}"),
+                temperature: 40.0 + index as f64,
+            })
+            .collect();
+        state.gpus = vec![GpuState {
+            index: 0,
+            name: long_ascii.clone(),
+            utilization: 99.0,
+            memory_used: 1,
+            memory_total: 2,
+            temperature: 70.0,
+        }];
+
+        let json = state_to_json(&state);
+        assert!(json.len() <= AGENT_TELEMETRY_MAX_JSON_BYTES);
+        let parsed = parse_json(&json);
+        assert_eq!(parsed["telemetry_truncated"], true);
+        assert_eq!(
+            parsed["disks"].as_array().unwrap().len(),
+            AGENT_TELEMETRY_MAX_ITEMS
+        );
+        assert_eq!(
+            parsed["net_io"].as_array().unwrap().len(),
+            AGENT_TELEMETRY_MAX_ITEMS
+        );
+        assert_eq!(
+            parsed["temperatures"].as_array().unwrap().len(),
+            AGENT_TELEMETRY_MAX_ITEMS
+        );
+        assert_eq!(
+            parsed["disks"][0]["mount_point"].as_str().unwrap().len(),
+            AGENT_TELEMETRY_MAX_STRING_BYTES
+        );
+        assert_eq!(
+            parsed["net_io"][0]["interface"].as_str().unwrap().len(),
+            AGENT_TELEMETRY_MAX_STRING_BYTES
+        );
+        assert_eq!(
+            parsed["temperatures"][0]["label"].as_str().unwrap().len(),
+            AGENT_TELEMETRY_MAX_STRING_BYTES
+        );
+        assert!(parsed.get("gpus").is_none());
+    }
+
+    #[test]
+    fn host_info_json_bounds_repeated_and_utf8_strings() {
+        let long_utf8 = "界".repeat(AGENT_TELEMETRY_MAX_STRING_BYTES);
+        let info = HostInfoUpdate {
+            host_info: Some(HostInfo {
+                hostname: long_utf8.clone(),
+                os: long_utf8.clone(),
+                platform: long_utf8.clone(),
+                platform_version: long_utf8.clone(),
+                kernel_version: long_utf8.clone(),
+                arch: long_utf8.clone(),
+                cpu_cores: 8,
+                total_memory: 16,
+                total_swap: 32,
+                disks: (0..AGENT_TELEMETRY_MAX_ITEMS + 8)
+                    .map(|index| DiskInfo {
+                        device: format!("{long_utf8}-{index}"),
+                        mount_point: format!("{long_utf8}-{index}"),
+                        fs_type: format!("{long_utf8}-{index}"),
+                        total: 1_000 + index as u64,
+                    })
+                    .collect(),
+            }),
+        };
+
+        let json = info_to_json(&info);
+        assert!(json.len() <= AGENT_TELEMETRY_MAX_JSON_BYTES);
+        let parsed = parse_json(&json);
+        assert_eq!(parsed["telemetry_truncated"], true);
+        assert_eq!(
+            parsed["disks"].as_array().unwrap().len(),
+            AGENT_TELEMETRY_MAX_ITEMS
+        );
+        assert!(parsed["hostname"]
+            .as_str()
+            .unwrap()
+            .is_char_boundary(parsed["hostname"].as_str().unwrap().len()));
+        assert!(parsed["hostname"].as_str().unwrap().len() <= AGENT_TELEMETRY_MAX_STRING_BYTES);
+        assert!(
+            parsed["disks"][0]["device"].as_str().unwrap().len()
+                <= AGENT_TELEMETRY_MAX_STRING_BYTES
+        );
+    }
+
+    #[test]
+    fn host_info_without_payload_remains_empty() {
+        assert_eq!(info_to_json(&HostInfoUpdate { host_info: None }), "");
+    }
 }

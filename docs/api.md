@@ -213,7 +213,7 @@ GeoIP 测试接口请求体上限为 4KiB，只允许管理员 Cookie session；
 
 ## gRPC
 
-Agent gRPC 服务定义在 `proto/xlstatus/v1/agent.proto`，生成代码在 `crates/proto-gen/`。默认消息大小限制为 `256 MiB`。该传输上限只用于兼容临时大文件传输；HTTP 文件操作、MCP、任务运行历史和后台服务监控会在消费 `TaskResult` 前按各自业务预算校验或截断 Agent 返回文本。Agent 撤销后，Server 侧 session / IO registry 会立即移除并标记该 Agent，后续任务下发、终端/NAT IO 帧和迟到注册都会被拒绝；该进程内标记配合数据库 `revoked_at` 与 gRPC 重新认证拒绝一起收敛撤权窗口。
+Agent gRPC 服务定义在 `proto/xlstatus/v1/agent.proto`，生成代码在 `crates/proto-gen/`。默认消息大小限制为 `256 MiB`。该传输上限只用于兼容临时大文件传输；HTTP 文件操作、MCP、任务运行历史和后台服务监控会在消费 `TaskResult` 前按各自业务预算校验或截断 Agent 返回文本。Agent `HostState` / `HostInfoUpdate` 遥测写入 `agents.last_state_json` / `last_info_json`、内存 TSDB、告警快照和实时 WebSocket 前会按业务预算归一化：每类磁盘/网卡/温度/HostInfo 磁盘数组最多保留 64 项，遥测字符串字段最长 128 字节且按 UTF-8 边界截断，单个持久化 JSON 最长 256KiB；发生裁剪时会带 `telemetry_truncated=true`。Agent 撤销后，Server 侧 session / IO registry 会立即移除并标记该 Agent，后续任务下发、终端/NAT IO 帧和迟到注册都会被拒绝；该进程内标记配合数据库 `revoked_at` 与 gRPC 重新认证拒绝一起收敛撤权窗口。
 
 典型流程：
 
