@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use xlstatus_proto_gen::xlstatus::v1::{IoFrame, ServerMessage, ServerTask, TaskResult};
@@ -10,16 +10,22 @@ pub type IoSender = mpsc::Sender<Result<IoFrame, tonic::Status>>;
 #[derive(Clone)]
 pub struct SessionRegistry {
     sessions: Arc<RwLock<HashMap<AgentId, SessionSender>>>,
+    revoked: Arc<RwLock<HashSet<AgentId>>>,
 }
 
 impl SessionRegistry {
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            revoked: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
     pub async fn register(&self, agent_id: AgentId, sender: SessionSender) {
+        if self.revoked.read().await.contains(&agent_id) {
+            tracing::warn!("refusing to register revoked Agent {} session", agent_id);
+            return;
+        }
         let mut sessions = self.sessions.write().await;
         sessions.insert(agent_id, sender);
         tracing::info!("Agent {} session registered", agent_id);
@@ -31,7 +37,15 @@ impl SessionRegistry {
         tracing::info!("Agent {} session unregistered", agent_id);
     }
 
+    pub async fn disconnect(&self, agent_id: &AgentId) {
+        self.revoked.write().await.insert(*agent_id);
+        self.unregister(agent_id).await;
+    }
+
     pub async fn send(&self, agent_id: &AgentId, message: ServerMessage) -> Result<(), String> {
+        if self.revoked.read().await.contains(agent_id) {
+            return Err("Agent has been revoked".to_string());
+        }
         let sessions = self.sessions.read().await;
         if let Some(sender) = sessions.get(agent_id) {
             sender
@@ -135,6 +149,81 @@ impl Default for SessionRegistry {
     }
 }
 
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn session_disconnect_blocks_late_task_sends_and_reregister() {
+        let registry = SessionRegistry::new();
+        let agent_id = AgentId(uuid::Uuid::now_v7());
+        let (tx, mut rx) = mpsc::channel(1);
+        registry.register(agent_id, tx).await;
+
+        registry.disconnect(&agent_id).await;
+        assert!(!registry.is_online(&agent_id).await);
+        assert!(registry
+            .send_task(&agent_id, "task-1", "true", 1)
+            .await
+            .unwrap_err()
+            .contains("revoked"));
+        assert!(rx.try_recv().is_err());
+
+        let (tx, mut rx) = mpsc::channel(1);
+        registry.register(agent_id, tx).await;
+        assert!(!registry.is_online(&agent_id).await);
+        assert!(registry
+            .send_task(&agent_id, "task-2", "true", 1)
+            .await
+            .unwrap_err()
+            .contains("revoked"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn io_disconnect_blocks_late_frame_sends_and_reregister() {
+        let registry = IoRegistry::new();
+        let agent_id = AgentId(uuid::Uuid::now_v7());
+        let (tx, mut rx) = mpsc::channel(1);
+        registry.register_agent(agent_id, tx).await;
+
+        registry.disconnect_agent(&agent_id).await;
+        assert!(!registry.is_agent_online(&agent_id).await);
+        assert!(registry
+            .send_to_agent(
+                &agent_id,
+                IoFrame {
+                    stream_id: "stream-1".into(),
+                    sequence: 1,
+                    agent_id: agent_id.0.to_string(),
+                    payload: None,
+                },
+            )
+            .await
+            .unwrap_err()
+            .contains("revoked"));
+        assert!(rx.try_recv().is_err());
+
+        let (tx, mut rx) = mpsc::channel(1);
+        registry.register_agent(agent_id, tx).await;
+        assert!(!registry.is_agent_online(&agent_id).await);
+        assert!(registry
+            .send_to_agent(
+                &agent_id,
+                IoFrame {
+                    stream_id: "stream-2".into(),
+                    sequence: 1,
+                    agent_id: agent_id.0.to_string(),
+                    payload: None,
+                },
+            )
+            .await
+            .unwrap_err()
+            .contains("revoked"));
+        assert!(rx.try_recv().is_err());
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TaskResultTextTruncation {
     pub stdout: bool,
@@ -211,6 +300,7 @@ pub fn truncate_utf8_to_bytes(value: &str, max_bytes: usize) -> (String, bool) {
 pub struct IoRegistry {
     agent_streams: Arc<RwLock<HashMap<AgentId, IoSender>>>,
     stream_subscribers: Arc<RwLock<HashMap<String, mpsc::Sender<IoFrame>>>>,
+    revoked_agents: Arc<RwLock<HashSet<AgentId>>>,
 }
 
 impl IoRegistry {
@@ -219,6 +309,10 @@ impl IoRegistry {
     }
 
     pub async fn register_agent(&self, agent_id: AgentId, sender: IoSender) {
+        if self.revoked_agents.read().await.contains(&agent_id) {
+            tracing::warn!("refusing to register revoked Agent {} io stream", agent_id);
+            return;
+        }
         let mut streams = self.agent_streams.write().await;
         streams.insert(agent_id, sender);
         tracing::info!("Agent {} io stream registered", agent_id);
@@ -228,6 +322,11 @@ impl IoRegistry {
         let mut streams = self.agent_streams.write().await;
         streams.remove(agent_id);
         tracing::info!("Agent {} io stream unregistered", agent_id);
+    }
+
+    pub async fn disconnect_agent(&self, agent_id: &AgentId) {
+        self.revoked_agents.write().await.insert(*agent_id);
+        self.unregister_agent(agent_id).await;
     }
 
     pub async fn subscribe_stream(&self, stream_id: String) -> mpsc::Receiver<IoFrame> {
@@ -243,6 +342,9 @@ impl IoRegistry {
     }
 
     pub async fn send_to_agent(&self, agent_id: &AgentId, frame: IoFrame) -> Result<(), String> {
+        if self.revoked_agents.read().await.contains(agent_id) {
+            return Err("Agent has been revoked".to_string());
+        }
         let streams = self.agent_streams.read().await;
         if let Some(sender) = streams.get(agent_id) {
             sender

@@ -27,7 +27,7 @@
 | `GET` | `/api/v1/transfers/temp/download` | 临时下载 |
 | `PUT` | `/api/v1/transfers/temp/upload` | 临时上传 |
 
-Agent 注册、JWT challenge 和 JWT 签发请求体上限为 4KiB。JWT nonce 为 32 字节 hex，signature 为 64 字节 hex；JWT challenge 只有在 Agent 签名验证通过后才会被消费。
+Agent 注册、JWT challenge 和 JWT 签发请求体上限为 4KiB。JWT nonce 为 32 字节 hex，signature 为 64 字节 hex；JWT challenge 只有在 Agent 签名验证通过后才会被消费。管理员撤销 Agent 后，控制面会写入 `revoked_at`、向现有 session 发送 ForceDisconnect，并立即从进程内 session / IO registry 摘除该 Agent；撤销后的迟到注册或发送路径不会继续接收任务或 IO 帧，后续 JWT/gRPC 认证也会拒绝该 Agent。
 
 登录请求体上限为 4KiB。`username` 最长 128 字节，`password` 最长 1024 字节，登录阶段的可选 TOTP code 必须是 6 位数字。
 
@@ -204,7 +204,7 @@ GeoIP 测试接口请求体上限为 4KiB。GeoIP MMDB update 请求体上限为
 
 ## gRPC
 
-Agent gRPC 服务定义在 `proto/xlstatus/v1/agent.proto`，生成代码在 `crates/proto-gen/`。默认消息大小限制为 `256 MiB`。该传输上限只用于兼容临时大文件传输；HTTP 文件操作、MCP、任务运行历史和后台服务监控会在消费 `TaskResult` 前按各自业务预算校验或截断 Agent 返回文本。
+Agent gRPC 服务定义在 `proto/xlstatus/v1/agent.proto`，生成代码在 `crates/proto-gen/`。默认消息大小限制为 `256 MiB`。该传输上限只用于兼容临时大文件传输；HTTP 文件操作、MCP、任务运行历史和后台服务监控会在消费 `TaskResult` 前按各自业务预算校验或截断 Agent 返回文本。Agent 撤销后，Server 侧 session / IO registry 会立即移除并标记该 Agent，后续任务下发、终端/NAT IO 帧和迟到注册都会被拒绝；该进程内标记配合数据库 `revoked_at` 与 gRPC 重新认证拒绝一起收敛撤权窗口。
 
 典型流程：
 

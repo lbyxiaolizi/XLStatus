@@ -5,7 +5,7 @@ use crate::auth::middleware::{AuthKind, AuthUser};
 use crate::db::{
     AgentRepository, CreateAgentInput, CreateEnrollmentTokenInput, EnrollmentTokenRepository,
 };
-use crate::grpc::SessionRegistry;
+use crate::grpc::{IoRegistry, SessionRegistry};
 use axum::{
     extract::{DefaultBodyLimit, Path, State},
     Json,
@@ -183,33 +183,42 @@ pub async fn revoke_agent(
     // main.rs wires in.
     let registry = revoke_registry()
         .ok_or_else(|| AppError::BadRequest("revoke registry not initialized".into()))?;
-    if let Err(e) = registry.send(&AgentId(agent_id), msg).await {
+    let agent_id = AgentId(agent_id);
+    if let Err(e) = registry.session.send(&agent_id, msg).await {
         // No live session is fine; the next reconnect attempt will be
         // rejected at the JWT challenge step. We still return 200 so
         // the admin's revoke succeeds.
         tracing::debug!("no live session to force_disconnect: {}", e);
     }
+    registry.session.disconnect(&agent_id).await;
+    registry.io.disconnect_agent(&agent_id).await;
     if let Some(manager) = crate::current_nat_manager() {
         if let Err(e) = manager.reload().await {
             tracing::warn!("NAT manager reload failed after agent revoke: {}", e);
         }
     }
     Ok(Json(ApiResponse::success(serde_json::json!({
-        "agent_id": agent_id.to_string(),
+        "agent_id": agent_id.0.to_string(),
         "revoked": true,
     }))))
 }
 
-static REVOKE_REGISTRY: once_cell::sync::Lazy<parking_lot::RwLock<Option<Arc<SessionRegistry>>>> =
+#[derive(Clone)]
+pub struct RevokeRegistry {
+    session: Arc<SessionRegistry>,
+    io: Arc<IoRegistry>,
+}
+
+static REVOKE_REGISTRY: once_cell::sync::Lazy<parking_lot::RwLock<Option<RevokeRegistry>>> =
     once_cell::sync::Lazy::new(|| parking_lot::RwLock::new(None));
 
 /// Wire the global session registry once at startup so the revoke
 /// handler can reach it. main.rs calls this before binding.
-pub fn set_revoke_registry(registry: Arc<SessionRegistry>) {
-    *REVOKE_REGISTRY.write() = Some(registry);
+pub fn set_revoke_registry(session: Arc<SessionRegistry>, io: Arc<IoRegistry>) {
+    *REVOKE_REGISTRY.write() = Some(RevokeRegistry { session, io });
 }
 
-fn revoke_registry() -> Option<Arc<SessionRegistry>> {
+fn revoke_registry() -> Option<RevokeRegistry> {
     REVOKE_REGISTRY.read().clone()
 }
 

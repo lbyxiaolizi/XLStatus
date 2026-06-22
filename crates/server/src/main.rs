@@ -712,10 +712,13 @@ async fn main() -> anyhow::Result<()> {
         run_http_server(http_bind, state).await
     });
 
-    // Hand the (already built) session registry to the agent
+    // Hand the (already built) registries to the agent
     // revoke handler so /api/v1/agents/:id/revoke can find the
-    // matching live session.
-    api::v1::agent::set_revoke_registry(Arc::new(session_registry.clone()));
+    // matching live session and IO stream.
+    api::v1::agent::set_revoke_registry(
+        Arc::new(session_registry.clone()),
+        Arc::new(io_registry.clone()),
+    );
 
     // Start gRPC server
     let grpc_config = config.clone();
