@@ -100,12 +100,22 @@ impl McpExecutor {
         let limit = args["limit"].as_i64().unwrap_or(50).clamp(1, 200);
         let offset = args["offset"].as_i64().unwrap_or(0).max(0);
         let repo = AgentRepository::new(self.db.clone());
-        let agents = repo.list_by_owner(auth.user_id, limit, offset).await?;
+        let agents = if let Some(server_ids) = auth.server_ids.as_deref() {
+            let owner_filter = if auth.role.is_admin() {
+                None
+            } else {
+                Some(auth.user_id)
+            };
+            let (agents, _) = repo
+                .list_with_state_by_server_ids(owner_filter, server_ids, limit, offset)
+                .await?;
+            agents.into_iter().map(|row| row.agent).collect()
+        } else {
+            repo.list_by_owner(auth.user_id, limit, offset).await?
+        };
         let servers: Vec<_> = agents
             .into_iter()
-            .filter(|agent| {
-                agent_visible_to_auth(auth, agent)
-            })
+            .filter(|agent| agent_visible_to_auth(auth, agent))
             .map(|agent| {
                 json!({
                     "server_id": agent.id.0.to_string(),
@@ -933,6 +943,89 @@ mod tests {
             .await;
 
         assert!(allowed.success);
+    }
+
+    #[tokio::test]
+    async fn mcp_server_list_filters_allowlist_before_pagination() {
+        let db = test_db().await;
+        let owner = UserId(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap());
+        seed_user(&db, owner, "owner", "member").await;
+        let blocked_agent = AgentRepository::new(db.clone())
+            .create(CreateAgentInput {
+                name: "blocked".into(),
+                public_key: "pk-blocked".into(),
+                owner_user_id: owner,
+            })
+            .await
+            .unwrap();
+        let allowed_agent = AgentRepository::new(db.clone())
+            .create(CreateAgentInput {
+                name: "allowed".into(),
+                public_key: "pk-allowed".into(),
+                owner_user_id: owner,
+            })
+            .await
+            .unwrap();
+        let executor = test_executor(db);
+        let auth = pat_auth(
+            owner,
+            UserRole::Member,
+            vec![allowed_agent.id.0.to_string()],
+        );
+
+        let response = executor
+            .execute(
+                &auth,
+                McpToolRequest {
+                    tool: "server.list".into(),
+                    arguments: json!({ "limit": 1, "offset": 0 }),
+                },
+            )
+            .await;
+
+        assert!(response.success);
+        let result = response.result.unwrap();
+        let servers = result["servers"].as_array().unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0]["server_id"], allowed_agent.id.0.to_string());
+        assert_ne!(servers[0]["server_id"], blocked_agent.id.0.to_string());
+        assert_eq!(result["total"], 1);
+    }
+
+    #[tokio::test]
+    async fn mcp_admin_pat_server_list_can_span_allowlisted_owners() {
+        let db = test_db().await;
+        let admin = UserId(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap());
+        let other = UserId(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap());
+        seed_user(&db, admin, "admin", "admin").await;
+        seed_user(&db, other, "other", "member").await;
+        let other_agent = AgentRepository::new(db.clone())
+            .create(CreateAgentInput {
+                name: "other".into(),
+                public_key: "pk-other".into(),
+                owner_user_id: other,
+            })
+            .await
+            .unwrap();
+        let executor = test_executor(db);
+        let auth = pat_auth(admin, UserRole::Admin, vec![other_agent.id.0.to_string()]);
+
+        let response = executor
+            .execute(
+                &auth,
+                McpToolRequest {
+                    tool: "server.list".into(),
+                    arguments: json!({ "limit": 10, "offset": 0 }),
+                },
+            )
+            .await;
+
+        assert!(response.success);
+        let result = response.result.unwrap();
+        let servers = result["servers"].as_array().unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0]["server_id"], other_agent.id.0.to_string());
+        assert_eq!(result["total"], 1);
     }
 
     #[test]
