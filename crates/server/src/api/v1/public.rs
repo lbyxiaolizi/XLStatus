@@ -19,21 +19,25 @@ use sqlx::Row;
 use std::collections::HashSet;
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::Duration as StdDuration;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use std::time::{Duration as StdDuration, Instant};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 use xlstatus_shared::AgentId;
 use xlstatus_tsdb::QueryRange;
 
 const ONLINE_THRESHOLD_SECS: i64 = 30;
 const MJPEG_BOUNDARY: &str = "xlstatus-status";
+const PUBLIC_SITE_PRIVATE_MESSAGE: &str = "public status page is private";
 const PUBLIC_MJPEG_MAX_CONNECTIONS: usize = 32;
+const PUBLIC_MJPEG_FRAME_CACHE_TTL: StdDuration = StdDuration::from_secs(1);
 const PUBLIC_METRIC_SAMPLE_LIMIT: usize = 240;
 const PUBLIC_SERVICE_HISTORY_LIMIT: i64 = 240;
 const PUBLIC_SERVER_ID_PATH_BYTES: usize = 36;
 
 static PUBLIC_MJPEG_CONNECTIONS: once_cell::sync::Lazy<Arc<Semaphore>> =
     once_cell::sync::Lazy::new(|| Arc::new(Semaphore::new(PUBLIC_MJPEG_MAX_CONNECTIONS)));
+static PUBLIC_MJPEG_FRAME_CACHE: once_cell::sync::Lazy<Mutex<PublicMjpegFrameCache>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(PublicMjpegFrameCache::default()));
 
 #[derive(Debug, Serialize)]
 pub struct PublicStatusResponse {
@@ -203,18 +207,18 @@ pub async fn public_status_mjpeg(State(state): State<AppState>) -> Result<Respon
             if !first {
                 tokio::time::sleep(StdDuration::from_secs(5)).await;
             }
-            let frame = match build_public_status_mjpeg_frame(&state).await {
+            let frame = match cached_public_status_mjpeg_frame(&state).await {
                 Ok(frame) => frame,
+                Err(err) if public_site_disabled_error(&err) => return None,
                 Err(err) => {
                     tracing::warn!("failed to build public status MJPEG frame: {:?}", err);
-                    build_mjpeg_frame(&fallback_status_jpeg("XLSTATUS", "ERROR", 0, 0, 0, 0))
-                        .unwrap_or_default()
+                    Bytes::from(
+                        build_mjpeg_frame(&fallback_status_jpeg("XLSTATUS", "ERROR", 0, 0, 0, 0))
+                            .unwrap_or_default(),
+                    )
                 }
             };
-            Some((
-                Ok::<Bytes, Infallible>(Bytes::from(frame)),
-                (state, false, permit),
-            ))
+            Some((Ok::<Bytes, Infallible>(frame), (state, false, permit)))
         })
         .map(|item| item);
     Ok((
@@ -244,6 +248,51 @@ fn acquire_public_mjpeg_permit_from(
     semaphore
         .try_acquire_owned()
         .map_err(|_| AppError::TooManyRequests("too many public MJPEG streams".to_string()))
+}
+
+async fn cached_public_status_mjpeg_frame(state: &AppState) -> Result<Bytes, AppError> {
+    cached_public_status_mjpeg_frame_from(state, &PUBLIC_MJPEG_FRAME_CACHE).await
+}
+
+async fn cached_public_status_mjpeg_frame_from(
+    state: &AppState,
+    cache: &Mutex<PublicMjpegFrameCache>,
+) -> Result<Bytes, AppError> {
+    let now = Instant::now();
+    let mut cache = cache.lock().await;
+    ensure_public_site_enabled(state).await?;
+    if let Some(frame) = cache.get(now) {
+        return Ok(frame);
+    }
+
+    let frame = Bytes::from(build_public_status_mjpeg_frame(state).await?);
+    ensure_public_site_enabled(state).await?;
+    Ok(cache.store(Instant::now(), frame))
+}
+
+#[derive(Default)]
+struct PublicMjpegFrameCache {
+    frame: Option<Bytes>,
+    expires_at: Option<Instant>,
+}
+
+impl PublicMjpegFrameCache {
+    fn get(&self, now: Instant) -> Option<Bytes> {
+        match (self.frame.as_ref(), self.expires_at) {
+            (Some(frame), Some(expires_at)) if expires_at > now => Some(frame.clone()),
+            _ => None,
+        }
+    }
+
+    fn store(&mut self, now: Instant, frame: Bytes) -> Bytes {
+        self.expires_at = now.checked_add(PUBLIC_MJPEG_FRAME_CACHE_TTL);
+        self.frame = Some(frame.clone());
+        frame
+    }
+}
+
+fn public_site_disabled_error(err: &AppError) -> bool {
+    matches!(err, AppError::Forbidden(message) if message == PUBLIC_SITE_PRIVATE_MESSAGE)
 }
 
 async fn build_public_status_mjpeg_frame(state: &AppState) -> Result<Vec<u8>, AppError> {
@@ -320,7 +369,7 @@ async fn ensure_public_site_enabled(state: &AppState) -> Result<(), AppError> {
     if crate::api::v1::settings::public_site_enabled(&state.db).await? {
         Ok(())
     } else {
-        Err(AppError::Forbidden("public status page is private".into()))
+        Err(AppError::Forbidden(PUBLIC_SITE_PRIVATE_MESSAGE.into()))
     }
 }
 
@@ -1491,6 +1540,69 @@ mod tests {
             .iter()
             .all(|item| item.server_id.as_deref() == Some(public_server.as_str())));
         assert!(history.iter().all(|item| item.status == "success"));
+    }
+
+    async fn test_state_with_public_site(enabled: bool) -> AppState {
+        let db = DatabaseBackend::connect("sqlite::memory:", true)
+            .await
+            .unwrap();
+        db.run_migrations().await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = &db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO system_settings (key, value_json, updated_at) VALUES ('public_site_enabled', ?, '2026-06-22T00:00:00Z')",
+        )
+        .bind(if enabled { "true" } else { "false" })
+        .execute(pool)
+        .await
+        .unwrap();
+
+        AppState {
+            db,
+            config: Arc::new(crate::config::Config::default()),
+            agent_jwt_challenges: Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            metrics: xlstatus_tsdb::MetricStore::in_memory(),
+            realtime: crate::realtime::BroadcastHub::new(),
+            session_registry: crate::grpc::SessionRegistry::new(),
+            terminal_sessions: crate::api::v1::terminal::TerminalSessionRegistry::new(),
+            io_registry: crate::grpc::IoRegistry::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn public_mjpeg_cache_hit_reuses_frame_when_site_is_enabled() {
+        let state = test_state_with_public_site(true).await;
+        let cache = Mutex::new(PublicMjpegFrameCache {
+            frame: Some(Bytes::from_static(b"cached-frame")),
+            expires_at: Some(Instant::now() + PUBLIC_MJPEG_FRAME_CACHE_TTL),
+        });
+
+        let frame = cached_public_status_mjpeg_frame_from(&state, &cache)
+            .await
+            .unwrap();
+
+        assert_eq!(&frame[..], b"cached-frame");
+    }
+
+    #[tokio::test]
+    async fn public_mjpeg_cache_is_not_served_after_site_is_disabled() {
+        let state = test_state_with_public_site(false).await;
+        let cache = Mutex::new(PublicMjpegFrameCache {
+            frame: Some(Bytes::from_static(b"cached-frame")),
+            expires_at: Some(Instant::now() + PUBLIC_MJPEG_FRAME_CACHE_TTL),
+        });
+
+        let err = cached_public_status_mjpeg_frame_from(&state, &cache)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            AppError::Forbidden(message) if message == PUBLIC_SITE_PRIVATE_MESSAGE
+        ));
     }
 
     #[test]
