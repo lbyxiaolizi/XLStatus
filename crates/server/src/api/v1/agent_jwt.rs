@@ -15,10 +15,16 @@ const MAX_PENDING_CHALLENGES_PER_AGENT: usize = 16;
 const AGENT_ID_TEXT_LEN: usize = 36;
 const NONCE_HEX_LEN: usize = 64;
 const SIGNATURE_HEX_LEN: usize = 128;
+const CHALLENGE_REQUEST_CLOCK_SKEW_SECONDS: i64 = 120;
+const REQUEST_CHALLENGE_KEY_PREFIX: &str = "request";
+const CHALLENGE_RECORDS_PER_REQUEST: usize = 2;
 
 #[derive(Debug, Deserialize)]
 pub struct GetJwtChallengeRequest {
     pub agent_id: String,
+    pub request_nonce: String,
+    pub request_timestamp: i64,
+    pub signature: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -56,10 +62,27 @@ pub async fn get_agent_jwt_challenge(
         return Err(AppError::Unauthorized("Agent has been revoked".to_string()));
     }
 
+    validate_challenge_request_shape(&req)?;
+    validate_challenge_request_timestamp(req.request_timestamp, Utc::now())?;
+    verify_agent_signature(
+        &agent.public_key,
+        &challenge_request_signature_payload(agent_id, &req.request_nonce, req.request_timestamp),
+        &req.signature,
+    )?;
+
     let now = Utc::now();
     let mut challenges = state.agent_jwt_challenges.write().await;
     prune_expired_challenges(&mut challenges, now);
-    if challenges.len() >= MAX_PENDING_CHALLENGES
+    let request_key = request_challenge_key(agent_id, &req.request_nonce);
+    if challenges.contains_key(&request_key) {
+        return Err(AppError::Unauthorized(
+            "JWT challenge request already used".to_string(),
+        ));
+    }
+    if challenges
+        .len()
+        .saturating_add(CHALLENGE_RECORDS_PER_REQUEST)
+        > MAX_PENDING_CHALLENGES
         || pending_challenges_for_agent(&challenges, agent_id) >= MAX_PENDING_CHALLENGES_PER_AGENT
     {
         return Err(AppError::Forbidden(
@@ -71,6 +94,7 @@ pub async fn get_agent_jwt_challenge(
     rand::thread_rng().fill_bytes(&mut nonce);
     let nonce = hex::encode(nonce);
     let expires_at = now + Duration::seconds(CHALLENGE_TTL_SECONDS);
+    challenges.insert(request_key, expires_at);
     challenges.insert(challenge_key(agent_id, &nonce), expires_at);
 
     Ok(Json(ApiResponse::success(GetJwtChallengeResponse {
@@ -154,6 +178,13 @@ fn challenge_key(agent_id: AgentId, nonce: &str) -> String {
     format!("{}:{}", agent_id.0, nonce)
 }
 
+fn request_challenge_key(agent_id: AgentId, request_nonce: &str) -> String {
+    format!(
+        "{REQUEST_CHALLENGE_KEY_PREFIX}:{}:{}",
+        agent_id.0, request_nonce
+    )
+}
+
 fn prune_expired_challenges(
     challenges: &mut std::collections::HashMap<String, chrono::DateTime<Utc>>,
     now: chrono::DateTime<Utc>,
@@ -170,6 +201,46 @@ fn pending_challenges_for_agent(
         .keys()
         .filter(|key| key.starts_with(&prefix))
         .count()
+}
+
+fn validate_challenge_request_shape(req: &GetJwtChallengeRequest) -> Result<(), AppError> {
+    if !valid_nonce_shape(&req.request_nonce) {
+        return Err(AppError::Unauthorized(
+            "JWT challenge request is invalid".to_string(),
+        ));
+    }
+    if !valid_signature_shape(&req.signature) {
+        return Err(AppError::Unauthorized(
+            "Agent signature verification failed".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_challenge_request_timestamp(
+    request_timestamp: i64,
+    now: chrono::DateTime<Utc>,
+) -> Result<(), AppError> {
+    let now = now.timestamp();
+    if request_timestamp < now - CHALLENGE_REQUEST_CLOCK_SKEW_SECONDS
+        || request_timestamp > now + CHALLENGE_REQUEST_CLOCK_SKEW_SECONDS
+    {
+        return Err(AppError::Unauthorized(
+            "JWT challenge request expired".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn challenge_request_signature_payload(
+    agent_id: AgentId,
+    request_nonce: &str,
+    request_timestamp: i64,
+) -> String {
+    format!(
+        "xlstatus-agent-jwt-challenge:{}:{}:{}",
+        agent_id.0, request_nonce, request_timestamp
+    )
 }
 
 fn valid_nonce_shape(nonce: &str) -> bool {
@@ -228,9 +299,14 @@ fn verify_agent_signature(public_key: &str, nonce: &str, signature: &str) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::{
+        AgentRepository, CreateAgentInput, CreateUserInput, DatabaseBackend, UserRepository,
+    };
+    use ed25519_dalek::{Signer, SigningKey};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::RwLock;
+    use xlstatus_shared::UserRole;
 
     #[test]
     fn challenge_pruning_and_agent_count_ignore_expired_items() {
@@ -294,6 +370,26 @@ mod tests {
     }
 
     #[test]
+    fn challenge_request_timestamp_has_short_window() {
+        let now = Utc::now();
+        assert!(validate_challenge_request_timestamp(now.timestamp(), now).is_ok());
+        assert!(matches!(
+            validate_challenge_request_timestamp(
+                now.timestamp() - CHALLENGE_REQUEST_CLOCK_SKEW_SECONDS - 1,
+                now
+            ),
+            Err(AppError::Unauthorized(_))
+        ));
+        assert!(matches!(
+            validate_challenge_request_timestamp(
+                now.timestamp() + CHALLENGE_REQUEST_CLOCK_SKEW_SECONDS + 1,
+                now
+            ),
+            Err(AppError::Unauthorized(_))
+        ));
+    }
+
+    #[test]
     fn invalid_signature_does_not_remove_challenge() {
         let public_key = "b".repeat(64);
         let nonce = "a".repeat(NONCE_HEX_LEN);
@@ -302,6 +398,87 @@ mod tests {
         let err = verify_agent_signature(&public_key, &nonce, &signature).unwrap_err();
 
         assert!(matches!(err, AppError::Unauthorized(_)));
+    }
+
+    #[tokio::test]
+    async fn jwt_challenge_requires_agent_signature_before_reserving_nonce() {
+        let (state, agent_id, _signing_key) = seeded_agent_state().await;
+        let invalid_signature = "c".repeat(SIGNATURE_HEX_LEN);
+        let err = get_agent_jwt_challenge(
+            State(state.clone()),
+            Json(GetJwtChallengeRequest {
+                agent_id: agent_id.to_string(),
+                request_nonce: "a".repeat(NONCE_HEX_LEN),
+                request_timestamp: Utc::now().timestamp(),
+                signature: invalid_signature,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::Unauthorized(_)));
+        assert!(state.agent_jwt_challenges.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn jwt_challenge_rejects_replayed_signed_request_nonce() {
+        let (state, agent_id, signing_key) = seeded_agent_state().await;
+        let request_nonce = "a".repeat(NONCE_HEX_LEN);
+        let request_timestamp = Utc::now().timestamp();
+        let signature =
+            sign_challenge_request(&signing_key, agent_id, &request_nonce, request_timestamp);
+        let request = || GetJwtChallengeRequest {
+            agent_id: agent_id.to_string(),
+            request_nonce: request_nonce.clone(),
+            request_timestamp,
+            signature: signature.clone(),
+        };
+
+        let _ = get_agent_jwt_challenge(State(state.clone()), Json(request()))
+            .await
+            .expect("first signed challenge request succeeds");
+        let err = get_agent_jwt_challenge(State(state.clone()), Json(request()))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, AppError::Unauthorized(message) if message.contains("already used")));
+        let challenges = state.agent_jwt_challenges.read().await;
+        assert_eq!(challenges.len(), 2);
+        assert!(challenges.contains_key(&request_challenge_key(agent_id, &request_nonce)));
+    }
+
+    #[tokio::test]
+    async fn jwt_challenge_reserves_two_slots_for_global_limit() {
+        let (state, agent_id, signing_key) = seeded_agent_state().await;
+        let now = Utc::now();
+        {
+            let mut challenges = state.agent_jwt_challenges.write().await;
+            for i in 0..(MAX_PENDING_CHALLENGES - 1) {
+                challenges.insert(format!("filler:{i}"), now + Duration::seconds(30));
+            }
+        }
+        let request_nonce = "a".repeat(NONCE_HEX_LEN);
+        let request_timestamp = now.timestamp();
+        let signature =
+            sign_challenge_request(&signing_key, agent_id, &request_nonce, request_timestamp);
+
+        let err = get_agent_jwt_challenge(
+            State(state.clone()),
+            Json(GetJwtChallengeRequest {
+                agent_id: agent_id.to_string(),
+                request_nonce,
+                request_timestamp,
+                signature,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(message) if message.contains("too many")));
+        assert_eq!(
+            state.agent_jwt_challenges.read().await.len(),
+            MAX_PENDING_CHALLENGES - 1
+        );
     }
 
     #[tokio::test]
@@ -327,5 +504,52 @@ mod tests {
             .await
             .unwrap();
         assert!(!store.read().await.contains_key(&key));
+    }
+
+    async fn seeded_agent_state() -> (AppState, AgentId, SigningKey) {
+        let db = DatabaseBackend::connect("sqlite::memory:", true)
+            .await
+            .unwrap();
+        db.run_migrations().await.unwrap();
+        let user = UserRepository::new(db.clone())
+            .create(CreateUserInput {
+                username: format!("user-{}", uuid::Uuid::now_v7()),
+                password: "password".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let public_key = hex::encode(signing_key.verifying_key().to_bytes());
+        let agent = AgentRepository::new(db.clone())
+            .create(CreateAgentInput {
+                name: "agent".into(),
+                public_key,
+                owner_user_id: user.id,
+            })
+            .await
+            .unwrap();
+        let state = AppState {
+            db,
+            config: std::sync::Arc::new(crate::config::Config::default()),
+            agent_jwt_challenges: Arc::new(RwLock::new(HashMap::new())),
+            metrics: xlstatus_tsdb::MetricStore::in_memory(),
+            realtime: crate::realtime::BroadcastHub::new(),
+            session_registry: crate::grpc::SessionRegistry::new(),
+            terminal_sessions: crate::api::v1::terminal::TerminalSessionRegistry::new(),
+            io_registry: crate::grpc::IoRegistry::new(),
+        };
+        (state, agent.id, signing_key)
+    }
+
+    fn sign_challenge_request(
+        signing_key: &SigningKey,
+        agent_id: AgentId,
+        request_nonce: &str,
+        request_timestamp: i64,
+    ) -> String {
+        let payload =
+            challenge_request_signature_payload(agent_id, request_nonce, request_timestamp);
+        hex::encode(signing_key.sign(payload.as_bytes()).to_bytes())
     }
 }

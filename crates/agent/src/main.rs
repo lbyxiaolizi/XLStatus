@@ -1388,9 +1388,20 @@ async fn send_host_state(
 
 async fn fetch_agent_jwt(config: &AgentConfig) -> anyhow::Result<String> {
     let client = reqwest::Client::new();
+    let signing_key = signing_key_from_config(config)?;
+    let request_nonce = random_hex_32();
+    let request_timestamp = now_unix_seconds() as i64;
+    let challenge_signature_payload =
+        agent_jwt_challenge_signature_payload(&config.agent_id, &request_nonce, request_timestamp);
+    let challenge_signature = signing_key.sign(challenge_signature_payload.as_bytes());
     let challenge = client
         .post(format!("{}/api/v1/agents/jwt/challenge", config.server))
-        .json(&serde_json::json!({ "agent_id": config.agent_id }))
+        .json(&serde_json::json!({
+            "agent_id": config.agent_id,
+            "request_nonce": request_nonce,
+            "request_timestamp": request_timestamp,
+            "signature": hex::encode(challenge_signature.to_bytes()),
+        }))
         .send()
         .await?
         .error_for_status()?
@@ -1410,7 +1421,6 @@ async fn fetch_agent_jwt(config: &AgentConfig) -> anyhow::Result<String> {
         .data
         .map(|data| data.nonce)
         .ok_or_else(|| anyhow::anyhow!("jwt challenge response did not include data"))?;
-    let signing_key = signing_key_from_config(config)?;
     let signature = signing_key.sign(nonce.as_bytes());
 
     let response = client
@@ -1439,6 +1449,20 @@ async fn fetch_agent_jwt(config: &AgentConfig) -> anyhow::Result<String> {
         .data
         .map(|data| data.jwt)
         .ok_or_else(|| anyhow::anyhow!("jwt response did not include data"))
+}
+
+fn random_hex_32() -> String {
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+fn agent_jwt_challenge_signature_payload(
+    agent_id: &str,
+    request_nonce: &str,
+    request_timestamp: i64,
+) -> String {
+    format!("xlstatus-agent-jwt-challenge:{agent_id}:{request_nonce}:{request_timestamp}")
 }
 
 fn generate_signing_key() -> SigningKey {

@@ -353,7 +353,7 @@ const ROUTES: &[RouteSpec] = &[
     RouteSpec {
         method: "post",
         path: "/api/v1/agents/jwt/challenge",
-        summary: "Create Agent JWT challenge",
+        summary: "Create signed Agent JWT challenge",
         protected: false,
     },
     RouteSpec {
