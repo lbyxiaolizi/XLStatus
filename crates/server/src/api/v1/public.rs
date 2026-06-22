@@ -171,7 +171,7 @@ pub async fn public_server_detail(
         .await?
         .ok_or(AppError::NotFound("server not found".to_string()))?;
     let dashboard = dashboard_metadata(row.dashboard_metadata_json.as_deref());
-    if !visible_to_public(&dashboard) {
+    if !agent_visible_to_public(&row.agent, &dashboard) {
         return Err(AppError::NotFound("server not found".to_string()));
     }
 
@@ -340,7 +340,7 @@ async fn public_servers(state: &AppState) -> Result<Vec<PublicServerView>, AppEr
     for row in rows.into_iter() {
         let agent = row.agent;
         let dashboard = dashboard_metadata(row.dashboard_metadata_json.as_deref());
-        if !visible_to_public(&dashboard) {
+        if !agent_visible_to_public(&agent, &dashboard) {
             continue;
         }
         let public_note = public_note_from_metadata(&dashboard);
@@ -1161,6 +1161,10 @@ fn visible_to_public(dashboard: &DashboardMetadata) -> bool {
     dashboard.dashboard_visible == Some(true) && dashboard.hide_for_guest != Some(true)
 }
 
+fn agent_visible_to_public(agent: &Agent, dashboard: &DashboardMetadata) -> bool {
+    agent.revoked_at.is_none() && visible_to_public(dashboard)
+}
+
 fn public_note_from_metadata(dashboard: &DashboardMetadata) -> Option<String> {
     dashboard.public_note.clone()
 }
@@ -1757,6 +1761,52 @@ mod tests {
 
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].id, public_server);
+    }
+
+    #[tokio::test]
+    async fn public_server_detail_rejects_revoked_public_agent() {
+        let state = test_state_with_public_site(true).await;
+        let DatabaseBackend::Sqlite(pool) = &state.db else {
+            unreachable!();
+        };
+        let owner = Uuid::now_v7().to_string();
+        seed_public_user(pool, &owner).await;
+        let server_id = Uuid::now_v7().to_string();
+        seed_public_agent(
+            pool,
+            &server_id,
+            &owner,
+            "revoked-public-server",
+            true,
+            false,
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+        sqlx::query(
+            "UPDATE agents SET revoked_at = '2026-06-22T00:00:00Z', last_state_json = ? WHERE id = ?",
+        )
+        .bind(
+            serde_json::json!({
+                "cpu_percent": 91.0,
+                "memory_used": 1024,
+                "memory_total": 2048
+            })
+            .to_string(),
+        )
+        .bind(&server_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let uri: Uri = format!("/api/v1/public/servers/{server_id}")
+            .parse()
+            .unwrap();
+        let err = match public_server_detail(axum::extract::State(state), uri).await {
+            Ok(_) => panic!("revoked public agent detail must be hidden"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, AppError::NotFound(message) if message == "server not found"));
     }
 
     #[tokio::test]
