@@ -337,50 +337,21 @@ async fn run_temp_download(
         .rsplit('/')
         .find(|part| !part.is_empty())
         .unwrap_or("download.bin");
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/octet-stream"),
-    );
-    headers.insert(
-        header::CONTENT_LENGTH,
-        match HeaderValue::from_str(&data.len().to_string()) {
-            Ok(value) => value,
-            Err(e) => {
-                let err = (StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
-                record_temporary_transfer_result(
-                    &state,
-                    &transfer.token_id,
-                    "failed",
-                    Some(&dispatched.run_id),
-                    Some(&err.1),
-                )
-                .await;
-                return Err(err);
-            }
-        },
-    );
-    headers.insert(
-        header::CONTENT_DISPOSITION,
-        match HeaderValue::from_str(&format!(
-            "attachment; filename=\"{}\"",
-            sanitize_filename(filename)
-        )) {
-            Ok(value) => value,
-            Err(e) => {
-                let err = (StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
-                record_temporary_transfer_result(
-                    &state,
-                    &transfer.token_id,
-                    "failed",
-                    Some(&dispatched.run_id),
-                    Some(&err.1),
-                )
-                .await;
-                return Err(err);
-            }
-        },
-    );
+    let headers = match temporary_download_headers(data.len(), filename) {
+        Ok(headers) => headers,
+        Err(e) => {
+            let err = (StatusCode::INTERNAL_SERVER_ERROR, e);
+            record_temporary_transfer_result(
+                &state,
+                &transfer.token_id,
+                "failed",
+                Some(&dispatched.run_id),
+                Some(&err.1),
+            )
+            .await;
+            return Err(err);
+        }
+    };
     record_temporary_transfer_result(
         &state,
         &transfer.token_id,
@@ -519,12 +490,14 @@ async fn run_temp_upload(
         None,
     )
     .await;
-    Ok(Json(ApiResponse::success(serde_json::json!({
-        "server_id": server_id,
-        "path": path,
-        "bytes_written": written,
-    })))
-    .into_response())
+    Ok(no_store_response(
+        Json(ApiResponse::success(serde_json::json!({
+            "server_id": server_id,
+            "path": path,
+            "bytes_written": written,
+        })))
+        .into_response(),
+    ))
 }
 
 async fn read_limited_upload_body(body: Body) -> Result<Bytes, (StatusCode, String)> {
@@ -954,15 +927,50 @@ fn sanitize_filename(filename: &str) -> String {
 }
 
 fn json_error(status: StatusCode, message: String) -> Response {
-    (
-        status,
-        Json(ApiResponse::<serde_json::Value> {
-            success: false,
-            data: None,
-            error: Some(message),
-        }),
+    no_store_response(
+        (
+            status,
+            Json(ApiResponse::<serde_json::Value> {
+                success: false,
+                data: None,
+                error: Some(message),
+            }),
+        )
+            .into_response(),
     )
-        .into_response()
+}
+
+fn temporary_download_headers(data_len: usize, filename: &str) -> Result<HeaderMap, String> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    headers.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&data_len.to_string()).map_err(|e| e.to_string())?,
+    );
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!(
+            "attachment; filename=\"{}\"",
+            sanitize_filename(filename)
+        ))
+        .map_err(|e| e.to_string())?,
+    );
+    insert_no_store_headers(&mut headers);
+    Ok(headers)
+}
+
+fn no_store_response(mut response: Response) -> Response {
+    insert_no_store_headers(response.headers_mut());
+    response
+}
+
+fn insert_no_store_headers(headers: &mut HeaderMap) {
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    headers.insert(header::EXPIRES, HeaderValue::from_static("0"));
 }
 
 fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
@@ -1070,6 +1078,22 @@ mod tests {
             .unwrap();
         let query = parse_temp_transfer_query(&uri).unwrap();
         assert_eq!(query.token, token);
+    }
+
+    #[test]
+    fn temporary_transfer_responses_are_not_cacheable() {
+        let headers = temporary_download_headers(42, "secret.txt").unwrap();
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+        assert_eq!(headers.get(header::PRAGMA).unwrap(), "no-cache");
+        assert_eq!(headers.get(header::EXPIRES).unwrap(), "0");
+
+        let response = json_error(StatusCode::FORBIDDEN, "invalid token".into());
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        assert_eq!(response.headers().get(header::PRAGMA).unwrap(), "no-cache");
+        assert_eq!(response.headers().get(header::EXPIRES).unwrap(), "0");
     }
 
     #[tokio::test]

@@ -886,9 +886,14 @@ struct AgentInstallQuery {
 }
 
 async fn install_agent_script(headers: HeaderMap, uri: Uri) -> Response {
-    match parse_agent_install_query(&uri)
-        .and_then(|query| build_install_agent_script(&headers, query))
-    {
+    install_agent_script_response(
+        parse_agent_install_query(&uri)
+            .and_then(|query| build_install_agent_script(&headers, query)),
+    )
+}
+
+fn install_agent_script_response(result: Result<String, String>) -> Response {
+    match result {
         Ok(body) => (
             [
                 (
@@ -899,16 +904,24 @@ async fn install_agent_script(headers: HeaderMap, uri: Uri) -> Response {
                     header::CONTENT_DISPOSITION,
                     HeaderValue::from_static("attachment; filename=\"install-agent.sh\""),
                 ),
+                (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+                (header::PRAGMA, HeaderValue::from_static("no-cache")),
+                (header::EXPIRES, HeaderValue::from_static("0")),
             ],
             body,
         )
             .into_response(),
         Err(message) => (
             StatusCode::BAD_REQUEST,
-            [(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("text/plain; charset=utf-8"),
-            )],
+            [
+                (
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("text/plain; charset=utf-8"),
+                ),
+                (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+                (header::PRAGMA, HeaderValue::from_static("no-cache")),
+                (header::EXPIRES, HeaderValue::from_static("0")),
+            ],
             message,
         )
             .into_response(),
@@ -1416,6 +1429,17 @@ mod tests {
             .unwrap();
         let err = ensure_http_path_length(&uri).unwrap_err();
         assert!(err.contains("path must be at most"));
+    }
+
+    #[test]
+    fn install_bootstrap_response_is_not_cacheable() {
+        let response = install_agent_script_response(Ok("body".into()));
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        assert_eq!(response.headers().get(header::PRAGMA).unwrap(), "no-cache");
+        assert_eq!(response.headers().get(header::EXPIRES).unwrap(), "0");
     }
 
     #[test]
