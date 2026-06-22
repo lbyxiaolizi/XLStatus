@@ -6,6 +6,7 @@ use crate::api::v1::auth::{AppError, AppState};
 use crate::api::v1::notifications::ensure_notification_group_owned_by;
 use crate::api::v1::servers::server_visible;
 use crate::api::v1::services::ensure_service_id_visible_to_auth;
+use crate::api::v1::tasks::ensure_task_ids_visible_to_auth_session;
 use crate::auth::middleware::AuthSession;
 use crate::auth::rbac::has_scope;
 use crate::db::repository::alerts::{AlertEventRepository, AlertRepository};
@@ -80,8 +81,8 @@ pub async fn create_alert_rule(
     .await?;
     let failure_task_ids = normalize_id_list(req.failure_task_ids, "failure_task_ids")?;
     let recovery_task_ids = normalize_id_list(req.recovery_task_ids, "recovery_task_ids")?;
-    ensure_tasks_owned_by(&state.db, &owner, &failure_task_ids).await?;
-    ensure_tasks_owned_by(&state.db, &owner, &recovery_task_ids).await?;
+    ensure_tasks_visible_to_auth(&state.db, &auth, &failure_task_ids).await?;
+    ensure_tasks_visible_to_auth(&state.db, &auth, &recovery_task_ids).await?;
     let repo = AlertRepository::new(state.db.clone());
     let row = repo
         .create(
@@ -254,44 +255,12 @@ fn row_to_view(r: &crate::db::repository::alerts::AlertRuleRow) -> AlertRuleView
     }
 }
 
-async fn ensure_tasks_owned_by(
+async fn ensure_tasks_visible_to_auth(
     db: &crate::db::Db,
-    owner_user_id: &str,
+    auth: &AuthSession,
     task_ids: &[String],
 ) -> Result<(), AppError> {
-    for task_id in task_ids {
-        let exists = match db {
-            crate::db::DatabaseBackend::Sqlite(pool) => {
-                let row: (i64,) =
-                    sqlx::query_as("SELECT COUNT(*) FROM tasks WHERE id = ? AND owner_user_id = ?")
-                        .bind(task_id)
-                        .bind(owner_user_id)
-                        .fetch_one(pool)
-                        .await
-                        .map_err(db_err)?;
-                row.0 > 0
-            }
-            crate::db::DatabaseBackend::Postgres(pool) => {
-                let owner = uuid::Uuid::parse_str(owner_user_id)
-                    .map_err(|e| AppError::BadRequest(format!("invalid owner_user_id: {e}")))?;
-                let row: (i64,) = sqlx::query_as(
-                    "SELECT COUNT(*) FROM tasks WHERE id = $1 AND owner_user_id = $2",
-                )
-                .bind(task_id)
-                .bind(owner)
-                .fetch_one(pool)
-                .await
-                .map_err(db_err)?;
-                row.0 > 0
-            }
-        };
-        if !exists {
-            return Err(AppError::BadRequest(format!(
-                "task {task_id} does not exist or is not owned by current user"
-            )));
-        }
-    }
-    Ok(())
+    ensure_task_ids_visible_to_auth_session(db, auth, task_ids).await
 }
 
 async fn ensure_alert_conditions_visible_to_auth(
@@ -407,10 +376,6 @@ fn normalize_id_list(values: Vec<String>, field: &str) -> Result<Vec<String>, Ap
     Ok(out)
 }
 
-fn db_err(err: sqlx::Error) -> AppError {
-    AppError::Database(anyhow::anyhow!(err))
-}
-
 fn parse_conditions(items: &[JsonValue]) -> Result<Vec<AlertCondition>, AppError> {
     if items.is_empty() {
         return Err(AppError::BadRequest(
@@ -473,6 +438,7 @@ mod tests {
     use crate::auth::middleware::AuthKind;
     use crate::db::DatabaseBackend;
     use std::sync::Arc;
+    use xlstatus_shared::tasks::{CoverMode, TaskType};
     use xlstatus_shared::{UserId, UserRole};
 
     #[tokio::test]
@@ -543,6 +509,34 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn alert_rule_trigger_tasks_must_be_visible_to_pat_allowlist() {
+        let db = test_db().await;
+        let owner = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let allowed_server = "00000000-0000-0000-0000-000000000101";
+        let blocked_server = "00000000-0000-0000-0000-000000000202";
+        let blocked_task = "00000000-0000-0000-0000-000000000301";
+
+        seed_user(&db, owner, "owner", "admin").await;
+        seed_task_with_selector(
+            &db,
+            blocked_task,
+            owner,
+            serde_json::json!({ "server_ids": [blocked_server] }),
+        )
+        .await;
+
+        let err = ensure_tasks_visible_to_auth(
+            &db,
+            &pat_alert_session(owner, UserRole::Admin, &[allowed_server]),
+            &[blocked_task.to_string()],
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
     }
 
     #[tokio::test]
@@ -904,6 +898,28 @@ mod tests {
         .bind(rule_id)
         .bind(agent_id)
         .bind(fired_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_task_with_selector(
+        db: &DatabaseBackend,
+        id: &str,
+        owner: uuid::Uuid,
+        selector: serde_json::Value,
+    ) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO tasks (id, owner_user_id, name, task_type, command, cover_mode, server_selector_json, created_at, updated_at) VALUES (?, ?, 'task', ?, 'true', ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(owner.to_string())
+        .bind(serde_json::to_string(&TaskType::Shell).unwrap())
+        .bind(serde_json::to_string(&CoverMode::Specific).unwrap())
+        .bind(selector.to_string())
         .execute(pool)
         .await
         .unwrap();

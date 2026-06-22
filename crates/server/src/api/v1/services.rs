@@ -2,6 +2,7 @@ use crate::api::types::*;
 use crate::api::v1::auth::{AppError, AppState};
 use crate::api::v1::notifications::ensure_notification_group_owned_by;
 use crate::api::v1::servers::agent_visible;
+use crate::api::v1::tasks::ensure_task_ids_visible_to_auth_session;
 use crate::auth::middleware::AuthSession;
 use crate::auth::rbac::has_scope;
 use crate::db::AgentRepository;
@@ -306,8 +307,8 @@ pub async fn create_service(
         input.notification_group_id.as_deref(),
     )
     .await?;
-    ensure_tasks_owned_by(&state.db, &owner, &input.failure_task_ids).await?;
-    ensure_tasks_owned_by(&state.db, &owner, &input.recovery_task_ids).await?;
+    ensure_tasks_visible_to_auth(&state.db, &auth, &input.failure_task_ids).await?;
+    ensure_tasks_visible_to_auth(&state.db, &auth, &input.recovery_task_ids).await?;
     let id = Uuid::now_v7().to_string();
     let now = Utc::now();
     let now_text = now.to_rfc3339();
@@ -400,8 +401,8 @@ pub async fn update_service(
         input.notification_group_id.as_deref(),
     )
     .await?;
-    ensure_tasks_owned_by(&state.db, &owner, &input.failure_task_ids).await?;
-    ensure_tasks_owned_by(&state.db, &owner, &input.recovery_task_ids).await?;
+    ensure_tasks_visible_to_auth(&state.db, &auth, &input.failure_task_ids).await?;
+    ensure_tasks_visible_to_auth(&state.db, &auth, &input.recovery_task_ids).await?;
     let now = Utc::now();
     let now_text = now.to_rfc3339();
     let failure_task_ids_json = task_ids_json(&input.failure_task_ids)?;
@@ -1295,44 +1296,12 @@ fn service_effective_server_ids(service: &ServiceResponse) -> Vec<String> {
     server_ids
 }
 
-async fn ensure_tasks_owned_by(
+async fn ensure_tasks_visible_to_auth(
     db: &crate::db::Db,
-    owner_user_id: &str,
+    auth: &AuthSession,
     task_ids: &[String],
 ) -> Result<(), AppError> {
-    for task_id in task_ids {
-        let exists = match db {
-            crate::db::DatabaseBackend::Sqlite(pool) => {
-                let row: (i64,) =
-                    sqlx::query_as("SELECT COUNT(*) FROM tasks WHERE id = ? AND owner_user_id = ?")
-                        .bind(task_id)
-                        .bind(owner_user_id)
-                        .fetch_one(pool)
-                        .await
-                        .map_err(db_err)?;
-                row.0 > 0
-            }
-            crate::db::DatabaseBackend::Postgres(pool) => {
-                let owner = Uuid::parse_str(owner_user_id)
-                    .map_err(|e| AppError::BadRequest(format!("invalid owner_user_id: {e}")))?;
-                let row: (i64,) = sqlx::query_as(
-                    "SELECT COUNT(*) FROM tasks WHERE id = $1 AND owner_user_id = $2",
-                )
-                .bind(task_id)
-                .bind(owner)
-                .fetch_one(pool)
-                .await
-                .map_err(db_err)?;
-                row.0 > 0
-            }
-        };
-        if !exists {
-            return Err(AppError::BadRequest(format!(
-                "task {task_id} does not exist or is not owned by current user"
-            )));
-        }
-    }
-    Ok(())
+    ensure_task_ids_visible_to_auth_session(db, auth, task_ids).await
 }
 
 async fn replace_service_servers(
@@ -1480,6 +1449,7 @@ mod tests {
     use super::*;
     use crate::auth::middleware::AuthKind;
     use crate::db::DatabaseBackend;
+    use xlstatus_shared::tasks::{CoverMode, TaskType};
     use xlstatus_shared::{UserId, UserRole};
 
     #[tokio::test]
@@ -1624,6 +1594,36 @@ mod tests {
             &db,
             &admin_pat_session(admin, vec![allowed_server.to_string()]),
             &input,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn admin_pat_service_trigger_tasks_must_be_visible() {
+        let db = test_db().await;
+        let admin = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let allowed_server = Uuid::parse_str("00000000-0000-0000-0000-000000000101").unwrap();
+        let blocked_server = Uuid::parse_str("00000000-0000-0000-0000-000000000202").unwrap();
+        let blocked_task = "00000000-0000-0000-0000-000000000301";
+
+        seed_user(&db, admin, "admin", "admin").await;
+        seed_agent(&db, allowed_server, admin, "allowed").await;
+        seed_agent(&db, blocked_server, admin, "blocked").await;
+        seed_task_with_selector(
+            &db,
+            blocked_task,
+            admin,
+            serde_json::json!({ "server_ids": [blocked_server.to_string()] }),
+        )
+        .await;
+
+        let err = ensure_tasks_visible_to_auth(
+            &db,
+            &admin_pat_session(admin, vec![allowed_server.to_string()]),
+            &[blocked_task.to_string()],
         )
         .await
         .unwrap_err();
@@ -1902,5 +1902,27 @@ mod tests {
             .await
             .unwrap();
         }
+    }
+
+    async fn seed_task_with_selector(
+        db: &DatabaseBackend,
+        id: &str,
+        owner: Uuid,
+        selector: serde_json::Value,
+    ) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO tasks (id, owner_user_id, name, task_type, command, cover_mode, server_selector_json, created_at, updated_at) VALUES (?, ?, 'task', ?, 'true', ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(owner.to_string())
+        .bind(serde_json::to_string(&TaskType::Shell).unwrap())
+        .bind(serde_json::to_string(&CoverMode::Specific).unwrap())
+        .bind(selector.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
     }
 }

@@ -552,6 +552,32 @@ pub fn task_body_limit() -> DefaultBodyLimit {
     DefaultBodyLimit::max(TASK_API_MAX_BODY_BYTES)
 }
 
+pub(crate) async fn ensure_task_ids_visible_to_auth_session(
+    db: &Db,
+    auth: &AuthSession,
+    task_ids: &[String],
+) -> Result<(), AppError> {
+    let owner_user_id = auth.user_id.0.to_string();
+    for task_id in task_ids {
+        let task = TaskRepository::get_by_id(db, task_id)
+            .await
+            .map_err(AppError::Database)?
+            .ok_or_else(|| {
+                AppError::BadRequest(format!(
+                    "task {task_id} does not exist or is not owned by current user"
+                ))
+            })?;
+        if task.owner_user_id != owner_user_id {
+            return Err(AppError::BadRequest(format!(
+                "task {task_id} does not exist or is not owned by current user"
+            )));
+        }
+        validate_task_selector_for_session(auth, &task.server_selector_json)
+            .map_err(|_| AppError::Forbidden("trigger task not in scope".into()))?;
+    }
+    Ok(())
+}
+
 async fn list_visible_tasks(
     db: &Db,
     auth_user: &AuthUser,
@@ -637,6 +663,13 @@ fn validate_task_selector_or_403(
     auth_user: &AuthUser,
     selector_json: &str,
 ) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
+    validate_task_selector_for_session(&auth_user.auth_session(), selector_json)
+}
+
+fn validate_task_selector_for_session(
+    session: &AuthSession,
+    selector_json: &str,
+) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
     let selector: ServerSelector = match serde_json::from_str(selector_json) {
         Ok(s) => s,
         Err(_) => {
@@ -649,9 +682,8 @@ fn validate_task_selector_or_403(
 
     let mut scoped_server_ids = selector.server_ids.clone();
     scoped_server_ids.extend(selector.exclude_server_ids.clone());
-    let session = auth_user.auth_session();
 
-    if auth_user.server_ids.is_some() {
+    if session.server_ids.is_some() {
         let has_dynamic_selector = selector.source_server
             || !selector.group_ids.is_empty()
             || !selector.tag_names.is_empty()
@@ -662,13 +694,13 @@ fn validate_task_selector_or_403(
                 "PAT-scoped tasks must target explicit servers in the allowlist",
             ));
         }
-        if !can_access_servers(&session, &scoped_server_ids) {
+        if !can_access_servers(session, &scoped_server_ids) {
             return Err(api_error(
                 StatusCode::FORBIDDEN,
                 "server_selector_json contains servers outside PAT allowlist",
             ));
         }
-    } else if !scoped_server_ids.is_empty() && !can_access_servers(&session, &scoped_server_ids) {
+    } else if !scoped_server_ids.is_empty() && !can_access_servers(session, &scoped_server_ids) {
         return Err(api_error(
             StatusCode::FORBIDDEN,
             "server_selector_json contains servers outside PAT allowlist",

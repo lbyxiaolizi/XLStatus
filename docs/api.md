@@ -114,7 +114,7 @@ Enrollment token 创建请求体上限为 4KiB，`expires_in_hours` 必须在 1 
 | `GET` | `/api/v1/services/:id/history` | 历史结果 |
 | `GET` | `/api/v1/services/:id/uptime` | 可用率 |
 
-服务创建、更新和测试探测请求体上限为 128KiB。服务名称最长 128 字节，target 最长 2048 字节，`interval_seconds` 必须在 10 到 86400 秒之间，`timeout_seconds` 必须在 1 到 30 秒之间。单个服务最多关联或排除 64 台服务器，失败/恢复触发任务各最多 32 个；后台一次服务探测最多下发到 64 台 Agent。服务列表会在 SQL 层按当前凭据可见服务器过滤后再分页/count；服务历史和 uptime 会在 SQL 层按当前凭据可见的 `service_results.server_id` 过滤后再应用 `limit` / `offset` 或聚合。
+服务创建、更新和测试探测请求体上限为 128KiB。服务名称最长 128 字节，target 最长 2048 字节，`interval_seconds` 必须在 10 到 86400 秒之间，`timeout_seconds` 必须在 1 到 30 秒之间。单个服务最多关联或排除 64 台服务器，失败/恢复触发任务各最多 32 个；引用的触发任务必须属于当前用户，且其任务选择器也必须对当前凭据可见。后台一次服务探测最多下发到 64 台 Agent。服务列表会在 SQL 层按当前凭据可见服务器过滤后再分页/count；服务历史和 uptime 会在 SQL 层按当前凭据可见的 `service_results.server_id` 过滤后再应用 `limit` / `offset` 或聚合。
 
 ### 告警
 
@@ -125,7 +125,7 @@ Enrollment token 创建请求体上限为 4KiB，`expires_in_hours` 必须在 1 
 | `DELETE` | `/api/v1/alert-rules/:id` | 删除告警规则 |
 | `GET` | `/api/v1/alert-events` | 告警事件 |
 
-告警规则创建请求体上限为 64KiB。规则名称最长 128 字节，单条规则最多 32 个条件、单个条件 JSON 最长 4KiB，失败/恢复触发任务各最多 32 个 UUID。
+告警规则创建请求体上限为 64KiB。规则名称最长 128 字节，单条规则最多 32 个条件、单个条件 JSON 最长 4KiB，失败/恢复触发任务各最多 32 个 UUID；引用的触发任务必须属于当前用户，且其任务选择器也必须对当前凭据可见。
 
 `GET /api/v1/alert-events` 会按规则 owner 与 PAT server allowlist 在 SQL 层过滤后再应用 `limit`。非管理员只能读取自己规则产生的事件；带 server allowlist 的 PAT 只能读取 `agent_id` 命中 allowlist 的事件，服务类事件如果没有可推断的唯一 `agent_id` 会保守隐藏。
 
