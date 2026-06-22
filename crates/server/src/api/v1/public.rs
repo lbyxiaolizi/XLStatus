@@ -7,8 +7,8 @@ use crate::api::v1::themes::{selected_public_theme, ThemeDefinition};
 use crate::db::{AgentRepository, DatabaseBackend};
 use axum::{
     body::{Body, Bytes},
-    extract::{Path, State},
-    http::{header, HeaderValue, StatusCode},
+    extract::State,
+    http::{header, HeaderValue, StatusCode, Uri},
     response::{IntoResponse, Response},
     Json,
 };
@@ -30,6 +30,7 @@ const MJPEG_BOUNDARY: &str = "xlstatus-status";
 const PUBLIC_MJPEG_MAX_CONNECTIONS: usize = 32;
 const PUBLIC_METRIC_SAMPLE_LIMIT: usize = 240;
 const PUBLIC_SERVICE_HISTORY_LIMIT: i64 = 240;
+const PUBLIC_SERVER_ID_PATH_BYTES: usize = 36;
 
 static PUBLIC_MJPEG_CONNECTIONS: once_cell::sync::Lazy<Arc<Semaphore>> =
     once_cell::sync::Lazy::new(|| Arc::new(Semaphore::new(PUBLIC_MJPEG_MAX_CONNECTIONS)));
@@ -153,11 +154,11 @@ pub async fn public_status(
 
 pub async fn public_server_detail(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    uri: Uri,
 ) -> Result<Json<ApiResponse<PublicServerDetailView>>, AppError> {
     ensure_public_site_enabled(&state).await?;
     let include_server_details = public_server_details_enabled(&state.db).await?;
-    let agent_id = parse_agent_id(&id)?;
+    let agent_id = parse_public_server_id_path(&uri)?;
     let agent_repo = AgentRepository::new(state.db.clone());
     let row = agent_repo
         .find_by_id_with_state(agent_id)
@@ -877,7 +878,27 @@ fn glyph(ch: char) -> [u8; 7] {
     }
 }
 
-fn parse_agent_id(id: &str) -> Result<AgentId, AppError> {
+fn parse_public_server_id_path(uri: &Uri) -> Result<AgentId, AppError> {
+    let path = uri.path();
+    let Some(id) = path.strip_prefix("/api/v1/public/servers/") else {
+        return Err(AppError::BadRequest(
+            "public server path is invalid".to_string(),
+        ));
+    };
+    if id.is_empty() || id.contains('/') {
+        return Err(AppError::BadRequest(
+            "public server path is invalid".to_string(),
+        ));
+    }
+    parse_public_server_id(id)
+}
+
+fn parse_public_server_id(id: &str) -> Result<AgentId, AppError> {
+    if id.len() > PUBLIC_SERVER_ID_PATH_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "public server id must be at most {PUBLIC_SERVER_ID_PATH_BYTES} bytes"
+        )));
+    }
     Uuid::parse_str(id)
         .map(AgentId)
         .map_err(|e| AppError::BadRequest(format!("invalid server id: {e}")))
@@ -1267,6 +1288,30 @@ mod tests {
 
         metadata.hide_for_guest = Some(true);
         assert!(!visible_to_public(&metadata));
+    }
+
+    #[test]
+    fn public_server_detail_path_bounds_id_before_uuid_parse() {
+        assert_eq!(PUBLIC_SERVER_ID_PATH_BYTES, 36);
+
+        let id = Uuid::now_v7();
+        let uri: Uri = format!("/api/v1/public/servers/{id}").parse().unwrap();
+        assert_eq!(parse_public_server_id_path(&uri).unwrap().0, id);
+
+        let uri: Uri = format!(
+            "/api/v1/public/servers/{}",
+            "a".repeat(PUBLIC_SERVER_ID_PATH_BYTES + 1)
+        )
+        .parse()
+        .unwrap();
+        let err = parse_public_server_id_path(&uri).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(message) if message.contains("at most")));
+
+        let uri: Uri = format!("/api/v1/public/servers/{id}/metrics")
+            .parse()
+            .unwrap();
+        let err = parse_public_server_id_path(&uri).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(message) if message.contains("invalid")));
     }
 
     #[test]
