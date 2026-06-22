@@ -32,6 +32,7 @@ type HmacSha256 = Hmac<Sha256>;
 const OAUTH_STATE_COOKIE_NAME: &str = "xlstatus_oauth_state";
 const OAUTH_STATE_COOKIE_PATH: &str = "/api/v1/oauth2";
 const OAUTH_STATE_TTL_SECONDS: i64 = 10 * 60;
+const OAUTH_MAX_PROVIDER_ID_BYTES: usize = 64;
 const OAUTH_MAX_QUERY_BYTES: usize = 16 * 1024;
 const OAUTH_MAX_STATE_BYTES: usize = 4096;
 const OAUTH_MAX_RETURN_TO_BYTES: usize = 1024;
@@ -145,9 +146,9 @@ pub async fn start_oauth_login(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Path(provider_id): Path<String>,
     uri: Uri,
 ) -> Result<Response, AppError> {
+    let provider_id = parse_oauth_provider_path(&uri, false)?;
     let query = parse_oauth_start_query(&uri)?;
     let client_ip = crate::security::client_ip_from_headers_and_peer(&headers, Some(peer_addr));
     if active_waf_ban(&state.db, &client_ip).await?.is_some() {
@@ -178,9 +179,9 @@ pub async fn start_oauth_login(
 pub async fn start_oauth_bind(
     State(state): State<AppState>,
     auth_user: AuthUser,
-    Path(provider_id): Path<String>,
     uri: Uri,
 ) -> Result<Response, AppError> {
+    let provider_id = parse_oauth_provider_path(&uri, true)?;
     let query = parse_oauth_start_query(&uri)?;
     require_cookie_session(&auth_user)?;
     let provider = oauth_provider(&state, &provider_id)?;
@@ -211,9 +212,7 @@ pub async fn unbind_oauth_provider(
     Path(provider_id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
     require_cookie_session(&auth_user)?;
-    if provider_id.trim().is_empty() {
-        return Err(AppError::BadRequest("OAuth provider is required".into()));
-    }
+    let provider_id = normalize_oauth_provider_id(&provider_id)?;
     delete_oauth_account(&state.db, auth_user.user.id, &provider_id).await?;
     Ok(Json(ApiResponse::success(())))
 }
@@ -525,11 +524,54 @@ fn oauth_provider<'a>(
     state: &'a AppState,
     provider_id: &str,
 ) -> Result<&'a OidcProviderConfig, AppError> {
+    let provider_id = normalize_oauth_provider_id(provider_id)?;
     state
         .config
         .oauth2
-        .provider(provider_id)
+        .provider(&provider_id)
         .ok_or(AppError::NotFound("OAuth provider not found".into()))
+}
+
+fn parse_oauth_provider_path(uri: &Uri, bind: bool) -> Result<String, AppError> {
+    let path = uri.path();
+    let Some(rest) = path.strip_prefix("/api/v1/oauth2/") else {
+        return Err(AppError::BadRequest(
+            "OAuth provider path is invalid".into(),
+        ));
+    };
+    let provider_id = if bind {
+        rest.strip_suffix("/bind")
+            .ok_or_else(|| AppError::BadRequest("OAuth provider path is invalid".into()))?
+    } else {
+        rest
+    };
+    if provider_id.contains('/') {
+        return Err(AppError::BadRequest(
+            "OAuth provider path is invalid".into(),
+        ));
+    }
+    normalize_oauth_provider_id(provider_id)
+}
+
+fn normalize_oauth_provider_id(value: &str) -> Result<String, AppError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(AppError::BadRequest("OAuth provider is required".into()));
+    }
+    if value.len() > OAUTH_MAX_PROVIDER_ID_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "OAuth provider must be at most {OAUTH_MAX_PROVIDER_ID_BYTES} bytes"
+        )));
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(AppError::BadRequest(
+            "OAuth provider contains invalid characters".into(),
+        ));
+    }
+    Ok(value.to_string())
 }
 
 fn authorize_url(
@@ -1366,10 +1408,38 @@ mod tests {
 
     #[test]
     fn validates_oauth_text_size_boundaries() {
+        assert_eq!(OAUTH_MAX_PROVIDER_ID_BYTES, 64);
         assert_eq!(OAUTH_MAX_QUERY_BYTES, 16 * 1024);
         assert!(ensure_oauth_text_size("abc", 1, 3, "field").is_ok());
         assert!(ensure_oauth_text_size("", 1, 3, "field").is_err());
         assert!(ensure_oauth_text_size("abcd", 1, 3, "field").is_err());
+    }
+
+    #[test]
+    fn oauth_provider_path_is_bounded_before_path_deserialize() {
+        let uri: Uri = "/api/v1/oauth2/oidc?return_to=%2Fsettings".parse().unwrap();
+        assert_eq!(parse_oauth_provider_path(&uri, false).unwrap(), "oidc");
+
+        let uri: Uri = "/api/v1/oauth2/oidc-prod_1/bind?return_to=%2Fsettings"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            parse_oauth_provider_path(&uri, true).unwrap(),
+            "oidc-prod_1"
+        );
+
+        let uri: Uri = format!(
+            "/api/v1/oauth2/{}?return_to=%2Fsettings",
+            "a".repeat(OAUTH_MAX_PROVIDER_ID_BYTES + 1)
+        )
+        .parse()
+        .unwrap();
+        assert!(parse_oauth_provider_path(&uri, false).is_err());
+
+        let uri: Uri = "/api/v1/oauth2/oidc%2Fbad?return_to=%2Fsettings"
+            .parse()
+            .unwrap();
+        assert!(parse_oauth_provider_path(&uri, false).is_err());
     }
 
     #[test]
