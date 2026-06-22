@@ -25,6 +25,7 @@ const MCP_EXEC_MAX_COMMAND_BYTES: usize = 8192;
 const MCP_EXEC_DEFAULT_TIMEOUT_SECS: u32 = 30;
 const MCP_EXEC_MAX_TIMEOUT_SECS: u32 = 60;
 const MCP_EXEC_RESULT_MAX_BYTES: usize = 64 * 1024;
+const MCP_UUID_TEXT_LEN: usize = 36;
 pub(crate) const TEMP_URL_DEFAULT_EXPIRES_SECS: i64 = 300;
 pub(crate) const TEMP_URL_MAX_EXPIRES_SECS: i64 = 600;
 
@@ -146,9 +147,10 @@ impl McpExecutor {
     ) -> Result<serde_json::Value> {
         let server_id = args["server_id"].as_str().context("Missing server_id")?;
         let agent = self.ensure_agent_visible(auth, server_id).await?;
+        let server_id = agent.id.0.to_string();
 
         Ok(json!({
-            "server_id": agent.id.0.to_string(),
+            "server_id": server_id,
             "name": agent.name,
             "online": agent.last_seen_at
                 .map(|last_seen| chrono::Utc::now().signed_duration_since(last_seen).num_seconds() <= 30)
@@ -167,7 +169,8 @@ impl McpExecutor {
         args: &serde_json::Value,
     ) -> Result<serde_json::Value> {
         let server_id = args["server_id"].as_str().context("Missing server_id")?;
-        let agent_id = self.ensure_agent_visible(auth, server_id).await?.id;
+        let agent_id = self.ensure_agent_active(auth, server_id).await?.id;
+        let server_id = agent_id.0.to_string();
         let command = validate_exec_command(args["command"].as_str().context("Missing command")?)?;
         let timeout = normalize_exec_timeout(args["timeout"].as_i64());
 
@@ -230,11 +233,12 @@ impl McpExecutor {
         args: &serde_json::Value,
     ) -> Result<serde_json::Value> {
         let server_id = args["server_id"].as_str().context("Missing server_id")?;
-        self.ensure_agent_active(auth, server_id).await?;
+        let agent = self.ensure_agent_active(auth, server_id).await?;
+        let server_id = agent.id.0.to_string();
         let path = validate_abs_path(args["path"].as_str().context("Missing path")?)?;
         let result = self
             .dispatch_file_task(
-                server_id,
+                &server_id,
                 ServerTask {
                     task_id: String::new(),
                     task_type: TaskType::FileList as i32,
@@ -261,7 +265,8 @@ impl McpExecutor {
         args: &serde_json::Value,
     ) -> Result<serde_json::Value> {
         let server_id = args["server_id"].as_str().context("Missing server_id")?;
-        self.ensure_agent_active(auth, server_id).await?;
+        let agent = self.ensure_agent_active(auth, server_id).await?;
+        let server_id = agent.id.0.to_string();
         let path = validate_abs_path(args["path"].as_str().context("Missing path")?)?;
         let max_size = args["max_size"]
             .as_u64()
@@ -269,7 +274,7 @@ impl McpExecutor {
             .clamp(1, MCP_FILE_READ_MAX_BYTES);
         let result = self
             .dispatch_file_task(
-                server_id,
+                &server_id,
                 ServerTask {
                     task_id: String::new(),
                     task_type: TaskType::FileRead as i32,
@@ -311,7 +316,8 @@ impl McpExecutor {
         args: &serde_json::Value,
     ) -> Result<serde_json::Value> {
         let server_id = args["server_id"].as_str().context("Missing server_id")?;
-        self.ensure_agent_active(auth, server_id).await?;
+        let agent = self.ensure_agent_active(auth, server_id).await?;
+        let server_id = agent.id.0.to_string();
         let path = validate_abs_path(args["path"].as_str().context("Missing path")?)?;
         let content = args["content"].as_str().context("Missing content")?;
         let mode = args["mode"].as_str().unwrap_or("overwrite");
@@ -320,7 +326,7 @@ impl McpExecutor {
         }
         let result = self
             .dispatch_file_task(
-                server_id,
+                &server_id,
                 ServerTask {
                     task_id: String::new(),
                     task_type: TaskType::FileWrite as i32,
@@ -351,14 +357,15 @@ impl McpExecutor {
         args: &serde_json::Value,
     ) -> Result<serde_json::Value> {
         let server_id = args["server_id"].as_str().context("Missing server_id")?;
-        self.ensure_agent_active(auth, server_id).await?;
+        let agent = self.ensure_agent_active(auth, server_id).await?;
+        let server_id = agent.id.0.to_string();
         let path = validate_abs_path(args["path"].as_str().context("Missing path")?)?;
         if path == "/" {
             anyhow::bail!("refusing to delete filesystem root");
         }
         let result = self
             .dispatch_file_task(
-                server_id,
+                &server_id,
                 ServerTask {
                     task_id: String::new(),
                     task_type: TaskType::FileDelete as i32,
@@ -386,7 +393,8 @@ impl McpExecutor {
         args: &serde_json::Value,
     ) -> Result<serde_json::Value> {
         let server_id = args["server_id"].as_str().context("Missing server_id")?;
-        self.ensure_agent_active(auth, server_id).await?;
+        let agent = self.ensure_agent_active(auth, server_id).await?;
+        let server_id = agent.id.0.to_string();
         let path = validate_abs_path(args["path"].as_str().context("Missing path")?)?;
         let expires_in = temporary_url_expires_in(
             args["expires_in"]
@@ -398,7 +406,7 @@ impl McpExecutor {
         let token = self
             .create_temporary_transfer_token(
                 auth,
-                server_id,
+                &server_id,
                 &path,
                 "download",
                 "transfer:read",
@@ -427,7 +435,8 @@ impl McpExecutor {
         args: &serde_json::Value,
     ) -> Result<serde_json::Value> {
         let server_id = args["server_id"].as_str().context("Missing server_id")?;
-        self.ensure_agent_active(auth, server_id).await?;
+        let agent = self.ensure_agent_active(auth, server_id).await?;
+        let server_id = agent.id.0.to_string();
         let path = validate_abs_path(args["path"].as_str().context("Missing path")?)?;
         let expires_in = temporary_url_expires_in(
             args["expires_in"]
@@ -439,7 +448,7 @@ impl McpExecutor {
         let token = self
             .create_temporary_transfer_token(
                 auth,
-                server_id,
+                &server_id,
                 &path,
                 "upload",
                 "transfer:write",
@@ -481,7 +490,7 @@ impl McpExecutor {
         TemporaryTransferTokenRepository::new(self.db.clone())
             .create(CreateTemporaryTransferTokenInput {
                 token_hash,
-                server_id: AgentId(uuid::Uuid::parse_str(server_id).context("invalid server_id")?),
+                server_id: parse_mcp_server_id(server_id)?,
                 path: path.to_string(),
                 op: op.to_string(),
                 issued_by_user_id: auth.user_id,
@@ -502,7 +511,7 @@ impl McpExecutor {
         auth: &AuthSession,
         server_id: &str,
     ) -> Result<crate::db::Agent> {
-        let agent_id = AgentId(uuid::Uuid::parse_str(server_id).context("Invalid server_id")?);
+        let agent_id = parse_mcp_server_id(server_id)?;
         let agent = AgentRepository::new(self.db.clone())
             .find_by_id(agent_id)
             .await?
@@ -539,8 +548,7 @@ impl McpExecutor {
     ) -> Result<serde_json::Value> {
         let command = validate_exec_command(command)?;
         let timeout_seconds = normalize_exec_timeout(Some(timeout_seconds as i64));
-        let agent_uuid = uuid::Uuid::parse_str(server_id).context("server_id must be a UUID")?;
-        let agent_id = AgentId(agent_uuid);
+        let agent_id = parse_mcp_server_id(server_id)?;
         if !self.session_registry.is_online(&agent_id).await {
             anyhow::bail!("agent {} is offline", server_id);
         }
@@ -596,8 +604,7 @@ impl McpExecutor {
         mut task: ServerTask,
         timeout_seconds: u64,
     ) -> Result<xlstatus_proto_gen::xlstatus::v1::TaskResult> {
-        let agent_uuid = uuid::Uuid::parse_str(server_id).context("server_id must be a UUID")?;
-        let agent_id = AgentId(agent_uuid);
+        let agent_id = parse_mcp_server_id(server_id)?;
         if !self.session_registry.is_online(&agent_id).await {
             anyhow::bail!("agent {} is offline", server_id);
         }
@@ -691,6 +698,20 @@ fn validate_exec_command(command: &str) -> Result<&str> {
         );
     }
     Ok(command)
+}
+
+fn parse_mcp_server_id(server_id: &str) -> Result<AgentId> {
+    if server_id.is_empty() {
+        anyhow::bail!("server_id is required");
+    }
+    if server_id.len() != MCP_UUID_TEXT_LEN {
+        anyhow::bail!("server_id must be a canonical UUID");
+    }
+    let parsed = uuid::Uuid::parse_str(server_id).context("server_id must be a canonical UUID")?;
+    if parsed.to_string() != server_id {
+        anyhow::bail!("server_id must be a canonical UUID");
+    }
+    Ok(AgentId(parsed))
 }
 
 pub(crate) fn temporary_url_token(
@@ -1082,6 +1103,94 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(total, 0);
+    }
+
+    #[tokio::test]
+    async fn mcp_server_exec_rejects_revoked_agent_before_dispatch() {
+        let db = test_db().await;
+        let owner = UserId(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap());
+        seed_user(&db, owner, "owner", "admin").await;
+        let agent_repo = AgentRepository::new(db.clone());
+        let agent = agent_repo
+            .create(CreateAgentInput {
+                name: "revoked-exec-agent".into(),
+                public_key: "pk".into(),
+                owner_user_id: owner,
+            })
+            .await
+            .unwrap();
+        assert!(agent_repo.revoke(agent.id).await.unwrap());
+        let executor = test_executor(db);
+        let auth = pat_auth(owner, UserRole::Admin, vec![agent.id.0.to_string()]);
+
+        let response = executor
+            .execute(
+                &auth,
+                McpToolRequest {
+                    tool: "server.exec".into(),
+                    arguments: json!({
+                        "server_id": agent.id.0.to_string(),
+                        "command": "whoami"
+                    }),
+                },
+            )
+            .await;
+
+        assert!(!response.success);
+        assert!(response
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("agent has been revoked"));
+    }
+
+    #[tokio::test]
+    async fn mcp_server_tools_require_canonical_server_id() {
+        let db = test_db().await;
+        let owner = UserId(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap());
+        seed_user(&db, owner, "owner", "admin").await;
+        let agent = AgentRepository::new(db.clone())
+            .create(CreateAgentInput {
+                name: "canonical-agent".into(),
+                public_key: "pk".into(),
+                owner_user_id: owner,
+            })
+            .await
+            .unwrap();
+        let executor = test_executor(db);
+        let auth = pat_auth(owner, UserRole::Admin, vec![agent.id.0.to_string()]);
+        let simple = agent.id.0.simple().to_string();
+        let uppercase = agent.id.0.to_string().to_uppercase();
+
+        for server_id in [
+            "server-a".to_string(),
+            format!(" {} ", agent.id.0),
+            simple,
+            uppercase,
+            "a".repeat(MCP_UUID_TEXT_LEN + 1),
+        ] {
+            let response = executor
+                .execute(
+                    &auth,
+                    McpToolRequest {
+                        tool: "server.get".into(),
+                        arguments: json!({ "server_id": server_id }),
+                    },
+                )
+                .await;
+
+            assert!(!response.success);
+            assert!(response
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("canonical UUID"));
+        }
+
+        assert_eq!(
+            parse_mcp_server_id(&agent.id.0.to_string()).unwrap(),
+            agent.id
+        );
     }
 
     #[test]
