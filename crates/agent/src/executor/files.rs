@@ -35,70 +35,78 @@ pub async fn list_files(path: &str, allowed_roots: &[String]) -> Result<Vec<File
     let roots = canonical_allowed_roots(allowed_roots, false).await?;
     let path = resolve_existing_path(path, &roots).await?;
 
-    if !fs::metadata(&path)
-        .await
-        .context("Failed to read metadata")?
-        .is_dir()
+    #[cfg(unix)]
     {
-        bail!("Path is not a directory");
+        return list_files_no_symlink_race(&path).await;
     }
 
-    let mut entries = Vec::new();
-    let mut read_dir = fs::read_dir(path)
-        .await
-        .context("Failed to read directory")?;
-
-    while let Some(entry) = read_dir
-        .next_entry()
-        .await
-        .context("Failed to read entry")?
+    #[cfg(not(unix))]
     {
-        let entry_path = entry.path();
-        let metadata = fs::symlink_metadata(&entry_path)
+        if !fs::metadata(&path)
             .await
-            .context("Failed to read metadata")?;
-        let file_name = entry.file_name().to_string_lossy().to_string();
+            .context("Failed to read metadata")?
+            .is_dir()
+        {
+            bail!("Path is not a directory");
+        }
 
-        let file_type = if metadata.is_symlink() {
-            FileType::Symlink
-        } else if metadata.is_dir() {
-            FileType::Dir
-        } else {
-            FileType::File
-        };
+        let mut entries = Vec::new();
+        let mut read_dir = fs::read_dir(path)
+            .await
+            .context("Failed to read directory")?;
 
-        let symlink_target = if metadata.is_symlink() {
-            fs::read_link(&entry_path)
+        while let Some(entry) = read_dir
+            .next_entry()
+            .await
+            .context("Failed to read entry")?
+        {
+            let entry_path = entry.path();
+            let metadata = fs::symlink_metadata(&entry_path)
                 .await
+                .context("Failed to read metadata")?;
+            let file_name = entry.file_name().to_string_lossy().to_string();
+
+            let file_type = if metadata.is_symlink() {
+                FileType::Symlink
+            } else if metadata.is_dir() {
+                FileType::Dir
+            } else {
+                FileType::File
+            };
+
+            let symlink_target = if metadata.is_symlink() {
+                fs::read_link(&entry_path)
+                    .await
+                    .ok()
+                    .and_then(|p| p.to_str().map(String::from))
+            } else {
+                None
+            };
+
+            let mode = metadata_mode(&metadata);
+
+            let modified_at = metadata
+                .modified()
                 .ok()
-                .and_then(|p| p.to_str().map(String::from))
-        } else {
-            None
-        };
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
 
-        let mode = metadata_mode(&metadata);
+            entries.push(FileEntry {
+                name: file_name,
+                file_type,
+                size: metadata.len(),
+                mode,
+                modified_at,
+                symlink_target,
+            });
+        }
 
-        let modified_at = metadata
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        // Sort by name
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
 
-        entries.push(FileEntry {
-            name: file_name,
-            file_type,
-            size: metadata.len(),
-            mode,
-            modified_at,
-            symlink_target,
-        });
+        Ok(entries)
     }
-
-    // Sort by name
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
-
-    Ok(entries)
 }
 
 /// Read file content
@@ -112,37 +120,45 @@ pub async fn read_file(
     let roots = canonical_allowed_roots(allowed_roots, false).await?;
     let path = resolve_existing_path(path, &roots).await?;
 
-    if !fs::metadata(&path)
-        .await
-        .context("Failed to read metadata")?
-        .is_file()
+    #[cfg(unix)]
     {
-        bail!("Path is not a file");
+        return read_file_no_symlink_race(&path, offset, length).await;
     }
 
-    let mut file = fs::File::open(path).await.context("Failed to open file")?;
-
-    if offset > 0 {
-        use tokio::io::AsyncSeekExt;
-        file.seek(std::io::SeekFrom::Start(offset))
+    #[cfg(not(unix))]
+    {
+        if !fs::metadata(&path)
             .await
-            .context("Failed to seek")?;
+            .context("Failed to read metadata")?
+            .is_file()
+        {
+            bail!("Path is not a file");
+        }
+
+        let mut file = fs::File::open(path).await.context("Failed to open file")?;
+
+        if offset > 0 {
+            use tokio::io::AsyncSeekExt;
+            file.seek(std::io::SeekFrom::Start(offset))
+                .await
+                .context("Failed to seek")?;
+        }
+
+        let mut buffer = Vec::new();
+        let max_read = if length > 0 {
+            length as usize
+        } else {
+            usize::MAX
+        };
+
+        use tokio::io::AsyncReadExt;
+        file.take(max_read as u64)
+            .read_to_end(&mut buffer)
+            .await
+            .context("Failed to read file")?;
+
+        Ok(buffer)
     }
-
-    let mut buffer = Vec::new();
-    let max_read = if length > 0 {
-        length as usize
-    } else {
-        usize::MAX
-    };
-
-    use tokio::io::AsyncReadExt;
-    file.take(max_read as u64)
-        .read_to_end(&mut buffer)
-        .await
-        .context("Failed to read file")?;
-
-    Ok(buffer)
 }
 
 /// Write file content
@@ -334,6 +350,22 @@ fn ensure_under_allowed_roots(path: &Path, allowed_roots: &[PathBuf]) -> Result<
 }
 
 #[cfg(unix)]
+async fn list_files_no_symlink_race(path: &Path) -> Result<Vec<FileEntry>> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || list_files_no_symlink_race_blocking(&path))
+        .await
+        .context("Failed to join file list task")?
+}
+
+#[cfg(unix)]
+async fn read_file_no_symlink_race(path: &Path, offset: u64, length: u64) -> Result<Vec<u8>> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || read_file_no_symlink_race_blocking(&path, offset, length))
+        .await
+        .context("Failed to join file read task")?
+}
+
+#[cfg(unix)]
 async fn delete_path_no_symlink_race(
     raw_path: &Path,
     recursive: bool,
@@ -427,18 +459,73 @@ fn create_file_no_symlink_blocking(path: &Path) -> Result<fs::File> {
 }
 
 #[cfg(unix)]
+fn list_files_no_symlink_race_blocking(path: &Path) -> Result<Vec<FileEntry>> {
+    let dir_fd = open_dir_path_no_follow(path)?;
+    let entry_names = read_dir_names(dir_fd.as_raw_fd()).context("Failed to read directory")?;
+    let mut entries = Vec::with_capacity(entry_names.len());
+    for entry_name in entry_names {
+        let metadata = child_metadata_no_follow(dir_fd.as_raw_fd(), &entry_name)
+            .context("Failed to read metadata")?;
+        let file_type = if is_symlink_mode(metadata.st_mode) {
+            FileType::Symlink
+        } else if is_dir_mode(metadata.st_mode) {
+            FileType::Dir
+        } else {
+            FileType::File
+        };
+        let symlink_target = if matches!(file_type, FileType::Symlink) {
+            read_link_child(dir_fd.as_raw_fd(), &entry_name, metadata.st_size).ok()
+        } else {
+            None
+        };
+        entries.push(FileEntry {
+            name: entry_name.to_string_lossy().to_string(),
+            file_type,
+            size: u64::try_from(metadata.st_size).unwrap_or(0),
+            mode: metadata.st_mode as u32,
+            modified_at: metadata.st_mtime as i64,
+            symlink_target,
+        });
+    }
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(entries)
+}
+
+#[cfg(unix)]
+fn read_file_no_symlink_race_blocking(path: &Path, offset: u64, length: u64) -> Result<Vec<u8>> {
+    let parts = absolute_normal_components(path)?;
+    let (file_name, parent_parts) = parts
+        .split_last()
+        .ok_or_else(|| anyhow::anyhow!("Path has no file name"))?;
+
+    let parent_fd = open_dir_parts_no_follow(parent_parts)?;
+    let file_fd = open_child_file_read_no_follow(parent_fd.as_raw_fd(), file_name)?;
+    let metadata = file_metadata(file_fd.as_raw_fd()).context("Failed to read metadata")?;
+    if !is_file_mode(metadata.st_mode) {
+        bail!("Path is not a file");
+    }
+
+    let mut file = std::fs::File::from(file_fd);
+    if offset > 0 {
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(offset))
+            .context("Failed to seek")?;
+    }
+
+    let mut buffer = Vec::new();
+    let max_read = if length > 0 { length } else { u64::MAX };
+    std::io::Read::read_to_end(&mut std::io::Read::take(file, max_read), &mut buffer)
+        .context("Failed to read file")?;
+    Ok(buffer)
+}
+
+#[cfg(unix)]
 fn delete_path_no_symlink_race_blocking(path: &Path, recursive: bool) -> Result<()> {
     let parts = absolute_normal_components(path)?;
     let (target_name, parent_parts) = parts
         .split_last()
         .ok_or_else(|| anyhow::anyhow!("Path has no file name"))?;
 
-    let root_fd = open_root_dir_no_follow()?;
-    let mut parent_fd = root_fd;
-    for part in parent_parts {
-        let next_fd = open_child_dir_no_follow(parent_fd.as_raw_fd(), part)?;
-        parent_fd = next_fd;
-    }
+    let parent_fd = open_dir_parts_no_follow(parent_parts)?;
 
     let metadata = child_metadata_no_follow(parent_fd.as_raw_fd(), target_name)
         .context("Failed to read metadata")?;
@@ -470,6 +557,23 @@ fn remove_dir_all_at(parent_fd: RawFd, name: &std::ffi::OsStr) -> Result<()> {
         }
     }
     unlink_child_dir(parent_fd, name)
+}
+
+#[cfg(unix)]
+fn open_dir_path_no_follow(path: &Path) -> Result<OwnedFd> {
+    let parts = absolute_normal_components(path)?;
+    open_dir_parts_no_follow(&parts)
+}
+
+#[cfg(unix)]
+fn open_dir_parts_no_follow(parts: &[std::ffi::OsString]) -> Result<OwnedFd> {
+    let root_fd = open_root_dir_no_follow()?;
+    let mut dir_fd = root_fd;
+    for part in parts {
+        let next_fd = open_child_dir_no_follow(dir_fd.as_raw_fd(), part)?;
+        dir_fd = next_fd;
+    }
+    Ok(dir_fd)
 }
 
 #[cfg(unix)]
@@ -530,6 +634,25 @@ fn open_child_file_no_follow(
 }
 
 #[cfg(unix)]
+fn open_child_file_read_no_follow(
+    parent_fd: std::os::unix::io::RawFd,
+    name: &std::ffi::OsStr,
+) -> Result<OwnedFd> {
+    let name = os_str_to_cstring(name)?;
+    let fd = unsafe {
+        libc::openat(
+            parent_fd,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("Failed to open file");
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
 fn mkdir_child_dir(parent_fd: std::os::unix::io::RawFd, name: &std::ffi::OsStr) -> Result<()> {
     let name = os_str_to_cstring(name)?;
     let result = unsafe { libc::mkdirat(parent_fd, name.as_ptr(), 0o777) };
@@ -537,6 +660,16 @@ fn mkdir_child_dir(parent_fd: std::os::unix::io::RawFd, name: &std::ffi::OsStr) 
         return Err(std::io::Error::last_os_error()).context("Failed to create directory");
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn file_metadata(fd: RawFd) -> Result<libc::stat> {
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe { libc::fstat(fd, metadata.as_mut_ptr()) };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error()).context("Failed to stat file");
+    }
+    Ok(unsafe { metadata.assume_init() })
 }
 
 #[cfg(unix)]
@@ -563,6 +696,16 @@ fn is_dir_mode(mode: libc::mode_t) -> bool {
 }
 
 #[cfg(unix)]
+fn is_file_mode(mode: libc::mode_t) -> bool {
+    (mode & libc::S_IFMT) == libc::S_IFREG
+}
+
+#[cfg(unix)]
+fn is_symlink_mode(mode: libc::mode_t) -> bool {
+    (mode & libc::S_IFMT) == libc::S_IFLNK
+}
+
+#[cfg(unix)]
 fn unlink_child(parent_fd: RawFd, name: &std::ffi::OsStr) -> Result<()> {
     unlink_child_with_flags(parent_fd, name, 0)
 }
@@ -584,6 +727,33 @@ fn unlink_child_with_flags(
         return Err(std::io::Error::last_os_error()).context("Failed to unlink path");
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn read_link_child(
+    parent_fd: RawFd,
+    name: &std::ffi::OsStr,
+    expected_size: libc::off_t,
+) -> Result<String> {
+    let name = os_str_to_cstring(name)?;
+    let buffer_len = usize::try_from(expected_size)
+        .unwrap_or(0)
+        .saturating_add(1)
+        .clamp(256, 65_536);
+    let mut buffer = vec![0u8; buffer_len];
+    let len = unsafe {
+        libc::readlinkat(
+            parent_fd,
+            name.as_ptr(),
+            buffer.as_mut_ptr().cast::<libc::c_char>(),
+            buffer.len(),
+        )
+    };
+    if len < 0 {
+        return Err(std::io::Error::last_os_error()).context("Failed to read symlink");
+    }
+    let len = usize::try_from(len).unwrap_or(0);
+    String::from_utf8(buffer[..len].to_vec()).context("Symlink target is not valid UTF-8")
 }
 
 #[cfg(unix)]
@@ -833,6 +1003,67 @@ mod tests {
         assert!(result.is_err());
         assert!(outside_target.exists());
         assert_eq!(std::fs::read(&outside_target).unwrap(), b"outside");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_read_rejects_replaced_parent_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let allowed = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let parent = allowed.path().join("parent");
+        let inside_target = parent.join("secret.txt");
+        let outside_target = outside.path().join("secret.txt");
+
+        fs::create_dir(&parent).await.unwrap();
+        fs::write(&inside_target, b"inside").await.unwrap();
+        fs::write(&outside_target, b"outside-secret").await.unwrap();
+
+        let stable_parent = fs::canonicalize(&parent).await.unwrap();
+        let stable_target = stable_parent.join("secret.txt");
+        fs::remove_dir_all(&parent).await.unwrap();
+        symlink(outside.path(), &parent).unwrap();
+
+        let result = tokio::task::spawn_blocking(move || {
+            read_file_no_symlink_race_blocking(&stable_target, 0, 0)
+        })
+        .await
+        .unwrap();
+
+        assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_list_rejects_replaced_parent_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let allowed = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let list_dir = allowed.path().join("list-me");
+        let outside_list_dir = outside.path().join("list-me");
+
+        fs::create_dir(&list_dir).await.unwrap();
+        fs::write(list_dir.join("inside.txt"), b"inside")
+            .await
+            .unwrap();
+        fs::create_dir(&outside_list_dir).await.unwrap();
+        fs::write(outside_list_dir.join("outside-secret.txt"), b"outside")
+            .await
+            .unwrap();
+
+        let stable_list_dir = fs::canonicalize(&list_dir).await.unwrap();
+        fs::remove_dir_all(&list_dir).await.unwrap();
+        symlink(outside.path(), &list_dir).unwrap();
+
+        let result = tokio::task::spawn_blocking(move || {
+            list_files_no_symlink_race_blocking(&stable_list_dir)
+        })
+        .await
+        .unwrap();
+
+        assert!(result.is_err());
     }
 
     #[cfg(unix)]
