@@ -23,6 +23,7 @@ use std::time::{Duration as StdDuration, Instant};
 use uuid::Uuid;
 
 const NOTIFICATION_TEST_COOLDOWN_SECS: u64 = 30;
+const NOTIFICATION_UUID_TEXT_LEN: usize = 36;
 
 static NOTIFICATION_TEST_RATE_STATE: once_cell::sync::Lazy<
     std::sync::Mutex<HashMap<String, Instant>>,
@@ -320,6 +321,7 @@ pub async fn update_notification(
     Json(req): Json<UpdateNotificationRequest>,
 ) -> Result<Json<ApiResponse<NotificationView>>, AppError> {
     require_scope(&auth, "notification:write")?;
+    let id = require_uuid_text(id, "notification_id")?;
     let owner = auth.user_id.0;
     let existing = load_notification_record_for_owner(&state.db, &id, owner).await?;
     let input = build_update_notification_input(req, &existing).await?;
@@ -391,6 +393,7 @@ pub async fn delete_notification(
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     require_scope(&auth, "notification:delete")?;
+    let id = require_uuid_text(id, "notification_id")?;
     let owner = auth.user_id.0;
     let affected = match &state.db {
         DatabaseBackend::Sqlite(pool) => {
@@ -426,6 +429,7 @@ pub async fn test_notification(
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     require_scope(&auth, "notification:write")?;
+    let id = require_uuid_text(id, "notification_id")?;
     let notification = load_notification_record_for_owner(&state.db, &id, auth.user_id.0).await?;
     check_notification_test_rate_limit(auth.user_id.0, &notification.id)?;
     let channel = notification_to_channel(&notification)?;
@@ -553,6 +557,7 @@ pub async fn update_notification_group(
     Json(req): Json<UpdateNotificationGroupRequest>,
 ) -> Result<Json<ApiResponse<NotificationGroupView>>, AppError> {
     require_scope(&auth, "notification:write")?;
+    let id = require_uuid_text(id, "group_id")?;
     let owner = auth.user_id.0;
     let name = require_name(req.name, "name")?;
     let now = Utc::now();
@@ -594,6 +599,7 @@ pub async fn delete_notification_group(
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     require_scope(&auth, "notification:delete")?;
+    let id = require_uuid_text(id, "group_id")?;
     let owner = auth.user_id.0;
     let affected = match &state.db {
         DatabaseBackend::Sqlite(pool) => {
@@ -1568,11 +1574,21 @@ async fn require_url(value: String) -> Result<String, AppError> {
 }
 
 fn require_uuid_text(value: String, field: &str) -> Result<String, AppError> {
-    let value = value.trim().to_string();
     if value.is_empty() {
         return Err(AppError::BadRequest(format!("{field} is required")));
     }
-    Uuid::parse_str(&value).map_err(|e| AppError::BadRequest(format!("invalid {field}: {e}")))?;
+    if value.len() != NOTIFICATION_UUID_TEXT_LEN {
+        return Err(AppError::BadRequest(format!(
+            "{field} must be a canonical UUID"
+        )));
+    }
+    let parsed = Uuid::parse_str(&value)
+        .map_err(|e| AppError::BadRequest(format!("invalid {field}: {e}")))?;
+    if parsed.to_string() != value {
+        return Err(AppError::BadRequest(format!(
+            "{field} must be a canonical UUID"
+        )));
+    }
     Ok(value)
 }
 
@@ -1818,6 +1834,34 @@ mod tests {
             redact_notification_url("https://example.com/"),
             "https://example.com/"
         );
+    }
+
+    #[test]
+    fn notification_resource_ids_require_canonical_uuid_text() {
+        let canonical = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        assert_eq!(
+            require_uuid_text(canonical.to_string(), "notification_id").unwrap(),
+            canonical
+        );
+        assert_eq!(
+            require_uuid_text(canonical.to_string(), "group_id").unwrap(),
+            canonical
+        );
+
+        for value in [
+            "",
+            "channel-a",
+            " aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa ",
+            "aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaaaaaa",
+            "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaax",
+        ] {
+            assert!(
+                require_uuid_text(value.to_string(), "notification_id").is_err(),
+                "{value:?} should be rejected"
+            );
+        }
     }
 
     #[tokio::test]
