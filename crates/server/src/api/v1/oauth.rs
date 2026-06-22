@@ -71,6 +71,11 @@ pub struct OAuthAccountListResponse {
     pub accounts: Vec<OAuthAccountView>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct OAuthStartResponse {
+    pub authorization_url: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct OAuthStartQuery {
     pub return_to: Option<String>,
@@ -193,7 +198,7 @@ pub async fn start_oauth_bind(
         nonce: random_nonce(),
         exp: (Utc::now() + Duration::minutes(10)).timestamp(),
     };
-    oauth_start_response(&state, provider, &oauth_state)
+    oauth_start_json_response(&state, provider, &oauth_state)
 }
 
 pub async fn list_oauth_bindings(
@@ -444,6 +449,24 @@ fn oauth_start_response(
             &encoded_state,
             &oauth_state.nonce,
         )?),
+    )
+        .into_response())
+}
+
+fn oauth_start_json_response(
+    state: &AppState,
+    provider: &OidcProviderConfig,
+    oauth_state: &OAuthState,
+) -> Result<Response, AppError> {
+    let encoded_state = encode_state(&state.config.security.session_secret, oauth_state)?;
+    Ok((
+        AppendHeaders([(
+            header::SET_COOKIE,
+            oauth_state_cookie_header(state.config.security.cookie_secure, &encoded_state)?,
+        )]),
+        Json(ApiResponse::success(OAuthStartResponse {
+            authorization_url: authorize_url(provider, &encoded_state, &oauth_state.nonce)?,
+        })),
     )
         .into_response())
 }
@@ -1539,6 +1562,46 @@ mod tests {
         assert!(!params.contains(&("client_id".into(), "evil".into())));
     }
 
+    #[tokio::test]
+    async fn oauth_bind_start_json_sets_state_cookie_and_returns_authorization_url() {
+        let state = test_app_state().await;
+        let provider = test_provider();
+        let oauth_state = OAuthState {
+            provider: provider.id.clone(),
+            flow: OAuthFlow::Bind,
+            user_id: Some(uuid::Uuid::from_bytes([1; 16]).to_string()),
+            return_to: "/settings".into(),
+            nonce: "abc".into(),
+            exp: (Utc::now() + Duration::minutes(1)).timestamp(),
+        };
+
+        let response = oauth_start_json_response(&state, &provider, &oauth_state).unwrap();
+        let headers = response.headers();
+        let set_cookie = headers
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .expect("state cookie");
+
+        assert!(set_cookie.starts_with(&format!("{OAUTH_STATE_COOKIE_NAME}=")));
+        assert!(set_cookie.contains("HttpOnly"));
+        assert!(set_cookie.contains(&format!("Path={OAUTH_STATE_COOKIE_PATH}")));
+
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let authorization_url = payload["data"]["authorization_url"].as_str().unwrap();
+        let parsed = reqwest::Url::parse(&authorization_url).unwrap();
+        assert_eq!(
+            parsed.as_str().split('?').next().unwrap(),
+            provider.auth_url
+        );
+        assert!(parsed.query_pairs().any(|(key, _)| key == "state"));
+        assert!(parsed
+            .query_pairs()
+            .any(|(key, value)| key == "nonce" && value == "abc"));
+    }
+
     #[test]
     fn normalizes_userinfo_with_custom_claim_paths() {
         let mut provider = test_provider();
@@ -1614,5 +1677,28 @@ mod tests {
             userinfo_err,
             AppError::BadRequest(message) if message.contains("disallowed private address")
         ));
+    }
+
+    async fn test_app_state() -> AppState {
+        let db = DatabaseBackend::connect("sqlite::memory:", true)
+            .await
+            .unwrap();
+        db.run_migrations().await.unwrap();
+        let mut config = crate::config::Config::default();
+        config.security.session_secret = "test-secret-with-enough-bytes".into();
+        config.security.cookie_secure = false;
+
+        AppState {
+            db,
+            config: std::sync::Arc::new(config),
+            agent_jwt_challenges: std::sync::Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            metrics: xlstatus_tsdb::MetricStore::in_memory(),
+            realtime: crate::realtime::BroadcastHub::new(),
+            session_registry: crate::grpc::SessionRegistry::new(),
+            terminal_sessions: crate::api::v1::terminal::TerminalSessionRegistry::new(),
+            io_registry: crate::grpc::IoRegistry::new(),
+        }
     }
 }

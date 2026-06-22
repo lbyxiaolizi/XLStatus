@@ -738,6 +738,15 @@ export default function SettingsPage() {
     }
   }
 
+  async function bindOAuthProvider(providerId: string) {
+    const response = await apiClient.startOAuthBind(providerId, "/settings");
+    if (response.success && response.data?.authorization_url) {
+      window.location.href = response.data.authorization_url;
+    } else {
+      setError(responseError(response));
+    }
+  }
+
   async function testGeoIp() {
     setGeoIpLoading(true);
     const response = await apiClient.testGeoIp(geoIp.ip.trim(), geoIp.provider, geoIp.token);
@@ -1293,12 +1302,13 @@ export default function SettingsPage() {
                               解绑
                             </button>
                           ) : (
-                            <a
-                              className={`${buttonClass("secondary")} text-center`}
-                              href={apiClient.getOAuthBindUrl(provider.id, "/settings")}
+                            <button
+                              type="button"
+                              className={buttonClass("secondary")}
+                              onClick={() => void bindOAuthProvider(provider.id)}
                             >
                               绑定
-                            </a>
+                            </button>
                           )}
                         </div>
                       </div>

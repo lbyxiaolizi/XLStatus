@@ -87,7 +87,7 @@ const ROUTES: &[RouteSpec] = &[
         protected: false,
     },
     RouteSpec {
-        method: "get",
+        method: "post",
         path: "/api/v1/oauth2/{provider}/bind",
         summary: "Start OAuth2 account binding",
         protected: true,
@@ -1078,6 +1078,15 @@ mod tests {
 
         assert!(geoip_test["post"].get("security").is_some());
         assert!(geoip_test["get"].is_null());
+    }
+
+    #[test]
+    fn openapi_documents_oauth_bind_as_post_only() {
+        let doc = openapi_document();
+        let oauth_bind = &doc["paths"]["/api/v1/oauth2/{provider}/bind"];
+
+        assert!(oauth_bind["post"].get("security").is_some());
+        assert!(oauth_bind["get"].is_null());
     }
 
     #[test]

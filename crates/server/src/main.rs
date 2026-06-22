@@ -320,7 +320,7 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .route("/api/v1/profile", get(get_profile))
                 .route("/api/v1/oauth2/bindings", get(list_oauth_bindings))
-                .route("/api/v1/oauth2/:provider/bind", get(start_oauth_bind))
+                .route("/api/v1/oauth2/:provider/bind", post(start_oauth_bind))
                 .route(
                     "/api/v1/oauth2/:provider/unbind",
                     post(unbind_oauth_provider),

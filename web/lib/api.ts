@@ -252,6 +252,10 @@ export interface OAuthAccountListResponse {
   accounts: OAuthAccount[];
 }
 
+export interface OAuthStartResponse {
+  authorization_url: string;
+}
+
 export interface GeoIpLookupResponse {
   provider: string;
   ip: string;
@@ -652,9 +656,14 @@ class ApiClient {
     return `${this.baseUrl}/api/v1/oauth2/${encodeURIComponent(providerId)}?${query.toString()}`;
   }
 
-  getOAuthBindUrl(providerId: string, returnTo = "/settings"): string {
+  async startOAuthBind(providerId: string, returnTo = "/settings"): Promise<ApiResponse<OAuthStartResponse>> {
     const query = new URLSearchParams({ return_to: returnTo });
-    return `${this.baseUrl}/api/v1/oauth2/${encodeURIComponent(providerId)}/bind?${query.toString()}`;
+    return this.request<OAuthStartResponse>(
+      `/api/v1/oauth2/${encodeURIComponent(providerId)}/bind?${query.toString()}`,
+      {
+        method: "POST",
+      },
+    );
   }
 
   async unbindOAuthProvider(providerId: string): Promise<ApiResponse<JsonObject>> {
