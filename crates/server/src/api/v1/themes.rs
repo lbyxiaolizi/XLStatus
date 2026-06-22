@@ -18,6 +18,18 @@ const SELECTED_DASHBOARD_THEME_KEY: &str = "theme_selected_dashboard";
 const THEME_API_MAX_BODY_BYTES: usize = 64 * 1024;
 const THEME_MAX_CUSTOM_THEMES: usize = 32;
 const THEME_MAX_CUSTOM_CATALOG_BYTES: usize = 256 * 1024;
+const THEME_ALLOWED_VARIABLES: &[&str] = &[
+    "--bg-page",
+    "--bg-card",
+    "--text-main",
+    "--text-muted",
+    "--border-color",
+    "--accent-color",
+    "--accent-bg",
+    "--btn-bg",
+    "--btn-text",
+    "--dot-color",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThemeDefinition {
@@ -495,26 +507,53 @@ fn normalize_theme_variables(
     }
     let mut out = HashMap::new();
     for (key, value) in variables {
-        let key = key.trim();
-        let value = value.trim();
-        let valid_key = key.starts_with("--")
-            && key.len() <= 80
-            && key
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'));
-        if !valid_key {
-            return Err(AppError::BadRequest(format!(
-                "invalid CSS variable name: {key}"
-            )));
-        }
-        if value.len() > 240 || value.contains(';') || value.contains('{') || value.contains('}') {
-            return Err(AppError::BadRequest(format!(
-                "invalid CSS variable value for {key}"
-            )));
-        }
-        out.insert(key.to_string(), value.to_string());
+        let (key, value) = normalize_theme_variable_entry(&key, &value)?;
+        out.insert(key, value);
     }
     Ok(out)
+}
+
+fn normalize_theme_variable_entry(key: &str, value: &str) -> Result<(String, String), AppError> {
+    let key = key.trim();
+    if !THEME_ALLOWED_VARIABLES.contains(&key) {
+        return Err(AppError::BadRequest(format!(
+            "invalid or unsupported CSS variable name: {key}"
+        )));
+    }
+    let value = value.trim();
+    if !is_safe_theme_color_value(value) {
+        return Err(AppError::BadRequest(format!(
+            "invalid CSS color value for {key}"
+        )));
+    }
+    Ok((key.to_string(), value.to_string()))
+}
+
+fn is_safe_theme_color_value(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 80 {
+        return false;
+    }
+    if let Some(hex) = value.strip_prefix('#') {
+        return matches!(hex.len(), 3 | 4 | 6 | 8) && hex.chars().all(|ch| ch.is_ascii_hexdigit());
+    }
+
+    let lower = value.to_ascii_lowercase();
+    for prefix in ["rgb(", "rgba(", "hsl(", "hsla("] {
+        if let Some(args) = lower
+            .strip_prefix(prefix)
+            .and_then(|value| value.strip_suffix(')'))
+        {
+            return !args.is_empty()
+                && !args.contains(['(', ')'])
+                && args.chars().all(|ch| {
+                    ch.is_ascii_digit()
+                        || ch.is_ascii_whitespace()
+                        || matches!(ch, ',' | '.' | '%' | '/' | '+' | '-')
+                });
+        }
+    }
+    false
 }
 
 async fn custom_themes(db: &DatabaseBackend) -> Result<Vec<ThemeDefinition>, AppError> {
@@ -524,7 +563,7 @@ async fn custom_themes(db: &DatabaseBackend) -> Result<Vec<ThemeDefinition>, App
     let mut themes = serde_json::from_str::<Vec<ThemeDefinition>>(&raw)
         .map_err(|e| AppError::BadRequest(format!("stored theme catalog is invalid: {e}")))?;
     for theme in &mut themes {
-        clear_custom_theme_css(theme);
+        sanitize_stored_theme(theme);
     }
     Ok(themes)
 }
@@ -549,6 +588,22 @@ fn clear_custom_theme_css(theme: &mut ThemeDefinition) {
     theme.custom_css = None;
     theme.light_custom_css = None;
     theme.dark_custom_css = None;
+}
+
+fn sanitize_stored_theme(theme: &mut ThemeDefinition) {
+    clear_custom_theme_css(theme);
+    theme.variables = sanitize_stored_theme_variables(std::mem::take(&mut theme.variables));
+    theme.light_variables =
+        sanitize_stored_theme_variables(std::mem::take(&mut theme.light_variables));
+    theme.dark_variables =
+        sanitize_stored_theme_variables(std::mem::take(&mut theme.dark_variables));
+}
+
+fn sanitize_stored_theme_variables(variables: HashMap<String, String>) -> HashMap<String, String> {
+    variables
+        .into_iter()
+        .filter_map(|(key, value)| normalize_theme_variable_entry(&key, &value).ok())
+        .collect()
 }
 
 async fn set_custom_themes(
@@ -677,6 +732,64 @@ mod tests {
         )]))
         .unwrap_err();
         assert!(matches!(err, AppError::BadRequest(_)));
+
+        let err = normalize_theme_variables(HashMap::from([(
+            "--bg-page".to_string(),
+            "url(https://example.com/pixel)".to_string(),
+        )]))
+        .unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+
+        let err = normalize_theme_variables(HashMap::from([(
+            "--shadow-brutal".to_string(),
+            "6px 6px 0 0 #000".to_string(),
+        )]))
+        .unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+
+        let normalized = normalize_theme_variables(HashMap::from([
+            ("--accent-color".to_string(), "#16a34a".to_string()),
+            (
+                "--accent-bg".to_string(),
+                "rgb(220 252 231 / 95%)".to_string(),
+            ),
+        ]))
+        .unwrap();
+        assert_eq!(normalized["--accent-color"], "#16a34a");
+        assert_eq!(normalized["--accent-bg"], "rgb(220 252 231 / 95%)");
+    }
+
+    #[test]
+    fn stored_theme_variables_are_sanitized() {
+        let mut theme = ThemeDefinition {
+            id: "custom".into(),
+            name: "Custom".into(),
+            description: None,
+            target: "both".into(),
+            variables: HashMap::from([
+                ("--accent-color".into(), "#16a34a".into()),
+                ("--bg-page".into(), "url(https://example.com/pixel)".into()),
+                ("--shadow-brutal".into(), "0 0 0 #000".into()),
+            ]),
+            light_variables: HashMap::from([("--text-main".into(), "rgb(17, 24, 39)".into())]),
+            dark_variables: HashMap::from([("--btn-bg".into(), "var(--accent-color)".into())]),
+            custom_css: Some("body{display:none}".into()),
+            light_custom_css: Some("@import url(https://example.com/a.css);".into()),
+            dark_custom_css: Some("*{color:red}".into()),
+            builtin: false,
+            created_at: None,
+            updated_at: None,
+        };
+
+        sanitize_stored_theme(&mut theme);
+
+        assert_eq!(theme.variables.len(), 1);
+        assert_eq!(theme.variables["--accent-color"], "#16a34a");
+        assert_eq!(theme.light_variables["--text-main"], "rgb(17, 24, 39)");
+        assert!(theme.dark_variables.is_empty());
+        assert!(theme.custom_css.is_none());
+        assert!(theme.light_custom_css.is_none());
+        assert!(theme.dark_custom_css.is_none());
     }
 
     #[test]
