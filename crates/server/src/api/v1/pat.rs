@@ -112,6 +112,11 @@ async fn validate_server_allowlist_ownership(
                 "server id in allowlist does not exist: {id}"
             )));
         };
+        if agent.revoked_at.is_some() {
+            return Err(AppError::BadRequest(format!(
+                "server id in allowlist has been revoked: {id}"
+            )));
+        }
         if !is_admin && agent.owner_user_id != user_id {
             return Err(AppError::Forbidden(
                 "non-admin PAT server allowlist can only contain owned servers".to_string(),
@@ -541,6 +546,34 @@ mod tests {
             owner,
             false,
             Some(&["00000000-0000-0000-0000-000000000404".to_string()]),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn pat_allowlist_rejects_revoked_server() {
+        let db = test_db().await;
+        let admin = seed_user(&db, "admin", UserRole::Admin).await;
+        let owner = seed_user(&db, "owner", UserRole::Member).await;
+        let agent_repo = AgentRepository::new(db.clone());
+        let revoked_agent = agent_repo
+            .create(CreateAgentInput {
+                name: "revoked".into(),
+                public_key: "pk".into(),
+                owner_user_id: owner,
+            })
+            .await
+            .unwrap();
+        assert!(agent_repo.revoke(revoked_agent.id).await.unwrap());
+
+        let err = validate_server_allowlist_ownership(
+            &db,
+            admin,
+            true,
+            Some(&[revoked_agent.id.0.to_string()]),
         )
         .await
         .unwrap_err();
