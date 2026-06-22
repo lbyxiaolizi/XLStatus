@@ -39,6 +39,15 @@ const AGENT_PROBE_DEFAULT_TIMEOUT_SECONDS: u64 = 10;
 const AGENT_PROBE_MAX_TIMEOUT_SECONDS: u64 = 30;
 const AGENT_PING_PROCESS_TIMEOUT_GRACE_SECONDS: u64 = 2;
 const AGENT_PING_OUTPUT_MAX_BYTES: usize = 4096;
+const REMOTE_CONFIG_MAX_BYTES: usize = 128 * 1024;
+const REMOTE_CONFIG_MAX_NAME_BYTES: usize = 255;
+const REMOTE_CONFIG_MAX_URL_BYTES: usize = 2048;
+const REMOTE_CONFIG_MAX_PATH_BYTES: usize = 4096;
+const REMOTE_CONFIG_MAX_ROOTS: usize = 32;
+const REMOTE_CONFIG_MIN_INTERVAL_SECONDS: u64 = 1;
+const REMOTE_CONFIG_MAX_INTERVAL_SECONDS: u64 = 86_400;
+const FORCE_UPDATE_MAX_VERSION_BYTES: usize = 80;
+const FORCE_UPDATE_MAX_URL_BYTES: usize = 2048;
 type TerminalSessionMap =
     Arc<Mutex<std::collections::HashMap<String, Arc<executor::terminal::TerminalSession>>>>;
 type NatSessionMap = Arc<Mutex<std::collections::HashMap<String, NatSocketSession>>>;
@@ -2246,84 +2255,68 @@ async fn apply_remote_config(
     runtime: &RuntimeContext,
     update: &ConfigUpdate,
 ) -> anyhow::Result<()> {
+    if update.config_yaml.len() > REMOTE_CONFIG_MAX_BYTES {
+        anyhow::bail!("remote config payload exceeds {REMOTE_CONFIG_MAX_BYTES} bytes");
+    }
     let patch: serde_json::Value = serde_json::from_slice(&update.config_yaml)
         .map_err(|e| anyhow::anyhow!("invalid remote config payload: {}", e))?;
+    let object = patch
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("remote config patch must be an object"))?;
+    validate_remote_config_fields(object)?;
     let mut guard = runtime.config.lock().await;
     let mut current = guard.clone();
 
-    if let Some(v) = patch.get("server").and_then(|v| v.as_str()) {
-        current.server = v.to_string();
+    if let Some(value) = object.get("server") {
+        current.server = validate_remote_config_url(value, "server")?;
     }
-    if let Some(v) = patch.get("grpc_server").and_then(|v| v.as_str()) {
-        current.grpc_server = v.to_string();
+    if let Some(value) = object.get("grpc_server") {
+        current.grpc_server = validate_remote_config_url(value, "grpc_server")?;
     }
-    if let Some(v) = patch.get("grpc_tls_ca_path").and_then(|v| v.as_str()) {
-        current.grpc_tls_ca_path = non_empty_string(v);
+    if let Some(value) = object.get("grpc_tls_ca_path") {
+        current.grpc_tls_ca_path = validate_optional_remote_config_path(value, "grpc_tls_ca_path")?;
     }
-    if let Some(v) = patch.get("grpc_tls_domain_name").and_then(|v| v.as_str()) {
-        current.grpc_tls_domain_name = non_empty_string(v);
+    if let Some(value) = object.get("grpc_tls_domain_name") {
+        current.grpc_tls_domain_name =
+            validate_optional_remote_config_text(value, "grpc_tls_domain_name", 253)?;
     }
-    if let Some(v) = patch
-        .get("grpc_tls_client_cert_path")
-        .and_then(|v| v.as_str())
-    {
-        current.grpc_tls_client_cert_path = non_empty_string(v);
+    if let Some(value) = object.get("grpc_tls_client_cert_path") {
+        current.grpc_tls_client_cert_path =
+            validate_optional_remote_config_path(value, "grpc_tls_client_cert_path")?;
     }
-    if let Some(v) = patch
-        .get("grpc_tls_client_key_path")
-        .and_then(|v| v.as_str())
-    {
-        current.grpc_tls_client_key_path = non_empty_string(v);
+    if let Some(value) = object.get("grpc_tls_client_key_path") {
+        current.grpc_tls_client_key_path =
+            validate_optional_remote_config_path(value, "grpc_tls_client_key_path")?;
     }
-    if let Some(v) = patch.get("agent_id").and_then(|v| v.as_str()) {
-        current.agent_id = v.to_string();
+    if let Some(value) = object.get("name") {
+        current.name = validate_remote_config_name(value)?;
     }
-    if let Some(v) = patch.get("name").and_then(|v| v.as_str()) {
-        current.name = v.to_string();
+    if let Some(value) = object.get("report_interval_seconds") {
+        current.report_interval_seconds =
+            validate_remote_config_interval(value, "report_interval_seconds")?;
     }
-    if let Some(v) = patch.get("public_key").and_then(|v| v.as_str()) {
-        current.public_key = v.to_string();
+    if let Some(value) = object.get("ip_report_interval_seconds") {
+        current.ip_report_interval_seconds =
+            validate_remote_config_interval(value, "ip_report_interval_seconds")?;
     }
-    if let Some(v) = patch
-        .get("report_interval_seconds")
-        .and_then(|v| v.as_u64())
-    {
-        current.report_interval_seconds = v.max(1);
+    if let Some(value) = object.get("disable_auto_update") {
+        current.disable_auto_update = validate_remote_config_bool(value, "disable_auto_update")?;
     }
-    if let Some(v) = patch
-        .get("ip_report_interval_seconds")
-        .and_then(|v| v.as_u64())
-    {
-        current.ip_report_interval_seconds = v.max(1);
+    if let Some(value) = object.get("disable_force_update") {
+        current.disable_force_update = validate_remote_config_bool(value, "disable_force_update")?;
     }
-    if let Some(v) = patch.get("disable_auto_update").and_then(|v| v.as_bool()) {
-        current.disable_auto_update = v;
+    if let Some(value) = object.get("disable_command_execute") {
+        current.disable_command_execute =
+            validate_remote_config_bool(value, "disable_command_execute")?;
     }
-    if let Some(v) = patch.get("disable_force_update").and_then(|v| v.as_bool()) {
-        current.disable_force_update = v;
+    if let Some(value) = object.get("disable_nat") {
+        current.disable_nat = validate_remote_config_bool(value, "disable_nat")?;
     }
-    if let Some(v) = patch
-        .get("disable_command_execute")
-        .and_then(|v| v.as_bool())
-    {
-        current.disable_command_execute = v;
+    if let Some(value) = object.get("disable_send_query") {
+        current.disable_send_query = validate_remote_config_bool(value, "disable_send_query")?;
     }
-    if let Some(v) = patch.get("disable_nat").and_then(|v| v.as_bool()) {
-        current.disable_nat = v;
-    }
-    if let Some(v) = patch.get("disable_send_query").and_then(|v| v.as_bool()) {
-        current.disable_send_query = v;
-    }
-    if let Some(v) = patch.get("file_allowed_roots").and_then(|v| v.as_array()) {
-        let roots = v
-            .iter()
-            .filter_map(|value| value.as_str().map(str::trim))
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-        if !roots.is_empty() {
-            current.file_allowed_roots = roots;
-        }
+    if let Some(value) = object.get("file_allowed_roots") {
+        current.file_allowed_roots = validate_remote_config_roots(value)?;
     }
     current.private_key = read_private_key(&runtime.config_path)?;
     persist_agent_config(&runtime.config_path, &current)?;
@@ -2331,14 +2324,165 @@ async fn apply_remote_config(
     Ok(())
 }
 
+fn validate_remote_config_fields(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> anyhow::Result<()> {
+    for key in object.keys() {
+        match key.as_str() {
+            "server"
+            | "grpc_server"
+            | "grpc_tls_ca_path"
+            | "grpc_tls_domain_name"
+            | "grpc_tls_client_cert_path"
+            | "grpc_tls_client_key_path"
+            | "name"
+            | "report_interval_seconds"
+            | "ip_report_interval_seconds"
+            | "disable_auto_update"
+            | "disable_force_update"
+            | "disable_command_execute"
+            | "disable_nat"
+            | "disable_send_query"
+            | "file_allowed_roots" => {}
+            "agent_id" | "public_key" | "private_key" => {
+                anyhow::bail!("remote config field {key} cannot be changed")
+            }
+            _ => anyhow::bail!("unknown remote config field: {key}"),
+        }
+    }
+    Ok(())
+}
+
+fn validate_remote_config_url(value: &serde_json::Value, field: &str) -> anyhow::Result<String> {
+    let text = value
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("{field} must be a string"))?
+        .trim();
+    validate_sized_remote_text(text, 1, REMOTE_CONFIG_MAX_URL_BYTES, field)?;
+    let parsed = reqwest::Url::parse(text).with_context(|| format!("{field} is invalid"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        scheme => anyhow::bail!("{field} scheme '{scheme}' is not allowed"),
+    }
+    if parsed.host_str().is_none() {
+        anyhow::bail!("{field} must include a host");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        anyhow::bail!("{field} must not include credentials");
+    }
+    Ok(parsed.to_string().trim_end_matches('/').to_string())
+}
+
+fn validate_optional_remote_config_path(
+    value: &serde_json::Value,
+    field: &str,
+) -> anyhow::Result<Option<String>> {
+    let Some(text) =
+        validate_optional_remote_config_text(value, field, REMOTE_CONFIG_MAX_PATH_BYTES)?
+    else {
+        return Ok(None);
+    };
+    if text.contains('\0') {
+        anyhow::bail!("{field} contains NUL byte");
+    }
+    Ok(Some(text))
+}
+
+fn validate_optional_remote_config_text(
+    value: &serde_json::Value,
+    field: &str,
+    max_bytes: usize,
+) -> anyhow::Result<Option<String>> {
+    let text = value
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("{field} must be a string"))?
+        .trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    validate_sized_remote_text(text, 1, max_bytes, field)?;
+    if text.chars().any(char::is_control) {
+        anyhow::bail!("{field} contains control characters");
+    }
+    Ok(Some(text.to_string()))
+}
+
+fn validate_remote_config_name(value: &serde_json::Value) -> anyhow::Result<String> {
+    let text = value
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("name must be a string"))?
+        .trim();
+    validate_sized_remote_text(text, 1, REMOTE_CONFIG_MAX_NAME_BYTES, "name")?;
+    if text.chars().any(char::is_control) {
+        anyhow::bail!("name contains control characters");
+    }
+    Ok(text.to_string())
+}
+
+fn validate_remote_config_interval(value: &serde_json::Value, field: &str) -> anyhow::Result<u64> {
+    let value = value
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("{field} must be an unsigned integer"))?;
+    if !(REMOTE_CONFIG_MIN_INTERVAL_SECONDS..=REMOTE_CONFIG_MAX_INTERVAL_SECONDS).contains(&value) {
+        anyhow::bail!(
+            "{field} must be between {REMOTE_CONFIG_MIN_INTERVAL_SECONDS} and {REMOTE_CONFIG_MAX_INTERVAL_SECONDS} seconds"
+        );
+    }
+    Ok(value)
+}
+
+fn validate_remote_config_bool(value: &serde_json::Value, field: &str) -> anyhow::Result<bool> {
+    value
+        .as_bool()
+        .ok_or_else(|| anyhow::anyhow!("{field} must be a boolean"))
+}
+
+fn validate_remote_config_roots(value: &serde_json::Value) -> anyhow::Result<Vec<String>> {
+    let roots = value
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("file_allowed_roots must be an array"))?;
+    if roots.is_empty() || roots.len() > REMOTE_CONFIG_MAX_ROOTS {
+        anyhow::bail!("file_allowed_roots must contain 1 to {REMOTE_CONFIG_MAX_ROOTS} entries");
+    }
+    let mut normalized = Vec::with_capacity(roots.len());
+    for root in roots {
+        let text = root
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("file_allowed_roots entries must be strings"))?
+            .trim();
+        validate_sized_remote_text(text, 1, REMOTE_CONFIG_MAX_PATH_BYTES, "file_allowed_roots")?;
+        if text.contains('\0') {
+            anyhow::bail!("file_allowed_roots contains NUL byte");
+        }
+        normalized.push(text.to_string());
+    }
+    Ok(normalized)
+}
+
+fn validate_sized_remote_text(
+    value: &str,
+    min_bytes: usize,
+    max_bytes: usize,
+    field: &str,
+) -> anyhow::Result<()> {
+    let len = value.len();
+    if len < min_bytes || len > max_bytes {
+        anyhow::bail!("{field} must be between {min_bytes} and {max_bytes} bytes");
+    }
+    Ok(())
+}
+
 async fn record_force_update_request(
     runtime: &RuntimeContext,
     update: &ForceUpdate,
 ) -> anyhow::Result<()> {
+    let version = validate_force_update_version(&update.version)?;
+    let download_url = validate_force_update_download_url(&update.download_url)?;
+    let checksum = validate_force_update_checksum(&update.checksum)?;
     let payload = serde_json::json!({
-        "version": update.version,
-        "download_url": update.download_url,
-        "checksum": update.checksum,
+        "version": version,
+        "download_url": download_url,
+        "checksum": checksum,
         "recorded_at": now_unix_seconds(),
     });
     let path = runtime
@@ -2348,6 +2492,52 @@ async fn record_force_update_request(
         .unwrap_or_else(|| PathBuf::from("last-force-update.json"));
     std::fs::write(path, serde_json::to_vec_pretty(&payload)?)?;
     Ok(())
+}
+
+fn validate_force_update_version(version: &str) -> anyhow::Result<String> {
+    let version = version.trim();
+    if version.is_empty() {
+        anyhow::bail!("force update version is required");
+    }
+    if version == "latest" {
+        anyhow::bail!("force update requires an explicit version");
+    }
+    if version.len() > FORCE_UPDATE_MAX_VERSION_BYTES
+        || !version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        anyhow::bail!("force update version contains unsupported characters");
+    }
+    Ok(version.to_string())
+}
+
+fn validate_force_update_download_url(download_url: &str) -> anyhow::Result<String> {
+    let download_url = download_url.trim();
+    validate_sized_remote_text(download_url, 1, FORCE_UPDATE_MAX_URL_BYTES, "download_url")?;
+    let parsed = reqwest::Url::parse(download_url).context("download_url is invalid")?;
+    if parsed.scheme() != "https" {
+        anyhow::bail!("download_url must use https");
+    }
+    if parsed.host_str().is_none() {
+        anyhow::bail!("download_url must include a host");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        anyhow::bail!("download_url must not include credentials");
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        anyhow::bail!("download_url must not include query or fragment");
+    }
+    Ok(parsed.to_string())
+}
+
+fn validate_force_update_checksum(checksum: &str) -> anyhow::Result<String> {
+    let checksum = checksum.trim();
+    let checksum = checksum.strip_prefix("sha256:").unwrap_or(checksum);
+    if checksum.len() != 64 || !checksum.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("checksum must be a sha256 hex digest");
+    }
+    Ok(checksum.to_ascii_lowercase())
 }
 
 fn persist_agent_config(config_path: &PathBuf, config: &AgentConfig) -> anyhow::Result<()> {
@@ -2364,6 +2554,40 @@ fn read_private_key(config_path: &PathBuf) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_agent_config() -> AgentConfig {
+        AgentConfig {
+            server: "http://dashboard.example".to_string(),
+            grpc_server: "http://dashboard.example:50051".to_string(),
+            grpc_tls_ca_path: None,
+            grpc_tls_domain_name: None,
+            grpc_tls_client_cert_path: None,
+            grpc_tls_client_key_path: None,
+            agent_id: "agent-1".to_string(),
+            name: "agent-1".to_string(),
+            public_key: String::new(),
+            private_key: "private-key".to_string(),
+            report_interval_seconds: 3,
+            ip_report_interval_seconds: 60,
+            disable_auto_update: false,
+            disable_force_update: false,
+            disable_command_execute: false,
+            disable_nat: false,
+            disable_send_query: false,
+            file_allowed_roots: default_file_allowed_roots(),
+        }
+    }
+
+    fn test_runtime_with_config(config: AgentConfig) -> (tempfile::TempDir, RuntimeContext) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("agent.json");
+        persist_agent_config(&config_path, &config).unwrap();
+        let runtime = RuntimeContext {
+            config_path,
+            config: Arc::new(Mutex::new(config)),
+        };
+        (temp_dir, runtime)
+    }
 
     #[test]
     fn agent_probe_blocks_private_ip_ranges() {
@@ -2557,24 +2781,8 @@ mod tests {
         use xlstatus_proto_gen::xlstatus::v1::{HttpGetTask, ServerTask, TaskOutcome, TaskType};
 
         let config = AgentConfig {
-            server: "http://dashboard.example".to_string(),
-            grpc_server: "http://dashboard.example:50051".to_string(),
-            grpc_tls_ca_path: None,
-            grpc_tls_domain_name: None,
-            grpc_tls_client_cert_path: None,
-            grpc_tls_client_key_path: None,
-            agent_id: "agent-1".to_string(),
-            name: "agent-1".to_string(),
-            public_key: String::new(),
-            private_key: String::new(),
-            report_interval_seconds: 3,
-            ip_report_interval_seconds: 60,
-            disable_auto_update: false,
-            disable_force_update: false,
-            disable_command_execute: false,
-            disable_nat: false,
             disable_send_query: true,
-            file_allowed_roots: default_file_allowed_roots(),
+            ..test_agent_config()
         };
         let runtime = RuntimeContext {
             config_path: PathBuf::from("agent.json"),
@@ -2595,5 +2803,106 @@ mod tests {
         assert_eq!(result.status, TaskOutcome::Failure as i32);
         assert_eq!(result.exit_code, 126);
         assert_eq!(result.error, "probe task disabled by agent policy");
+    }
+
+    #[tokio::test]
+    async fn agent_remote_config_applies_allowed_fields_and_preserves_identity() {
+        let (_temp_dir, runtime) = test_runtime_with_config(test_agent_config());
+        let update = ConfigUpdate {
+            config_yaml: serde_json::to_vec(&serde_json::json!({
+                "name": " edge-1 ",
+                "server": "https://dashboard.example/",
+                "report_interval_seconds": 30,
+                "disable_send_query": true,
+                "file_allowed_roots": ["/var/lib/xlstatus/files"]
+            }))
+            .unwrap(),
+        };
+
+        apply_remote_config(&runtime, &update).await.unwrap();
+
+        let guard = runtime.config.lock().await;
+        assert_eq!(guard.name, "edge-1");
+        assert_eq!(guard.server, "https://dashboard.example");
+        assert_eq!(guard.report_interval_seconds, 30);
+        assert!(guard.disable_send_query);
+        assert_eq!(guard.file_allowed_roots, vec!["/var/lib/xlstatus/files"]);
+        assert_eq!(guard.private_key, "private-key");
+    }
+
+    #[tokio::test]
+    async fn agent_remote_config_rejects_forbidden_unknown_and_oversized_payloads() {
+        let (_temp_dir, runtime) = test_runtime_with_config(test_agent_config());
+        for patch in [
+            serde_json::json!({ "agent_id": "other" }),
+            serde_json::json!({ "private_key": "secret" }),
+            serde_json::json!({ "unexpected": true }),
+            serde_json::json!({ "server": "https://user:pass@example.com" }),
+            serde_json::json!({ "name": "x".repeat(REMOTE_CONFIG_MAX_NAME_BYTES + 1) }),
+            serde_json::json!({ "report_interval_seconds": REMOTE_CONFIG_MAX_INTERVAL_SECONDS + 1 }),
+            serde_json::json!({ "file_allowed_roots": [] }),
+        ] {
+            let update = ConfigUpdate {
+                config_yaml: serde_json::to_vec(&patch).unwrap(),
+            };
+            assert!(
+                apply_remote_config(&runtime, &update).await.is_err(),
+                "patch should be rejected: {patch}"
+            );
+        }
+
+        let update = ConfigUpdate {
+            config_yaml: vec![b' '; REMOTE_CONFIG_MAX_BYTES + 1],
+        };
+        assert!(apply_remote_config(&runtime, &update).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn agent_force_update_record_validates_shape_before_writing() {
+        let (_temp_dir, runtime) = test_runtime_with_config(test_agent_config());
+        let valid = ForceUpdate {
+            version: "v0.1.0".into(),
+            download_url: "https://updates.example.com/xlstatus-agent-linux-amd64.tar.gz".into(),
+            checksum: format!("sha256:{}", "a".repeat(64)),
+        };
+
+        record_force_update_request(&runtime, &valid).await.unwrap();
+        let recorded = std::fs::read_to_string(
+            runtime
+                .config_path
+                .parent()
+                .unwrap()
+                .join("last-force-update.json"),
+        )
+        .unwrap();
+        assert!(recorded.contains("\"checksum\": \""));
+        assert!(recorded.contains(&"a".repeat(64)));
+
+        for invalid in [
+            ForceUpdate {
+                version: "latest".into(),
+                ..valid.clone()
+            },
+            ForceUpdate {
+                download_url: "http://updates.example.com/agent.tar.gz".into(),
+                ..valid.clone()
+            },
+            ForceUpdate {
+                download_url: "https://user@updates.example.com/agent.tar.gz".into(),
+                ..valid.clone()
+            },
+            ForceUpdate {
+                download_url: "https://updates.example.com/agent.tar.gz?token=secret".into(),
+                ..valid.clone()
+            },
+            ForceUpdate {
+                checksum: "not-a-sha256".into(),
+                ..valid.clone()
+            },
+        ] {
+            assert!(record_force_update_request(&runtime, &invalid)
+                .await
+                .is_err());
+        }
     }
 }
