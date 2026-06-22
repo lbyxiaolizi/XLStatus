@@ -6,7 +6,7 @@ use crate::api::v1::auth::{AppError, AppState};
 use crate::api::v1::notifications::ensure_notification_group_owned_by;
 use crate::api::v1::servers::server_visible;
 use crate::api::v1::services::ensure_service_id_visible_to_auth;
-use crate::api::v1::tasks::ensure_task_ids_visible_to_auth_session;
+use crate::api::v1::tasks::{ensure_task_ids_visible_to_auth_session, require_task_uuid_text};
 use crate::auth::middleware::AuthSession;
 use crate::auth::rbac::has_scope;
 use crate::db::repository::alerts::{AlertEventRepository, AlertRepository};
@@ -25,6 +25,7 @@ const ALERT_MAX_CONDITIONS: usize = 32;
 const ALERT_MAX_CONDITION_BYTES: usize = 4 * 1024;
 const ALERT_MAX_TASK_IDS: usize = 32;
 const ALERT_RULE_LIST_SCAN_BATCH: i64 = 500;
+const ALERT_UUID_TEXT_LEN: usize = 36;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateAlertRuleRequest {
@@ -206,6 +207,7 @@ pub async fn delete_alert_rule(
     if !has_scope(&auth, "alert:delete") {
         return Err(AppError::Forbidden("missing scope: alert:delete".into()));
     }
+    let id = require_alert_uuid_text(&id, "alert_rule_id")?;
     let repo = AlertRepository::new(state.db.clone());
     let owner = auth.user_id.0.to_string();
     let rule = repo
@@ -412,22 +414,40 @@ fn normalize_alert_name(value: &str) -> Result<String, AppError> {
 fn normalize_id_list(values: Vec<String>, field: &str) -> Result<Vec<String>, AppError> {
     let mut out = Vec::new();
     for value in values {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() && uuid::Uuid::parse_str(trimmed).is_err() {
+        if value.is_empty() {
+            continue;
+        }
+        let task_id = require_task_uuid_text(&value, "task_id")?;
+        if out.iter().any(|existing| existing == &task_id) {
+            continue;
+        }
+        if out.len() >= ALERT_MAX_TASK_IDS {
             return Err(AppError::BadRequest(format!(
-                "{field} contains invalid UUID"
+                "{field} exceeds {ALERT_MAX_TASK_IDS} items"
             )));
         }
-        if !trimmed.is_empty() && !out.iter().any(|existing| existing == trimmed) {
-            if out.len() >= ALERT_MAX_TASK_IDS {
-                return Err(AppError::BadRequest(format!(
-                    "{field} exceeds {ALERT_MAX_TASK_IDS} items"
-                )));
-            }
-            out.push(trimmed.to_string());
-        }
+        out.push(task_id);
     }
     Ok(out)
+}
+
+fn require_alert_uuid_text(value: &str, field: &str) -> Result<String, AppError> {
+    if value.is_empty() {
+        return Err(AppError::BadRequest(format!("{field} is required")));
+    }
+    if value.len() != ALERT_UUID_TEXT_LEN {
+        return Err(AppError::BadRequest(format!(
+            "{field} must be a canonical UUID"
+        )));
+    }
+    let parsed = uuid::Uuid::parse_str(value)
+        .map_err(|_| AppError::BadRequest(format!("{field} must be a canonical UUID")))?;
+    if parsed.to_string() != value {
+        return Err(AppError::BadRequest(format!(
+            "{field} must be a canonical UUID"
+        )));
+    }
+    Ok(value.to_string())
 }
 
 fn parse_conditions(items: &[JsonValue]) -> Result<Vec<AlertCondition>, AppError> {
@@ -871,6 +891,30 @@ mod tests {
         assert_eq!(ALERT_MAX_NAME_BYTES, 128);
         assert_eq!(ALERT_MAX_CONDITIONS, 32);
         assert_eq!(ALERT_MAX_TASK_IDS, 32);
+        assert_eq!(ALERT_UUID_TEXT_LEN, 36);
+    }
+
+    #[test]
+    fn alert_rule_path_ids_require_canonical_uuid_text() {
+        let canonical = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        assert_eq!(
+            require_alert_uuid_text(canonical, "alert_rule_id").unwrap(),
+            canonical
+        );
+
+        for value in [
+            "alert-rule-a",
+            " aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa ",
+            "aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaaaaaa",
+            "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaax",
+        ] {
+            assert!(
+                require_alert_uuid_text(value, "alert_rule_id").is_err(),
+                "{value:?} should be rejected"
+            );
+        }
     }
 
     #[test]
@@ -888,6 +932,17 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(normalize_id_list(too_many_ids, "failure_task_ids").is_err());
         assert!(normalize_id_list(vec!["not-a-uuid".into()], "failure_task_ids").is_err());
+        for value in [
+            " 00000000-0000-0000-0000-000000000001",
+            "00000000-0000-0000-0000-000000000001 ",
+            "00000000000000000000000000000001",
+            "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+        ] {
+            assert!(
+                normalize_id_list(vec![value.into()], "failure_task_ids").is_err(),
+                "{value:?} should be rejected"
+            );
+        }
     }
 
     #[test]
