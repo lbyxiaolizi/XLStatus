@@ -1203,100 +1203,137 @@ async fn load_server_groups(
 ) -> Result<(Vec<ServerGroupView>, i64), AppError> {
     match db {
         DatabaseBackend::Sqlite(pool) => {
-            let paged = auth.server_ids.is_none();
-            let total = if paged {
-                let row: (i64,) =
-                    sqlx::query_as("SELECT COUNT(*) FROM server_groups WHERE owner_user_id = ?")
-                        .bind(auth.user_id.0.to_string())
-                        .fetch_one(pool)
-                        .await?;
-                row.0
-            } else {
-                0
-            };
-            let sql = if paged {
-                r#"
-                SELECT id, owner_user_id, name, color, display_order, created_at, updated_at
-                FROM server_groups
-                WHERE owner_user_id = ?
-                ORDER BY COALESCE(display_order, 999999), created_at ASC
-                LIMIT ? OFFSET ?
-                "#
-            } else {
-                r#"
-                SELECT id, owner_user_id, name, color, display_order, created_at, updated_at
-                FROM server_groups
-                WHERE owner_user_id = ?
-                ORDER BY COALESCE(display_order, 999999), created_at ASC
-                "#
-            };
-            let mut query = sqlx::query(sql).bind(auth.user_id.0.to_string());
-            if paged {
-                query = query.bind(limit).bind(offset);
+            let owner = auth.user_id.0.to_string();
+            let mut count_query = QueryBuilder::<sqlx::Sqlite>::new(
+                "SELECT COUNT(*) FROM server_groups sg WHERE sg.owner_user_id = ",
+            );
+            count_query.push_bind(&owner);
+            if let Some(server_ids) = auth.server_ids.as_ref() {
+                push_sqlite_server_group_allowlist_filter(&mut count_query, &owner, server_ids);
             }
-            let rows = query.fetch_all(pool).await?;
+            let (total,): (i64,) = count_query.build_query_as().fetch_one(pool).await?;
+
+            let mut query = QueryBuilder::<sqlx::Sqlite>::new(
+                r#"
+                SELECT sg.id AS id, sg.owner_user_id AS owner_user_id, sg.name AS name,
+                       sg.color AS color, sg.display_order AS display_order,
+                       sg.created_at AS created_at, sg.updated_at AS updated_at
+                FROM server_groups sg
+                WHERE sg.owner_user_id =
+                "#,
+            );
+            query.push_bind(&owner);
+            if let Some(server_ids) = auth.server_ids.as_ref() {
+                push_sqlite_server_group_allowlist_filter(&mut query, &owner, server_ids);
+            }
+            query
+                .push(" ORDER BY COALESCE(sg.display_order, 999999), sg.created_at ASC LIMIT ")
+                .push_bind(limit)
+                .push(" OFFSET ")
+                .push_bind(offset);
+            let rows = query.build().fetch_all(pool).await?;
             let mut groups = Vec::with_capacity(rows.len());
             for row in rows {
                 let mut group = server_group_from_sqlite_row(row)?;
-                group.server_ids = load_server_group_members(db, &group.id).await?;
+                group.server_ids = load_server_group_members(db, &group.id, auth.user_id).await?;
                 groups.push(group);
             }
-            if paged {
-                Ok((groups, total))
-            } else {
-                Ok(visible_server_groups_page(auth, groups, limit, offset))
-            }
+            Ok((groups, total))
         }
         DatabaseBackend::Postgres(pool) => {
-            let paged = auth.server_ids.is_none();
-            let total = if paged {
-                let row: (i64,) =
-                    sqlx::query_as("SELECT COUNT(*) FROM server_groups WHERE owner_user_id = $1")
-                        .bind(auth.user_id.0)
-                        .fetch_one(pool)
-                        .await?;
-                row.0
-            } else {
-                0
-            };
-            let sql = if paged {
-                r#"
-                SELECT id::text AS id, owner_user_id::text AS owner_user_id, name, color,
-                       display_order::bigint AS display_order, created_at::text AS created_at,
-                       updated_at::text AS updated_at
-                FROM server_groups
-                WHERE owner_user_id = $1
-                ORDER BY COALESCE(display_order, 999999), created_at ASC
-                LIMIT $2 OFFSET $3
-                "#
-            } else {
-                r#"
-                SELECT id::text AS id, owner_user_id::text AS owner_user_id, name, color,
-                       display_order::bigint AS display_order, created_at::text AS created_at,
-                       updated_at::text AS updated_at
-                FROM server_groups
-                WHERE owner_user_id = $1
-                ORDER BY COALESCE(display_order, 999999), created_at ASC
-                "#
-            };
-            let mut query = sqlx::query(sql).bind(auth.user_id.0);
-            if paged {
-                query = query.bind(limit).bind(offset);
+            let mut count_query = QueryBuilder::<sqlx::Postgres>::new(
+                "SELECT COUNT(*) FROM server_groups sg WHERE sg.owner_user_id = ",
+            );
+            count_query.push_bind(auth.user_id.0);
+            if let Some(server_ids) = auth.server_ids.as_ref() {
+                push_pg_server_group_allowlist_filter(&mut count_query, auth.user_id, server_ids)?;
             }
-            let rows = query.fetch_all(pool).await?;
+            let (total,): (i64,) = count_query.build_query_as().fetch_one(pool).await?;
+
+            let mut query = QueryBuilder::<sqlx::Postgres>::new(
+                r#"
+                SELECT sg.id::text AS id, sg.owner_user_id::text AS owner_user_id,
+                       sg.name AS name, sg.color AS color,
+                       sg.display_order::bigint AS display_order,
+                       sg.created_at::text AS created_at, sg.updated_at::text AS updated_at
+                FROM server_groups sg
+                WHERE sg.owner_user_id =
+                "#,
+            );
+            query.push_bind(auth.user_id.0);
+            if let Some(server_ids) = auth.server_ids.as_ref() {
+                push_pg_server_group_allowlist_filter(&mut query, auth.user_id, server_ids)?;
+            }
+            query
+                .push(" ORDER BY COALESCE(sg.display_order, 999999), sg.created_at ASC LIMIT ")
+                .push_bind(limit)
+                .push(" OFFSET ")
+                .push_bind(offset);
+            let rows = query.build().fetch_all(pool).await?;
             let mut groups = Vec::with_capacity(rows.len());
             for row in rows {
                 let mut group = server_group_from_pg_row(row)?;
-                group.server_ids = load_server_group_members(db, &group.id).await?;
+                group.server_ids = load_server_group_members(db, &group.id, auth.user_id).await?;
                 groups.push(group);
             }
-            if paged {
-                Ok((groups, total))
-            } else {
-                Ok(visible_server_groups_page(auth, groups, limit, offset))
-            }
+            Ok((groups, total))
         }
     }
+}
+
+fn push_sqlite_server_group_allowlist_filter<'a>(
+    builder: &mut QueryBuilder<'a, sqlx::Sqlite>,
+    owner_user_id: &'a str,
+    server_ids: &'a [String],
+) {
+    builder.push(
+        r#"
+        AND NOT EXISTS (
+            SELECT 1
+            FROM server_group_members sgm
+            JOIN agents a ON a.id = sgm.agent_id
+            WHERE sgm.group_id = sg.id
+              AND a.owner_user_id =
+        "#,
+    );
+    builder.push_bind(owner_user_id);
+    if !server_ids.is_empty() {
+        builder.push(" AND a.id NOT IN (");
+        let mut separated = builder.separated(", ");
+        for id in server_ids {
+            separated.push_bind(id);
+        }
+        separated.push_unseparated(")");
+    }
+    builder.push(")");
+}
+
+fn push_pg_server_group_allowlist_filter(
+    builder: &mut QueryBuilder<'_, sqlx::Postgres>,
+    owner_user_id: UserId,
+    server_ids: &[String],
+) -> Result<(), AppError> {
+    builder.push(
+        r#"
+        AND NOT EXISTS (
+            SELECT 1
+            FROM server_group_members sgm
+            JOIN agents a ON a.id = sgm.agent_id
+            WHERE sgm.group_id = sg.id
+              AND a.owner_user_id =
+        "#,
+    );
+    builder.push_bind(owner_user_id.0);
+    if !server_ids.is_empty() {
+        builder.push(" AND a.id NOT IN (");
+        let mut separated = builder.separated(", ");
+        for id in server_ids {
+            separated.push_bind(parse_uuid(id)?);
+        }
+        separated.push_unseparated(")");
+    }
+    builder.push(")");
+    Ok(())
 }
 
 async fn load_server_group(
@@ -1321,7 +1358,7 @@ async fn load_server_group(
                 .map(server_group_from_sqlite_row)
                 .transpose()?
                 .ok_or(AppError::NotFound("server group not found".into()))?;
-            group.server_ids = load_server_group_members(db, &group.id).await?;
+            group.server_ids = load_server_group_members(db, &group.id, auth.user_id).await?;
             ensure_server_group_visible(auth, &group.server_ids)?;
             group.server_ids = filter_visible_server_ids(auth, &group.server_ids);
             Ok(group)
@@ -1344,7 +1381,7 @@ async fn load_server_group(
                 .map(server_group_from_pg_row)
                 .transpose()?
                 .ok_or(AppError::NotFound("server group not found".into()))?;
-            group.server_ids = load_server_group_members(db, &group.id).await?;
+            group.server_ids = load_server_group_members(db, &group.id, auth.user_id).await?;
             ensure_server_group_visible(auth, &group.server_ids)?;
             group.server_ids = filter_visible_server_ids(auth, &group.server_ids);
             Ok(group)
@@ -1355,22 +1392,37 @@ async fn load_server_group(
 async fn load_server_group_members(
     db: &DatabaseBackend,
     group_id: &str,
+    owner_user_id: UserId,
 ) -> Result<Vec<String>, AppError> {
     match db {
         DatabaseBackend::Sqlite(pool) => {
             let rows: Vec<(String,)> = sqlx::query_as(
-                "SELECT agent_id FROM server_group_members WHERE group_id = ? ORDER BY created_at ASC",
+                r#"
+                SELECT sgm.agent_id
+                FROM server_group_members sgm
+                JOIN agents a ON a.id = sgm.agent_id
+                WHERE sgm.group_id = ? AND a.owner_user_id = ?
+                ORDER BY sgm.created_at ASC
+                "#,
             )
             .bind(group_id)
+            .bind(owner_user_id.0.to_string())
             .fetch_all(pool)
             .await?;
             Ok(rows.into_iter().map(|(id,)| id).collect())
         }
         DatabaseBackend::Postgres(pool) => {
             let rows: Vec<(String,)> = sqlx::query_as(
-                "SELECT agent_id::text FROM server_group_members WHERE group_id = $1 ORDER BY created_at ASC",
+                r#"
+                SELECT sgm.agent_id::text
+                FROM server_group_members sgm
+                JOIN agents a ON a.id = sgm.agent_id
+                WHERE sgm.group_id = $1 AND a.owner_user_id = $2
+                ORDER BY sgm.created_at ASC
+                "#,
             )
             .bind(parse_uuid(group_id)?)
+            .bind(owner_user_id.0)
             .fetch_all(pool)
             .await?;
             Ok(rows.into_iter().map(|(id,)| id).collect())
@@ -1431,25 +1483,6 @@ fn ensure_server_group_visible(auth: &AuthSession, server_ids: &[String]) -> Res
     } else {
         Err(AppError::Forbidden("server group not in scope".into()))
     }
-}
-
-fn visible_server_groups_page(
-    auth: &AuthSession,
-    groups: Vec<ServerGroupView>,
-    limit: i64,
-    offset: i64,
-) -> (Vec<ServerGroupView>, i64) {
-    let visible: Vec<_> = groups
-        .into_iter()
-        .filter(|group| server_group_visible(auth, &group.server_ids))
-        .collect();
-    let total = visible.len() as i64;
-    let start = offset.max(0) as usize;
-    let end = (start + limit.clamp(1, 500) as usize).min(visible.len());
-    if start >= visible.len() {
-        return (Vec::new(), total);
-    }
-    (visible[start..end].to_vec(), total)
 }
 
 async fn ensure_group_server_access(
@@ -3186,6 +3219,28 @@ mod tests {
         .unwrap();
     }
 
+    async fn seed_server_group_with_order(
+        db: &DatabaseBackend,
+        id: Uuid,
+        owner: Uuid,
+        name: &str,
+        display_order: i64,
+    ) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO server_groups (id, owner_user_id, name, display_order, created_at, updated_at) VALUES (?, ?, ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id.to_string())
+        .bind(owner.to_string())
+        .bind(name)
+        .bind(display_order)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     async fn seed_server_group_member(db: &DatabaseBackend, group_id: Uuid, server_id: Uuid) {
         let DatabaseBackend::Sqlite(pool) = db else {
             unreachable!();
@@ -3255,10 +3310,19 @@ mod tests {
         let admin = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
         let allowed_server = Uuid::parse_str("00000000-0000-0000-0000-000000000101").unwrap();
         let blocked_server = Uuid::parse_str("00000000-0000-0000-0000-000000000202").unwrap();
+        let foreign_server = Uuid::parse_str("00000000-0000-0000-0000-000000000203").unwrap();
         let allowed_group = Uuid::parse_str("00000000-0000-0000-0000-000000000301").unwrap();
         let blocked_group = Uuid::parse_str("00000000-0000-0000-0000-000000000302").unwrap();
+        let foreign_dirty_group = Uuid::parse_str("00000000-0000-0000-0000-000000000303").unwrap();
 
         seed_user(&db, admin, "admin", "admin").await;
+        seed_user(
+            &db,
+            Uuid::parse_str("00000000-0000-0000-0000-000000000009").unwrap(),
+            "other",
+            "member",
+        )
+        .await;
         seed_agent(
             &db,
             allowed_server,
@@ -3275,20 +3339,37 @@ mod tests {
             "2026-01-02T00:00:00Z",
         )
         .await;
-        seed_server_group(&db, allowed_group, admin, "allowed-group").await;
-        seed_server_group(&db, blocked_group, admin, "blocked-group").await;
+        seed_agent(
+            &db,
+            foreign_server,
+            Uuid::parse_str("00000000-0000-0000-0000-000000000009").unwrap(),
+            "foreign",
+            "2026-01-03T00:00:00Z",
+        )
+        .await;
+        seed_server_group_with_order(&db, blocked_group, admin, "blocked-group", 1).await;
+        seed_server_group_with_order(&db, allowed_group, admin, "allowed-group", 2).await;
+        seed_server_group_with_order(&db, foreign_dirty_group, admin, "foreign-dirty-group", 3)
+            .await;
         seed_server_group_member(&db, allowed_group, allowed_server).await;
         seed_server_group_member(&db, blocked_group, blocked_server).await;
+        seed_server_group_member(&db, foreign_dirty_group, foreign_server).await;
 
         let mut auth = auth_session(AuthKind::PersonalAccessToken, UserRole::Admin);
         auth.user_id = UserId(admin);
         auth.server_ids = Some(vec![allowed_server.to_string()]);
         auth.pat_id = Some("pat".into());
 
-        let (groups, total) = load_server_groups(&db, &auth, 50, 0).await.unwrap();
-        assert_eq!(total, 1);
+        let (groups, total) = load_server_groups(&db, &auth, 1, 0).await.unwrap();
+        assert_eq!(total, 2);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].id, allowed_group.to_string());
+
+        let (groups, total) = load_server_groups(&db, &auth, 10, 0).await.unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].server_ids, vec![allowed_server.to_string()]);
+        assert!(groups[1].server_ids.is_empty());
 
         let err = load_server_group(&db, &auth, &blocked_group.to_string())
             .await
@@ -3314,6 +3395,47 @@ mod tests {
                 .await
                 .unwrap_err();
         assert!(matches!(delete_err, AppError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn server_group_members_ignore_cross_owner_dirty_members() {
+        let db = test_db().await;
+        let owner = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let other = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let owner_server = Uuid::parse_str("00000000-0000-0000-0000-000000000111").unwrap();
+        let other_server = Uuid::parse_str("00000000-0000-0000-0000-000000000222").unwrap();
+        let group_id = Uuid::parse_str("00000000-0000-0000-0000-000000000333").unwrap();
+
+        seed_user(&db, owner, "owner", "member").await;
+        seed_user(&db, other, "other", "member").await;
+        seed_agent(
+            &db,
+            owner_server,
+            owner,
+            "owner-server",
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+        seed_agent(
+            &db,
+            other_server,
+            other,
+            "other-server",
+            "2026-01-02T00:00:00Z",
+        )
+        .await;
+        seed_server_group(&db, group_id, owner, "owner-group").await;
+        seed_server_group_member(&db, group_id, owner_server).await;
+        seed_server_group_member(&db, group_id, other_server).await;
+
+        let mut auth = auth_session(AuthKind::Session, UserRole::Member);
+        auth.user_id = UserId(owner);
+
+        let group = load_server_group(&db, &auth, &group_id.to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(group.server_ids, vec![owner_server.to_string()]);
     }
 
     #[test]
