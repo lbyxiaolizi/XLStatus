@@ -1197,14 +1197,19 @@ fn parse_public_server_id_path(uri: &Uri) -> Result<AgentId, AppError> {
 }
 
 fn parse_public_server_id(id: &str) -> Result<AgentId, AppError> {
-    if id.len() > PUBLIC_SERVER_ID_PATH_BYTES {
+    if id.len() != PUBLIC_SERVER_ID_PATH_BYTES {
         return Err(AppError::BadRequest(format!(
-            "public server id must be at most {PUBLIC_SERVER_ID_PATH_BYTES} bytes"
+            "public server id must be a canonical UUID"
         )));
     }
-    Uuid::parse_str(id)
-        .map(AgentId)
-        .map_err(|e| AppError::BadRequest(format!("invalid server id: {e}")))
+    let parsed = Uuid::parse_str(id)
+        .map_err(|_| AppError::BadRequest("public server id must be a canonical UUID".into()))?;
+    if parsed.to_string() != id {
+        return Err(AppError::BadRequest(
+            "public server id must be a canonical UUID".into(),
+        ));
+    }
+    Ok(AgentId(parsed))
 }
 
 fn server_status(
@@ -1605,14 +1610,22 @@ mod tests {
         let uri: Uri = format!("/api/v1/public/servers/{id}").parse().unwrap();
         assert_eq!(parse_public_server_id_path(&uri).unwrap().0, id);
 
-        let uri: Uri = format!(
-            "/api/v1/public/servers/{}",
-            "a".repeat(PUBLIC_SERVER_ID_PATH_BYTES + 1)
-        )
-        .parse()
-        .unwrap();
-        let err = parse_public_server_id_path(&uri).unwrap_err();
-        assert!(matches!(err, AppError::BadRequest(message) if message.contains("at most")));
+        for bad_id in [
+            "server-a".to_string(),
+            id.simple().to_string(),
+            id.to_string().to_uppercase(),
+            "a".repeat(PUBLIC_SERVER_ID_PATH_BYTES + 1),
+        ] {
+            let uri: Uri = format!("/api/v1/public/servers/{bad_id}").parse().unwrap();
+            let err = parse_public_server_id_path(&uri).unwrap_err();
+            assert!(
+                matches!(err, AppError::BadRequest(message) if message.contains("canonical UUID"))
+            );
+        }
+        assert!(matches!(
+            parse_public_server_id(&format!(" {id} ")),
+            Err(AppError::BadRequest(message)) if message.contains("canonical UUID")
+        ));
 
         let uri: Uri = format!("/api/v1/public/servers/{id}/metrics")
             .parse()
