@@ -4,8 +4,9 @@
 //! dashboard's history view.
 
 use crate::api::v1::services::{
-    SERVICE_MAX_INTERVAL_SECONDS, SERVICE_MAX_TARGETS_PER_PROBE, SERVICE_MAX_TIMEOUT_SECONDS,
-    SERVICE_MIN_INTERVAL_SECONDS, SERVICE_MIN_TIMEOUT_SECONDS,
+    SERVICE_MAX_INTERVAL_SECONDS, SERVICE_MAX_NAME_BYTES, SERVICE_MAX_SERVER_IDS,
+    SERVICE_MAX_TARGETS_PER_PROBE, SERVICE_MAX_TARGET_BYTES, SERVICE_MAX_TASK_IDS,
+    SERVICE_MAX_TIMEOUT_SECONDS, SERVICE_MIN_INTERVAL_SECONDS, SERVICE_MIN_TIMEOUT_SECONDS,
 };
 use crate::db::Db;
 use crate::grpc::{ensure_task_result_text_within, SessionRegistry, TaskResponseRegistry};
@@ -27,6 +28,7 @@ use xlstatus_shared::AgentId;
 
 const SERVICE_AGENT_PROBE_STDOUT_MAX_BYTES: usize = 16 * 1024;
 const SERVICE_AGENT_PROBE_ERROR_MAX_BYTES: usize = 4096;
+const SERVICE_UUID_TEXT_LEN: usize = 36;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceConfig {
@@ -52,6 +54,23 @@ pub struct ServiceMonitor {
     response_registry: Arc<TaskResponseRegistry>,
     scheduled: Arc<RwLock<HashMap<String, chrono::DateTime<Utc>>>>,
     service_states: Arc<RwLock<HashMap<String, bool>>>,
+}
+
+struct LoadedServiceRow {
+    id: String,
+    owner_user_id: Option<String>,
+    name: String,
+    kind: String,
+    target: String,
+    interval_seconds: i64,
+    timeout_seconds: i64,
+    enabled: bool,
+    server_id: Option<String>,
+    notification_group_id: Option<String>,
+    cover_mode: String,
+    exclude_server_ids_json: Option<String>,
+    failure_task_ids_json: Option<String>,
+    recovery_task_ids_json: Option<String>,
 }
 
 impl ServiceMonitor {
@@ -291,7 +310,7 @@ impl ServiceMonitor {
                 .await?;
                 let mut services = rows
                     .into_iter()
-                    .map(
+                    .filter_map(
                         |(
                             id,
                             owner_user_id,
@@ -308,27 +327,34 @@ impl ServiceMonitor {
                             failure_task_ids_json,
                             recovery_task_ids_json,
                         )| {
-                            let server_ids = server_id.into_iter().collect();
-                            ServiceConfig {
+                            let row = LoadedServiceRow {
                                 id,
                                 owner_user_id,
                                 name,
                                 kind,
                                 target,
-                                interval_seconds: interval_seconds as u64,
-                                timeout_seconds: timeout_seconds as u64,
+                                interval_seconds,
+                                timeout_seconds,
                                 enabled: enabled != 0,
-                                cover_mode,
-                                server_ids,
-                                exclude_server_ids: parse_server_ids_json(exclude_server_ids_json),
+                                server_id,
                                 notification_group_id,
-                                failure_task_ids: parse_task_ids_json(failure_task_ids_json),
-                                recovery_task_ids: parse_task_ids_json(recovery_task_ids_json),
+                                cover_mode,
+                                exclude_server_ids_json,
+                                failure_task_ids_json,
+                                recovery_task_ids_json,
+                            };
+                            match validate_loaded_service_config(row) {
+                                Ok(service) => Some(service),
+                                Err(err) => {
+                                    warn!("historical service monitor row skipped: {err}");
+                                    None
+                                }
                             }
                         },
                     )
                     .collect::<Vec<_>>();
                 self.attach_service_server_ids(&mut services).await?;
+                retain_valid_loaded_services(&mut services);
                 Ok(services)
             }
             crate::db::DatabaseBackend::Postgres(pool) => {
@@ -354,7 +380,7 @@ impl ServiceMonitor {
                 .await?;
                 let mut services = rows
                     .into_iter()
-                    .map(
+                    .filter_map(
                         |(
                             id,
                             owner_user_id,
@@ -371,27 +397,34 @@ impl ServiceMonitor {
                             failure_task_ids_json,
                             recovery_task_ids_json,
                         )| {
-                            let server_ids = server_id.into_iter().collect();
-                            ServiceConfig {
+                            let row = LoadedServiceRow {
                                 id,
                                 owner_user_id,
                                 name,
                                 kind,
                                 target,
-                                interval_seconds: interval_seconds as u64,
-                                timeout_seconds: timeout_seconds as u64,
+                                interval_seconds: i64::from(interval_seconds),
+                                timeout_seconds: i64::from(timeout_seconds),
                                 enabled,
-                                cover_mode,
-                                server_ids,
-                                exclude_server_ids: parse_server_ids_json(exclude_server_ids_json),
+                                server_id,
                                 notification_group_id,
-                                failure_task_ids: parse_task_ids_json(failure_task_ids_json),
-                                recovery_task_ids: parse_task_ids_json(recovery_task_ids_json),
+                                cover_mode,
+                                exclude_server_ids_json,
+                                failure_task_ids_json,
+                                recovery_task_ids_json,
+                            };
+                            match validate_loaded_service_config(row) {
+                                Ok(service) => Some(service),
+                                Err(err) => {
+                                    warn!("historical service monitor row skipped: {err}");
+                                    None
+                                }
                             }
                         },
                     )
                     .collect::<Vec<_>>();
                 self.attach_service_server_ids(&mut services).await?;
+                retain_valid_loaded_services(&mut services);
                 Ok(services)
             }
         }
@@ -411,9 +444,10 @@ impl ServiceMonitor {
         match &self.db {
             crate::db::DatabaseBackend::Sqlite(pool) => {
                 let rows: Vec<(String,)> = sqlx::query_as(
-                    "SELECT server_id FROM service_servers WHERE service_id = ? ORDER BY created_at ASC, server_id ASC",
+                    "SELECT server_id FROM service_servers WHERE service_id = ? ORDER BY created_at ASC, server_id ASC LIMIT ?",
                 )
                 .bind(service_id)
+                .bind((SERVICE_MAX_SERVER_IDS + 1) as i64)
                 .fetch_all(pool)
                 .await?;
                 Ok(rows.into_iter().map(|(id,)| id).collect())
@@ -421,9 +455,10 @@ impl ServiceMonitor {
             crate::db::DatabaseBackend::Postgres(pool) => {
                 let parsed = uuid::Uuid::parse_str(service_id).context("invalid service_id")?;
                 let rows: Vec<(String,)> = sqlx::query_as(
-                    "SELECT server_id::text FROM service_servers WHERE service_id = $1 ORDER BY created_at ASC, server_id ASC",
+                    "SELECT server_id::text FROM service_servers WHERE service_id = $1 ORDER BY created_at ASC, server_id ASC LIMIT $2",
                 )
                 .bind(parsed)
+                .bind((SERVICE_MAX_SERVER_IDS + 1) as i64)
                 .fetch_all(pool)
                 .await?;
                 Ok(rows.into_iter().map(|(id,)| id).collect())
@@ -829,18 +864,251 @@ fn parse_tcp_target(target: &str) -> Result<(&str, u16)> {
     Ok((host, port))
 }
 
-fn parse_server_ids_json(value: Option<String>) -> Vec<String> {
-    value
-        .as_deref()
-        .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
-        .unwrap_or_default()
+fn validate_loaded_service_config(row: LoadedServiceRow) -> Result<ServiceConfig> {
+    let id = require_canonical_uuid(&row.id, "service_id")?;
+    let owner_user_id = row
+        .owner_user_id
+        .map(|value| require_canonical_uuid(&value, "owner_user_id"))
+        .transpose()?;
+    let name = row.name.trim().to_string();
+    ensure_nonempty_bounded_text(&name, SERVICE_MAX_NAME_BYTES, "name")?;
+    let kind = row.kind.trim().to_ascii_lowercase();
+    let probe_type = ProbeType::from_str(&kind).context("invalid kind")?;
+    let target = row.target.trim().to_string();
+    ensure_nonempty_bounded_text(&target, SERVICE_MAX_TARGET_BYTES, "target")?;
+    validate_probe_target_shape(&probe_type, &target)?;
+    let interval_seconds = checked_runtime_seconds(
+        row.interval_seconds,
+        SERVICE_MIN_INTERVAL_SECONDS,
+        SERVICE_MAX_INTERVAL_SECONDS,
+        "interval_seconds",
+    )?;
+    let timeout_seconds = checked_runtime_seconds(
+        row.timeout_seconds,
+        SERVICE_MIN_TIMEOUT_SECONDS,
+        SERVICE_MAX_TIMEOUT_SECONDS,
+        "timeout_seconds",
+    )?;
+    let cover_mode = normalize_loaded_cover_mode(&row.cover_mode)?;
+    let server_ids = match row.server_id {
+        Some(server_id) => {
+            bounded_normalized_uuid_list(vec![server_id], SERVICE_MAX_SERVER_IDS, "server_id")?
+        }
+        None => Vec::new(),
+    };
+    let exclude_server_ids = parse_bounded_normalized_uuid_json_list(
+        row.exclude_server_ids_json,
+        SERVICE_MAX_SERVER_IDS,
+        "exclude_server_ids_json",
+    )?;
+    let notification_group_id = row
+        .notification_group_id
+        .map(|value| require_canonical_uuid(&value, "notification_group_id"))
+        .transpose()?;
+    let failure_task_ids = parse_bounded_canonical_uuid_json_list(
+        row.failure_task_ids_json,
+        SERVICE_MAX_TASK_IDS,
+        "failure_task_ids_json",
+    )?;
+    let recovery_task_ids = parse_bounded_canonical_uuid_json_list(
+        row.recovery_task_ids_json,
+        SERVICE_MAX_TASK_IDS,
+        "recovery_task_ids_json",
+    )?;
+
+    Ok(ServiceConfig {
+        id,
+        owner_user_id,
+        name,
+        kind,
+        target,
+        interval_seconds,
+        timeout_seconds,
+        enabled: row.enabled,
+        cover_mode,
+        server_ids,
+        exclude_server_ids,
+        notification_group_id,
+        failure_task_ids,
+        recovery_task_ids,
+    })
 }
 
-fn parse_task_ids_json(value: Option<String>) -> Vec<String> {
-    value
-        .as_deref()
-        .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
-        .unwrap_or_default()
+fn retain_valid_loaded_services(services: &mut Vec<ServiceConfig>) {
+    services.retain_mut(
+        |service| match validate_loaded_service_runtime_lists(service) {
+            Ok(()) => true,
+            Err(err) => {
+                warn!(
+                    "historical service monitor row {} skipped after relation load: {err}",
+                    service.id
+                );
+                false
+            }
+        },
+    );
+}
+
+fn validate_loaded_service_runtime_lists(service: &mut ServiceConfig) -> Result<()> {
+    service.server_ids = bounded_normalized_uuid_list(
+        std::mem::take(&mut service.server_ids),
+        SERVICE_MAX_SERVER_IDS,
+        "server_ids",
+    )?;
+    service.exclude_server_ids = bounded_normalized_uuid_list(
+        std::mem::take(&mut service.exclude_server_ids),
+        SERVICE_MAX_SERVER_IDS,
+        "exclude_server_ids",
+    )?;
+    service.failure_task_ids = bounded_canonical_uuid_list(
+        std::mem::take(&mut service.failure_task_ids),
+        SERVICE_MAX_TASK_IDS,
+        "failure_task_ids",
+    )?;
+    service.recovery_task_ids = bounded_canonical_uuid_list(
+        std::mem::take(&mut service.recovery_task_ids),
+        SERVICE_MAX_TASK_IDS,
+        "recovery_task_ids",
+    )?;
+    Ok(())
+}
+
+fn checked_runtime_seconds(value: i64, min: i32, max: i32, field: &str) -> Result<u64> {
+    if value < i64::from(min) || value > i64::from(max) {
+        anyhow::bail!("{field} must be between {min} and {max}");
+    }
+    Ok(value as u64)
+}
+
+fn ensure_nonempty_bounded_text(value: &str, max_bytes: usize, field: &str) -> Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("{field} is required");
+    }
+    if value.len() > max_bytes {
+        anyhow::bail!("{field} must be at most {max_bytes} bytes");
+    }
+    Ok(())
+}
+
+fn validate_probe_target_shape(probe_type: &ProbeType, target: &str) -> Result<()> {
+    match probe_type {
+        ProbeType::Http => {
+            let parsed = reqwest::Url::parse(target).context("HTTP monitor URL is invalid")?;
+            match parsed.scheme() {
+                "http" | "https" => {}
+                scheme => anyhow::bail!("HTTP monitor URL scheme '{scheme}' is not allowed"),
+            }
+            if !parsed.username().is_empty() || parsed.password().is_some() {
+                anyhow::bail!("HTTP monitor URL must not include credentials");
+            }
+            parsed
+                .host_str()
+                .context("HTTP monitor URL must include a host")?;
+            parsed
+                .port_or_known_default()
+                .context("HTTP monitor URL must include a port or known scheme")?;
+            Ok(())
+        }
+        ProbeType::Tcp => parse_tcp_target(target).map(|_| ()),
+        ProbeType::Icmp => Ok(()),
+    }
+}
+
+fn normalize_loaded_cover_mode(value: &str) -> Result<String> {
+    let value = value.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "local" | "all" | "specific" | "exclude" => Ok(value),
+        _ => anyhow::bail!("cover_mode must be local, all, specific, or exclude"),
+    }
+}
+
+fn parse_bounded_normalized_uuid_json_list(
+    value: Option<String>,
+    max_len: usize,
+    field: &str,
+) -> Result<Vec<String>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let values = serde_json::from_str::<Vec<String>>(&value)
+        .with_context(|| format!("{field} must be a JSON string array"))?;
+    bounded_normalized_uuid_list(values, max_len, field)
+}
+
+fn parse_bounded_canonical_uuid_json_list(
+    value: Option<String>,
+    max_len: usize,
+    field: &str,
+) -> Result<Vec<String>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let values = serde_json::from_str::<Vec<String>>(&value)
+        .with_context(|| format!("{field} must be a JSON string array"))?;
+    bounded_canonical_uuid_list(values, max_len, field)
+}
+
+fn bounded_normalized_uuid_list(
+    values: Vec<String>,
+    max_len: usize,
+    field: &str,
+) -> Result<Vec<String>> {
+    if values.len() > max_len {
+        anyhow::bail!("{field} must contain at most {max_len} entries");
+    }
+    let mut out = Vec::new();
+    for value in values {
+        let id = canonical_uuid(&value, field)?;
+        if !out.iter().any(|existing| existing == &id) {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
+fn bounded_canonical_uuid_list(
+    values: Vec<String>,
+    max_len: usize,
+    field: &str,
+) -> Result<Vec<String>> {
+    if values.len() > max_len {
+        anyhow::bail!("{field} must contain at most {max_len} entries");
+    }
+    let mut out = Vec::new();
+    for value in values {
+        let id = require_canonical_uuid(&value, field)?;
+        if !out.iter().any(|existing| existing == &id) {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
+fn require_canonical_uuid(value: &str, field: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.len() != SERVICE_UUID_TEXT_LEN {
+        anyhow::bail!("{field} must be a canonical UUID");
+    }
+    let parsed = uuid::Uuid::parse_str(trimmed).context("invalid UUID")?;
+    if parsed.to_string() != trimmed {
+        anyhow::bail!("{field} must be a canonical UUID");
+    }
+    Ok(trimmed.to_string())
+}
+
+fn canonical_uuid(value: &str, field: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("{field} contains an empty UUID");
+    }
+    let parsed = uuid::Uuid::parse_str(trimmed).context("invalid UUID")?;
+    Ok(parsed.to_string())
 }
 
 fn trusted_service_owner_from_config(service: &ServiceConfig) -> Option<String> {
@@ -988,6 +1256,35 @@ mod tests {
     }
 
     #[test]
+    fn loaded_service_config_rejects_invalid_historical_fields() {
+        let valid = test_loaded_service_row();
+        let service = validate_loaded_service_config(valid).unwrap();
+        assert_eq!(service.kind, "http");
+        assert_eq!(service.cover_mode, "exclude");
+        assert_eq!(
+            service.exclude_server_ids,
+            vec!["00000000-0000-0000-0000-000000000101".to_string()]
+        );
+
+        let mut malformed_exclude = test_loaded_service_row();
+        malformed_exclude.exclude_server_ids_json = Some("not json".into());
+        assert!(validate_loaded_service_config(malformed_exclude).is_err());
+
+        let mut negative_interval = test_loaded_service_row();
+        negative_interval.interval_seconds = -1;
+        assert!(validate_loaded_service_config(negative_interval).is_err());
+
+        let mut unknown_cover = test_loaded_service_row();
+        unknown_cover.cover_mode = "remote".into();
+        assert!(validate_loaded_service_config(unknown_cover).is_err());
+
+        let mut simple_task_id = test_loaded_service_row();
+        simple_task_id.failure_task_ids_json =
+            Some(r#"["00000000000000000000000000000401"]"#.into());
+        assert!(validate_loaded_service_config(simple_task_id).is_err());
+    }
+
+    #[test]
     fn service_monitor_bounds_timeout_interval_and_target_count() {
         assert_eq!(
             bounded_interval_seconds(1),
@@ -1043,6 +1340,98 @@ mod tests {
         };
 
         assert_eq!(tcp.timeout_seconds, SERVICE_MAX_TIMEOUT_SECONDS as u32);
+    }
+
+    #[tokio::test]
+    async fn invalid_historical_service_monitor_rows_are_not_loaded() {
+        let db = test_db().await;
+        let owner = "00000000-0000-0000-0000-000000000001";
+        let service_ok = "00000000-0000-0000-0000-000000000301";
+        let service_bad_interval = "00000000-0000-0000-0000-000000000302";
+        let service_bad_exclude = "00000000-0000-0000-0000-000000000303";
+        let service_bad_cover = "00000000-0000-0000-0000-000000000304";
+        let service_too_many_servers = "00000000-0000-0000-0000-000000000305";
+        seed_user(&db, owner, "owner").await;
+        seed_service(
+            &db,
+            service_ok,
+            Some(owner),
+            "http",
+            "https://example.com",
+            60,
+            10,
+            "exclude",
+            Some(r#"["00000000000000000000000000000101"]"#),
+        )
+        .await;
+        seed_service(
+            &db,
+            service_bad_interval,
+            Some(owner),
+            "http",
+            "https://example.com",
+            -1,
+            10,
+            "local",
+            None,
+        )
+        .await;
+        seed_service(
+            &db,
+            service_bad_exclude,
+            Some(owner),
+            "http",
+            "https://example.com",
+            60,
+            10,
+            "exclude",
+            Some("not json"),
+        )
+        .await;
+        seed_service(
+            &db,
+            service_bad_cover,
+            Some(owner),
+            "http",
+            "https://example.com",
+            60,
+            10,
+            "remote",
+            None,
+        )
+        .await;
+        seed_service(
+            &db,
+            service_too_many_servers,
+            Some(owner),
+            "http",
+            "https://example.com",
+            60,
+            10,
+            "specific",
+            None,
+        )
+        .await;
+        for index in 0..=SERVICE_MAX_SERVER_IDS {
+            let server_id = format!("00000000-0000-0000-0000-{:012}", 600 + index);
+            seed_agent(&db, &server_id, owner, &format!("srv-{index}")).await;
+            seed_service_server(&db, service_too_many_servers, &server_id).await;
+        }
+
+        let monitor = ServiceMonitor::new(
+            db,
+            SessionRegistry::new(),
+            Arc::new(TaskResponseRegistry::new()),
+        );
+        let services = monitor.load_services().await.unwrap();
+
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].id, service_ok);
+        assert_eq!(services[0].cover_mode, "exclude");
+        assert_eq!(
+            services[0].exclude_server_ids,
+            vec!["00000000-0000-0000-0000-000000000101".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -1239,6 +1628,51 @@ mod tests {
         .unwrap();
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_service(
+        db: &DatabaseBackend,
+        id: &str,
+        owner: Option<&str>,
+        kind: &str,
+        target: &str,
+        interval_seconds: i64,
+        timeout_seconds: i64,
+        cover_mode: &str,
+        exclude_server_ids_json: Option<&str>,
+    ) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO services (id, owner_user_id, name, type, target, interval_seconds, timeout_seconds, enabled, cover_mode, exclude_server_ids_json, created_at, updated_at) VALUES (?, ?, 'demo', ?, ?, ?, ?, 1, ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(owner)
+        .bind(kind)
+        .bind(target)
+        .bind(interval_seconds)
+        .bind(timeout_seconds)
+        .bind(cover_mode)
+        .bind(exclude_server_ids_json)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_service_server(db: &DatabaseBackend, service_id: &str, server_id: &str) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO service_servers (service_id, server_id, created_at) VALUES (?, ?, '2026-01-01T00:00:00Z')",
+        )
+        .bind(service_id)
+        .bind(server_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     fn test_service_config() -> ServiceConfig {
         ServiceConfig {
             id: "00000000-0000-0000-0000-000000000301".into(),
@@ -1255,6 +1689,25 @@ mod tests {
             notification_group_id: None,
             failure_task_ids: Vec::new(),
             recovery_task_ids: Vec::new(),
+        }
+    }
+
+    fn test_loaded_service_row() -> LoadedServiceRow {
+        LoadedServiceRow {
+            id: "00000000-0000-0000-0000-000000000301".into(),
+            owner_user_id: Some("00000000-0000-0000-0000-000000000001".into()),
+            name: "demo".into(),
+            kind: "HTTP".into(),
+            target: "https://example.com".into(),
+            interval_seconds: 60,
+            timeout_seconds: 10,
+            enabled: true,
+            server_id: Some("00000000000000000000000000000102".into()),
+            notification_group_id: Some("00000000-0000-0000-0000-000000000201".into()),
+            cover_mode: "EXCLUDE".into(),
+            exclude_server_ids_json: Some(r#"["00000000000000000000000000000101"]"#.into()),
+            failure_task_ids_json: Some(r#"["00000000-0000-0000-0000-000000000401"]"#.into()),
+            recovery_task_ids_json: Some(r#"["00000000-0000-0000-0000-000000000402"]"#.into()),
         }
     }
 }
