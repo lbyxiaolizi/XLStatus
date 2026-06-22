@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
@@ -188,44 +188,59 @@ pub async fn write_file(
 pub async fn delete_path(path: &str, recursive: bool, allowed_roots: &[String]) -> Result<()> {
     let roots = canonical_allowed_roots(allowed_roots, false).await?;
     let raw_path = validate_absolute_path(path)?;
-    let canonical = resolve_existing_path(path, &roots).await?;
 
     // Safety: prevent deleting root
     if raw_path.parent().is_none() || raw_path.to_str() == Some("/") {
         bail!("Cannot delete root directory");
     }
 
-    let metadata = fs::symlink_metadata(raw_path)
-        .await
-        .context("Failed to read metadata")?;
-    if metadata.is_symlink() {
-        fs::remove_file(raw_path)
-            .await
-            .context("Failed to delete symlink")?;
-        return Ok(());
-    }
-
-    if fs::metadata(&canonical)
-        .await
-        .context("Failed to read metadata")?
-        .is_dir()
+    #[cfg(unix)]
     {
-        if recursive {
-            fs::remove_dir_all(raw_path)
-                .await
-                .context("Failed to delete directory")?;
-        } else {
-            fs::remove_dir(raw_path)
-                .await
-                .context("Failed to delete directory (not empty?)")?;
-        }
-    } else {
-        fs::remove_file(raw_path)
-            .await
-            .context("Failed to delete file")?;
+        return delete_path_no_symlink_race(raw_path, recursive, &roots).await;
     }
 
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        let parent = raw_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Path has no parent"))?;
+        let canonical_parent = fs::canonicalize(parent)
+            .await
+            .with_context(|| format!("Parent {} does not exist", parent.display()))?;
+        ensure_under_allowed_roots(&canonical_parent, &roots)?;
+        let canonical = resolve_existing_path(path, &roots).await?;
+        let metadata = fs::symlink_metadata(raw_path)
+            .await
+            .context("Failed to read metadata")?;
+        if metadata.is_symlink() {
+            fs::remove_file(raw_path)
+                .await
+                .context("Failed to delete symlink")?;
+            return Ok(());
+        }
+
+        if fs::metadata(&canonical)
+            .await
+            .context("Failed to read metadata")?
+            .is_dir()
+        {
+            if recursive {
+                fs::remove_dir_all(raw_path)
+                    .await
+                    .context("Failed to delete directory")?;
+            } else {
+                fs::remove_dir(raw_path)
+                    .await
+                    .context("Failed to delete directory (not empty?)")?;
+            }
+        } else {
+            fs::remove_file(raw_path)
+                .await
+                .context("Failed to delete file")?;
+        }
+
+        Ok(())
+    }
 }
 
 async fn canonical_allowed_roots(
@@ -319,6 +334,32 @@ fn ensure_under_allowed_roots(path: &Path, allowed_roots: &[PathBuf]) -> Result<
 }
 
 #[cfg(unix)]
+async fn delete_path_no_symlink_race(
+    raw_path: &Path,
+    recursive: bool,
+    allowed_roots: &[PathBuf],
+) -> Result<()> {
+    let parent = raw_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Path has no parent"))?;
+    let file_name = raw_path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("Path has no file name"))?
+        .to_os_string();
+    let canonical_parent = fs::canonicalize(parent)
+        .await
+        .with_context(|| format!("Parent {} does not exist", parent.display()))?;
+    ensure_under_allowed_roots(&canonical_parent, allowed_roots)?;
+    let stable_path = canonical_parent.join(file_name);
+
+    tokio::task::spawn_blocking(move || {
+        delete_path_no_symlink_race_blocking(&stable_path, recursive)
+    })
+    .await
+    .context("Failed to join file delete task")?
+}
+
+#[cfg(unix)]
 async fn create_file_no_symlink(path: &Path) -> Result<fs::File> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || create_file_no_symlink_blocking(&path))
@@ -386,6 +427,52 @@ fn create_file_no_symlink_blocking(path: &Path) -> Result<fs::File> {
 }
 
 #[cfg(unix)]
+fn delete_path_no_symlink_race_blocking(path: &Path, recursive: bool) -> Result<()> {
+    let parts = absolute_normal_components(path)?;
+    let (target_name, parent_parts) = parts
+        .split_last()
+        .ok_or_else(|| anyhow::anyhow!("Path has no file name"))?;
+
+    let root_fd = open_root_dir_no_follow()?;
+    let mut parent_fd = root_fd;
+    for part in parent_parts {
+        let next_fd = open_child_dir_no_follow(parent_fd.as_raw_fd(), part)?;
+        parent_fd = next_fd;
+    }
+
+    let metadata = child_metadata_no_follow(parent_fd.as_raw_fd(), target_name)
+        .context("Failed to read metadata")?;
+    if is_dir_mode(metadata.st_mode) {
+        if recursive {
+            remove_dir_all_at(parent_fd.as_raw_fd(), target_name)
+                .context("Failed to delete directory")?;
+        } else {
+            unlink_child_dir(parent_fd.as_raw_fd(), target_name)
+                .context("Failed to delete directory (not empty?)")?;
+        }
+    } else {
+        unlink_child(parent_fd.as_raw_fd(), target_name).context("Failed to delete file")?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remove_dir_all_at(parent_fd: RawFd, name: &std::ffi::OsStr) -> Result<()> {
+    let dir_fd = open_child_dir_no_follow(parent_fd, name)?;
+    let entries = read_dir_names(dir_fd.as_raw_fd()).context("Failed to read directory")?;
+    for entry in entries {
+        let metadata = child_metadata_no_follow(dir_fd.as_raw_fd(), &entry)
+            .context("Failed to read metadata")?;
+        if is_dir_mode(metadata.st_mode) {
+            remove_dir_all_at(dir_fd.as_raw_fd(), &entry)?;
+        } else {
+            unlink_child(dir_fd.as_raw_fd(), &entry)?;
+        }
+    }
+    unlink_child_dir(parent_fd, name)
+}
+
+#[cfg(unix)]
 fn open_root_dir_no_follow() -> Result<OwnedFd> {
     open_dir_at(libc::AT_FDCWD, std::ffi::OsStr::new("/"))
 }
@@ -450,6 +537,90 @@ fn mkdir_child_dir(parent_fd: std::os::unix::io::RawFd, name: &std::ffi::OsStr) 
         return Err(std::io::Error::last_os_error()).context("Failed to create directory");
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn child_metadata_no_follow(parent_fd: RawFd, name: &std::ffi::OsStr) -> Result<libc::stat> {
+    let name = os_str_to_cstring(name)?;
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe {
+        libc::fstatat(
+            parent_fd,
+            name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error()).context("Failed to stat path");
+    }
+    Ok(unsafe { metadata.assume_init() })
+}
+
+#[cfg(unix)]
+fn is_dir_mode(mode: libc::mode_t) -> bool {
+    (mode & libc::S_IFMT) == libc::S_IFDIR
+}
+
+#[cfg(unix)]
+fn unlink_child(parent_fd: RawFd, name: &std::ffi::OsStr) -> Result<()> {
+    unlink_child_with_flags(parent_fd, name, 0)
+}
+
+#[cfg(unix)]
+fn unlink_child_dir(parent_fd: RawFd, name: &std::ffi::OsStr) -> Result<()> {
+    unlink_child_with_flags(parent_fd, name, libc::AT_REMOVEDIR)
+}
+
+#[cfg(unix)]
+fn unlink_child_with_flags(
+    parent_fd: RawFd,
+    name: &std::ffi::OsStr,
+    flags: libc::c_int,
+) -> Result<()> {
+    let name = os_str_to_cstring(name)?;
+    let result = unsafe { libc::unlinkat(parent_fd, name.as_ptr(), flags) };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error()).context("Failed to unlink path");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_dir_names(fd: RawFd) -> Result<Vec<std::ffi::OsString>> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let duplicated_fd = unsafe { libc::dup(fd) };
+    if duplicated_fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("Failed to duplicate directory fd");
+    }
+    let dir = unsafe { libc::fdopendir(duplicated_fd) };
+    if dir.is_null() {
+        let err = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(duplicated_fd);
+        }
+        return Err(err).context("Failed to open directory stream");
+    }
+
+    let mut entries = Vec::new();
+    loop {
+        let entry = unsafe { libc::readdir(dir) };
+        if entry.is_null() {
+            break;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        let bytes = name.to_bytes();
+        if bytes != b"." && bytes != b".." {
+            entries.push(std::ffi::OsString::from_vec(bytes.to_vec()));
+        }
+    }
+
+    let close_result = unsafe { libc::closedir(dir) };
+    if close_result < 0 {
+        return Err(std::io::Error::last_os_error()).context("Failed to close directory stream");
+    }
+    Ok(entries)
 }
 
 #[cfg(unix)]
@@ -631,5 +802,64 @@ mod tests {
 
         assert!(result.is_err());
         assert!(!outside.path().join("owned.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_delete_rejects_replaced_parent_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let allowed = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let parent = allowed.path().join("parent");
+        let target = parent.join("victim.txt");
+        let outside_target = outside.path().join("victim.txt");
+
+        fs::create_dir(&parent).await.unwrap();
+        fs::write(&target, b"inside").await.unwrap();
+        fs::write(&outside_target, b"outside").await.unwrap();
+
+        let stable_parent = fs::canonicalize(&parent).await.unwrap();
+        let stable_target = stable_parent.join("victim.txt");
+        fs::remove_dir_all(&parent).await.unwrap();
+        symlink(outside.path(), &parent).unwrap();
+
+        let result = tokio::task::spawn_blocking(move || {
+            delete_path_no_symlink_race_blocking(&stable_target, false)
+        })
+        .await
+        .unwrap();
+
+        assert!(result.is_err());
+        assert!(outside_target.exists());
+        assert_eq!(std::fs::read(&outside_target).unwrap(), b"outside");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_recursive_delete_unlinks_nested_symlink_without_following() {
+        use std::os::unix::fs::symlink;
+
+        let allowed = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let dir_path = allowed.path().join("tree");
+        let nested = dir_path.join("nested");
+        let link_path = dir_path.join("outside-link");
+        let outside_file = outside.path().join("secret.txt");
+        let roots = vec![allowed.path().to_str().unwrap().to_string()];
+
+        fs::create_dir(&dir_path).await.unwrap();
+        fs::create_dir(&nested).await.unwrap();
+        fs::write(nested.join("file.txt"), b"inside").await.unwrap();
+        fs::write(&outside_file, b"secret").await.unwrap();
+        symlink(outside.path(), &link_path).unwrap();
+
+        delete_path(dir_path.to_str().unwrap(), true, &roots)
+            .await
+            .unwrap();
+
+        assert!(!dir_path.exists());
+        assert!(outside_file.exists());
+        assert_eq!(std::fs::read(&outside_file).unwrap(), b"secret");
     }
 }
