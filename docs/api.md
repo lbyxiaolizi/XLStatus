@@ -196,7 +196,7 @@ Enrollment token 创建请求体上限为 4KiB，`expires_in_hours` 必须在 1 
 
 NAT 创建/更新请求体上限为 64KiB，并支持安全策略字段：`allowed_sources`、`max_active_tunnels`、`idle_timeout_seconds`、`max_bytes_per_tunnel`、`max_bandwidth_bytes_per_second`、`rate_limit_window_seconds`、`max_connections_per_window`、`max_bytes_per_window`。`agent_id` 必须是 UUID 并会规范化为 canonical 文本；`local_host` 最长 253 字节，默认只能是 Agent 本机 loopback 目标，如需转发到 Agent 所在内网其他主机，必须显式启用私网 NAT 目标环境变量。`description` 最长 1024 字节，`allowed_sources` 最长 4096 字节、最多 64 个 IP/CIDR 条目、单条最长 128 字节。单 mapping `max_active_tunnels` 最高 1024，`idle_timeout_seconds` 和 `rate_limit_window_seconds` 最高 86400 秒，单隧道/窗口字节上限最高 1TiB，带宽上限最高 1GiB/s，窗口连接数最高 100000。窗口字段按 mapping 和来源 IP 计数，用于限制窗口内连接数和累计双向流量。
 
-DDNS 配置创建请求体上限为 64KiB。`provider` 只允许 `cloudflare`、`tencent_cloud`、`he`、`webhook`、`dummy`；`agent_id` 必须是 UUID 并会规范化为 canonical 文本。名称最长 128 字节，域名最长 253 字节，`record_id` / `zone_id` 各最长 128 字节，`api_token` / `api_key` / `api_secret` 各最长 4096 字节，`webhook_url` 最长 2048 字节且 webhook provider 必填并继续执行出站 SSRF 校验。
+DDNS 配置创建请求体上限为 64KiB。`provider` 只允许 `cloudflare`、`tencent_cloud`、`he`、`webhook`、`dummy`；`agent_id` 必须是 UUID 并会规范化为 canonical 文本。名称最长 128 字节，域名最长 253 字节，`record_id` / `zone_id` 各最长 128 字节，`api_token` / `api_key` / `api_secret` 各最长 4096 字节，`webhook_url` 最长 2048 字节且 webhook provider 必填并继续执行出站 SSRF 校验。后台 DDNS 执行时会重新校验历史配置中的 `agent_id` 必须解析为现存未撤销 Agent，且配置 owner 必须与 Agent owner 一致；不满足的历史配置会被跳过。
 
 MCP POST 入口请求体上限为 1MiB。`/mcp` JSON-RPC batch 最多 16 项，空 batch 或超过上限会返回 `Invalid Request`。`server.exec` 命令最长 8192 字节，timeout 被限制在 1 到 60 秒，默认 30 秒；Agent 返回的 exec stdout/stderr 各最多 64KiB、error 最多 4KiB。MCP `fs.read` 单次最多读取 1MiB，返回 base64 文本按该预算校验；`fs.list` Agent 返回 JSON 最长 1MiB，`fs.write/delete` 小结果最长 4KiB。
 

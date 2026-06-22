@@ -2,14 +2,14 @@
 #![allow(unused_imports)]
 
 use crate::api::v1::settings;
-use crate::db::Db;
+use crate::db::{AgentRepository, AgentWithState, Db};
 use crate::security::{secure_reqwest_client_builder, validate_outbound_url_resolved};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{interval, Duration};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use super::provider::{create_provider, DdnsProviderTrait};
 use xlstatus_shared::ddns::*;
@@ -143,7 +143,6 @@ impl DdnsManager {
     /// `last_applied_ip`, and call the provider when they differ.
     async fn check_all_agents(&self) -> Result<()> {
         use crate::db::repository::ddns::DdnsConfigRepository;
-        use crate::db::AgentRepository;
 
         let configs = DdnsConfigRepository::list_enabled(&self.db).await?;
         if configs.is_empty() {
@@ -151,18 +150,8 @@ impl DdnsManager {
         }
         let agent_repo = AgentRepository::new(self.db.clone());
         for cfg in configs {
-            let agent_id = match &cfg.agent_id {
-                Some(a) => a.clone(),
-                None => continue,
-            };
-            let agent = match agent_repo
-                .find_by_id_with_state(xlstatus_shared::AgentId(
-                    uuid::Uuid::parse_str(&agent_id).unwrap_or_default(),
-                ))
-                .await
-            {
-                Ok(Some(a)) => a,
-                _ => continue,
+            let Some(agent) = self.validated_config_agent(&cfg, &agent_repo).await? else {
+                continue;
             };
             let state_json = match &agent.last_state_json {
                 Some(s) => s,
@@ -356,6 +345,10 @@ impl DdnsManager {
     ) -> Result<()> {
         use crate::db::repository::ddns::DdnsConfigRepository;
 
+        let Ok(agent_uuid) = uuid::Uuid::parse_str(agent_id) else {
+            warn!(agent_id = %agent_id, "ignoring DDNS IP report for invalid agent id");
+            return Ok(());
+        };
         let new_ip = ipv4
             .filter(|value| !value.trim().is_empty())
             .or_else(|| ipv6.filter(|value| !value.trim().is_empty()));
@@ -364,10 +357,20 @@ impl DdnsManager {
         };
 
         let configs = DdnsConfigRepository::list_enabled(&self.db).await?;
-        for cfg in configs
-            .into_iter()
-            .filter(|cfg| cfg.agent_id.as_deref() == Some(agent_id))
-        {
+        let agent_repo = AgentRepository::new(self.db.clone());
+        for cfg in configs.into_iter().filter(|cfg| {
+            cfg.agent_id
+                .as_deref()
+                .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                == Some(agent_uuid)
+        }) {
+            if self
+                .validated_config_agent(&cfg, &agent_repo)
+                .await?
+                .is_none()
+            {
+                continue;
+            }
             if cfg.last_applied_ip.as_deref() == Some(new_ip) {
                 continue;
             }
@@ -375,6 +378,57 @@ impl DdnsManager {
         }
 
         Ok(())
+    }
+
+    async fn validated_config_agent(
+        &self,
+        cfg: &crate::db::repository::ddns::DdnsConfigRow,
+        agent_repo: &AgentRepository,
+    ) -> Result<Option<AgentWithState>> {
+        let Some(agent_id) = cfg.agent_id.as_deref() else {
+            return Ok(None);
+        };
+        let Ok(agent_uuid) = uuid::Uuid::parse_str(agent_id) else {
+            warn!(
+                config_id = %cfg.id,
+                agent_id = %agent_id,
+                "skipping DDNS config with invalid historical agent_id"
+            );
+            return Ok(None);
+        };
+        let Ok(owner_uuid) = uuid::Uuid::parse_str(&cfg.owner_user_id) else {
+            warn!(
+                config_id = %cfg.id,
+                owner_user_id = %cfg.owner_user_id,
+                "skipping DDNS config with invalid historical owner_user_id"
+            );
+            return Ok(None);
+        };
+        let Some(agent) = agent_repo
+            .find_by_id_with_state(xlstatus_shared::AgentId(agent_uuid))
+            .await?
+        else {
+            return Ok(None);
+        };
+        if agent.agent.revoked_at.is_some() {
+            warn!(
+                config_id = %cfg.id,
+                agent_id = %agent_id,
+                "skipping DDNS config for revoked agent"
+            );
+            return Ok(None);
+        }
+        if agent.agent.owner_user_id.0 != owner_uuid {
+            warn!(
+                config_id = %cfg.id,
+                agent_id = %agent_id,
+                config_owner = %cfg.owner_user_id,
+                agent_owner = %agent.agent.owner_user_id.0,
+                "skipping DDNS config whose owner does not match agent owner"
+            );
+            return Ok(None);
+        }
+        Ok(Some(agent))
     }
 
     /// Get statistics
@@ -432,9 +486,272 @@ pub struct DdnsStatistics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::{
+        repository::ddns::{DdnsConfigRepository, DdnsConfigRow, DdnsHistoryRepository},
+        AgentRepository, CreateAgentInput, CreateUserInput, DatabaseBackend, UserRepository,
+    };
+    use xlstatus_shared::{AgentId, UserRole};
 
-    #[test]
-    fn test_ddns_manager_creation() {
-        // Placeholder test
+    #[tokio::test]
+    async fn test_ddns_manager_creation() {
+        let db = test_db().await;
+        let manager = DdnsManager::new(db);
+
+        assert_eq!(manager.get_statistics().await.total_providers, 0);
+    }
+
+    #[tokio::test]
+    async fn ddns_manager_updates_valid_agent_config() {
+        let db = test_db().await;
+        let fixture = create_fixture(&db).await;
+        let config_id = create_ddns_config(
+            &db,
+            fixture.owner.id.0.to_string(),
+            Some(fixture.agent.id.0.to_string()),
+            "valid.example.com",
+        )
+        .await;
+        AgentRepository::new(db.clone())
+            .update_last_state(fixture.agent.id, r#"{"primary_ip":"203.0.113.10"}"#)
+            .await
+            .unwrap();
+
+        let manager = DdnsManager::new(db.clone());
+        manager.reload_providers().await.unwrap();
+        manager.check_now().await.unwrap();
+
+        let config = DdnsConfigRepository::get_by_id(&db, &config_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.last_applied_ip.as_deref(), Some("203.0.113.10"));
+        assert_eq!(
+            DdnsHistoryRepository::list_for_config(&db, &config_id, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn ddns_manager_skips_invalid_historical_agent_binding() {
+        let db = test_db().await;
+        let fixture = create_fixture(&db).await;
+        let owner_mismatch_config_id = create_ddns_config(
+            &db,
+            fixture.other_owner.id.0.to_string(),
+            Some(fixture.agent.id.0.to_string()),
+            "owner-mismatch.example.com",
+        )
+        .await;
+        let revoked_config_id = create_ddns_config(
+            &db,
+            fixture.owner.id.0.to_string(),
+            Some(fixture.revoked_agent.id.0.to_string()),
+            "revoked.example.com",
+        )
+        .await;
+        let invalid_agent_config_id = insert_raw_ddns_config(
+            &db,
+            &fixture.owner.id.0.to_string(),
+            "not-a-uuid",
+            "invalid-agent.example.com",
+        )
+        .await;
+        AgentRepository::new(db.clone())
+            .update_last_state(fixture.agent.id, r#"{"primary_ip":"203.0.113.20"}"#)
+            .await
+            .unwrap();
+        AgentRepository::new(db.clone())
+            .update_last_state(fixture.revoked_agent.id, r#"{"primary_ip":"203.0.113.30"}"#)
+            .await
+            .unwrap();
+
+        let manager = DdnsManager::new(db.clone());
+        manager.reload_providers().await.unwrap();
+        manager.check_now().await.unwrap();
+        manager
+            .check_agent_ip_report(&fixture.agent.id.0.to_string(), Some("203.0.113.21"), None)
+            .await
+            .unwrap();
+        manager
+            .check_agent_ip_report(
+                &fixture.revoked_agent.id.0.to_string(),
+                Some("203.0.113.31"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        for config_id in [
+            owner_mismatch_config_id,
+            revoked_config_id,
+            invalid_agent_config_id,
+        ] {
+            let config = DdnsConfigRepository::get_by_id(&db, &config_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(config.last_applied_ip, None);
+            assert!(DdnsHistoryRepository::list_for_config(&db, &config_id, 10)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn ddns_agent_ip_report_matches_agent_id_by_uuid_semantics() {
+        let db = test_db().await;
+        let fixture = create_fixture(&db).await;
+        let uppercase_agent_id = fixture.agent.id.0.to_string().to_uppercase();
+        let config_id = create_ddns_config(
+            &db,
+            fixture.owner.id.0.to_string(),
+            Some(uppercase_agent_id),
+            "uuid-case.example.com",
+        )
+        .await;
+
+        let manager = DdnsManager::new(db.clone());
+        manager.reload_providers().await.unwrap();
+        manager
+            .check_agent_ip_report(&fixture.agent.id.0.to_string(), Some("203.0.113.40"), None)
+            .await
+            .unwrap();
+
+        let config = DdnsConfigRepository::get_by_id(&db, &config_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.last_applied_ip.as_deref(), Some("203.0.113.40"));
+    }
+
+    async fn test_db() -> DatabaseBackend {
+        let path =
+            std::env::temp_dir().join(format!("xlstatus-ddns-manager-{}.db", uuid::Uuid::now_v7()));
+        let url = format!("sqlite://{}?mode=rwc", path.to_string_lossy());
+        let db = DatabaseBackend::connect(&url, true).await.unwrap();
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    struct TestFixture {
+        owner: crate::db::User,
+        other_owner: crate::db::User,
+        agent: crate::db::Agent,
+        revoked_agent: crate::db::Agent,
+    }
+
+    async fn create_fixture(db: &DatabaseBackend) -> TestFixture {
+        let user_repo = UserRepository::new(db.clone());
+        let owner = user_repo
+            .create(CreateUserInput {
+                username: format!("ddns-owner-{}", uuid::Uuid::now_v7()),
+                password: "password123".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        let other_owner = user_repo
+            .create(CreateUserInput {
+                username: format!("ddns-other-{}", uuid::Uuid::now_v7()),
+                password: "password123".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        let agent_repo = AgentRepository::new(db.clone());
+        let agent = agent_repo
+            .create_with_id(
+                AgentId(uuid::Uuid::now_v7()),
+                CreateAgentInput {
+                    name: "ddns-agent".into(),
+                    public_key: "public-key".into(),
+                    owner_user_id: owner.id,
+                },
+            )
+            .await
+            .unwrap();
+        let revoked_agent = agent_repo
+            .create_with_id(
+                AgentId(uuid::Uuid::now_v7()),
+                CreateAgentInput {
+                    name: "ddns-revoked-agent".into(),
+                    public_key: "public-key".into(),
+                    owner_user_id: owner.id,
+                },
+            )
+            .await
+            .unwrap();
+        agent_repo.revoke(revoked_agent.id).await.unwrap();
+
+        TestFixture {
+            owner,
+            other_owner,
+            agent,
+            revoked_agent,
+        }
+    }
+
+    async fn create_ddns_config(
+        db: &DatabaseBackend,
+        owner_user_id: String,
+        agent_id: Option<String>,
+        domain: &str,
+    ) -> String {
+        let now = chrono::Utc::now().to_rfc3339();
+        let row = DdnsConfigRow {
+            id: uuid::Uuid::now_v7().to_string(),
+            owner_user_id,
+            agent_id,
+            name: domain.to_string(),
+            provider: "dummy".into(),
+            domain: domain.to_string(),
+            record_id: None,
+            zone_id: None,
+            api_token: None,
+            api_key: None,
+            api_secret: None,
+            webhook_url: None,
+            current_ip: None,
+            last_applied_ip: None,
+            last_applied_at: None,
+            enabled: true,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        DdnsConfigRepository::create(db, &row).await.unwrap();
+        row.id
+    }
+
+    async fn insert_raw_ddns_config(
+        db: &DatabaseBackend,
+        owner_user_id: &str,
+        agent_id: &str,
+        domain: &str,
+    ) -> String {
+        let id = uuid::Uuid::now_v7().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        match db {
+            DatabaseBackend::Sqlite(pool) => {
+                sqlx::query(
+                    "INSERT INTO ddns_configs (id, owner_user_id, agent_id, name, provider, domain, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, 'dummy', ?, 1, ?, ?)",
+                )
+                .bind(&id)
+                .bind(owner_user_id)
+                .bind(agent_id)
+                .bind(domain)
+                .bind(domain)
+                .bind(&now)
+                .bind(&now)
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+            DatabaseBackend::Postgres(_) => unreachable!(),
+        }
+        id
     }
 }
