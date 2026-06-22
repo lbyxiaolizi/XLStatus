@@ -88,7 +88,7 @@ pub async fn create_terminal_session(
         .find_by_id(agent_id)
         .await?
         .ok_or(AppError::NotFound("agent not found".into()))?;
-    ensure_agent_visible(&auth, &agent)?;
+    ensure_terminal_agent_active(&auth, &agent)?;
     if !state.session_registry.is_online(&agent_id).await
         || !state.io_registry.is_agent_online(&agent_id).await
     {
@@ -146,7 +146,7 @@ pub async fn ws_terminal(
             return Err(AppError::NotFound("agent not found".into()));
         }
     };
-    if let Err(err) = ensure_agent_visible(&auth, &agent) {
+    if let Err(err) = ensure_terminal_agent_active(&auth, &agent) {
         state.terminal_sessions.restore(session).await;
         return Err(err);
     }
@@ -175,6 +175,17 @@ fn terminal_session_created_by_auth(session: &TerminalSession, auth: &AuthSessio
                 session.created_pat_id.as_deref() == Some(pat_id)
             }
         }
+}
+
+fn ensure_terminal_agent_active(
+    auth: &AuthSession,
+    agent: &crate::db::Agent,
+) -> Result<(), AppError> {
+    ensure_agent_visible(auth, agent)?;
+    if agent.revoked_at.is_some() {
+        return Err(AppError::Forbidden("agent has been revoked".into()));
+    }
+    Ok(())
 }
 
 async fn handle_terminal_socket(
@@ -565,6 +576,7 @@ fn prune_expired_terminal_sessions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::{CreateAgentInput, CreateUserInput, DatabaseBackend, UserRepository};
     use xlstatus_shared::{UserId, UserRole};
 
     fn test_auth_session(session_id: &str) -> AuthSession {
@@ -708,6 +720,31 @@ mod tests {
             .is_some());
     }
 
+    #[tokio::test]
+    async fn terminal_agent_active_check_rejects_revoked_agent() {
+        let db = test_db().await;
+        let owner = seed_user(&db).await;
+        let agent_repo = AgentRepository::new(db.clone());
+        let agent = agent_repo
+            .create(CreateAgentInput {
+                name: "terminal-agent".into(),
+                public_key: "pk".into(),
+                owner_user_id: owner,
+            })
+            .await
+            .unwrap();
+        let auth = test_auth_session("sess-1");
+
+        let active_agent = agent_repo.find_by_id(agent.id).await.unwrap().unwrap();
+        assert!(ensure_terminal_agent_active(&auth, &active_agent).is_ok());
+
+        assert!(agent_repo.revoke(agent.id).await.unwrap());
+        let revoked_agent = agent_repo.find_by_id(agent.id).await.unwrap().unwrap();
+        let err = ensure_terminal_agent_active(&auth, &revoked_agent).unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
     #[test]
     fn terminal_resource_limits_are_explicit() {
         assert_eq!(TERMINAL_CREATE_MAX_BODY_BYTES, 4 * 1024);
@@ -813,5 +850,25 @@ mod tests {
             }
             _ => panic!("expected closed message"),
         }
+    }
+
+    async fn test_db() -> DatabaseBackend {
+        let db = DatabaseBackend::connect("sqlite::memory:", true)
+            .await
+            .unwrap();
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    async fn seed_user(db: &DatabaseBackend) -> UserId {
+        UserRepository::new(db.clone())
+            .create(CreateUserInput {
+                username: "owner".into(),
+                password: "password123".into(),
+                role: UserRole::Member,
+            })
+            .await
+            .unwrap()
+            .id
     }
 }
