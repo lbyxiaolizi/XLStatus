@@ -37,6 +37,7 @@ const PUBLIC_MJPEG_MAX_CONNECTIONS: usize = 32;
 const PUBLIC_MJPEG_FRAME_CACHE_TTL: StdDuration = StdDuration::from_secs(1);
 const PUBLIC_METRIC_SAMPLE_LIMIT: usize = 240;
 const PUBLIC_POSTGRES_SCAN_BATCH: i64 = 500;
+const PUBLIC_POSTGRES_MAX_SCAN_CANDIDATES: i64 = 5_000;
 const PUBLIC_SERVICE_HISTORY_LIMIT: i64 = 240;
 const PUBLIC_SERVER_ID_PATH_BYTES: usize = 36;
 const PUBLIC_STATUS_SERVER_LIMIT: i64 = 100;
@@ -487,7 +488,9 @@ async fn public_services_postgres(
 ) -> Result<Vec<PublicServiceView>, AppError> {
     let mut offset = 0_i64;
     let mut services = Vec::new();
-    while services.len() < PUBLIC_STATUS_SERVICE_LIMIT as usize {
+    while let Some(scan_limit) =
+        public_postgres_scan_batch_limit(offset, services.len(), PUBLIC_STATUS_SERVICE_LIMIT)
+    {
         let rows = sqlx::query(
             r#"
             SELECT s.id::text AS id, s.name, s.type, s.server_id::text AS server_id
@@ -497,7 +500,7 @@ async fn public_services_postgres(
             LIMIT $1 OFFSET $2
             "#,
         )
-        .bind(PUBLIC_POSTGRES_SCAN_BATCH)
+        .bind(scan_limit)
         .bind(offset)
         .fetch_all(pool)
         .await
@@ -539,9 +542,17 @@ async fn public_services_postgres(
             });
         }
         offset += count;
-        if count < PUBLIC_POSTGRES_SCAN_BATCH {
+        if count < scan_limit {
             break;
         }
+    }
+    if public_postgres_scan_cap_reached(offset, services.len(), PUBLIC_STATUS_SERVICE_LIMIT) {
+        tracing::warn!(
+            scanned = offset,
+            returned = services.len(),
+            max = PUBLIC_POSTGRES_MAX_SCAN_CANDIDATES,
+            "public status PostgreSQL service scan reached candidate cap"
+        );
     }
     Ok(services)
 }
@@ -598,7 +609,7 @@ async fn public_agent_rows_postgres(
 ) -> Result<Vec<AgentWithState>, AppError> {
     let mut offset = 0_i64;
     let mut out = Vec::new();
-    while (out.len() as i64) < limit {
+    while let Some(scan_limit) = public_postgres_scan_batch_limit(offset, out.len(), limit) {
         let rows: Vec<PublicAgentRow> = sqlx::query_as(
             r#"
             SELECT id::text, name, public_key, owner_user_id::text,
@@ -615,7 +626,7 @@ async fn public_agent_rows_postgres(
             LIMIT $1 OFFSET $2
             "#,
         )
-        .bind(PUBLIC_POSTGRES_SCAN_BATCH)
+        .bind(scan_limit)
         .bind(offset)
         .bind(AGENT_DASHBOARD_METADATA_JSON_MAX_BYTES as i64)
         .fetch_all(pool)
@@ -628,11 +639,42 @@ async fn public_agent_rows_postgres(
         let count = rows.len() as i64;
         append_visible_public_agent_rows(&mut out, rows, limit as usize);
         offset += count;
-        if count < PUBLIC_POSTGRES_SCAN_BATCH {
+        if count < scan_limit {
             break;
         }
     }
+    if public_postgres_scan_cap_reached(offset, out.len(), limit) {
+        tracing::warn!(
+            scanned = offset,
+            returned = out.len(),
+            max = PUBLIC_POSTGRES_MAX_SCAN_CANDIDATES,
+            "public status PostgreSQL agent scan reached candidate cap"
+        );
+    }
     Ok(out)
+}
+
+fn public_postgres_scan_batch_limit(
+    offset: i64,
+    returned: usize,
+    response_limit: i64,
+) -> Option<i64> {
+    if response_limit <= 0 || returned >= response_limit as usize {
+        return None;
+    }
+    let offset = offset.max(0);
+    let remaining = PUBLIC_POSTGRES_MAX_SCAN_CANDIDATES.saturating_sub(offset);
+    if remaining <= 0 {
+        None
+    } else {
+        Some(remaining.min(PUBLIC_POSTGRES_SCAN_BATCH))
+    }
+}
+
+fn public_postgres_scan_cap_reached(offset: i64, returned: usize, response_limit: i64) -> bool {
+    response_limit > 0
+        && returned < response_limit as usize
+        && offset >= PUBLIC_POSTGRES_MAX_SCAN_CANDIDATES
 }
 
 fn visible_public_service_server_ids(
@@ -1841,6 +1883,51 @@ mod tests {
 
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].agent.id.0, public_id);
+    }
+
+    #[test]
+    fn public_postgres_scan_batch_limit_caps_total_candidates() {
+        assert_eq!(
+            public_postgres_scan_batch_limit(0, 0, PUBLIC_STATUS_SERVER_LIMIT),
+            Some(PUBLIC_POSTGRES_SCAN_BATCH)
+        );
+        assert_eq!(
+            public_postgres_scan_batch_limit(4_500, 0, PUBLIC_STATUS_SERVER_LIMIT),
+            Some(PUBLIC_POSTGRES_SCAN_BATCH)
+        );
+        assert_eq!(
+            public_postgres_scan_batch_limit(4_999, 0, PUBLIC_STATUS_SERVER_LIMIT),
+            Some(1)
+        );
+        assert_eq!(
+            public_postgres_scan_batch_limit(5_000, 0, PUBLIC_STATUS_SERVER_LIMIT),
+            None
+        );
+        assert_eq!(
+            public_postgres_scan_batch_limit(
+                0,
+                PUBLIC_STATUS_SERVER_LIMIT as usize,
+                PUBLIC_STATUS_SERVER_LIMIT,
+            ),
+            None
+        );
+        assert_eq!(public_postgres_scan_batch_limit(0, 0, 0), None);
+
+        assert!(public_postgres_scan_cap_reached(
+            PUBLIC_POSTGRES_MAX_SCAN_CANDIDATES,
+            0,
+            PUBLIC_STATUS_SERVER_LIMIT
+        ));
+        assert!(!public_postgres_scan_cap_reached(
+            PUBLIC_POSTGRES_MAX_SCAN_CANDIDATES,
+            PUBLIC_STATUS_SERVER_LIMIT as usize,
+            PUBLIC_STATUS_SERVER_LIMIT
+        ));
+        assert!(!public_postgres_scan_cap_reached(
+            PUBLIC_POSTGRES_MAX_SCAN_CANDIDATES - 1,
+            0,
+            PUBLIC_STATUS_SERVER_LIMIT
+        ));
     }
 
     #[test]
