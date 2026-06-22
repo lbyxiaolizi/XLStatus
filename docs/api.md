@@ -249,7 +249,7 @@ Agent gRPC 服务定义在 `proto/xlstatus/v1/agent.proto`，生成代码在 `cr
 curl -fsSL 'http://dashboard.example.com:8080/api/v1/agents/install.sh?server_url=http%3A%2F%2Fdashboard.example.com%3A8080&grpc_server=http%3A%2F%2Fdashboard.example.com%3A50051&enrollment_token=xle_...&agent_name=%24(hostname)&version=v0.1.0-alpha.3' | sudo bash
 ```
 
-`enrollment_token` 会进入 URL，建议使用短有效期 token。若需要让 Agent 连接到不同主机名的控制面，不要使用这个公开 bootstrap 端点；请直接从 GitHub Release 下载 `install-agent.sh` 并通过环境变量传入 `SERVER_URL` / `GRPC_SERVER`。
+`enrollment_token` 会进入 URL 和 bootstrap 脚本内容，建议使用短有效期 token。Release 安装脚本会通过 stdin 把 token 交给 `xlstatus-agent enroll`，避免 token 出现在 Agent 子进程命令行参数中。若需要让 Agent 连接到不同主机名的控制面，不要使用这个公开 bootstrap 端点；请直接从 GitHub Release 下载 `install-agent.sh` 并通过环境变量传入 `SERVER_URL` / `GRPC_SERVER`。
 
 ## CORS 和 Cookie
 

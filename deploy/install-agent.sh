@@ -156,7 +156,7 @@ echo "🔐 Enrolling agent..."
 ENROLL_ARGS=(
   enroll
   --server "$SERVER_URL"
-  --token "$ENROLLMENT_TOKEN"
+  --token-stdin
   --name "$AGENT_NAME"
   --config "$CONFIG_FILE"
 )
@@ -175,7 +175,7 @@ fi
 if [ -n "$GRPC_TLS_CLIENT_KEY_PATH" ]; then
   ENROLL_ARGS+=(--grpc-tls-client-key-path "$GRPC_TLS_CLIENT_KEY_PATH")
 fi
-/usr/local/bin/xlstatus-agent "${ENROLL_ARGS[@]}"
+printf '%s' "$ENROLLMENT_TOKEN" | /usr/local/bin/xlstatus-agent "${ENROLL_ARGS[@]}"
 
 chown root:root "$CONFIG_FILE"
 chmod 600 "$CONFIG_FILE"

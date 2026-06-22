@@ -313,7 +313,7 @@ curl -fsSL 'http://dashboard.example.com:8080/api/v1/agents/install.sh?server_ur
 https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.3/install-agent.sh
 ```
 
-`enrollment_token` 会出现在安装链接里，应只给受信任的主机使用；令牌过期或使用后需要重新生成。
+`enrollment_token` 会出现在安装链接和 bootstrap 脚本内容里，应只给受信任的主机使用；令牌过期或使用后需要重新生成。Release 安装脚本会通过 stdin 把 token 交给 `xlstatus-agent enroll`，避免 token 出现在 Agent 子进程命令行参数中。
 
 ## 远端 Linux 验证
 

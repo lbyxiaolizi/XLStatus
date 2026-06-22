@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use ed25519_dalek::{Signer, SigningKey};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -48,6 +48,7 @@ const REMOTE_CONFIG_MIN_INTERVAL_SECONDS: u64 = 1;
 const REMOTE_CONFIG_MAX_INTERVAL_SECONDS: u64 = 86_400;
 const FORCE_UPDATE_MAX_VERSION_BYTES: usize = 80;
 const FORCE_UPDATE_MAX_URL_BYTES: usize = 2048;
+const AGENT_ENROLLMENT_TOKEN_MAX_BYTES: usize = 128;
 type TerminalSessionMap =
     Arc<Mutex<std::collections::HashMap<String, Arc<executor::terminal::TerminalSession>>>>;
 type NatSessionMap = Arc<Mutex<std::collections::HashMap<String, NatSocketSession>>>;
@@ -122,9 +123,13 @@ enum Commands {
         #[arg(long)]
         grpc_tls_client_key_path: Option<String>,
 
-        /// Enrollment token
-        #[arg(long)]
-        token: String,
+        /// Enrollment token. Prefer --token-stdin on shared hosts so the token is not visible in process arguments.
+        #[arg(long, conflicts_with = "token_stdin")]
+        token: Option<String>,
+
+        /// Read the enrollment token from stdin
+        #[arg(long, conflicts_with = "token")]
+        token_stdin: bool,
 
         /// Agent display name
         #[arg(long, default_value = "xlstatus-agent")]
@@ -226,9 +231,11 @@ async fn main() -> anyhow::Result<()> {
             grpc_tls_client_cert_path,
             grpc_tls_client_key_path,
             token,
+            token_stdin,
             name,
             config,
         } => {
+            let token = enrollment_token_from_sources(token, token_stdin)?;
             tracing::info!("Enrolling agent with server: {}", server);
             enroll_agent(
                 server,
@@ -250,6 +257,50 @@ async fn main() -> anyhow::Result<()> {
             run_agent(PathBuf::from(config)).await
         }
     }
+}
+
+fn enrollment_token_from_sources(
+    token: Option<String>,
+    token_stdin: bool,
+) -> anyhow::Result<String> {
+    let stdin = std::io::stdin();
+    enrollment_token_from_sources_with_reader(token, token_stdin, stdin.lock())
+}
+
+fn enrollment_token_from_sources_with_reader<R: Read>(
+    token: Option<String>,
+    token_stdin: bool,
+    reader: R,
+) -> anyhow::Result<String> {
+    if token_stdin {
+        let mut raw = String::new();
+        reader
+            .take((AGENT_ENROLLMENT_TOKEN_MAX_BYTES + 2) as u64)
+            .read_to_string(&mut raw)?;
+        return normalize_enrollment_token_input(&raw);
+    }
+
+    let Some(token) = token else {
+        anyhow::bail!("enrollment token is required; use --token or --token-stdin");
+    };
+    normalize_enrollment_token_input(&token)
+}
+
+fn normalize_enrollment_token_input(raw: &str) -> anyhow::Result<String> {
+    let token = raw.trim();
+    if token.is_empty() {
+        anyhow::bail!("enrollment token is required");
+    }
+    if token.len() > AGENT_ENROLLMENT_TOKEN_MAX_BYTES {
+        anyhow::bail!(
+            "enrollment token must be at most {} bytes",
+            AGENT_ENROLLMENT_TOKEN_MAX_BYTES
+        );
+    }
+    if token.chars().any(char::is_whitespace) {
+        anyhow::bail!("enrollment token must not contain whitespace");
+    }
+    Ok(token.to_string())
 }
 
 async fn enroll_agent(
@@ -2587,6 +2638,44 @@ mod tests {
             config: Arc::new(Mutex::new(config)),
         };
         (temp_dir, runtime)
+    }
+
+    #[test]
+    fn enrollment_token_can_be_read_from_stdin_without_using_argv() {
+        let token = format!("xle_{}", "a".repeat(64));
+
+        assert_eq!(
+            enrollment_token_from_sources_with_reader(None, true, token.as_bytes()).unwrap(),
+            token
+        );
+        assert_eq!(
+            enrollment_token_from_sources_with_reader(Some(format!(" {token}\n")), false, &b""[..])
+                .unwrap(),
+            token
+        );
+        assert!(
+            enrollment_token_from_sources_with_reader(None, false, &b""[..])
+                .unwrap_err()
+                .to_string()
+                .contains("use --token or --token-stdin")
+        );
+        assert!(
+            enrollment_token_from_sources_with_reader(None, true, "xle_bad token".as_bytes())
+                .unwrap_err()
+                .to_string()
+                .contains("must not contain whitespace")
+        );
+    }
+
+    #[test]
+    fn install_agent_script_keeps_enrollment_token_out_of_agent_argv() {
+        let script = include_str!("../../../deploy/install-agent.sh");
+
+        assert!(script.contains("--token-stdin"));
+        assert!(
+            script.contains("printf '%s' \"$ENROLLMENT_TOKEN\" | /usr/local/bin/xlstatus-agent")
+        );
+        assert!(!script.contains("--token \"$ENROLLMENT_TOKEN\""));
     }
 
     #[test]

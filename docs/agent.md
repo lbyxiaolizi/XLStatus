@@ -17,13 +17,16 @@ cargo build --release --bin xlstatus-agent
 示例：
 
 ```bash
-xlstatus-agent enroll \
+printf '%s' 'xle_...' | xlstatus-agent enroll \
   --server http://dashboard.example.com:8080 \
   --grpc-server http://dashboard.example.com:50051 \
-  --token xle_... \
   --name web-01 \
-  --config /etc/xlstatus-agent/agent.json
+  --config /etc/xlstatus-agent/agent.json \
+  --token-stdin
 ```
+
+也可以省略管道后在 stdin 中交互输入 enrollment token。继续使用 `--token xle_...` 仍兼容，
+但在共享主机上不推荐，因为命令行参数可能被本机其他用户或进程审计读取。
 
 运行：
 
@@ -57,27 +60,27 @@ xlstatus-agent run --config /etc/xlstatus-agent/agent.json
 生产环境如果 gRPC 不在可信内网或 WireGuard/VPC 内，建议把 `--grpc-server` 配置为 `https://...`，并在 Server 设置 `GRPC_TLS_CERT_PATH` 与 `GRPC_TLS_KEY_PATH`。使用私有 CA 时，在 Agent 注册时传入 CA：
 
 ```bash
-xlstatus-agent enroll \
+printf '%s' 'xle_...' | xlstatus-agent enroll \
   --server https://dashboard.example.com \
   --grpc-server https://grpc.dashboard.example.com:50051 \
   --grpc-tls-ca-path /etc/xlstatus-agent/tls/grpc-ca.crt \
-  --token xle_... \
   --name web-01 \
-  --config /etc/xlstatus-agent/agent.json
+  --config /etc/xlstatus-agent/agent.json \
+  --token-stdin
 ```
 
 如果 Server 配置了 `GRPC_TLS_CLIENT_CA_PATH` 启用 mTLS，Agent 还必须配置客户端证书和私钥：
 
 ```bash
-xlstatus-agent enroll \
+printf '%s' 'xle_...' | xlstatus-agent enroll \
   --server https://dashboard.example.com \
   --grpc-server https://grpc.dashboard.example.com:50051 \
   --grpc-tls-ca-path /etc/xlstatus-agent/tls/grpc-ca.crt \
   --grpc-tls-client-cert-path /etc/xlstatus-agent/tls/agent.crt \
   --grpc-tls-client-key-path /etc/xlstatus-agent/tls/agent.key \
-  --token xle_... \
   --name web-01 \
-  --config /etc/xlstatus-agent/agent.json
+  --config /etc/xlstatus-agent/agent.json \
+  --token-stdin
 ```
 
 ## systemd 安装
@@ -132,6 +135,8 @@ https://github.com/lbyxiaolizi/XLStatus/releases/download/<VERSION>/install-agen
 后台“设置 / Agent 安装”默认会从 GitHub Releases 获取最新非草稿版本，并把该版本写入带参数安装命令。
 
 生成链接时会包含 enrollment token；后端限制有效期为 1 到 24 小时，建议使用默认 1 小时，并只发给受信任主机。
+Release 安装脚本会通过 stdin 把该 token 交给 `xlstatus-agent enroll`，
+避免 token 出现在 Agent 子进程命令行参数中；安装链接和 bootstrap 脚本内容本身仍应按敏感信息处理。
 
 ## 地址说明
 
