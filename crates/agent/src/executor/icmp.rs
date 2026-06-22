@@ -3,8 +3,16 @@
 
 use anyhow::{bail, Context, Result};
 use std::process::Stdio;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::process::Command;
+use tokio::time::timeout;
+
+const ICMP_PING_MAX_COUNT: u32 = 10;
+const ICMP_PING_MIN_TIMEOUT_SECONDS: u32 = 1;
+const ICMP_PING_DEFAULT_TIMEOUT_SECONDS: u32 = 10;
+const ICMP_PING_MAX_TIMEOUT_SECONDS: u32 = 30;
+const ICMP_PING_PROCESS_TIMEOUT_GRACE_SECONDS: u64 = 2;
+const ICMP_PING_OUTPUT_MAX_BYTES: usize = 4096;
 
 /// ICMP ping result
 #[derive(Debug)]
@@ -25,44 +33,84 @@ pub async fn execute_icmp_ping(
     timeout_seconds: u32,
 ) -> Result<IcmpPingResult> {
     let _start = Instant::now();
+    let count = count.clamp(1, ICMP_PING_MAX_COUNT);
+    let timeout_seconds = bounded_timeout_seconds(timeout_seconds);
 
-    let output = if cfg!(target_os = "windows") {
-        Command::new("ping")
-            .args([
-                "-n",
-                &count.to_string(),
-                "-w",
-                &(timeout_seconds * 1000).to_string(),
-                host,
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .context("Failed to execute ping command")?
+    let mut command = if cfg!(target_os = "windows") {
+        let mut command = Command::new("ping");
+        command.args([
+            "-n",
+            &count.to_string(),
+            "-w",
+            &(timeout_seconds * 1000).to_string(),
+            host,
+        ]);
+        command
     } else {
-        Command::new("ping")
-            .args([
-                "-c",
-                &count.to_string(),
-                "-W",
-                &timeout_seconds.to_string(),
-                host,
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .context("Failed to execute ping command")?
+        let mut command = Command::new("ping");
+        command.args([
+            "-c",
+            &count.to_string(),
+            "-W",
+            &timeout_seconds.to_string(),
+            host,
+        ]);
+        command
+    };
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    command.kill_on_drop(true);
+
+    let process_timeout = Duration::from_secs(
+        u64::from(timeout_seconds).saturating_add(ICMP_PING_PROCESS_TIMEOUT_GRACE_SECONDS),
+    );
+    let output = match timeout(process_timeout, command.output()).await {
+        Ok(output) => output.context("Failed to execute ping command")?,
+        Err(_) => bail!("Ping timed out after {} seconds", timeout_seconds),
     };
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("Ping failed: {}", stderr);
+        bail!("{}", ping_failure_message(&output.stderr, &output.stdout));
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = bounded_ping_output_text(&output.stdout);
     parse_ping_output(&stdout, count)
+}
+
+fn bounded_timeout_seconds(value: u32) -> u32 {
+    if value == 0 {
+        ICMP_PING_DEFAULT_TIMEOUT_SECONDS
+    } else {
+        value.clamp(ICMP_PING_MIN_TIMEOUT_SECONDS, ICMP_PING_MAX_TIMEOUT_SECONDS)
+    }
+}
+
+fn ping_failure_message(stderr: &[u8], stdout: &[u8]) -> String {
+    let stderr = bounded_ping_output_text(stderr);
+    let stdout = bounded_ping_output_text(stdout);
+    let detail = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
+    if detail.is_empty() {
+        "Ping failed".to_string()
+    } else {
+        format!("Ping failed: {detail}")
+    }
+}
+
+fn bounded_ping_output_text(bytes: &[u8]) -> String {
+    if bytes.len() <= ICMP_PING_OUTPUT_MAX_BYTES {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let mut end = ICMP_PING_OUTPUT_MAX_BYTES;
+    while end > 0 && std::str::from_utf8(&bytes[..end]).is_err() {
+        end -= 1;
+    }
+    let mut text = String::from_utf8_lossy(&bytes[..end]).into_owned();
+    text.push_str("... [truncated]");
+    text
 }
 
 fn parse_ping_output(output: &str, expected_count: u32) -> Result<IcmpPingResult> {
@@ -220,5 +268,41 @@ rtt min/avg/max/mdev = 10.234/10.456/10.678/0.222 ms
         let result = parse_ping_output(output, 2).unwrap();
         assert_eq!(result.packets_received, 2);
         assert!((result.avg_latency_ms - 10.456).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_icmp_timeout_is_bounded() {
+        assert_eq!(
+            bounded_timeout_seconds(0),
+            ICMP_PING_DEFAULT_TIMEOUT_SECONDS
+        );
+        assert_eq!(bounded_timeout_seconds(1), ICMP_PING_MIN_TIMEOUT_SECONDS);
+        assert_eq!(
+            bounded_timeout_seconds(u32::MAX),
+            ICMP_PING_MAX_TIMEOUT_SECONDS
+        );
+    }
+
+    #[test]
+    fn test_ping_output_text_is_bounded_and_utf8_safe() {
+        let oversized = format!("{}é", "x".repeat(ICMP_PING_OUTPUT_MAX_BYTES - 1));
+        let bounded = bounded_ping_output_text(oversized.as_bytes());
+        assert!(bounded.ends_with("... [truncated]"));
+        assert!(bounded.len() <= ICMP_PING_OUTPUT_MAX_BYTES + "... [truncated]".len());
+    }
+
+    #[test]
+    fn test_ping_failure_message_uses_bounded_stderr_or_stdout() {
+        let stderr = "e".repeat(ICMP_PING_OUTPUT_MAX_BYTES + 64);
+        let message = ping_failure_message(stderr.as_bytes(), b"stdout detail");
+        assert!(message.starts_with("Ping failed: "));
+        assert!(message.contains("[truncated]"));
+        assert!(!message.contains("stdout detail"));
+
+        let fallback = ping_failure_message(b"   ", b"stdout detail");
+        assert_eq!(fallback, "Ping failed: stdout detail");
+
+        let empty = ping_failure_message(b"", b"");
+        assert_eq!(empty, "Ping failed");
     }
 }

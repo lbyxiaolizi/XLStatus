@@ -4,9 +4,15 @@
 use anyhow::{bail, Context, Result};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::timeout;
+
+const SHELL_MIN_TIMEOUT_SECONDS: u32 = 1;
+const SHELL_DEFAULT_TIMEOUT_SECONDS: u32 = 30;
+const SHELL_MAX_TIMEOUT_SECONDS: u32 = 60;
+const SHELL_DEFAULT_OUTPUT_MAX_BYTES: u64 = 64 * 1024;
+const SHELL_MAX_OUTPUT_BYTES: u64 = 64 * 1024;
 
 /// Shell command execution result
 #[derive(Debug)]
@@ -28,6 +34,8 @@ pub async fn execute_shell_command(
     max_output_bytes: u64,
 ) -> Result<ShellResult> {
     let start = Instant::now();
+    let timeout_seconds = bounded_timeout_seconds(timeout_seconds);
+    let max_output_bytes = bounded_output_max_bytes(max_output_bytes);
 
     let mut cmd = if cfg!(target_os = "windows") {
         let mut c = Command::new("cmd");
@@ -90,32 +98,51 @@ pub async fn execute_shell_command(
     }
 }
 
+fn bounded_timeout_seconds(value: u32) -> u32 {
+    if value == 0 {
+        SHELL_DEFAULT_TIMEOUT_SECONDS
+    } else {
+        value.clamp(SHELL_MIN_TIMEOUT_SECONDS, SHELL_MAX_TIMEOUT_SECONDS)
+    }
+}
+
+fn bounded_output_max_bytes(value: u64) -> u64 {
+    if value == 0 {
+        SHELL_DEFAULT_OUTPUT_MAX_BYTES
+    } else {
+        value.min(SHELL_MAX_OUTPUT_BYTES)
+    }
+}
+
 async fn collect_output(
-    handle: impl tokio::io::AsyncRead + Unpin,
+    mut handle: impl tokio::io::AsyncRead + Unpin,
     max_bytes: u64,
 ) -> Result<(Vec<u8>, bool)> {
-    let mut reader = BufReader::new(handle);
+    let max_bytes = max_bytes as usize;
     let mut output = Vec::new();
     let mut truncated = false;
-    let mut line = Vec::new();
+    let mut buffer = [0u8; 8192];
 
     loop {
-        line.clear();
-        let bytes_read = reader.read_until(b'\n', &mut line).await?;
+        let bytes_read = handle.read(&mut buffer).await?;
 
         if bytes_read == 0 {
             break;
         }
 
-        if output.len() + line.len() > max_bytes as usize {
-            // Truncate
-            let remaining = max_bytes as usize - output.len();
-            output.extend_from_slice(&line[..remaining]);
+        let remaining = max_bytes.saturating_sub(output.len());
+        if remaining == 0 {
             truncated = true;
             break;
         }
 
-        output.extend_from_slice(&line);
+        if bytes_read > remaining {
+            output.extend_from_slice(&buffer[..remaining]);
+            truncated = true;
+            break;
+        }
+
+        output.extend_from_slice(&buffer[..bytes_read]);
     }
 
     Ok((output, truncated))
@@ -124,6 +151,7 @@ async fn collect_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
     async fn test_simple_command() {
@@ -195,5 +223,26 @@ mod tests {
 
         assert!(result.output_truncated);
         assert_eq!(result.stdout.len(), 1024);
+    }
+
+    #[tokio::test]
+    async fn test_collect_output_truncates_long_line_without_buffering_it_all() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        writer.write_all(&vec![b'x'; 2048]).await.unwrap();
+        drop(writer);
+
+        let (output, truncated) = collect_output(reader, 1024).await.unwrap();
+
+        assert!(truncated);
+        assert_eq!(output.len(), 1024);
+    }
+
+    #[test]
+    fn test_shell_limits_are_bounded() {
+        assert_eq!(bounded_timeout_seconds(0), SHELL_DEFAULT_TIMEOUT_SECONDS);
+        assert_eq!(bounded_timeout_seconds(1), SHELL_MIN_TIMEOUT_SECONDS);
+        assert_eq!(bounded_timeout_seconds(u32::MAX), SHELL_MAX_TIMEOUT_SECONDS);
+        assert_eq!(bounded_output_max_bytes(0), SHELL_DEFAULT_OUTPUT_MAX_BYTES);
+        assert_eq!(bounded_output_max_bytes(u64::MAX), SHELL_MAX_OUTPUT_BYTES);
     }
 }

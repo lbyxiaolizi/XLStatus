@@ -29,6 +29,16 @@ mod collector;
 mod executor;
 
 const GRPC_MESSAGE_LIMIT: usize = 256 * 1024 * 1024;
+const AGENT_SHELL_MIN_TIMEOUT_SECONDS: u64 = 1;
+const AGENT_SHELL_DEFAULT_TIMEOUT_SECONDS: u64 = 30;
+const AGENT_SHELL_MAX_TIMEOUT_SECONDS: u64 = 60;
+const AGENT_SHELL_DEFAULT_OUTPUT_MAX_BYTES: u64 = 64 * 1024;
+const AGENT_SHELL_OUTPUT_MAX_BYTES: u64 = 64 * 1024;
+const AGENT_PROBE_MIN_TIMEOUT_SECONDS: u64 = 1;
+const AGENT_PROBE_DEFAULT_TIMEOUT_SECONDS: u64 = 10;
+const AGENT_PROBE_MAX_TIMEOUT_SECONDS: u64 = 30;
+const AGENT_PING_PROCESS_TIMEOUT_GRACE_SECONDS: u64 = 2;
+const AGENT_PING_OUTPUT_MAX_BYTES: usize = 4096;
 type TerminalSessionMap =
     Arc<Mutex<std::collections::HashMap<String, Arc<executor::terminal::TerminalSession>>>>;
 type NatSessionMap = Arc<Mutex<std::collections::HashMap<String, NatSocketSession>>>;
@@ -1483,45 +1493,35 @@ async fn run_server_task(
                 result.finished_at = finished();
                 return result;
             }
-            let cmd = shell.command.clone();
-            let timeout = if shell.timeout_seconds > 0 {
-                shell.timeout_seconds as u64
-            } else {
-                30
-            };
-            let max_output_bytes = shell.max_output_bytes as usize;
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(timeout),
-                tokio::process::Command::new("/bin/sh")
-                    .arg("-c")
-                    .arg(&cmd)
-                    .output(),
+            let timeout = shell_task_timeout_seconds(shell.timeout_seconds);
+            let max_output_bytes = shell_task_output_max_bytes(shell.max_output_bytes);
+            let working_dir = non_empty_string(&shell.working_dir);
+            let env = shell.env.into_iter().collect::<Vec<(String, String)>>();
+            match executor::shell::execute_shell_command(
+                &shell.command,
+                working_dir.as_deref(),
+                &env,
+                timeout as u32,
+                max_output_bytes,
             )
             .await
             {
-                Ok(Ok(out)) => {
-                    result.exit_code = out.status.code().unwrap_or(-1);
-                    let mut truncated = false;
-                    let stdout = truncate_output(&out.stdout, max_output_bytes, &mut truncated);
-                    let stderr = truncate_output(&out.stderr, max_output_bytes, &mut truncated);
-                    result.stdout = String::from_utf8_lossy(stdout).to_string();
-                    result.stderr = String::from_utf8_lossy(stderr).to_string();
-                    if truncated {
+                Ok(out) => {
+                    result.exit_code = out.exit_code;
+                    result.stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                    result.stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                    if out.output_truncated {
                         result.error = format!("output truncated at {} bytes", max_output_bytes);
                     }
-                    result.status = if out.status.success() {
+                    result.status = if out.exit_code == 0 {
                         TaskOutcome::Success as i32
                     } else {
                         TaskOutcome::Failure as i32
                     };
                 }
-                Ok(Err(e)) => {
+                Err(e) => {
                     result.status = TaskOutcome::Failure as i32;
-                    result.error = format!("spawn failed: {e}");
-                }
-                Err(_) => {
-                    result.status = TaskOutcome::Failure as i32;
-                    result.error = format!("timeout after {timeout}s");
+                    result.error = e.to_string();
                 }
             }
         }
@@ -1807,9 +1807,12 @@ async fn run_icmp_probe_task(
         cmd.args(["-c", &count, "-W", &timeout_text, &ping_target]);
         cmd
     };
+    command.kill_on_drop(true);
 
     let output = match tokio::time::timeout(
-        std::time::Duration::from_secs(timeout + 2),
+        std::time::Duration::from_secs(
+            timeout.saturating_add(AGENT_PING_PROCESS_TIMEOUT_GRACE_SECONDS),
+        ),
         command.output(),
     )
     .await
@@ -1817,21 +1820,15 @@ async fn run_icmp_probe_task(
         Ok(Ok(output)) => {
             let latency_ms = start.elapsed().as_millis() as i32;
             if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stdout = bounded_ping_output_text(&output.stdout);
                 probe_output_json(
                     true,
-                    Some(parse_ping_latency(&stdout).unwrap_or(latency_ms)),
+                    Some(parse_ping_latency(stdout.as_str()).unwrap_or(latency_ms)),
                     None,
                     None,
                 )
             } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let message = if stderr.trim().is_empty() {
-                    stdout.trim().to_string()
-                } else {
-                    stderr.trim().to_string()
-                };
+                let message = ping_failure_message(&output.stderr, &output.stdout);
                 probe_output_json(false, Some(latency_ms), None, Some(message))
             }
         }
@@ -1870,10 +1867,60 @@ fn probe_output_json(
 
 fn task_timeout_seconds(value: u32) -> u64 {
     if value == 0 {
-        10
+        AGENT_PROBE_DEFAULT_TIMEOUT_SECONDS
     } else {
-        u64::from(value)
+        u64::from(value).clamp(
+            AGENT_PROBE_MIN_TIMEOUT_SECONDS,
+            AGENT_PROBE_MAX_TIMEOUT_SECONDS,
+        )
     }
+}
+
+fn shell_task_timeout_seconds(value: u32) -> u64 {
+    if value == 0 {
+        AGENT_SHELL_DEFAULT_TIMEOUT_SECONDS
+    } else {
+        u64::from(value).clamp(
+            AGENT_SHELL_MIN_TIMEOUT_SECONDS,
+            AGENT_SHELL_MAX_TIMEOUT_SECONDS,
+        )
+    }
+}
+
+fn shell_task_output_max_bytes(value: u64) -> u64 {
+    if value == 0 {
+        AGENT_SHELL_DEFAULT_OUTPUT_MAX_BYTES
+    } else {
+        value.min(AGENT_SHELL_OUTPUT_MAX_BYTES)
+    }
+}
+
+fn ping_failure_message(stderr: &[u8], stdout: &[u8]) -> String {
+    let stderr = bounded_ping_output_text(stderr);
+    let stdout = bounded_ping_output_text(stdout);
+    let detail = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
+    if detail.is_empty() {
+        "Ping failed".to_string()
+    } else {
+        format!("Ping failed: {detail}")
+    }
+}
+
+fn bounded_ping_output_text(bytes: &[u8]) -> String {
+    if bytes.len() <= AGENT_PING_OUTPUT_MAX_BYTES {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let mut end = AGENT_PING_OUTPUT_MAX_BYTES;
+    while end > 0 && std::str::from_utf8(&bytes[..end]).is_err() {
+        end -= 1;
+    }
+    let mut text = String::from_utf8_lossy(&bytes[..end]).into_owned();
+    text.push_str("... [truncated]");
+    text
 }
 
 fn reject_probe_task_when_disabled(
@@ -2157,14 +2204,6 @@ fn parse_ping_latency(output: &str) -> Option<i32> {
     None
 }
 
-fn truncate_output<'a>(data: &'a [u8], max_output_bytes: usize, truncated: &mut bool) -> &'a [u8] {
-    if max_output_bytes == 0 || data.len() <= max_output_bytes {
-        return data;
-    }
-    *truncated = true;
-    &data[..max_output_bytes]
-}
-
 fn base64_encode(data: &[u8]) -> String {
     const ALPH: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
@@ -2415,6 +2454,66 @@ mod tests {
         assert!(err.to_string().contains("out of range"));
         let err = agent_probe_port(0, "test").unwrap_err();
         assert!(err.to_string().contains("greater than 0"));
+    }
+
+    #[test]
+    fn agent_shell_task_limits_are_bounded() {
+        assert_eq!(
+            shell_task_timeout_seconds(0),
+            AGENT_SHELL_DEFAULT_TIMEOUT_SECONDS
+        );
+        assert_eq!(
+            shell_task_timeout_seconds(1),
+            AGENT_SHELL_MIN_TIMEOUT_SECONDS
+        );
+        assert_eq!(
+            shell_task_timeout_seconds(u32::MAX),
+            AGENT_SHELL_MAX_TIMEOUT_SECONDS
+        );
+        assert_eq!(
+            shell_task_output_max_bytes(0),
+            AGENT_SHELL_DEFAULT_OUTPUT_MAX_BYTES
+        );
+        assert_eq!(
+            shell_task_output_max_bytes(u64::MAX),
+            AGENT_SHELL_OUTPUT_MAX_BYTES
+        );
+    }
+
+    #[test]
+    fn agent_probe_task_timeout_is_bounded() {
+        assert_eq!(task_timeout_seconds(0), AGENT_PROBE_DEFAULT_TIMEOUT_SECONDS);
+        assert_eq!(task_timeout_seconds(1), AGENT_PROBE_MIN_TIMEOUT_SECONDS);
+        assert_eq!(
+            task_timeout_seconds(u32::MAX),
+            AGENT_PROBE_MAX_TIMEOUT_SECONDS
+        );
+    }
+
+    #[test]
+    fn agent_ping_output_text_is_bounded_and_utf8_safe() {
+        let oversized = format!("{}é", "x".repeat(AGENT_PING_OUTPUT_MAX_BYTES - 1));
+        assert!(oversized.len() > AGENT_PING_OUTPUT_MAX_BYTES);
+
+        let bounded = bounded_ping_output_text(oversized.as_bytes());
+        assert!(bounded.ends_with("... [truncated]"));
+        assert!(bounded.len() <= AGENT_PING_OUTPUT_MAX_BYTES + "... [truncated]".len());
+        assert!(bounded.is_char_boundary(bounded.len()));
+    }
+
+    #[test]
+    fn agent_ping_failure_message_uses_bounded_stderr_or_stdout() {
+        let stderr = "e".repeat(AGENT_PING_OUTPUT_MAX_BYTES + 64);
+        let message = ping_failure_message(stderr.as_bytes(), b"stdout detail");
+        assert!(message.starts_with("Ping failed: "));
+        assert!(message.contains("[truncated]"));
+        assert!(!message.contains("stdout detail"));
+
+        let fallback = ping_failure_message(b"   ", b"stdout detail");
+        assert_eq!(fallback, "Ping failed: stdout detail");
+
+        let empty = ping_failure_message(b"", b"");
+        assert_eq!(empty, "Ping failed");
     }
 
     #[tokio::test]
