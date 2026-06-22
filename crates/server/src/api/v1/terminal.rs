@@ -33,6 +33,7 @@ const TERMINAL_MAX_INPUT_BYTES: usize = 8 * 1024;
 const TERMINAL_MAX_AGENT_FRAME_BYTES: usize = 64 * 1024;
 const TERMINAL_MAX_CLOSE_REASON_BYTES: usize = 1024;
 const TERMINAL_MAX_ERROR_BYTES: usize = 4096;
+const TERMINAL_UUID_TEXT_LEN: usize = 36;
 
 #[derive(Clone, Default)]
 pub struct TerminalSessionRegistry {
@@ -124,6 +125,7 @@ pub async fn ws_terminal(
     if !has_scope(&auth, "server:exec") {
         return Err(AppError::Forbidden("missing scope: server:exec".into()));
     }
+    let session_id = require_terminal_uuid_text(&session_id, "terminal_session_id")?;
     let session = match state
         .terminal_sessions
         .take_for_auth(&session_id, &auth)
@@ -470,9 +472,28 @@ async fn send_terminal_message(
 }
 
 fn parse_agent_id(id: &str) -> Result<AgentId, AppError> {
-    let parsed = uuid::Uuid::parse_str(id)
-        .map_err(|_| AppError::BadRequest(format!("invalid agent id: {}", id)))?;
+    let id = require_terminal_uuid_text(id, "agent_id")?;
+    let parsed = uuid::Uuid::parse_str(&id).expect("canonical UUID must parse after validation");
     Ok(AgentId(parsed))
+}
+
+fn require_terminal_uuid_text(value: &str, field: &str) -> Result<String, AppError> {
+    if value.is_empty() {
+        return Err(AppError::BadRequest(format!("{field} is required")));
+    }
+    if value.len() != TERMINAL_UUID_TEXT_LEN {
+        return Err(AppError::BadRequest(format!(
+            "{field} must be a canonical UUID"
+        )));
+    }
+    let parsed = uuid::Uuid::parse_str(value)
+        .map_err(|_| AppError::BadRequest(format!("{field} must be a canonical UUID")))?;
+    if parsed.to_string() != value {
+        return Err(AppError::BadRequest(format!(
+            "{field} must be a canonical UUID"
+        )));
+    }
+    Ok(value.to_string())
 }
 
 fn sanitize_cols(cols: u16) -> u16 {
@@ -753,6 +774,33 @@ mod tests {
         assert_eq!(TERMINAL_MAX_AGENT_FRAME_BYTES, 64 * 1024);
         assert_eq!(TERMINAL_MAX_CLOSE_REASON_BYTES, 1024);
         assert_eq!(TERMINAL_MAX_ERROR_BYTES, 4096);
+        assert_eq!(TERMINAL_UUID_TEXT_LEN, 36);
+    }
+
+    #[test]
+    fn terminal_resource_ids_require_canonical_uuid_text() {
+        let id = uuid::Uuid::parse_str("018f7e34-1234-4abc-8def-abcdefabcdef").unwrap();
+        let canonical = id.to_string();
+
+        assert_eq!(parse_agent_id(&canonical).unwrap().0, id);
+        assert_eq!(
+            require_terminal_uuid_text(&canonical, "terminal_session_id").unwrap(),
+            canonical
+        );
+
+        assert!(require_terminal_uuid_text("session-a", "terminal_session_id").is_err());
+        assert!(require_terminal_uuid_text(&format!(" {id} "), "terminal_session_id").is_err());
+        assert!(
+            require_terminal_uuid_text(&id.simple().to_string(), "terminal_session_id").is_err()
+        );
+        assert!(
+            require_terminal_uuid_text(&canonical.to_uppercase(), "terminal_session_id").is_err()
+        );
+        assert!(require_terminal_uuid_text(
+            &"a".repeat(TERMINAL_UUID_TEXT_LEN + 1),
+            "terminal_session_id",
+        )
+        .is_err());
     }
 
     #[test]
