@@ -1327,12 +1327,16 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 
 fn sanitize_return_to(value: Option<String>) -> String {
     value
-        .filter(|item| {
-            item.starts_with('/')
-                && !item.starts_with("//")
-                && item.len() <= OAUTH_MAX_RETURN_TO_BYTES
-        })
+        .filter(|item| valid_local_return_to(item))
         .unwrap_or_else(|| "/dashboard".to_string())
+}
+
+fn valid_local_return_to(value: &str) -> bool {
+    value.starts_with('/')
+        && !value.starts_with("//")
+        && value.len() <= OAUTH_MAX_RETURN_TO_BYTES
+        && !value.contains('\\')
+        && !value.bytes().any(|byte| byte.is_ascii_control())
 }
 
 fn random_nonce() -> String {
@@ -1522,6 +1526,14 @@ mod tests {
             "/dashboard"
         );
         assert_eq!(sanitize_return_to(Some("//x.test".into())), "/dashboard");
+        assert_eq!(
+            sanitize_return_to(Some("/\\evil.test".into())),
+            "/dashboard"
+        );
+        assert_eq!(
+            sanitize_return_to(Some("/\tevil.test".into())),
+            "/dashboard"
+        );
         assert_eq!(
             sanitize_return_to(Some(format!("/{}", "a".repeat(OAUTH_MAX_RETURN_TO_BYTES)))),
             "/dashboard"

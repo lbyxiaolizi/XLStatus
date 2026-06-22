@@ -62,6 +62,18 @@ export default function OAuthCallbackPage() {
 }
 
 function sanitizeReturnTo(value: string | null): string {
-  if (!value || !value.startsWith("/") || value.startsWith("//")) return "/dashboard";
+  if (
+    !value ||
+    !value.startsWith("/") ||
+    value.startsWith("//") ||
+    value.includes("\\") ||
+    hasControlCharacter(value)
+  ) {
+    return "/dashboard";
+  }
   return value;
+}
+
+function hasControlCharacter(value: string): boolean {
+  return /[\u0000-\u001f\u007f]/.test(value);
 }
