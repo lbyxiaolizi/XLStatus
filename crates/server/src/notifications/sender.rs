@@ -1,5 +1,5 @@
 use crate::security::{
-    secure_reqwest_client_builder, validate_outbound_url_resolved, ValidatedOutboundUrl,
+    secure_reqwest_client_builder, validate_webhook_outbound_url_resolved, ValidatedOutboundUrl,
 };
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -108,7 +108,8 @@ impl NotificationSender {
         message: &NotificationMessage,
     ) -> Result<()> {
         let url_text = self.render_url_template(&channel.url, message)?;
-        let validated = validate_outbound_url_resolved(&url_text, "notification webhook").await?;
+        let validated =
+            validate_webhook_outbound_url_resolved(&url_text, "notification webhook").await?;
         let url = validated.url.clone();
         let body = self.render_template(&channel.body_template, message)?;
         let client = self.client_for_channel(channel, &validated)?;
@@ -145,7 +146,8 @@ impl NotificationSender {
         message: &NotificationMessage,
     ) -> Result<()> {
         let url_text = self.render_url_template(&channel.url, message)?;
-        let validated = validate_outbound_url_resolved(&url_text, "notification webhook").await?;
+        let validated =
+            validate_webhook_outbound_url_resolved(&url_text, "notification webhook").await?;
         let url = validated.url.clone();
         let body = self.render_template(&channel.body_template, message)?;
         let client = self.client_for_channel(channel, &validated)?;
@@ -181,7 +183,8 @@ impl NotificationSender {
         message: &NotificationMessage,
     ) -> Result<()> {
         let url_text = self.render_url_template(&channel.url, message)?;
-        let validated = validate_outbound_url_resolved(&url_text, "notification webhook").await?;
+        let validated =
+            validate_webhook_outbound_url_resolved(&url_text, "notification webhook").await?;
         let url = validated.url.clone();
         let body = self.render_template(&channel.body_template, message)?;
         let client = self.client_for_channel(channel, &validated)?;

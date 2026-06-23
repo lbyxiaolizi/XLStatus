@@ -11,6 +11,12 @@ pub async fn validate_outbound_url(url: &str, purpose: &str) -> Result<reqwest::
         .map(|validated| validated.url)
 }
 
+pub async fn validate_webhook_outbound_url(url: &str, purpose: &str) -> Result<reqwest::Url> {
+    validate_webhook_outbound_url_resolved(url, purpose)
+        .await
+        .map(|validated| validated.url)
+}
+
 #[derive(Debug, Clone)]
 pub struct ValidatedOutboundUrl {
     pub url: reqwest::Url,
@@ -21,6 +27,21 @@ pub struct ValidatedOutboundUrl {
 pub async fn validate_outbound_url_resolved(
     url: &str,
     purpose: &str,
+) -> Result<ValidatedOutboundUrl> {
+    validate_outbound_url_resolved_with_policy(url, purpose, allow_private_outbound()).await
+}
+
+pub async fn validate_webhook_outbound_url_resolved(
+    url: &str,
+    purpose: &str,
+) -> Result<ValidatedOutboundUrl> {
+    validate_outbound_url_resolved_with_policy(url, purpose, allow_private_webhooks()).await
+}
+
+async fn validate_outbound_url_resolved_with_policy(
+    url: &str,
+    purpose: &str,
+    allow_private: bool,
 ) -> Result<ValidatedOutboundUrl> {
     let parsed = reqwest::Url::parse(url).with_context(|| format!("{purpose} URL is invalid"))?;
     match parsed.scheme() {
@@ -39,7 +60,7 @@ pub async fn validate_outbound_url_resolved(
         .port_or_known_default()
         .with_context(|| format!("{purpose} URL must include a port or known scheme"))?;
 
-    let addrs = resolve_outbound_host(&host, port, purpose).await?;
+    let addrs = resolve_outbound_host_with_policy(&host, port, purpose, allow_private).await?;
     Ok(ValidatedOutboundUrl {
         url: parsed,
         host,
@@ -56,7 +77,16 @@ pub async fn resolve_outbound_host(
     port: u16,
     purpose: &str,
 ) -> Result<Vec<SocketAddr>> {
-    if allow_private_outbound() {
+    resolve_outbound_host_with_policy(host, port, purpose, allow_private_outbound()).await
+}
+
+async fn resolve_outbound_host_with_policy(
+    host: &str,
+    port: u16,
+    purpose: &str,
+    allow_private: bool,
+) -> Result<Vec<SocketAddr>> {
+    if allow_private {
         let resolved: Vec<_> = lookup_host((host, port))
             .await
             .with_context(|| format!("failed to resolve {purpose} host '{host}'"))
@@ -100,16 +130,17 @@ fn ensure_public_ip(ip: IpAddr, purpose: &str) -> Result<()> {
 }
 
 pub fn allow_private_outbound() -> bool {
-    [
-        "XLSTATUS_ALLOW_PRIVATE_OUTBOUND",
-        "XLSTATUS_ALLOW_PRIVATE_WEBHOOKS",
-    ]
-    .iter()
-    .any(|name| {
-        std::env::var(name)
-            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-            .unwrap_or(false)
-    })
+    env_truthy("XLSTATUS_ALLOW_PRIVATE_OUTBOUND")
+}
+
+fn allow_private_webhooks() -> bool {
+    allow_private_outbound() || env_truthy("XLSTATUS_ALLOW_PRIVATE_WEBHOOKS")
+}
+
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
 }
 
 pub fn client_ip_from_headers(headers: &HeaderMap) -> String {
@@ -460,6 +491,7 @@ mod tests {
     use std::sync::{Mutex, MutexGuard};
 
     static PROXY_ENV_LOCK: Mutex<()> = Mutex::new(());
+    static OUTBOUND_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn blocks_private_ip_ranges() {
@@ -485,6 +517,35 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("disallowed private address"));
+    }
+
+    #[tokio::test]
+    async fn webhook_private_escape_hatch_does_not_apply_to_general_outbound_urls() {
+        let _env = OutboundEnvGuard::set_webhook_only();
+
+        let err = validate_outbound_url_resolved("http://127.0.0.1:8080/status", "service probe")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("disallowed private address"));
+
+        let validated = validate_webhook_outbound_url_resolved(
+            "http://127.0.0.1:8080/status",
+            "notification webhook",
+        )
+        .await
+        .unwrap();
+        assert_eq!(validated.host, "127.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn global_private_escape_hatch_applies_to_all_outbound_urls() {
+        let _env = OutboundEnvGuard::set_global();
+
+        let validated =
+            validate_outbound_url_resolved("http://127.0.0.1:8080/status", "service probe")
+                .await
+                .unwrap();
+        assert_eq!(validated.host, "127.0.0.1");
     }
 
     #[tokio::test]
@@ -674,6 +735,53 @@ mod tests {
             match &self.trusted_proxies {
                 Some(value) => std::env::set_var("XLSTATUS_TRUSTED_PROXIES", value),
                 None => std::env::remove_var("XLSTATUS_TRUSTED_PROXIES"),
+            }
+        }
+    }
+
+    struct OutboundEnvGuard {
+        allow_private_outbound: Option<String>,
+        allow_private_webhooks: Option<String>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl OutboundEnvGuard {
+        fn set_webhook_only() -> Self {
+            let lock = OUTBOUND_ENV_LOCK.lock().unwrap();
+            let allow_private_outbound = std::env::var("XLSTATUS_ALLOW_PRIVATE_OUTBOUND").ok();
+            let allow_private_webhooks = std::env::var("XLSTATUS_ALLOW_PRIVATE_WEBHOOKS").ok();
+            std::env::remove_var("XLSTATUS_ALLOW_PRIVATE_OUTBOUND");
+            std::env::set_var("XLSTATUS_ALLOW_PRIVATE_WEBHOOKS", "1");
+            Self {
+                allow_private_outbound,
+                allow_private_webhooks,
+                _lock: lock,
+            }
+        }
+
+        fn set_global() -> Self {
+            let lock = OUTBOUND_ENV_LOCK.lock().unwrap();
+            let allow_private_outbound = std::env::var("XLSTATUS_ALLOW_PRIVATE_OUTBOUND").ok();
+            let allow_private_webhooks = std::env::var("XLSTATUS_ALLOW_PRIVATE_WEBHOOKS").ok();
+            std::env::set_var("XLSTATUS_ALLOW_PRIVATE_OUTBOUND", "1");
+            std::env::remove_var("XLSTATUS_ALLOW_PRIVATE_WEBHOOKS");
+            Self {
+                allow_private_outbound,
+                allow_private_webhooks,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for OutboundEnvGuard {
+        fn drop(&mut self) {
+            match &self.allow_private_outbound {
+                Some(value) => std::env::set_var("XLSTATUS_ALLOW_PRIVATE_OUTBOUND", value),
+                None => std::env::remove_var("XLSTATUS_ALLOW_PRIVATE_OUTBOUND"),
+            }
+            match &self.allow_private_webhooks {
+                Some(value) => std::env::set_var("XLSTATUS_ALLOW_PRIVATE_WEBHOOKS", value),
+                None => std::env::remove_var("XLSTATUS_ALLOW_PRIVATE_WEBHOOKS"),
             }
         }
     }

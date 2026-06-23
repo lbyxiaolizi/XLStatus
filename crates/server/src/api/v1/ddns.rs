@@ -22,7 +22,7 @@ use crate::ddns::policy::{
     DDNS_MAX_DOMAIN_BYTES, DDNS_MAX_NAME_BYTES, DDNS_MAX_PROVIDER_BYTES, DDNS_MAX_RECORD_ID_BYTES,
     DDNS_MAX_SECRET_BYTES, DDNS_MAX_WEBHOOK_URL_BYTES, DDNS_MAX_ZONE_ID_BYTES, DDNS_UUID_TEXT_LEN,
 };
-use crate::security::validate_outbound_url;
+use crate::security::validate_webhook_outbound_url;
 use xlstatus_shared::ddns::{DdnsHistoryEntry, ProviderType};
 use xlstatus_shared::AgentId;
 
@@ -116,7 +116,7 @@ pub async fn create_ddns_config(
         let probe_url = url
             .replace("{{ip}}", "198.51.100.10")
             .replace("{{hostname}}", "example.com");
-        if let Err(e) = validate_outbound_url(&probe_url, "DDNS webhook").await {
+        if let Err(e) = validate_webhook_outbound_url(&probe_url, "DDNS webhook").await {
             return Err((
                 StatusCode::BAD_REQUEST,
                 Json(ApiResponse {

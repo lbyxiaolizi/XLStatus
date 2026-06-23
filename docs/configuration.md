@@ -52,6 +52,10 @@ XLSTATUS_SEED_ADMIN_PASSWORD_FILE=/run/secrets/xlstatus_seed_admin_password
 | `XLSTATUS_SEED_ADMIN_USERNAME` | 可选的首个管理员用户名。 |
 | `XLSTATUS_SEED_ADMIN_PASSWORD_FILE` | 可选的首个管理员密码文件路径。设置后优先于明文密码变量，Compose 默认使用 Docker secret 挂载到 `/run/secrets/xlstatus_seed_admin_password`。 |
 | `XLSTATUS_SEED_ADMIN_PASSWORD` | 可选的首个管理员密码。只在用户不存在时创建；容器部署优先使用 `XLSTATUS_SEED_ADMIN_PASSWORD_FILE`，避免把密码持久保存在容器环境里。 |
+| `XLSTATUS_ALLOW_PRIVATE_WEBHOOKS` | 可选的 Webhook 专用私网出站逃生阀。设置为 `1` / `true` / `yes` 时，只允许通知 Webhook 和 DDNS Webhook 访问私网、loopback 或链路本地目标。 |
+| `XLSTATUS_ALLOW_PRIVATE_OUTBOUND` | 可选的全局主控私网出站逃生阀。设置后会放开服务探测、OAuth/OIDC、GeoIP、DDNS provider/resolver 和 Webhook 等所有主控出站路径的私网地址阻断；生产应优先使用更窄的专用开关。 |
+
+主控默认会阻断 HTTP/TCP/ICMP 探测、OAuth/OIDC、GeoIP、DDNS、通知 Webhook 等出站请求访问私网、loopback、链路本地、保留地址和云元数据常见地址，并固定 DNS 解析结果以减少重绑定风险。只有确需把 Webhook 发到内网接收器时才建议启用 `XLSTATUS_ALLOW_PRIVATE_WEBHOOKS=1`；它不会放开服务探测、OAuth/OIDC、GeoIP 或 DDNS resolver/provider。`XLSTATUS_ALLOW_PRIVATE_OUTBOUND=1` 是实例级高危全局开关，应只用于受控内网部署并配合主机 egress firewall 和审计。
 
 ## config.toml
 

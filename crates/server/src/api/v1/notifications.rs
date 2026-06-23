@@ -11,7 +11,7 @@ use crate::notifications::sender::{
     NotificationSeverity, NOTIFICATION_MAX_BODY_TEMPLATE_BYTES, NOTIFICATION_MAX_GROUP_CHANNELS,
     NOTIFICATION_MAX_HEADERS_JSON_BYTES, NOTIFICATION_MAX_NAME_BYTES, NOTIFICATION_MAX_URL_BYTES,
 };
-use crate::security::validate_outbound_url;
+use crate::security::validate_webhook_outbound_url;
 use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
     http::HeaderMap,
@@ -1604,7 +1604,7 @@ fn require_uuid_text(value: String, field: &str) -> Result<String, AppError> {
 
 async fn validate_notification_url(url: &str) -> Result<(), AppError> {
     let probe_url = replace_template_markers(url);
-    validate_outbound_url(&probe_url, "notification webhook")
+    validate_webhook_outbound_url(&probe_url, "notification webhook")
         .await
         .map(|_| ())
         .map_err(|e| AppError::BadRequest(e.to_string()))

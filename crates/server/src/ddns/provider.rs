@@ -1,4 +1,7 @@
-use crate::security::{secure_reqwest_client_builder, validate_outbound_url_resolved};
+use crate::security::{
+    secure_reqwest_client_builder, validate_outbound_url_resolved,
+    validate_webhook_outbound_url_resolved,
+};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
@@ -313,7 +316,7 @@ impl DdnsProviderTrait for WebhookProvider {
             .url
             .replace("{{ip}}", ip)
             .replace("{{hostname}}", hostname);
-        let validated = validate_outbound_url_resolved(&url, "DDNS webhook").await?;
+        let validated = validate_webhook_outbound_url_resolved(&url, "DDNS webhook").await?;
         let client = secure_reqwest_client_builder(&validated)
             .timeout(DDNS_HTTP_TIMEOUT)
             .build()
