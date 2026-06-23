@@ -18,7 +18,7 @@ Server 有两种配置模式：
 DATABASE_URL=sqlite:///var/lib/xlstatus/xlstatus.db?mode=rwc
 DATABASE_CREATE_IF_MISSING=true
 HTTP_BIND=127.0.0.1:8080
-GRPC_BIND=127.0.0.1:50051
+GRPC_BIND=0.0.0.0:50051
 GRPC_TLS_CERT_PATH=/etc/xlstatus/tls/grpc-server.crt
 GRPC_TLS_KEY_PATH=/etc/xlstatus/tls/grpc-server.key
 GRPC_TLS_CLIENT_CA_PATH=/etc/xlstatus/tls/agent-ca.crt
@@ -39,7 +39,7 @@ XLSTATUS_SEED_ADMIN_PASSWORD_FILE=/run/secrets/xlstatus_seed_admin_password
 | `DATABASE_URL` | SQLite 或 PostgreSQL URL。设置后启用环境变量模式。 |
 | `DATABASE_CREATE_IF_MISSING` | 仅 SQLite 使用。`1`、`true`、`yes`、`y`、`on` 视为开启。 |
 | `HTTP_BIND` | HTTP API 监听地址，默认 `127.0.0.1:8080`。 |
-| `GRPC_BIND` | Agent gRPC 监听地址，默认 `127.0.0.1:50051`。 |
+| `GRPC_BIND` | Agent gRPC 监听地址。Release/systemd 和 Docker 部署默认使用 `0.0.0.0:50051`，让远端 Agent 可直接接入；源码无配置裸跑的内置默认仍是 `127.0.0.1:50051`。 |
 | `GRPC_TLS_CERT_PATH` | 可选的 gRPC 服务端 PEM 证书路径。必须与 `GRPC_TLS_KEY_PATH` 同时设置，设置后 gRPC 使用 TLS。 |
 | `GRPC_TLS_KEY_PATH` | 可选的 gRPC 服务端 PEM 私钥路径。必须与 `GRPC_TLS_CERT_PATH` 同时设置。 |
 | `GRPC_TLS_CLIENT_CA_PATH` | 可选的 gRPC 客户端证书 CA 路径。设置后启用 mTLS，Agent 必须提交该 CA 签发的客户端证书。 |
@@ -74,7 +74,7 @@ create_if_missing = true
 
 [server]
 http_bind = "127.0.0.1:8080"
-grpc_bind = "127.0.0.1:50051"
+grpc_bind = "0.0.0.0:50051"
 # grpc_tls_cert_path = "/etc/xlstatus/tls/grpc-server.crt"
 # grpc_tls_key_path = "/etc/xlstatus/tls/grpc-server.key"
 # grpc_tls_client_ca_path = "/etc/xlstatus/tls/agent-ca.crt"

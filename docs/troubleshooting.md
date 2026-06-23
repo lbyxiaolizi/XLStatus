@@ -251,7 +251,7 @@ sudo /usr/local/bin/xlstatus-agent run --config /etc/xlstatus-agent/agent.json
 常见原因：
 
 - `--server` 填错，应该是 HTTP API 地址。
-- `--grpc-server` 不可达。
+- `--grpc-server` 不可达；生产主控默认应放行公网 `50051/tcp`，云防火墙或主机防火墙不能阻断 Agent 来源。
 - enrollment token 过期或已使用。
 - Agent 配置文件缺少私钥或权限异常。
 

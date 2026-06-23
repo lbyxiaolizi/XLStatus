@@ -13,7 +13,9 @@ create_if_missing = true
 
 [server]
 http_bind = "127.0.0.1:8080"
-grpc_bind = "127.0.0.1:50051"
+# Agent gRPC must be reachable by remote agents. Bind publicly unless you
+# terminate gRPC through a reverse proxy, VPN, or private network.
+grpc_bind = "0.0.0.0:50051"
 # Optional gRPC TLS/mTLS. When cert/key are both set the Agent gRPC listener
 # serves TLS. When client_ca_path is also set, Agents must present a client
 # certificate signed by that CA.

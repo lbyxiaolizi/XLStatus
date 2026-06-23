@@ -32,14 +32,13 @@ COPY --from=builder /app/target/release/xlstatus-server /usr/local/bin/
 # Create data directory
 RUN mkdir -p /data
 
-# Expose the HTTP API port. Agent gRPC is intentionally not advertised by
-# the image default; compose deployments use the container network explicitly.
-EXPOSE 8080
+# Expose HTTP for reverse proxies and Agent gRPC for remote agents.
+EXPOSE 8080 50051
 
 # Environment variables
 ENV DATABASE_URL=sqlite:///data/xlstatus.db?mode=rwc
 ENV HTTP_BIND=127.0.0.1:8080
-ENV GRPC_BIND=127.0.0.1:50051
+ENV GRPC_BIND=0.0.0.0:50051
 ENV RUST_LOG=info
 
 CMD ["xlstatus-server"]

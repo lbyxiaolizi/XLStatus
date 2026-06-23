@@ -24,6 +24,7 @@ services:
     container_name: xlstatus-server
     ports:
       - "127.0.0.1:8080:8080"
+      - "50051:50051"
     environment:
       - DATABASE_URL=postgresql://xlstatus:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/xlstatus
       - RUST_LOG=info

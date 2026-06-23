@@ -36,6 +36,10 @@ Open:
 - API: `http://localhost:8080`
 - Public status: `http://localhost:3000/status`
 
+Docker Compose publishes Agent gRPC on `0.0.0.0:50051` by default so remote
+agents can connect without per-IP firewall allowlisting. Keep `8080` and
+`3000` behind localhost or your reverse proxy in production.
+
 Set a strong initial password in `.secrets/xlstatus_seed_admin_password` before first start.
 
 For PostgreSQL:

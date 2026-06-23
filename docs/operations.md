@@ -25,6 +25,10 @@ sudo journalctl -u xlstatus-agent -n 100 --no-pager
 - Agent gRPC: `50051`
 - Web UI: `3000`
 
+生产部署默认让 `50051` 面向公网可达，方便新增 Agent 不再按来源 IP
+维护白名单。`8080` 和 `3000` 建议保持本机监听或只对反向代理开放，由
+HTTPS 入口处理浏览器访问。
+
 检查占用：
 
 ```bash

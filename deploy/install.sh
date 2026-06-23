@@ -11,7 +11,7 @@ BINARY_PATH="${BINARY_PATH:-}"  # User can provide compiled binary path
 CONFIG_FILE="${CONFIG_FILE:-/etc/xlstatus/server.toml}"
 BOOTSTRAP_ENV_FILE="/run/xlstatus/bootstrap.env"
 HTTP_BIND="${HTTP_BIND:-127.0.0.1:8080}"
-GRPC_BIND="${GRPC_BIND:-127.0.0.1:50051}"
+GRPC_BIND="${GRPC_BIND:-0.0.0.0:50051}"
 DATABASE_URL="${DATABASE_URL:-sqlite://$DATA_DIR/xlstatus.db?mode=rwc}"
 DATABASE_CREATE_IF_MISSING="${DATABASE_CREATE_IF_MISSING:-true}"
 CORS_ALLOWED_ORIGINS="${CORS_ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}"

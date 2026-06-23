@@ -9,6 +9,7 @@ services:
     container_name: xlstatus-server
     ports:
       - "127.0.0.1:8080:8080"
+      - "50051:50051"
     volumes:
       - xlstatus-data:/data
     environment:

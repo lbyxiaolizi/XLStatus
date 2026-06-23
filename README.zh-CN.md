@@ -36,6 +36,10 @@ curl -fsS http://localhost:8080/healthz
 - API：`http://localhost:8080`
 - 公开状态页：`http://localhost:3000/status`
 
+Docker Compose 默认把 Agent gRPC 发布到 `0.0.0.0:50051`，远端 Agent
+无需逐个添加来源 IP 白名单即可接入。生产环境仍建议让 `8080` 和 `3000`
+只经本机或反向代理访问。
+
 首次启动前请在 `.secrets/xlstatus_seed_admin_password` 写入强初始密码。
 
 PostgreSQL 版本：

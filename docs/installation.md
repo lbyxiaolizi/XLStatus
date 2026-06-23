@@ -34,6 +34,11 @@ docker compose -f docker-compose.pg.yml up -d
 curl -fsS http://localhost:8080/healthz
 ```
 
+Docker Compose 默认把 Agent gRPC `50051` 发布到宿主所有地址，便于远端
+Agent 直接接入。HTTP API `8080` 和 Web UI `3000` 仍只发布到宿主
+`127.0.0.1`，生产环境建议继续通过 Nginx、Caddy 或其他反向代理对外提供
+HTTPS 页面/API。
+
 PostgreSQL Compose 默认只把数据库端口发布到宿主 `127.0.0.1:5432`，供本机调试和备份使用；不要把 `5432` 直接发布到公网。需要远端维护数据库时，优先通过 SSH tunnel、VPN 或受控防火墙访问。
 Compose 会把 `.secrets/xlstatus_seed_admin_password` 挂载为 Docker secret，并通过 `XLSTATUS_SEED_ADMIN_PASSWORD_FILE` 让 Server 读取；不要把首次管理员密码写进 `.env` 或 Compose 环境变量。
 
@@ -148,7 +153,7 @@ sudo bash deploy/install.sh
 sudo INTERACTIVE=false \
   VERSION=v0.1 \
   HTTP_BIND=127.0.0.1:8080 \
-  GRPC_BIND=127.0.0.1:50051 \
+  GRPC_BIND=0.0.0.0:50051 \
   DATABASE_URL=sqlite:///var/lib/xlstatus/xlstatus.db?mode=rwc \
   DATABASE_CREATE_IF_MISSING=true \
   CORS_ALLOWED_ORIGINS=https://status.example.com \
@@ -187,7 +192,7 @@ DATA_DIR=/var/lib/xlstatus
 BINARY_PATH=target/release/xlstatus-server
 CONFIG_FILE=/etc/xlstatus/server.toml
 HTTP_BIND=127.0.0.1:8080
-GRPC_BIND=127.0.0.1:50051
+GRPC_BIND=0.0.0.0:50051
 DATABASE_URL=sqlite:///var/lib/xlstatus/xlstatus.db?mode=rwc
 DATABASE_CREATE_IF_MISSING=true
 CORS_ALLOWED_ORIGINS=https://status.example.com
@@ -221,7 +226,7 @@ psql 'postgresql://xlstatus:change-this-password@localhost:5432/xlstatus' -c 'se
 ```bash
 DATABASE_URL='postgresql://xlstatus:change-this-password@localhost:5432/xlstatus' \
 HTTP_BIND="127.0.0.1:8080" \
-GRPC_BIND="127.0.0.1:50051" \
+GRPC_BIND="0.0.0.0:50051" \
 CORS_ALLOWED_ORIGINS="http://localhost:3000,http://127.0.0.1:3000" \
 SESSION_SECRET="$(openssl rand -hex 32)" \
 XLSTATUS_SEED_ADMIN_USERNAME="admin" \
