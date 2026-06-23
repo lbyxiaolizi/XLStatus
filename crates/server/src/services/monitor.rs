@@ -29,6 +29,8 @@ use xlstatus_shared::AgentId;
 const SERVICE_AGENT_PROBE_STDOUT_MAX_BYTES: usize = 16 * 1024;
 const SERVICE_AGENT_PROBE_ERROR_MAX_BYTES: usize = 4096;
 const SERVICE_UUID_TEXT_LEN: usize = 36;
+const LOAD_SERVICES_SQLITE: &str = "SELECT id, owner_user_id, name, type, target, interval_seconds, timeout_seconds, enabled, server_id, notification_group_id, COALESCE(cover_mode, 'local'), exclude_server_ids_json, failure_task_ids_json, recovery_task_ids_json FROM services WHERE enabled = 1";
+const LOAD_SERVICES_POSTGRES: &str = "SELECT id::text, owner_user_id::text, name, type, target, interval_seconds, timeout_seconds, enabled, server_id::text, notification_group_id::text, COALESCE(cover_mode, 'local'), exclude_server_ids_json, failure_task_ids_json, recovery_task_ids_json FROM services WHERE enabled = TRUE";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceConfig {
@@ -306,11 +308,7 @@ impl ServiceMonitor {
                     Option<String>,
                     Option<String>,
                     Option<String>,
-                )> = sqlx::query_as(
-                    "SELECT id, owner_user_id, name, type, target, interval_seconds, timeout_seconds, enabled, server_id, notification_group_id, COALESCE(cover_mode, 'local'), exclude_server_ids_json, failure_task_ids_json, recovery_task_ids_json FROM services WHERE enabled = 1",
-                )
-                .fetch_all(pool)
-                .await?;
+                )> = sqlx::query_as(LOAD_SERVICES_SQLITE).fetch_all(pool).await?;
                 let mut services = rows
                     .into_iter()
                     .filter_map(
@@ -376,11 +374,9 @@ impl ServiceMonitor {
                     Option<String>,
                     Option<String>,
                     Option<String>,
-                )> = sqlx::query_as(
-                    "SELECT id::text, owner_user_id::text, name, type, target, interval_seconds, timeout_seconds, enabled, server_id::text, notification_group_id::text, COALESCE(cover_mode, 'local'), exclude_server_ids_json, failure_task_ids_json, recovery_task_ids_json FROM services WHERE enabled = 1",
-                )
-                .fetch_all(pool)
-                .await?;
+                )> = sqlx::query_as(LOAD_SERVICES_POSTGRES)
+                    .fetch_all(pool)
+                    .await?;
                 let mut services = rows
                     .into_iter()
                     .filter_map(
@@ -1202,6 +1198,13 @@ mod tests {
         let back: ServiceConfig = serde_json::from_str(&s).unwrap();
         assert_eq!(back.id, "x");
         assert_eq!(back.owner_user_id.as_deref(), Some("owner"));
+    }
+
+    #[test]
+    fn postgres_load_services_query_uses_boolean_literal() {
+        assert!(LOAD_SERVICES_SQLITE.contains("WHERE enabled = 1"));
+        assert!(LOAD_SERVICES_POSTGRES.contains("WHERE enabled = TRUE"));
+        assert!(!LOAD_SERVICES_POSTGRES.contains("enabled = 1"));
     }
 
     #[test]

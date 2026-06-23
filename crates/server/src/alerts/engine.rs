@@ -28,6 +28,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
+const LOAD_ALERT_RULES_SQLITE: &str = "SELECT id, owner_user_id, name, enabled, trigger_mode, rules_json, notification_group_id, fail_task_ids_json, recover_task_ids_json FROM alert_rules WHERE enabled = 1";
+const LOAD_ALERT_RULES_POSTGRES: &str = "SELECT id::text, owner_user_id::text, name, enabled, trigger_mode, rules_json, notification_group_id::text, fail_task_ids_json, recover_task_ids_json FROM alert_rules WHERE enabled = TRUE";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlertRule {
     pub id: String,
@@ -1283,11 +1286,9 @@ impl AlertEngine {
                     Option<String>,
                     Option<String>,
                     Option<String>,
-                )> = sqlx::query_as(
-                    "SELECT id, owner_user_id, name, enabled, trigger_mode, rules_json, notification_group_id, fail_task_ids_json, recover_task_ids_json FROM alert_rules WHERE enabled = 1",
-                )
-                .fetch_all(pool)
-                .await?;
+                )> = sqlx::query_as(LOAD_ALERT_RULES_SQLITE)
+                    .fetch_all(pool)
+                    .await?;
                 for (
                     id,
                     owner_user_id,
@@ -1328,11 +1329,9 @@ impl AlertEngine {
                     Option<String>,
                     Option<String>,
                     Option<String>,
-                )> = sqlx::query_as(
-                    "SELECT id::text, owner_user_id::text, name, enabled, trigger_mode, rules_json, notification_group_id::text, fail_task_ids_json, recover_task_ids_json FROM alert_rules WHERE enabled = 1",
-                )
-                .fetch_all(pool)
-                .await?;
+                )> = sqlx::query_as(LOAD_ALERT_RULES_POSTGRES)
+                    .fetch_all(pool)
+                    .await?;
                 for (
                     id,
                     owner_user_id,
@@ -1909,6 +1908,13 @@ mod tests {
         assert!(Operator::Gte.compare(1.0, 1.0));
         assert!(Operator::Lte.compare(1.0, 1.0));
         assert!(!Operator::Lt.compare(1.0, 1.0));
+    }
+
+    #[test]
+    fn postgres_load_alert_rules_query_uses_boolean_literal() {
+        assert!(LOAD_ALERT_RULES_SQLITE.contains("WHERE enabled = 1"));
+        assert!(LOAD_ALERT_RULES_POSTGRES.contains("WHERE enabled = TRUE"));
+        assert!(!LOAD_ALERT_RULES_POSTGRES.contains("enabled = 1"));
     }
 
     #[test]
