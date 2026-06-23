@@ -1062,20 +1062,49 @@ async fn bind_oauth_account(
         .or(userinfo.preferred_username.as_deref());
     match db {
         DatabaseBackend::Sqlite(pool) => {
+            let now_text = now.to_rfc3339();
+            let mut tx = pool.begin().await?;
+            let existing: Option<(String,)> = sqlx::query_as(
+                "SELECT user_id FROM oauth_accounts WHERE provider = ? AND subject = ?",
+            )
+            .bind(&provider.id)
+            .bind(&userinfo.sub)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some((existing_user_id,)) = existing {
+                let existing_user_id = parse_user_id(&existing_user_id)?;
+                if existing_user_id != user_id {
+                    return Err(oauth_account_already_bound_error());
+                }
+                sqlx::query(
+                    r#"
+                    UPDATE oauth_accounts
+                    SET email = ?, display_name = ?, updated_at = ?
+                    WHERE provider = ? AND subject = ? AND user_id = ?
+                    "#,
+                )
+                .bind(&userinfo.email)
+                .bind(display_name)
+                .bind(&now_text)
+                .bind(&provider.id)
+                .bind(&userinfo.sub)
+                .bind(user_id.0.to_string())
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                return Ok(());
+            }
+
             sqlx::query("DELETE FROM oauth_accounts WHERE provider = ? AND user_id = ?")
                 .bind(&provider.id)
                 .bind(user_id.0.to_string())
-                .execute(pool)
+                .execute(&mut *tx)
                 .await?;
-            sqlx::query(
+            let result = sqlx::query(
                 r#"
                 INSERT INTO oauth_accounts (id, user_id, provider, subject, email, display_name, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(provider, subject) DO UPDATE SET
-                    user_id = excluded.user_id,
-                    email = excluded.email,
-                    display_name = excluded.display_name,
-                    updated_at = excluded.updated_at
+                ON CONFLICT(provider, subject) DO NOTHING
                 "#,
             )
             .bind(id.to_string())
@@ -1084,26 +1113,57 @@ async fn bind_oauth_account(
             .bind(&userinfo.sub)
             .bind(&userinfo.email)
             .bind(display_name)
-            .bind(now.to_rfc3339())
-            .bind(now.to_rfc3339())
-            .execute(pool)
+            .bind(&now_text)
+            .bind(&now_text)
+            .execute(&mut *tx)
             .await?;
+            if result.rows_affected() == 0 {
+                return Err(oauth_account_already_bound_error());
+            }
+            tx.commit().await?;
         }
         DatabaseBackend::Postgres(pool) => {
+            let mut tx = pool.begin().await?;
+            let existing: Option<(uuid::Uuid,)> = sqlx::query_as(
+                "SELECT user_id FROM oauth_accounts WHERE provider = $1 AND subject = $2",
+            )
+            .bind(&provider.id)
+            .bind(&userinfo.sub)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some((existing_user_id,)) = existing {
+                if UserId(existing_user_id) != user_id {
+                    return Err(oauth_account_already_bound_error());
+                }
+                sqlx::query(
+                    r#"
+                    UPDATE oauth_accounts
+                    SET email = $1, display_name = $2, updated_at = $3
+                    WHERE provider = $4 AND subject = $5 AND user_id = $6
+                    "#,
+                )
+                .bind(&userinfo.email)
+                .bind(display_name)
+                .bind(now)
+                .bind(&provider.id)
+                .bind(&userinfo.sub)
+                .bind(user_id.0)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                return Ok(());
+            }
+
             sqlx::query("DELETE FROM oauth_accounts WHERE provider = $1 AND user_id = $2")
                 .bind(&provider.id)
                 .bind(user_id.0)
-                .execute(pool)
+                .execute(&mut *tx)
                 .await?;
-            sqlx::query(
+            let result = sqlx::query(
                 r#"
                 INSERT INTO oauth_accounts (id, user_id, provider, subject, email, display_name, created_at, updated_at)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                ON CONFLICT(provider, subject) DO UPDATE SET
-                    user_id = excluded.user_id,
-                    email = excluded.email,
-                    display_name = excluded.display_name,
-                    updated_at = excluded.updated_at
+                ON CONFLICT(provider, subject) DO NOTHING
                 "#,
             )
             .bind(id)
@@ -1114,11 +1174,19 @@ async fn bind_oauth_account(
             .bind(display_name)
             .bind(now)
             .bind(now)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
+            if result.rows_affected() == 0 {
+                return Err(oauth_account_already_bound_error());
+            }
+            tx.commit().await?;
         }
     }
     Ok(())
+}
+
+fn oauth_account_already_bound_error() -> AppError {
+    AppError::Forbidden("OAuth account is already bound to another user".into())
 }
 
 async fn delete_oauth_account(
@@ -1664,6 +1732,52 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn oauth_bind_rejects_subject_already_bound_to_another_user() {
+        let state = test_app_state().await;
+        let first_user = UserId(uuid::Uuid::from_bytes([1; 16]));
+        let second_user = UserId(uuid::Uuid::from_bytes([2; 16]));
+        seed_user(&state.db, first_user.0).await;
+        seed_user(&state.db, second_user.0).await;
+        let provider = test_provider();
+        let userinfo = OidcUserInfo {
+            sub: "shared-subject".into(),
+            email: Some("owner@example.com".into()),
+            name: Some("Owner".into()),
+            preferred_username: None,
+        };
+        let second_userinfo = OidcUserInfo {
+            sub: "second-subject".into(),
+            email: Some("second@example.com".into()),
+            name: Some("Second".into()),
+            preferred_username: None,
+        };
+
+        bind_oauth_account(&state.db, first_user, &provider, &userinfo)
+            .await
+            .unwrap();
+        bind_oauth_account(&state.db, second_user, &provider, &second_userinfo)
+            .await
+            .unwrap();
+        let err = bind_oauth_account(&state.db, second_user, &provider, &userinfo)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(message) if message.contains("already bound")));
+        assert_eq!(
+            find_bound_user(&state.db, &provider, &userinfo.sub)
+                .await
+                .unwrap(),
+            Some(first_user)
+        );
+        assert_eq!(
+            find_bound_user(&state.db, &provider, &second_userinfo.sub)
+                .await
+                .unwrap(),
+            Some(second_user)
+        );
     }
 
     #[test]
