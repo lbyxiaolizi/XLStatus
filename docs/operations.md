@@ -104,6 +104,56 @@ psql 'postgresql://xlstatus:replace-with-a-strong-db-password@localhost:5432/xls
 
 恢复建议使用创建备份时相同的应用版本，升级迁移前先在测试环境验证。
 
+## SQLite 到 PostgreSQL 迁移
+
+仓库提供 `scripts/import_sqlite_to_postgres.py` 用于把 XLStatus SQLite
+备份导入到已经初始化过 schema 的 PostgreSQL 数据库。脚本面向 Docker
+Compose 部署，默认通过 `docker exec xlstatus-postgres psql ...` 写入数据。
+
+迁移前提：
+
+- 使用和 SQLite 备份匹配的 XLStatus 版本先完成一次测试迁移。
+- 已备份 SQLite 数据库、部署配置和 `.env` / secret 文件。
+- 迁移后继续使用原来的 `SESSION_SECRET` 和 `SECRET_ENCRYPTION_KEY`。缺少匹配的 `SECRET_ENCRYPTION_KEY` 时，历史加密密文无法恢复。
+- PostgreSQL schema 必须先由 XLStatus Server 初始化。仅启动空的 PostgreSQL 容器还不够。
+- 不要把 PostgreSQL `5432` 发布到公网。容器内部访问即可；远端维护优先使用 SSH tunnel、VPN 或受控防火墙。
+
+推荐流程：
+
+```bash
+# 1. 停止写入并做 SQLite 在线外备份
+docker compose stop web server
+mkdir -p /root/xlstatus-backups/$(date -u +%Y%m%dT%H%M%SZ)-pre-pg
+sqlite3 /path/to/xlstatus.db ".backup /root/xlstatus-backups/YYYYMMDDTHHMMSSZ-pre-pg/xlstatus.sqlite3"
+
+# 2. 启动 PostgreSQL
+docker compose -f docker-compose.pg.yml up -d postgres
+
+# 3. 临时启动 Server，让应用迁移创建 PostgreSQL schema
+docker compose -f docker-compose.pg.yml up -d server
+curl -fsS http://127.0.0.1:8080/healthz
+docker compose -f docker-compose.pg.yml stop server
+
+# 4. 导入 SQLite 备份。--truncate 会清空目标 PG public schema 中的应用表。
+python3 scripts/import_sqlite_to_postgres.py \
+  /root/xlstatus-backups/YYYYMMDDTHHMMSSZ-pre-pg/xlstatus.sqlite3 \
+  --container xlstatus-postgres \
+  --truncate
+
+# 5. 启动 Server 和 Web，并做健康检查
+docker compose -f docker-compose.pg.yml up -d server web
+curl -fsS http://127.0.0.1:8080/healthz
+```
+
+脚本行为和注意事项：
+
+- 默认不会清空目标 PostgreSQL。如果目标表已有数据且没有传 `--truncate`，脚本会拒绝导入。
+- `--truncate` 会执行 `TRUNCATE ... RESTART IDENTITY CASCADE`，只能在确认备份可用、目标库可替换时使用。
+- 脚本按 PostgreSQL 外键关系计算导入顺序，只导入 SQLite 和 PostgreSQL 都存在的列。
+- SQLite 的 `0/1` 会转换为 PostgreSQL boolean，空字符串会按 nullable UUID/timestamp 转为 `NULL`。
+- 导入后脚本会逐表核对已导入行数；任何 COPY 或行数不一致都会以非零状态退出。
+- 如果脚本提示 PostgreSQL 没有表，先启动同版本 XLStatus Server 跑完迁移，再重新执行导入。
+
 ## 升级
 
 源码安装的常规流程：

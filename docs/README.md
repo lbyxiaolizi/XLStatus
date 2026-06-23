@@ -9,7 +9,7 @@
 3. [配置参考](./configuration.md)：`config.toml`、环境变量、CORS、SQLite/PostgreSQL、Web i18n。
 4. [Web 前端](./web.md)：Next.js 构建、运行、API 地址和 CORS 配合。
 5. [Agent 接入](./agent.md)：注册、运行、systemd 和常见问题。
-6. [运维手册](./operations.md)：健康检查、日志、备份、升级和生产运行。
+6. [运维手册](./operations.md)：健康检查、日志、备份恢复、SQLite 到 PostgreSQL 迁移、升级和生产运行。
 7. [故障排查](./troubleshooting.md)：服务直接退出、端口冲突、数据库、CORS、Agent。
 8. [架构说明](./architecture.md)：当前组件、数据边界和发布拓扑。
 9. [项目结构](./project-structure.md)：仓库目录、Rust workspace、Web 和 docs 约定。
@@ -24,7 +24,7 @@
 | [web.md](./web.md) | 前端构建、运行、i18n 和部署注意事项 |
 | [agent.md](./agent.md) | Agent 注册、运行和服务安装 |
 | [api.md](./api.md) | 当前 HTTP、WebSocket、gRPC、MCP 接口概览 |
-| [operations.md](./operations.md) | 运维命令、备份恢复、升级、远端 smoke |
+| [operations.md](./operations.md) | 运维命令、备份恢复、SQLite 到 PostgreSQL 迁移、升级、远端 smoke |
 | [troubleshooting.md](./troubleshooting.md) | 常见故障定位和修复 |
 | [development.md](./development.md) | 本地开发、测试脚本和代码结构 |
 | [release-checklist.md](./release-checklist.md) | 发布前检查清单 |

@@ -241,6 +241,10 @@ sudo BINARY_PATH=target/release/xlstatus-server \
 ```
 
 新站数据库应为空。恢复备份时，请使用和备份匹配的应用版本并先在测试环境验证。
+从既有 SQLite 实例迁移到 PostgreSQL 时，先让同版本 Server 在目标
+PostgreSQL 上初始化 schema，再使用
+`scripts/import_sqlite_to_postgres.py` 导入 SQLite 备份。完整步骤、备份要求和
+`--truncate` 注意事项见 [运维手册](./operations.md#sqlite-到-postgresql-迁移)。
 
 ## Web UI 部署
 
