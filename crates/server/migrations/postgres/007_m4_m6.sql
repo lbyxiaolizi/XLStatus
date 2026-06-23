@@ -2,13 +2,13 @@
 -- See sqlite/007_m4_m6.sql for the full rationale.
 
 CREATE TABLE IF NOT EXISTS alert_rules (
-    id UUID PRIMARY KEY NOT NULL,
+    id TEXT PRIMARY KEY NOT NULL,
     owner_user_id UUID NOT NULL,
     name VARCHAR(255) NOT NULL,
     enabled BOOLEAN NOT NULL DEFAULT true,
     trigger_mode VARCHAR(20) NOT NULL DEFAULT 'once',
     rules_json TEXT NOT NULL,
-    notification_group_id UUID,
+    notification_group_id TEXT,
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
     FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -17,8 +17,8 @@ CREATE TABLE IF NOT EXISTS alert_rules (
 CREATE INDEX IF NOT EXISTS idx_alert_rules_enabled ON alert_rules(enabled);
 
 CREATE TABLE IF NOT EXISTS alert_events (
-    id UUID PRIMARY KEY NOT NULL,
-    rule_id UUID NOT NULL,
+    id TEXT PRIMARY KEY NOT NULL,
+    rule_id TEXT NOT NULL,
     agent_id UUID,
     service_id UUID,
     kind VARCHAR(20) NOT NULL,

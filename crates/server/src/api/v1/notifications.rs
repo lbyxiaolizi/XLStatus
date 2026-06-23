@@ -1176,12 +1176,10 @@ pub(crate) async fn ensure_notification_group_owned_by(
             row.is_some()
         }
         DatabaseBackend::Postgres(pool) => {
-            let parsed_group_id = Uuid::parse_str(group_id)
-                .map_err(|e| AppError::BadRequest(format!("invalid notification_group_id: {e}")))?;
             let row: Option<(i64,)> = sqlx::query_as(
                 "SELECT 1::BIGINT FROM notification_groups WHERE id = $1 AND owner_user_id = $2",
             )
-            .bind(parsed_group_id)
+            .bind(group_id)
             .bind(owner)
             .fetch_optional(pool)
             .await
@@ -1256,8 +1254,6 @@ async fn ensure_group_member_count_allowed(
             row.0 as usize
         }
         DatabaseBackend::Postgres(pool) => {
-            let group_uuid = Uuid::parse_str(group_id)
-                .map_err(|e| AppError::BadRequest(format!("invalid group_id: {e}")))?;
             let row: (i64,) = sqlx::query_as(
                 r#"
                 SELECT COUNT(*)::BIGINT
@@ -1266,7 +1262,7 @@ async fn ensure_group_member_count_allowed(
                 WHERE ngm.group_id = $1 AND ng.owner_user_id = $2
                 "#,
             )
-            .bind(group_uuid)
+            .bind(group_id)
             .bind(owner)
             .fetch_one(pool)
             .await
@@ -1312,10 +1308,6 @@ async fn notification_group_member_exists(
             Ok(row.is_some())
         }
         DatabaseBackend::Postgres(pool) => {
-            let group_uuid = Uuid::parse_str(group_id)
-                .map_err(|e| AppError::BadRequest(format!("invalid group_id: {e}")))?;
-            let notification_uuid = Uuid::parse_str(notification_id)
-                .map_err(|e| AppError::BadRequest(format!("invalid notification_id: {e}")))?;
             let row: Option<(i64,)> = sqlx::query_as(
                 r#"
                 SELECT 1::BIGINT
@@ -1328,8 +1320,8 @@ async fn notification_group_member_exists(
                   AND n.owner_user_id = $3
                 "#,
             )
-            .bind(group_uuid)
-            .bind(notification_uuid)
+            .bind(group_id)
+            .bind(notification_id)
             .bind(owner)
             .fetch_optional(pool)
             .await

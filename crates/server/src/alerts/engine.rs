@@ -1134,8 +1134,6 @@ impl AlertEngine {
                 .await?;
             }
             crate::db::DatabaseBackend::Postgres(pool) => {
-                let pid = uuid::Uuid::parse_str(&id)?;
-                let prid = uuid::Uuid::parse_str(&rule.id)?;
                 let agent_id = source_agent_id
                     .map(uuid::Uuid::parse_str)
                     .transpose()
@@ -1143,8 +1141,8 @@ impl AlertEngine {
                 sqlx::query(
                     "INSERT INTO alert_events (id, rule_id, agent_id, kind, payload_json, fired_at) VALUES ($1, $2, $3, $4, $5, $6)",
                 )
-                .bind(pid)
-                .bind(prid)
+                .bind(&id)
+                .bind(&rule.id)
                 .bind(agent_id)
                 .bind(kind)
                 .bind(&payload_text)

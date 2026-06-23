@@ -67,18 +67,16 @@ impl AlertRepository {
                 .await?;
             }
             DatabaseBackend::Postgres(pool) => {
-                let pid = Uuid::parse_str(&id)?;
                 let poid = Uuid::parse_str(owner_user_id)?;
-                let png = notification_group_id.map(Uuid::parse_str).transpose()?;
                 sqlx::query(
                     "INSERT INTO alert_rules (id, owner_user_id, name, enabled, trigger_mode, rules_json, notification_group_id, fail_task_ids_json, recover_task_ids_json, created_at, updated_at) VALUES ($1, $2, $3, true, $4, $5, $6, $7, $8, $9, $10)",
                 )
-                .bind(pid)
+                .bind(&id)
                 .bind(poid)
                 .bind(name)
                 .bind(trigger_mode.as_db())
                 .bind(&conditions_json)
-                .bind(png)
+                .bind(notification_group_id)
                 .bind(&failure_task_ids_json)
                 .bind(&recovery_task_ids_json)
                 .bind(now)
@@ -673,14 +671,11 @@ impl AlertRepository {
                 .execute(pool)
                 .await?
                 .rows_affected(),
-            DatabaseBackend::Postgres(pool) => {
-                let pid = Uuid::parse_str(id)?;
-                sqlx::query("DELETE FROM alert_rules WHERE id = $1")
-                    .bind(pid)
-                    .execute(pool)
-                    .await?
-                    .rows_affected()
-            }
+            DatabaseBackend::Postgres(pool) => sqlx::query("DELETE FROM alert_rules WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await?
+                .rows_affected(),
         };
         Ok(affected > 0)
     }
@@ -696,10 +691,9 @@ impl AlertRepository {
                     .rows_affected()
             }
             DatabaseBackend::Postgres(pool) => {
-                let pid = Uuid::parse_str(id)?;
                 let owner = Uuid::parse_str(owner_user_id)?;
                 sqlx::query("DELETE FROM alert_rules WHERE id = $1 AND owner_user_id = $2")
-                    .bind(pid)
+                    .bind(id)
                     .bind(owner)
                     .execute(pool)
                     .await?

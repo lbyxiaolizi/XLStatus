@@ -531,6 +531,37 @@ mod tests {
         )));
     }
 
+    #[test]
+    fn postgres_alert_rule_event_migrations_keep_rule_ids_text() {
+        fn table_definition<'a>(sql: &'a str, table: &str) -> &'a str {
+            let marker = format!("CREATE TABLE IF NOT EXISTS {table} (");
+            let start = sql.find(&marker).expect("missing table definition");
+            let rest = &sql[start..];
+            let end = rest.find("\n);").expect("missing table terminator") + 3;
+            &rest[..end]
+        }
+
+        let initial_alert_rules = table_definition(
+            include_str!("../../migrations/postgres/005_tasks.sql"),
+            "alert_rules",
+        );
+        let supplementary_alert_rules = table_definition(
+            include_str!("../../migrations/postgres/007_m4_m6.sql"),
+            "alert_rules",
+        );
+        let supplementary_alert_events = table_definition(
+            include_str!("../../migrations/postgres/007_m4_m6.sql"),
+            "alert_events",
+        );
+
+        assert!(initial_alert_rules.contains("id TEXT PRIMARY KEY"));
+        assert!(initial_alert_rules.contains("notification_group_id TEXT"));
+        assert!(supplementary_alert_rules.contains("id TEXT PRIMARY KEY NOT NULL"));
+        assert!(supplementary_alert_rules.contains("notification_group_id TEXT"));
+        assert!(supplementary_alert_events.contains("rule_id TEXT NOT NULL"));
+        assert!(!supplementary_alert_events.contains("rule_id UUID"));
+    }
+
     #[tokio::test]
     async fn sqlite_migrations_are_idempotent_for_existing_file() {
         let db_path =
