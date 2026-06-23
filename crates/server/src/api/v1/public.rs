@@ -2195,11 +2195,13 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+        let metric_start = Utc::now() - chrono::Duration::seconds(60);
+        let metric_end = metric_start + chrono::Duration::seconds(60);
         state
             .metrics
             .write(xlstatus_tsdb::MetricSample {
                 agent_id: xlstatus_tsdb::AgentId(Uuid::parse_str(&server_id).unwrap()),
-                sample_at: "2026-06-22T00:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+                sample_at: metric_start,
                 fields_json: serde_json::json!({
                     "cpu_percent": 38.0,
                     "memory_used": 1536,
@@ -2213,7 +2215,7 @@ mod tests {
             .metrics
             .write(xlstatus_tsdb::MetricSample {
                 agent_id: xlstatus_tsdb::AgentId(Uuid::parse_str(&server_id).unwrap()),
-                sample_at: "2026-06-22T00:01:00Z".parse::<DateTime<Utc>>().unwrap(),
+                sample_at: metric_end,
                 fields_json: serde_json::json!({
                     "cpu_percent": 42.0,
                     "memory_used": 1024,
