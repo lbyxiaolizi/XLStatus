@@ -175,7 +175,7 @@ jobs:
           esac
           zig_dir="$RUNNER_TEMP/zig"
           mkdir -p "$zig_dir"
-          curl -fsSL "https://ziglang.org/download/${zig_version}/zig-linux-${zig_arch}-${zig_version}.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          curl -fsSL "https://ziglang.org/download/${zig_version}/zig-${zig_arch}-linux-${zig_version}.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$zig_dir" --strip-components=1
           echo "$zig_dir" >> "$GITHUB_PATH"
           "$zig_dir/zig" version
