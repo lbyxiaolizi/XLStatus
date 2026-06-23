@@ -1097,7 +1097,7 @@ function ServerCard({
           <MetricBlock label="内存" value={memoryLabel(server)}>
             <UsageBar value={memoryPercent} />
           </MetricBlock>
-          <MetricBlock label="负载" value={server.load_1 === undefined ? "N/A" : server.load_1.toFixed(2)} />
+          <MetricBlock label="负载" value={server.load_1 === undefined || server.load_1 === null ? "N/A" : server.load_1.toFixed(2)} />
           <MetricBlock label="运行时间" value={durationLabel(server.uptime_seconds)} />
           <MetricBlock label="上传" value={formatRate(server.net_tx_bps)} />
           <MetricBlock label="下载" value={formatRate(server.net_rx_bps)} />
@@ -1140,7 +1140,7 @@ function CompactServerRow({
         <CompactMetric label="状态" value={serverStatusLabel(server.status)} />
         <CompactMetric label="CPU" value={formatPercent(server.cpu_percent)} />
         <CompactMetric label="内存" value={memoryLabel(server)} />
-        <CompactMetric label="负载" value={server.load_1 === undefined ? "N/A" : server.load_1.toFixed(2)} />
+        <CompactMetric label="负载" value={server.load_1 === undefined || server.load_1 === null ? "N/A" : server.load_1.toFixed(2)} />
         <CompactMetric label="运行" value={durationLabel(server.uptime_seconds)} />
         <CompactMetric label="上传" value={formatRate(server.net_tx_bps)} />
         <CompactMetric label="下载" value={formatRate(server.net_rx_bps)} />
