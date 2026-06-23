@@ -179,7 +179,7 @@ Enrollment token 创建请求体上限为 4KiB，`expires_in_hours` 必须在 1 
 
 终端 session 创建请求体上限为 4KiB，创建终端会话只允许 Cookie session；若账号已启用 TOTP，请求必须携带有效 `x-totp-code`，PAT 不能创建交互式终端会话。创建 body `agent_id` 和 WebSocket path `:session_id` 都必须是 36 字节 canonical UUID 文本；非法、simple、大写或带空格 UUID 会在 Agent 可见性校验、registry 查找或 IO 打开前返回 400。创建和 WebSocket 升级前都会重新校验目标 Agent 当前未撤销。终端 WebSocket 单条浏览器文本消息最多 16KiB，单次输入转发给 Agent 前最多保留 8KiB；Agent 终端输出单帧最多 64KiB，关闭原因最多 1024 字节，错误消息最多 4096 字节。
 
-强制更新需要 `server:exec` 权限、明确版本、HTTPS 下载 URL 和 SHA-256 校验和；若账号已启用 TOTP，请求必须携带有效 `x-totp-code`。默认只允许 `https://github.com/lbyxiaolizi/XLStatus/releases/download/<VERSION>/xlstatus-agent-*` 这类官方 Agent release 资产；自托管更新源必须显式设置 `XLSTATUS_ALLOW_CUSTOM_FORCE_UPDATE_URL=1`，但仍要求 HTTPS 和 SHA-256。Agent 记录强制更新请求前也会拒绝 `latest`、非法版本、非 HTTPS、URL credentials/query/fragment、超长 URL 和非 SHA-256 checksum。
+强制更新需要 Cookie session、`server:exec` 权限、明确版本、HTTPS 下载 URL 和 SHA-256 校验和；若账号已启用 TOTP，请求必须携带有效 `x-totp-code`。PAT 不能下发 Agent 强制更新请求。默认只允许 `https://github.com/lbyxiaolizi/XLStatus/releases/download/<VERSION>/xlstatus-agent-*` 这类官方 Agent release 资产；自托管更新源必须显式设置 `XLSTATUS_ALLOW_CUSTOM_FORCE_UPDATE_URL=1`，但仍要求 HTTPS 和 SHA-256。Agent 记录强制更新请求前也会拒绝 `latest`、非法版本、非 HTTPS、URL credentials/query/fragment、超长 URL 和非 SHA-256 checksum。
 
 维护导出、SQLite VACUUM、TSDB compact 和 TSDB retention 均只允许管理员 Cookie session，敏感写操作仍要求 TOTP。维护导出附件响应会发送 `Cache-Control: no-store`、`Pragma: no-cache` 和 `Expires: 0`，避免数据库备份或完整归档被浏览器、代理或 CDN 缓存。SQLite 备份导出、完整归档和恢复验证的临时数据库文件只会写入本进程创建的私有临时目录，Unix 下目录权限为 `0700`，操作结束后会清理。恢复请求体上限为 512MiB。TSDB retention 请求体上限为 4KiB，`retention_days` 必须在 1 到 3650 天之间；超出范围会拒绝而不是静默修正。
 

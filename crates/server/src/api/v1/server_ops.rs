@@ -782,6 +782,11 @@ async fn require_force_update_auth(
     headers: &HeaderMap,
 ) -> Result<(), AppError> {
     require_force_update_scope(auth)?;
+    if matches!(auth.auth_kind, AuthKind::PersonalAccessToken) {
+        return Err(AppError::Forbidden(
+            "force update requests require a cookie session".into(),
+        ));
+    }
     require_sensitive_totp(db, auth.user_id, headers).await
 }
 
@@ -1082,6 +1087,22 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn force_update_rejects_pat_session() {
+        let state = test_state().await;
+        let auth = auth_session(
+            AuthKind::PersonalAccessToken,
+            xlstatus_shared::UserRole::Admin,
+            vec!["server:exec"],
+        );
+
+        let err = require_force_update_auth(&state.db, &auth, &HeaderMap::new())
+            .await
+            .unwrap_err();
+
+        assert!(app_error_message(&err).contains("cookie session"));
     }
 
     #[test]
