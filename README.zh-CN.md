@@ -6,7 +6,7 @@
 
 XLStatus 是一个用 Rust 和 Next.js 编写的自托管服务器监控与运维面板。它把主机实时指标、公开状态页、服务探测、告警、任务执行、文件操作、Web 终端、DDNS、NAT 隧道和 MCP 工具整合到一个可部署的系统里。
 
-当前预发布版本是 `v0.1.0-alpha.3`。安装、运维和继续开发请从文档索引开始：[docs/README.md](./docs/README.md)。
+当前正式版本是 `v0.1`。安装、运维和继续开发请从文档索引开始：[docs/README.md](./docs/README.md)。
 
 ## 功能特性
 
@@ -49,7 +49,7 @@ docker compose -f docker-compose.pg.yml up -d
 Server：
 
 ```bash
-curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.3/install-server.sh | sudo bash
+curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1/install-server.sh | sudo bash
 ```
 
 Agent：
@@ -59,10 +59,10 @@ sudo SERVER_URL=http://dashboard.example.com:8080 \
   GRPC_SERVER=https://grpc.dashboard.example.com:50051 \
   ENROLLMENT_TOKEN=xle_... \
   AGENT_NAME="$(hostname)" \
-  bash -c 'curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.3/install-agent.sh | bash'
+  bash -c 'curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1/install-agent.sh | bash'
 ```
 
-后台设置页可以生成带参数的 Agent bootstrap 链接。默认情况下会从 GitHub Releases 获取最新非草稿版本；如果 GitHub 不可用，则回退到 `v0.1.0-alpha.3`。
+后台设置页可以生成带参数的 Agent bootstrap 链接。默认情况下会从 GitHub Releases 获取最新非草稿版本；如果 GitHub 不可用，则回退到 `v0.1`。
 
 ## 文档
 

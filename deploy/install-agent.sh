@@ -4,7 +4,7 @@ set -e
 # XLStatus Agent Installation Script
 # Usage: bash install-agent.sh
 
-VERSION="${VERSION:-v0.1.0-alpha.3}"
+VERSION="${VERSION:-v0.1}"
 SERVER_URL="${SERVER_URL:-http://localhost:8080}"
 GRPC_SERVER="${GRPC_SERVER:-}"
 GRPC_TLS_CA_PATH="${GRPC_TLS_CA_PATH:-}"

@@ -65,7 +65,7 @@ XLSTATUS_CORS_ALLOWED_ORIGINS=https://status.example.com
 
 ### systemd
 
-`deploy/install.sh` 安装 Server，`deploy/install-agent.sh` 安装 Agent。默认 Release 版本为 `v0.1.0-alpha.3`。
+`deploy/install.sh` 安装 Server，`deploy/install-agent.sh` 安装 Agent。默认 Release 版本为 `v0.1`。
 
 ### GitHub Release
 

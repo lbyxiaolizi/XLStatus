@@ -241,12 +241,12 @@ Agent gRPC 服务定义在 `proto/xlstatus/v1/agent.proto`，生成代码在 `cr
 | `grpc_tls_client_key_path` | 可选，Agent 侧 mTLS 客户端 PEM 私钥路径，最长 1024 字节 |
 | `enrollment_token` | enrollment token，最长 128 字节 |
 | `agent_name` | Agent 名称，最长 255 字节；默认 `$(hostname)` |
-| `version` | GitHub Release 版本，默认 `v0.1.0-alpha.3`；后台设置页默认会从 GitHub Releases 获取最新非草稿版本后传入 |
+| `version` | GitHub Release 版本，默认 `v0.1`；后台设置页默认会从 GitHub Releases 获取最新非草稿版本后传入 |
 
 示例：
 
 ```bash
-curl -fsSL 'http://dashboard.example.com:8080/api/v1/agents/install.sh?server_url=http%3A%2F%2Fdashboard.example.com%3A8080&grpc_server=http%3A%2F%2Fdashboard.example.com%3A50051&enrollment_token=xle_...&agent_name=%24(hostname)&version=v0.1.0-alpha.3' | sudo bash
+curl -fsSL 'http://dashboard.example.com:8080/api/v1/agents/install.sh?server_url=http%3A%2F%2Fdashboard.example.com%3A8080&grpc_server=http%3A%2F%2Fdashboard.example.com%3A50051&enrollment_token=xle_...&agent_name=%24(hostname)&version=v0.1' | sudo bash
 ```
 
 `enrollment_token` 会进入 URL 和 bootstrap 脚本内容，建议使用短有效期 token。Release 安装脚本会通过 stdin 把 token 交给 `xlstatus-agent enroll`，避免 token 出现在 Agent 子进程命令行参数中。若需要让 Agent 连接到不同主机名的控制面，不要使用这个公开 bootstrap 端点；请直接从 GitHub Release 下载 `install-agent.sh` 并通过环境变量传入 `SERVER_URL` / `GRPC_SERVER`。

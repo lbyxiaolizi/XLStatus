@@ -36,7 +36,7 @@ import {
   type TsdbRetentionResponse,
 } from "@/lib/api";
 
-const DEFAULT_AGENT_VERSION = "v0.1.0-alpha.3";
+const DEFAULT_AGENT_VERSION = "v0.1";
 const GITHUB_RELEASES_API = "https://api.github.com/repos/lbyxiaolizi/XLStatus/releases?per_page=20";
 
 interface UserAccount {

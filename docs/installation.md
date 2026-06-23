@@ -119,10 +119,10 @@ https://github.com/lbyxiaolizi/XLStatus/releases/download/<VERSION>/xlstatus-age
 
 ## systemd 安装 Server
 
-Release 安装脚本默认下载 `v0.1.0-alpha.3` 的 Linux 二进制，并按当前机器选择 `x86_64`、`arm64` 或 `i386`：
+Release 安装脚本默认下载 `v0.1` 的 Linux 二进制，并按当前机器选择 `x86_64`、`arm64` 或 `i386`：
 
 ```bash
-curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.3/install-server.sh | sudo bash
+curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1/install-server.sh | sudo bash
 ```
 
 如果需要安装本地构建产物：
@@ -146,7 +146,7 @@ sudo bash deploy/install.sh
 
 ```bash
 sudo INTERACTIVE=false \
-  VERSION=v0.1.0-alpha.3 \
+  VERSION=v0.1 \
   HTTP_BIND=127.0.0.1:8080 \
   GRPC_BIND=127.0.0.1:50051 \
   DATABASE_URL=sqlite:///var/lib/xlstatus/xlstatus.db?mode=rwc \
@@ -181,7 +181,7 @@ root-only 的 `/run/xlstatus/bootstrap.env` 临时文件；服务通过 `/health
 常用变量：
 
 ```bash
-VERSION=v0.1.0-alpha.3
+VERSION=v0.1
 INSTALL_DIR=/opt/xlstatus
 DATA_DIR=/var/lib/xlstatus
 BINARY_PATH=target/release/xlstatus-server
@@ -280,7 +280,7 @@ sudo SERVER_URL=http://dashboard.example.com:8080 \
   GRPC_SERVER=http://dashboard.example.com:50051 \
   ENROLLMENT_TOKEN=xle_... \
   AGENT_NAME="$(hostname)" \
-  bash -c 'curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.3/install-agent.sh | bash'
+  bash -c 'curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1/install-agent.sh | bash'
 ```
 
 如果需要安装本地构建的 Agent：
@@ -316,13 +316,13 @@ GET /api/v1/agents/install.sh
 手动使用带参数链接：
 
 ```bash
-curl -fsSL 'http://dashboard.example.com:8080/api/v1/agents/install.sh?server_url=http%3A%2F%2Fdashboard.example.com%3A8080&grpc_server=http%3A%2F%2Fdashboard.example.com%3A50051&enrollment_token=xle_...&agent_name=%24(hostname)&version=v0.1.0-alpha.3' | sudo bash
+curl -fsSL 'http://dashboard.example.com:8080/api/v1/agents/install.sh?server_url=http%3A%2F%2Fdashboard.example.com%3A8080&grpc_server=http%3A%2F%2Fdashboard.example.com%3A50051&enrollment_token=xle_...&agent_name=%24(hostname)&version=v0.1' | sudo bash
 ```
 
 这个 bootstrap 会下载并执行：
 
 ```text
-https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.3/install-agent.sh
+https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1/install-agent.sh
 ```
 
 `enrollment_token` 会出现在安装链接和 bootstrap 脚本内容里，应只给受信任的主机使用；令牌过期或使用后需要重新生成。Release 安装脚本会通过 stdin 把 token 交给 `xlstatus-agent enroll`，避免 token 出现在 Agent 子进程命令行参数中。

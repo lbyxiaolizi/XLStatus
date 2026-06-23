@@ -109,7 +109,7 @@ use xlstatus_shared::UserRole;
 const GRPC_MESSAGE_LIMIT: usize = 256 * 1024 * 1024;
 const HTTP_MAX_PATH_BYTES: usize = 4096;
 const HTTP_MAX_QUERY_BYTES: usize = 16 * 1024;
-const DEFAULT_AGENT_INSTALL_VERSION: &str = "v0.1.0-alpha.3";
+const DEFAULT_AGENT_INSTALL_VERSION: &str = "v0.1";
 const INSTALL_BOOTSTRAP_MAX_QUERY_BYTES: usize = 16 * 1024;
 const INSTALL_BOOTSTRAP_MAX_HOST_BYTES: usize = 512;
 const INSTALL_BOOTSTRAP_MAX_URL_BYTES: usize = 2048;

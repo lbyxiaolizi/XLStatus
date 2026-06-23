@@ -6,7 +6,7 @@ English | [简体中文](./README.zh-CN.md)
 
 XLStatus is a self-hosted server monitoring and operations panel written in Rust and Next.js. It combines real-time host metrics, public status pages, service probes, alerting, task execution, file operations, terminal sessions, DDNS, NAT tunnels, and MCP tools in one deployable stack.
 
-The current pre-release is `v0.1.0-alpha.3`. Start from the documentation index for installation, operations, and development details: [docs/README.md](./docs/README.md).
+The current release is `v0.1`. Start from the documentation index for installation, operations, and development details: [docs/README.md](./docs/README.md).
 
 ## Features
 
@@ -49,7 +49,7 @@ docker compose -f docker-compose.pg.yml up -d
 Server:
 
 ```bash
-curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.3/install-server.sh | sudo bash
+curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1/install-server.sh | sudo bash
 ```
 
 Agent:
@@ -59,10 +59,10 @@ sudo SERVER_URL=http://dashboard.example.com:8080 \
   GRPC_SERVER=https://grpc.dashboard.example.com:50051 \
   ENROLLMENT_TOKEN=xle_... \
   AGENT_NAME="$(hostname)" \
-  bash -c 'curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.3/install-agent.sh | bash'
+  bash -c 'curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1/install-agent.sh | bash'
 ```
 
-The dashboard Settings page can generate a parameterized Agent bootstrap link. By default it fetches the newest non-draft GitHub Release version and falls back to `v0.1.0-alpha.3` if GitHub is unavailable.
+The dashboard Settings page can generate a parameterized Agent bootstrap link. By default it fetches the newest non-draft GitHub Release version and falls back to `v0.1` if GitHub is unavailable.
 
 ## Documentation
 

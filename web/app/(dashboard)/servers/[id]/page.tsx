@@ -880,10 +880,10 @@ function AgentOpsPanel({
         <h2 className="mb-4 text-xl font-black uppercase">发送更新</h2>
         <form onSubmit={onForceUpdate} className="space-y-4">
           <Field label="版本">
-            <input className={inputClass} value={updateForm.version} onChange={(e) => onUpdateChange({ ...updateForm, version: e.target.value })} placeholder="v0.1.0-alpha.3" />
+            <input className={inputClass} value={updateForm.version} onChange={(e) => onUpdateChange({ ...updateForm, version: e.target.value })} placeholder="v0.1" />
           </Field>
           <Field label="下载 URL">
-            <input className={inputClass} value={updateForm.download_url} onChange={(e) => onUpdateChange({ ...updateForm, download_url: e.target.value })} placeholder="https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.3/xlstatus-agent-linux-amd64.tar.gz" />
+            <input className={inputClass} value={updateForm.download_url} onChange={(e) => onUpdateChange({ ...updateForm, download_url: e.target.value })} placeholder="https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1/xlstatus-agent-linux-amd64.tar.gz" />
           </Field>
           <Field label="SHA-256">
             <input className={inputClass} value={updateForm.checksum} onChange={(e) => onUpdateChange({ ...updateForm, checksum: e.target.value })} placeholder="64 位十六进制摘要" />

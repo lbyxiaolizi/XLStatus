@@ -1008,7 +1008,7 @@ mod tests {
 
     fn force_update_req(download_url: &str) -> ForceUpdateRequest {
         ForceUpdateRequest {
-            version: "v0.1.0-alpha.3".into(),
+            version: "v0.1".into(),
             download_url: download_url.into(),
             checksum: Some(valid_checksum()),
         }
@@ -1362,19 +1362,19 @@ mod tests {
     #[test]
     fn force_update_accepts_project_agent_release_asset() {
         let update = validate_force_update_request_with_custom_source(force_update_req(
-            "https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.3/xlstatus-agent-linux-amd64.tar.gz",
+            "https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1/xlstatus-agent-linux-amd64.tar.gz",
         ), false)
         .unwrap();
 
-        assert_eq!(update.version, "v0.1.0-alpha.3");
+        assert_eq!(update.version, "v0.1");
         assert_eq!(update.checksum, valid_checksum());
     }
 
     #[test]
     fn force_update_requires_sha256_checksum() {
         let err = validate_force_update_request_with_custom_source(ForceUpdateRequest {
-            version: "v0.1.0-alpha.3".into(),
-            download_url: "https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.3/xlstatus-agent-linux-amd64.tar.gz".into(),
+            version: "v0.1".into(),
+            download_url: "https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1/xlstatus-agent-linux-amd64.tar.gz".into(),
             checksum: None,
         }, false)
         .unwrap_err();
@@ -1401,7 +1401,7 @@ mod tests {
                 "https://updates.example.net/{}",
                 "a".repeat(FORCE_UPDATE_MAX_URL_BYTES)
             ),
-            "v0.1.0-alpha.3",
+            "v0.1",
             true,
         )
         .unwrap_err();
@@ -1411,9 +1411,12 @@ mod tests {
 
     #[test]
     fn force_update_rejects_non_project_release_host_by_default() {
-        let err = validate_force_update_request_with_custom_source(force_update_req(
-            "https://example.com/releases/download/v0.1.0-alpha.3/xlstatus-agent-linux-amd64.tar.gz",
-        ), false)
+        let err = validate_force_update_request_with_custom_source(
+            force_update_req(
+                "https://example.com/releases/download/v0.1/xlstatus-agent-linux-amd64.tar.gz",
+            ),
+            false,
+        )
         .unwrap_err();
 
         assert!(app_error_message(&err).contains("GitHub release host"));
@@ -1431,9 +1434,12 @@ mod tests {
 
     #[test]
     fn force_update_rejects_non_agent_release_asset() {
-        let err = validate_force_update_request_with_custom_source(force_update_req(
-            "https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.3/install-agent.sh",
-        ), false)
+        let err = validate_force_update_request_with_custom_source(
+            force_update_req(
+                "https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1/install-agent.sh",
+            ),
+            false,
+        )
         .unwrap_err();
 
         assert!(app_error_message(&err).contains("XLStatus Agent release asset"));
@@ -1442,9 +1448,9 @@ mod tests {
     #[test]
     fn force_update_rejects_url_credentials_query_and_fragment() {
         for url in [
-            "https://user@github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.3/xlstatus-agent-linux-amd64.tar.gz",
-            "https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.3/xlstatus-agent-linux-amd64.tar.gz?token=secret",
-            "https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1.0-alpha.3/xlstatus-agent-linux-amd64.tar.gz#sha256",
+            "https://user@github.com/lbyxiaolizi/XLStatus/releases/download/v0.1/xlstatus-agent-linux-amd64.tar.gz",
+            "https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1/xlstatus-agent-linux-amd64.tar.gz?token=secret",
+            "https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1/xlstatus-agent-linux-amd64.tar.gz#sha256",
         ] {
             assert!(
                 validate_force_update_request_with_custom_source(force_update_req(url), false)
