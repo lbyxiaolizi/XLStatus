@@ -13,8 +13,16 @@ export default function LoginPage() {
   const [totpCode, setTotpCode] = useState("");
   const [mfaRequired, setMfaRequired] = useState(false);
   const [oauthProviders, setOauthProviders] = useState<OAuthProvider[]>([]);
+  const [returnTo, setReturnTo] = useState("/dashboard");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    const timeoutId = window.setTimeout(() => {
+      setReturnTo(sanitizeReturnTo(new URLSearchParams(window.location.search).get("return_to")));
+    }, 0);
+    return () => window.clearTimeout(timeoutId);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -48,7 +56,7 @@ export default function LoginPage() {
       if (data.user) {
         localStorage.removeItem("session_token");
         localStorage.setItem("user", JSON.stringify(data.user));
-        router.push("/dashboard");
+        router.push(returnTo);
         return;
       }
     }
@@ -123,7 +131,7 @@ export default function LoginPage() {
                 <a
                   key={provider.id}
                   className={`${buttonClass("secondary")} text-center`}
-                  href={apiClient.getOAuthLoginUrl(provider.id, "/dashboard")}
+                  href={apiClient.getOAuthLoginUrl(provider.id, returnTo)}
                 >
                   使用 {provider.display_name} 登录
                 </a>
@@ -134,4 +142,18 @@ export default function LoginPage() {
       </div>
     </main>
   );
+}
+
+function sanitizeReturnTo(value: string | null): string {
+  if (
+    !value ||
+    !value.startsWith("/") ||
+    value.startsWith("//") ||
+    value.includes("\\") ||
+    /[\u0000-\u001f\u007f]/.test(value) ||
+    value.startsWith("/login")
+  ) {
+    return "/dashboard";
+  }
+  return value;
 }

@@ -28,6 +28,25 @@ export function buildWebSocketUrl(path: string): string {
 
 export const API_BASE_URL = getApiBaseUrl();
 
+let authRedirectPending = false;
+
+function redirectToLogin(): void {
+  if (typeof window === "undefined") return;
+  if (authRedirectPending) return;
+  if (isAuthRedirectExemptPath(window.location.pathname)) return;
+
+  authRedirectPending = true;
+  window.localStorage.removeItem("session_token");
+  window.localStorage.removeItem("user");
+
+  const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  window.location.assign(`/login?return_to=${encodeURIComponent(returnTo)}`);
+}
+
+function isAuthRedirectExemptPath(pathname: string): boolean {
+  return pathname === "/login" || pathname.startsWith("/status") || pathname.startsWith("/oauth/");
+}
+
 export interface ApiResponse<T> {
   success: boolean;
   data?: T;
@@ -473,6 +492,7 @@ export type JsonObject = Record<string, unknown>;
 
 type ApiRequestOptions = RequestInit & {
   anonymous?: boolean;
+  skipAuthRedirect?: boolean;
 };
 
 class ApiClient {
@@ -487,7 +507,7 @@ class ApiClient {
     options: ApiRequestOptions = {},
   ): Promise<ApiResponse<T>> {
     const url = `${this.baseUrl}${path}`;
-    const { anonymous, headers, ...fetchOptions } = options;
+    const { anonymous, headers, skipAuthRedirect, ...fetchOptions } = options;
     const csrfToken = getCookie("xlstatus_csrf");
     const hasBody = fetchOptions.body !== undefined && fetchOptions.body !== null;
     const isFormData = typeof FormData !== "undefined" && fetchOptions.body instanceof FormData;
@@ -518,6 +538,10 @@ class ApiClient {
               data: payload as T,
               status: response.status,
             };
+      }
+
+      if (response.status === 401 && !anonymous && !skipAuthRedirect) {
+        redirectToLogin();
       }
 
       return {
@@ -570,7 +594,7 @@ class ApiClient {
     options: ApiRequestOptions = {},
   ): Promise<ApiResponse<DownloadFileResponse>> {
     const url = `${this.baseUrl}${path}`;
-    const { anonymous, headers, ...fetchOptions } = options;
+    const { anonymous, headers, skipAuthRedirect, ...fetchOptions } = options;
     const csrfToken = getCookie("xlstatus_csrf");
 
     try {
@@ -587,6 +611,9 @@ class ApiClient {
         const text = await response.text();
         const payload = parseJson(text);
         const envelope = normalizeEnvelope<DownloadFileResponse>(payload, response.status);
+        if (response.status === 401 && !anonymous && !skipAuthRedirect) {
+          redirectToLogin();
+        }
         return {
           success: false,
           data: envelope.data,
@@ -630,6 +657,7 @@ class ApiClient {
     return this.request<JsonObject>("/api/v1/auth/login", {
       method: "POST",
       body: JSON.stringify({ username, password, totp_code: totpCode }),
+      skipAuthRedirect: true,
     });
   }
 
