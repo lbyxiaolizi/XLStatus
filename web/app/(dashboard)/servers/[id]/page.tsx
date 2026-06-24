@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { FormEvent, MouseEvent, memo, useCallback, useEffect, useMemo, useState } from "react";
-import Navigation from "@/app/components/Navigation";
+import { useDialogs } from "@/app/components/Dialogs";
 import {
   asRecord,
   asString,
@@ -27,6 +27,8 @@ import {
   thClass,
 } from "@/app/components/M7Primitives";
 import { apiClient, type FileEntry, type JsonObject } from "@/lib/api";
+import { durationLabel, formatRate, maxOf, minOf, optionalNumber } from "@/app/lib/format";
+import { useI18n } from "@/lib/use-i18n";
 
 interface ServerDetail {
   id: string;
@@ -193,6 +195,8 @@ const blankMetadataForm: ServerMetadataForm = {
 };
 
 export default function ServerDetailPage({ params }: PageProps) {
+  const dialogs = useDialogs();
+  const { t: copy } = useI18n();
   const [serverId, setServerId] = useState("");
   const [server, setServer] = useState<ServerDetail | null>(null);
   const [files, setFiles] = useState<FileEntry[]>([]);
@@ -446,7 +450,7 @@ export default function ServerDetailPage({ params }: PageProps) {
     if (response.success && response.data) {
       setWritePath(nextPath);
       setWriteContent(response.data.content);
-      setNotice(`已从 ${nextPath} 读取 ${response.data.bytes} 字节。`);
+      setNotice(copy.serverDetailPage.readFileNotice.replace("{path}", nextPath).replace("{bytes}", String(response.data.bytes)));
     } else {
       setError(responseError(response));
     }
@@ -455,7 +459,7 @@ export default function ServerDetailPage({ params }: PageProps) {
   async function writeFile(event: FormEvent) {
     event.preventDefault();
     if (!writePath.trim()) {
-      setError("请填写写入路径。");
+      setError(copy.serverDetailPage.writePathRequired);
       return;
     }
     const totpCode = await sensitiveTotpCode();
@@ -469,7 +473,7 @@ export default function ServerDetailPage({ params }: PageProps) {
     }, totpCode);
     setSaving(false);
     if (response.success) {
-      setNotice(`已写入 ${writePath.trim()}。`);
+      setNotice(copy.serverDetailPage.writeFileNotice.replace("{path}", writePath.trim()));
       await loadFiles(path);
     } else {
       setError(responseError(response));
@@ -477,12 +481,12 @@ export default function ServerDetailPage({ params }: PageProps) {
   }
 
   async function deleteEntry(entryPath: string, recursive: boolean) {
-    if (!confirm(`确定删除 ${entryPath}？`)) return;
+    if (!(await dialogs.confirm({ message: copy.serverDetailPage.deleteEntryConfirm.replace("{path}", entryPath), danger: true }))) return;
     const totpCode = await sensitiveTotpCode();
     if (totpCode === null) return;
     const response = await apiClient.deleteServerFile(serverId, { path: entryPath, recursive }, totpCode);
     if (response.success) {
-      setNotice(`已删除 ${entryPath}。`);
+      setNotice(copy.serverDetailPage.deleteEntryNotice.replace("{path}", entryPath));
       await loadFiles(path);
     } else {
       setError(responseError(response));
@@ -492,7 +496,7 @@ export default function ServerDetailPage({ params }: PageProps) {
   async function createTempUrl(kind: "download" | "upload") {
     const target = kind === "download" ? selectedPath || writePath : writePath;
     if (!target.trim()) {
-      setError("请先选择或输入文件路径。");
+      setError(copy.serverDetailPage.selectFilePathFirst);
       return;
     }
     const totpCode = kind === "upload" ? await sensitiveTotpCode() : undefined;
@@ -525,7 +529,7 @@ export default function ServerDetailPage({ params }: PageProps) {
     const response = await apiClient.applyServerConfig(serverId, config, totpCode);
     setSaving(false);
     if (response.success) {
-      setNotice("配置补丁已发送到 Agent。");
+      setNotice(copy.serverDetailPage.configPatchSent);
       await loadServer();
     } else {
       setError(responseError(response));
@@ -538,7 +542,7 @@ export default function ServerDetailPage({ params }: PageProps) {
     const downloadUrl = updateForm.download_url.trim();
     const checksum = updateForm.checksum.trim();
     if (!version || !downloadUrl || !checksum) {
-      setError("版本、下载 URL 和 SHA-256 校验和均为必填。");
+      setError(copy.serverDetailPage.updateFieldsRequired);
       return;
     }
     const totpCode = await sensitiveTotpCode();
@@ -551,7 +555,7 @@ export default function ServerDetailPage({ params }: PageProps) {
     }, totpCode);
     setSaving(false);
     if (response.success) {
-      setNotice("强制更新请求已发送。");
+      setNotice(copy.serverDetailPage.forceUpdateSent);
       setUpdateForm({ version: "", download_url: "", checksum: "" });
     } else {
       setError(responseError(response));
@@ -565,11 +569,11 @@ export default function ServerDetailPage({ params }: PageProps) {
       return null;
     }
     if (!status.data?.enabled) return undefined;
-    const code = window.prompt("请输入 6 位 TOTP 验证码");
+    const code = await dialogs.totp();
     if (code === null) return null;
     const trimmed = code.trim();
     if (!/^\d{6}$/.test(trimmed)) {
-      setError("请输入 6 位 TOTP 验证码。");
+      setError(copy.serverDetailPage.totpRequired);
       return null;
     }
     return trimmed;
@@ -610,7 +614,7 @@ export default function ServerDetailPage({ params }: PageProps) {
     if (response.success && response.data) {
       const detail = response.data as unknown as ServerDetail;
       setServer(detail);
-      setNotice("服务器自定义信息已保存。");
+      setNotice(copy.serverDetailPage.metadataSaved);
       await loadServer();
     } else {
       setError(responseError(response));
@@ -618,17 +622,16 @@ export default function ServerDetailPage({ params }: PageProps) {
   }
 
   return (
-    <div className="min-h-screen">
-      <Navigation />
+    <div>
       <PageShell>
         <PageHeader
-          eyebrow="服务器详情"
+          eyebrow={copy.serverDetailPage.eyebrow}
           title={server?.name || compactId(serverId)}
-          detail={`最后在线 ${formatDate(server?.last_seen_at)}`}
+          detail={copy.serverDetailPage.lastSeen.replace("{time}", formatDate(server?.last_seen_at))}
           actions={
             <>
-              <Link href="/servers" className={buttonClass("secondary")}>返回</Link>
-              {server ? <StatusBadge tone={statusTone}>{serverStatusLabel(server.status)}</StatusBadge> : null}
+              <Link href="/servers" className={buttonClass("secondary")}>{copy.serverDetailPage.back}</Link>
+              {server ? <StatusBadge tone={statusTone}>{serverStatusLabel(server.status, copy)}</StatusBadge> : null}
             </>
           }
         />
@@ -637,7 +640,7 @@ export default function ServerDetailPage({ params }: PageProps) {
           {notice ? <InlineNotice tone="green">{notice}</InlineNotice> : null}
         </div>
 
-        {loading && !server ? <EmptyState title="正在加载服务器" /> : null}
+        {loading && !server ? <EmptyState title={copy.serverDetailPage.loadingServer} /> : null}
 
         {server ? (
           <div className="mb-6 grid gap-5">
@@ -697,6 +700,7 @@ export default function ServerDetailPage({ params }: PageProps) {
           </div>
         ) : null}
       </PageShell>
+      {dialogs.element}
     </div>
   );
 }
@@ -718,13 +722,14 @@ const formatChartRound = (value: number) => String(Math.round(value));
 const formatChartTemperature = (value: number) => `${value.toFixed(1)} °C`;
 
 function SecondaryPanelNav({ active, onOpen }: { active: SecondaryPanel; onOpen: (panel: SecondaryPanel) => void }) {
+  const { t: copy } = useI18n();
   return (
     <div className="flex flex-wrap gap-3 border-2 border-black bg-[var(--bg-card)] p-3 shadow-[var(--shadow-brutal)]">
       {(
         [
-          ["custom", "自定义信息"],
-          ["files", "文件系统"],
-          ["ops", "Agent 设置"],
+          ["custom", copy.serverDetailPage.panelCustom],
+          ["files", copy.serverDetailPage.panelFiles],
+          ["ops", copy.serverDetailPage.panelOps],
         ] as Array<[Exclude<SecondaryPanel, null>, string]>
       ).map(([panel, label]) => (
         <button
@@ -772,32 +777,33 @@ function FileSystemPanel({
   onWriteContentChange: (value: string) => void;
   onTempUrl: (kind: "download" | "upload") => void | Promise<void>;
 }) {
+  const { t: copy } = useI18n();
   return (
     <div className="grid gap-6 xl:grid-cols-[minmax(0,1.15fr)_minmax(320px,0.85fr)]">
       <BrutalCard>
         <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
           <div>
-            <h2 className="text-xl font-black uppercase">文件系统</h2>
+            <h2 className="text-xl font-black uppercase">{copy.serverDetailPage.fileSystem}</h2>
             <p className="text-sm font-bold text-[var(--text-muted)]">{path}</p>
           </div>
           <div className="flex flex-wrap gap-2">
-            <button className={buttonClass("secondary")} onClick={() => void onLoad(currentDir)}>上级</button>
-            <button className={buttonClass("secondary")} onClick={() => void onLoad(path)}>刷新</button>
+            <button className={buttonClass("secondary")} onClick={() => void onLoad(currentDir)}>{copy.serverDetailPage.parentDir}</button>
+            <button className={buttonClass("secondary")} onClick={() => void onLoad(path)}>{copy.serverDetailPage.refresh}</button>
           </div>
         </div>
         {filesLoading ? (
-          <p className="font-bold">正在加载文件...</p>
+          <p className="font-bold">{copy.serverDetailPage.loadingFiles}</p>
         ) : files.length === 0 ? (
-          <EmptyState title="没有返回文件" detail="Agent 可能没有暴露这个路径。" />
+          <EmptyState title={copy.serverDetailPage.noFilesTitle} detail={copy.serverDetailPage.noFilesDetail} />
         ) : (
           <div className="overflow-x-auto">
             <table className="w-full">
               <thead>
                 <tr>
-                  <th className={thClass}>名称</th>
-                  <th className={thClass}>类型</th>
-                  <th className={thClass}>大小</th>
-                  <th className={thClass}>操作</th>
+                  <th className={thClass}>{copy.serverDetailPage.colName}</th>
+                  <th className={thClass}>{copy.serverDetailPage.colType}</th>
+                  <th className={thClass}>{copy.serverDetailPage.colSize}</th>
+                  <th className={thClass}>{copy.serverDetailPage.colActions}</th>
                 </tr>
               </thead>
               <tbody>
@@ -810,11 +816,11 @@ function FileSystemPanel({
                       <td className={tdClass}>{formatBytes(entry.size)}</td>
                       <td className={`${tdClass} flex flex-wrap gap-2`}>
                         {entry.file_type === "dir" ? (
-                          <button className={buttonClass("secondary")} onClick={() => void onLoad(nextPath)}>打开</button>
+                          <button className={buttonClass("secondary")} onClick={() => void onLoad(nextPath)}>{copy.serverDetailPage.open}</button>
                         ) : (
-                          <button className={buttonClass("primary")} onClick={() => void onRead(nextPath)}>读取</button>
+                          <button className={buttonClass("primary")} onClick={() => void onRead(nextPath)}>{copy.serverDetailPage.read}</button>
                         )}
-                        <button className={buttonClass("danger")} onClick={() => void onDelete(nextPath, entry.file_type === "dir")}>删除</button>
+                        <button className={buttonClass("danger")} onClick={() => void onDelete(nextPath, entry.file_type === "dir")}>{copy.serverDetailPage.delete}</button>
                       </td>
                     </tr>
                   );
@@ -826,18 +832,18 @@ function FileSystemPanel({
       </BrutalCard>
 
       <BrutalCard accent>
-        <h2 className="mb-4 text-xl font-black uppercase">写入文件</h2>
+        <h2 className="mb-4 text-xl font-black uppercase">{copy.serverDetailPage.writeFileTitle}</h2>
         <form onSubmit={onWrite} className="space-y-4">
-          <Field label="路径">
+          <Field label={copy.serverDetailPage.pathLabel}>
             <input className={inputClass} value={writePath} onChange={(event) => onWritePathChange(event.target.value)} placeholder="/tmp/xlstatus.txt" />
           </Field>
-          <Field label="内容">
+          <Field label={copy.serverDetailPage.contentLabel}>
             <textarea className={`${textareaClass} min-h-40`} value={writeContent} onChange={(event) => onWriteContentChange(event.target.value)} />
           </Field>
           <div className="flex flex-wrap gap-2">
-            <button disabled={saving} className={buttonClass("primary")}>写入文件</button>
-            <button type="button" className={buttonClass("secondary")} onClick={() => void onTempUrl("download")}>下载 URL</button>
-            <button type="button" className={buttonClass("secondary")} onClick={() => void onTempUrl("upload")}>上传 URL</button>
+            <button disabled={saving} className={buttonClass("primary")}>{copy.serverDetailPage.writeFileButton}</button>
+            <button type="button" className={buttonClass("secondary")} onClick={() => void onTempUrl("download")}>{copy.serverDetailPage.downloadUrl}</button>
+            <button type="button" className={buttonClass("secondary")} onClick={() => void onTempUrl("upload")}>{copy.serverDetailPage.uploadUrl}</button>
           </div>
         </form>
       </BrutalCard>
@@ -862,44 +868,53 @@ function AgentOpsPanel({
   onApplyConfig: (event: FormEvent) => void | Promise<void>;
   onForceUpdate: (event: FormEvent) => void | Promise<void>;
 }) {
+  const { t: copy } = useI18n();
   return (
     <div className="grid gap-6 lg:grid-cols-2">
       <BrutalCard>
-        <h2 className="mb-4 text-xl font-black uppercase">应用配置</h2>
+        <h2 className="mb-4 text-xl font-black uppercase">{copy.serverDetailPage.applyConfigTitle}</h2>
         <form onSubmit={onApplyConfig} className="space-y-4">
           <div className="grid gap-3 sm:grid-cols-2">
-            <Field label="上报间隔">
+            <Field label={copy.serverDetailPage.reportInterval}>
               <input className={inputClass} value={configForm.report_interval_seconds} onChange={(e) => onConfigChange({ ...configForm, report_interval_seconds: e.target.value })} />
             </Field>
-            <Field label="IP 上报间隔">
+            <Field label={copy.serverDetailPage.ipReportInterval}>
               <input className={inputClass} value={configForm.ip_report_interval_seconds} onChange={(e) => onConfigChange({ ...configForm, ip_report_interval_seconds: e.target.value })} />
             </Field>
           </div>
           <div className="grid gap-2">
-            {(["disable_auto_update", "disable_force_update", "disable_command_execute", "disable_nat", "disable_send_query"] as const).map((key) => (
+            {(
+              [
+                ["disable_auto_update", copy.serverDetailPage.flagDisableAutoUpdate],
+                ["disable_force_update", copy.serverDetailPage.flagDisableForceUpdate],
+                ["disable_command_execute", copy.serverDetailPage.flagDisableCommandExecute],
+                ["disable_nat", copy.serverDetailPage.flagDisableNat],
+                ["disable_send_query", copy.serverDetailPage.flagDisableSendQuery],
+              ] as const
+            ).map(([key, label]) => (
               <label key={key} className="flex items-center gap-2 text-sm font-black">
                 <input type="checkbox" checked={configForm[key]} onChange={(e) => onConfigChange({ ...configForm, [key]: e.target.checked })} />
-                {configFlagLabel(key)}
+                {label}
               </label>
             ))}
           </div>
-          <button disabled={saving} className={buttonClass("primary")}>应用配置</button>
+          <button disabled={saving} className={buttonClass("primary")}>{copy.serverDetailPage.applyConfigButton}</button>
         </form>
       </BrutalCard>
 
       <BrutalCard>
-        <h2 className="mb-4 text-xl font-black uppercase">发送更新</h2>
+        <h2 className="mb-4 text-xl font-black uppercase">{copy.serverDetailPage.sendUpdateTitle}</h2>
         <form onSubmit={onForceUpdate} className="space-y-4">
-          <Field label="版本">
+          <Field label={copy.serverDetailPage.versionLabel}>
             <input className={inputClass} value={updateForm.version} onChange={(e) => onUpdateChange({ ...updateForm, version: e.target.value })} placeholder="v0.1" />
           </Field>
-          <Field label="下载 URL">
+          <Field label={copy.serverDetailPage.downloadUrlLabel}>
             <input className={inputClass} value={updateForm.download_url} onChange={(e) => onUpdateChange({ ...updateForm, download_url: e.target.value })} placeholder="https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1/xlstatus-agent-linux-amd64.tar.gz" />
           </Field>
           <Field label="SHA-256">
-            <input className={inputClass} value={updateForm.checksum} onChange={(e) => onUpdateChange({ ...updateForm, checksum: e.target.value })} placeholder="64 位十六进制摘要" />
+            <input className={inputClass} value={updateForm.checksum} onChange={(e) => onUpdateChange({ ...updateForm, checksum: e.target.value })} placeholder={copy.serverDetailPage.checksumPlaceholder} />
           </Field>
-          <button disabled={saving} className={buttonClass("danger")}>发送更新</button>
+          <button disabled={saving} className={buttonClass("danger")}>{copy.serverDetailPage.sendUpdateButton}</button>
         </form>
       </BrutalCard>
     </div>
@@ -941,6 +956,7 @@ function MonitoringCharts({
   onClearProbes: () => void;
   onPeakCutChange: (enabled: boolean) => void;
 }) {
+  const { t: copy } = useI18n();
   const resourceCharts = [
     {
       key: "cpu",
@@ -952,24 +968,24 @@ function MonitoringCharts({
     },
     {
       key: "memory",
-      title: "内存",
+      title: copy.serverDetailPage.chartMemory,
       value: formatPercent(metricCharts.latestMemory),
-      series: [{ id: "memory", label: "内存", color: "var(--btn-bg)", points: metricCharts.memory }],
+      series: [{ id: "memory", label: copy.serverDetailPage.chartMemory, color: "var(--btn-bg)", points: metricCharts.memory }],
       maxValue: 100,
       formatValue: formatChartPercent,
     },
     {
       key: "load",
-      title: "负载",
+      title: copy.serverDetailPage.chartLoad,
       value: metricCharts.latestLoad === undefined ? "N/A" : metricCharts.latestLoad.toFixed(2),
-      series: [{ id: "load", label: "负载", color: "#0ea5e9", points: metricCharts.load }],
+      series: [{ id: "load", label: copy.serverDetailPage.chartLoad, color: "#0ea5e9", points: metricCharts.load }],
       formatValue: formatChartFixed2,
     },
     {
       key: "disk",
-      title: "磁盘",
+      title: copy.serverDetailPage.chartDisk,
       value: formatPercent(metricCharts.latestDisk),
-      series: [{ id: "disk", label: "磁盘", color: "#f97316", points: metricCharts.disk }],
+      series: [{ id: "disk", label: copy.serverDetailPage.chartDisk, color: "#f97316", points: metricCharts.disk }],
       maxValue: 100,
       formatValue: formatChartPercent,
     },
@@ -983,14 +999,14 @@ function MonitoringCharts({
     },
     {
       key: "process",
-      title: "进程",
+      title: copy.serverDetailPage.chartProcess,
       value: metricCharts.latestProcess === undefined ? "N/A" : String(Math.round(metricCharts.latestProcess)),
-      series: [{ id: "process", label: "进程", color: "#10b981", points: metricCharts.process }],
+      series: [{ id: "process", label: copy.serverDetailPage.chartProcess, color: "#10b981", points: metricCharts.process }],
       formatValue: formatChartRound,
     },
     {
       key: "connection",
-      title: "连接",
+      title: copy.serverDetailPage.chartConnection,
       value: `TCP ${metricCharts.latestTcp === undefined ? "N/A" : Math.round(metricCharts.latestTcp)} / UDP ${metricCharts.latestUdp === undefined ? "N/A" : Math.round(metricCharts.latestUdp)}`,
       series: [
         { id: "tcp", label: "TCP", color: "var(--accent-color)", points: metricCharts.tcp },
@@ -1000,9 +1016,9 @@ function MonitoringCharts({
     },
     {
       key: "temperature",
-      title: "温度",
+      title: copy.serverDetailPage.chartTemperature,
       value: metricCharts.latestTemperature === undefined ? "N/A" : `${metricCharts.latestTemperature.toFixed(1)} °C`,
-      series: [{ id: "temperature", label: "温度", color: "#dc2626", points: metricCharts.temperature }],
+      series: [{ id: "temperature", label: copy.serverDetailPage.chartTemperature, color: "#dc2626", points: metricCharts.temperature }],
       formatValue: formatChartTemperature,
     },
     {
@@ -1019,7 +1035,7 @@ function MonitoringCharts({
   return (
     <section className="border-2 border-black bg-[var(--accent-bg)] p-4 shadow-[var(--shadow-brutal)]">
       <div className="mb-4 flex flex-wrap items-end justify-between gap-3 border-b-4 border-black pb-3">
-        <h2 className="text-2xl font-black uppercase">监控图表</h2>
+        <h2 className="text-2xl font-black uppercase">{copy.serverDetailPage.monitoringCharts}</h2>
         <div className="flex flex-wrap gap-2">
           {(["1d", "7d", "30d"] as const).map((range) => (
             <button
@@ -1037,8 +1053,8 @@ function MonitoringCharts({
       <div className="mb-4 flex items-end gap-1 overflow-x-auto border-b-4 border-black">
         {(
           [
-            ["resources", "资源"],
-            ["network", "网络 / 探测"],
+            ["resources", copy.serverDetailPage.tabResources],
+            ["network", copy.serverDetailPage.tabNetwork],
           ] as Array<[ChartTab, string]>
         ).map(([tab, label]) => (
           <button
@@ -1071,7 +1087,7 @@ function MonitoringCharts({
             ))}
           </div>
         ) : (
-          <EmptyState title="暂无资源图表" detail="服务器暂未上报可绘制的资源指标。" />
+          <EmptyState title={copy.serverDetailPage.noResourceChartsTitle} detail={copy.serverDetailPage.noResourceChartsDetail} />
         )
       ) : null}
       {activeTab === "network" ? (
@@ -1118,6 +1134,7 @@ function NetworkProbePanel({
   onClear: () => void;
   onPeakCutChange: (enabled: boolean) => void;
 }) {
+  const { t: copy } = useI18n();
   const visibleHistories = selectedIds.length
     ? histories.filter((history) => selectedIds.includes(history.id))
     : histories;
@@ -1125,8 +1142,8 @@ function NetworkProbePanel({
     ? latencySeries.map((item) => ({ ...item, points: smoothPeakPoints(item.points) }))
     : latencySeries;
   const networkSeries = [
-    { id: "tx", label: "上传", color: "var(--accent-color)", points: metricCharts.tx },
-    { id: "rx", label: "下载", color: "var(--border-color)", points: metricCharts.rx },
+    { id: "tx", label: copy.serverDetailPage.seriesUpload, color: "var(--accent-color)", points: metricCharts.tx },
+    { id: "rx", label: copy.serverDetailPage.seriesDownload, color: "var(--border-color)", points: metricCharts.rx },
   ];
   const hasNetworkData = chartHasData(networkSeries);
   const hasProbeData = chartHasData(displayedLatencySeries) || chartHasData(lossSeries);
@@ -1137,7 +1154,7 @@ function NetworkProbePanel({
     <div className="grid gap-4">
       {showNetworkChart ? (
         <MetricChartCard
-          title="网络"
+          title={copy.serverDetailPage.chartNetwork}
           value={`↑ ${formatRate(metricCharts.latestTx)} / ↓ ${formatRate(metricCharts.latestRx)}`}
           loading={metricsLoading}
           series={networkSeries}
@@ -1180,7 +1197,7 @@ function NetworkProbePanel({
           <div className="flex flex-wrap items-center gap-2">
             {selectedIds.length ? (
               <button type="button" className={buttonClass("secondary")} onClick={onClear}>
-                清空选择 ({selectedIds.length})
+                {copy.serverDetailPage.clearSelection.replace("{count}", String(selectedIds.length))}
               </button>
             ) : null}
             <label className="inline-flex min-h-10 items-center gap-2 border-2 border-black bg-[var(--bg-card)] px-3 py-2 text-xs font-black shadow-[var(--shadow-brutal-sm)]">
@@ -1190,7 +1207,7 @@ function NetworkProbePanel({
                 onChange={(event) => onPeakCutChange(event.target.checked)}
                 className="h-4 w-4 accent-black"
               />
-              削峰
+              {copy.serverDetailPage.peakCut}
             </label>
           </div>
         </div>
@@ -1205,7 +1222,7 @@ function NetworkProbePanel({
         />
       ) : null}
       {!showNetworkChart && !showProbeChart ? (
-        <EmptyState title="暂无网络 / 探测图表" detail="服务器暂未上报网络历史，且没有关联探测历史。" />
+        <EmptyState title={copy.serverDetailPage.noNetworkChartsTitle} detail={copy.serverDetailPage.noNetworkChartsDetail} />
       ) : null}
     </div>
   );
@@ -1220,6 +1237,7 @@ function ServerOverview({
   showMissing: boolean;
   onShowMissingChange: (next: boolean) => void;
 }) {
+  const { t: copy } = useI18n();
   const info = server.last_info ?? {};
   const state = server.last_state ?? {};
   const remark = server.remark || metadataFromRecord(info, ["remark", "note", "description"]);
@@ -1235,7 +1253,7 @@ function ServerOverview({
   const region = locationLabel(server, info);
   const plan = server.plan || metadataFromRecord(info, ["plan", "package", "sku", "product", "instance_type"]);
   const tags = Array.isArray(server.tags) ? server.tags.filter(Boolean) : [];
-  const platformDetails = parsePlatformDetails(info);
+  const platformDetails = parsePlatformDetails(info, copy);
   const platform = joinLabels([platformDetails.os, platformDetails.version]);
   const load = [optionalNumber(state.load_1), optionalNumber(state.load_5), optionalNumber(state.load_15)]
     .map((value) => (value === undefined ? null : value.toFixed(2)))
@@ -1245,50 +1263,50 @@ function ServerOverview({
   const udp = optionalNumber(state.udp_connections);
   const tiles = filterInfoTiles(
     [
-      { label: "私有备注", value: remark, wide: true },
-      { label: "公开说明", value: publicNote, wide: true },
-      { label: "供应商", value: provider },
-      { label: "地区", value: region },
-      { label: "套餐", value: plan },
-      { label: "到期", value: expiresAt ? formatDate(expiresAt) : null, danger: isExpired(expiresAt) },
+      { label: copy.serverDetailPage.tilePrivateRemark, value: remark, wide: true },
+      { label: copy.serverDetailPage.tilePublicNote, value: publicNote, wide: true },
+      { label: copy.serverDetailPage.tileProvider, value: provider },
+      { label: copy.serverDetailPage.tileRegion, value: region },
+      { label: copy.serverDetailPage.tilePlan, value: plan },
+      { label: copy.serverDetailPage.tileExpires, value: expiresAt ? formatDate(expiresAt) : null, danger: isExpired(expiresAt) },
       {
-        label: "续费",
+        label: copy.serverDetailPage.tileRenewal,
         value: renewalPrice === null || renewalPrice === undefined || renewalPrice === "" ? null : String(renewalPrice),
       },
-      { label: "价格", value: billingLabel(price, currency, billingCycle) },
-      { label: "自动续费", value: booleanLabel(server.auto_renew) },
-      { label: "流量额度", value: trafficQuotaLabel(trafficQuotaBytes, trafficQuotaType) },
-      { label: "公开访问", value: publicVisibilityLabel(server) },
+      { label: copy.serverDetailPage.tilePrice, value: billingLabel(price, currency, billingCycle) },
+      { label: copy.serverDetailPage.tileAutoRenew, value: booleanLabel(server.auto_renew, copy) },
+      { label: copy.serverDetailPage.tileTrafficQuota, value: trafficQuotaLabel(trafficQuotaBytes, trafficQuotaType) },
+      { label: copy.serverDetailPage.tilePublicAccess, value: publicVisibilityLabel(server, copy) },
     ],
     showMissing,
   );
   const hostRows = filterInfoRows(
     [
-      ["主机名", stringValue(info.hostname)],
-      ["系统", platform],
-      ["内核", stringValue(info.kernel_version)],
-      ["架构", stringValue(info.arch)],
+      [copy.serverDetailPage.rowHostname, stringValue(info.hostname)],
+      [copy.serverDetailPage.rowSystem, platform],
+      [copy.serverDetailPage.rowKernel, stringValue(info.kernel_version)],
+      [copy.serverDetailPage.rowArch, stringValue(info.arch)],
       ["Agent", platformDetails.agent],
     ],
     showMissing,
   );
   const resourceRows = filterInfoRows(
     [
-      ["CPU 核心", numberLabel(info.cpu_cores)],
-      ["内存", resourceBytes(state.memory_used, state.memory_total, info.total_memory)],
+      [copy.serverDetailPage.rowCpuCores, numberLabel(info.cpu_cores)],
+      [copy.serverDetailPage.rowMemory, resourceBytes(state.memory_used, state.memory_total, info.total_memory)],
       ["Swap", resourceBytes(state.swap_used, state.swap_total, info.total_swap)],
-      ["磁盘", diskLabel(state, info)],
+      [copy.serverDetailPage.rowDisk, diskLabel(state, info)],
     ],
     showMissing,
   );
   const runtimeRows = filterInfoRows(
     [
-      ["运行时间", durationLabel(state.uptime_seconds)],
-      ["负载", load],
-      ["进程", numberLabel(state.process_count)],
-      ["连接", tcp === undefined && udp === undefined ? "" : `TCP ${tcp ?? 0} / UDP ${udp ?? 0}`],
-      ["上报", platformDetails.report],
-      ["限制", platformDetails.flags],
+      [copy.serverDetailPage.rowUptime, durationLabel(state.uptime_seconds)],
+      [copy.serverDetailPage.rowLoad, load],
+      [copy.serverDetailPage.rowProcess, numberLabel(state.process_count)],
+      [copy.serverDetailPage.rowConnection, tcp === undefined && udp === undefined ? "" : `TCP ${tcp ?? 0} / UDP ${udp ?? 0}`],
+      [copy.serverDetailPage.rowReport, platformDetails.report],
+      [copy.serverDetailPage.rowFlags, platformDetails.flags],
     ],
     showMissing,
   );
@@ -1308,10 +1326,10 @@ function ServerOverview({
               onChange={(event) => onShowMissingChange(event.target.checked)}
               className="h-4 w-4 accent-black"
             />
-            显示缺失
+            {copy.serverDetailPage.showMissing}
           </label>
           <StatusBadge tone={server.status === "online" ? "green" : server.status === "revoked" ? "yellow" : "red"}>
-            {serverStatusLabel(server.status)}
+            {serverStatusLabel(server.status, copy)}
           </StatusBadge>
         </div>
       </div>
@@ -1339,9 +1357,9 @@ function ServerOverview({
       ) : null}
 
       <div className="mt-4 grid gap-3 lg:grid-cols-3">
-        {hostRows.length || showMissing ? <InfoGroup title="主机" rows={hostRows} /> : null}
-        {resourceRows.length || showMissing ? <InfoGroup title="资源" rows={resourceRows} /> : null}
-        {runtimeRows.length || showMissing ? <InfoGroup title="运行/网络" rows={runtimeRows} /> : null}
+        {hostRows.length || showMissing ? <InfoGroup title={copy.serverDetailPage.groupHost} rows={hostRows} /> : null}
+        {resourceRows.length || showMissing ? <InfoGroup title={copy.serverDetailPage.groupResource} rows={resourceRows} /> : null}
+        {runtimeRows.length || showMissing ? <InfoGroup title={copy.serverDetailPage.groupRuntime} rows={runtimeRows} /> : null}
       </div>
     </section>
   );
@@ -1402,9 +1420,9 @@ function billingLabel(
   return parts.length ? parts.join(" / ") : null;
 }
 
-function booleanLabel(value?: boolean | null): string | null {
+function booleanLabel(value: boolean | null | undefined, copy: import("@/lib/i18n").Translations): string | null {
   if (value === undefined || value === null) return null;
-  return value ? "是" : "否";
+  return value ? copy.serverDetailPage.yes : copy.serverDetailPage.no;
 }
 
 function trafficQuotaLabel(value?: string | number | null, type?: string | null): string | null {
@@ -1415,10 +1433,10 @@ function trafficQuotaLabel(value?: string | number | null, type?: string | null)
   return parts.length ? parts.join(" / ") : null;
 }
 
-function publicVisibilityLabel(server: ServerDetail): string {
-  if (server.hide_for_guest) return "游客隐藏";
-  if (server.dashboard_visible !== true) return "状态页隐藏";
-  return "公开显示";
+function publicVisibilityLabel(server: ServerDetail, copy: import("@/lib/i18n").Translations): string {
+  if (server.hide_for_guest) return copy.serverDetailPage.visibilityGuestHidden;
+  if (server.dashboard_visible !== true) return copy.serverDetailPage.visibilityStatusHidden;
+  return copy.serverDetailPage.visibilityPublic;
 }
 
 function ServerMetadataEditor({
@@ -1432,91 +1450,92 @@ function ServerMetadataEditor({
   onChange: (next: ServerMetadataForm) => void;
   onSubmit: (event: FormEvent) => void;
 }) {
+  const { t: copy } = useI18n();
   return (
     <BrutalCard>
       <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h2 className="text-xl font-black uppercase">自定义信息</h2>
+          <h2 className="text-xl font-black uppercase">{copy.serverDetailPage.customInfo}</h2>
         </div>
       </div>
       <form onSubmit={onSubmit} className="space-y-4">
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-          <Field label="名称">
+          <Field label={copy.serverDetailPage.fieldName}>
             <input className={inputClass} value={form.name} onChange={(event) => onChange({ ...form, name: event.target.value })} required />
           </Field>
-          <Field label="供应商">
+          <Field label={copy.serverDetailPage.fieldProvider}>
             <input className={inputClass} value={form.provider} onChange={(event) => onChange({ ...form, provider: event.target.value })} placeholder="Wawo" />
           </Field>
-          <Field label="地区">
+          <Field label={copy.serverDetailPage.fieldRegion}>
             <input className={inputClass} value={form.region} onChange={(event) => onChange({ ...form, region: event.target.value })} placeholder="HK" />
           </Field>
-          <Field label="套餐">
+          <Field label={copy.serverDetailPage.fieldPlan}>
             <input className={inputClass} value={form.plan} onChange={(event) => onChange({ ...form, plan: event.target.value })} placeholder="Dedicated" />
           </Field>
         </div>
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-          <Field label="国家">
+          <Field label={copy.serverDetailPage.fieldCountry}>
             <input className={inputClass} value={form.country} onChange={(event) => onChange({ ...form, country: event.target.value })} placeholder="Hong Kong" />
           </Field>
-          <Field label="城市">
+          <Field label={copy.serverDetailPage.fieldCity}>
             <input className={inputClass} value={form.city} onChange={(event) => onChange({ ...form, city: event.target.value })} placeholder="Hong Kong" />
           </Field>
-          <Field label="纬度">
+          <Field label={copy.serverDetailPage.fieldLatitude}>
             <input type="number" min="-90" max="90" step="0.000001" className={inputClass} value={form.latitude} onChange={(event) => onChange({ ...form, latitude: event.target.value })} placeholder="22.3193" />
           </Field>
-          <Field label="经度">
+          <Field label={copy.serverDetailPage.fieldLongitude}>
             <input type="number" min="-180" max="180" step="0.000001" className={inputClass} value={form.longitude} onChange={(event) => onChange({ ...form, longitude: event.target.value })} placeholder="114.1694" />
           </Field>
         </div>
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-          <Field label="备注">
-            <input className={inputClass} value={form.remark} onChange={(event) => onChange({ ...form, remark: event.target.value })} placeholder="线路、套餐、用途" />
+          <Field label={copy.serverDetailPage.fieldRemark}>
+            <input className={inputClass} value={form.remark} onChange={(event) => onChange({ ...form, remark: event.target.value })} placeholder={copy.serverDetailPage.fieldRemarkPlaceholder} />
           </Field>
-          <Field label="公开说明">
-            <input className={inputClass} value={form.public_note} onChange={(event) => onChange({ ...form, public_note: event.target.value })} placeholder="状态页展示文案" />
+          <Field label={copy.serverDetailPage.fieldPublicNote}>
+            <input className={inputClass} value={form.public_note} onChange={(event) => onChange({ ...form, public_note: event.target.value })} placeholder={copy.serverDetailPage.fieldPublicNotePlaceholder} />
           </Field>
-          <Field label="到期时间">
+          <Field label={copy.serverDetailPage.fieldExpiresAt}>
             <input className={inputClass} value={form.expires_at} onChange={(event) => onChange({ ...form, expires_at: event.target.value })} placeholder="2026-12-31" />
           </Field>
-          <Field label="续费价格">
-            <input className={inputClass} value={form.renewal_price} onChange={(event) => onChange({ ...form, renewal_price: event.target.value })} placeholder="$12/月" />
+          <Field label={copy.serverDetailPage.fieldRenewalPrice}>
+            <input className={inputClass} value={form.renewal_price} onChange={(event) => onChange({ ...form, renewal_price: event.target.value })} placeholder={copy.serverDetailPage.fieldRenewalPricePlaceholder} />
           </Field>
         </div>
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-          <Field label="价格">
+          <Field label={copy.serverDetailPage.fieldPrice}>
             <input className={inputClass} value={form.price} onChange={(event) => onChange({ ...form, price: event.target.value })} placeholder="12" />
           </Field>
-          <Field label="币种">
+          <Field label={copy.serverDetailPage.fieldCurrency}>
             <input className={inputClass} value={form.currency} onChange={(event) => onChange({ ...form, currency: event.target.value })} placeholder="USD" />
           </Field>
-          <Field label="账单周期">
+          <Field label={copy.serverDetailPage.fieldBillingCycle}>
             <input className={inputClass} value={form.billing_cycle} onChange={(event) => onChange({ ...form, billing_cycle: event.target.value })} placeholder="monthly" />
           </Field>
-          <Field label="流量额度 Bytes">
+          <Field label={copy.serverDetailPage.fieldTrafficQuotaBytes}>
             <input type="number" min="0" step="1" className={inputClass} value={form.traffic_quota_bytes} onChange={(event) => onChange({ ...form, traffic_quota_bytes: event.target.value })} placeholder="1099511627776" />
           </Field>
         </div>
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-          <Field label="额度类型">
+          <Field label={copy.serverDetailPage.fieldQuotaType}>
             <input className={inputClass} value={form.traffic_quota_type} onChange={(event) => onChange({ ...form, traffic_quota_type: event.target.value })} placeholder="monthly / total" />
           </Field>
-          <Field label="排序">
+          <Field label={copy.serverDetailPage.fieldDisplayOrder}>
             <input className={inputClass} value={form.display_order} onChange={(event) => onChange({ ...form, display_order: event.target.value })} placeholder="10" />
           </Field>
           <label className="flex min-h-12 items-center gap-2 border-2 border-black bg-[var(--accent-bg)] px-3 py-2 text-sm font-black shadow-[var(--shadow-brutal-sm)]">
             <input type="checkbox" checked={form.auto_renew} onChange={(event) => onChange({ ...form, auto_renew: event.target.checked })} />
-            自动续费
+            {copy.serverDetailPage.fieldAutoRenew}
           </label>
           <label className="flex min-h-12 items-center gap-2 border-2 border-black bg-[var(--accent-bg)] px-3 py-2 text-sm font-black shadow-[var(--shadow-brutal-sm)]">
             <input type="checkbox" checked={form.hide_for_guest} onChange={(event) => onChange({ ...form, hide_for_guest: event.target.checked })} />
-            游客隐藏
+            {copy.serverDetailPage.fieldHideForGuest}
           </label>
         </div>
         <div className="grid gap-4 md:grid-cols-[minmax(0,1fr)_12rem_12rem] md:items-end">
-          <Field label="标签">
-            <input className={inputClass} value={form.tags} onChange={(event) => onChange({ ...form, tags: event.target.value })} placeholder="生产, 香港, 高防" />
+          <Field label={copy.serverDetailPage.fieldTags}>
+            <input className={inputClass} value={form.tags} onChange={(event) => onChange({ ...form, tags: event.target.value })} placeholder={copy.serverDetailPage.fieldTagsPlaceholder} />
           </Field>
-          <Field label="强调色">
+          <Field label={copy.serverDetailPage.fieldAccentColor}>
             <div className="grid grid-cols-[3.5rem_minmax(0,1fr)] gap-2">
               <input
                 type="color"
@@ -1529,11 +1548,11 @@ function ServerMetadataEditor({
           </Field>
           <label className="flex min-h-12 items-center gap-2 border-2 border-black bg-[var(--accent-bg)] px-3 py-2 text-sm font-black shadow-[var(--shadow-brutal-sm)]">
             <input type="checkbox" checked={form.dashboard_visible} onChange={(event) => onChange({ ...form, dashboard_visible: event.target.checked })} />
-            公开状态页显示
+            {copy.serverDetailPage.fieldDashboardVisible}
           </label>
         </div>
         <button type="submit" disabled={saving} className={buttonClass("primary")}>
-          保存
+          {copy.serverDetailPage.save}
         </button>
       </form>
     </BrutalCard>
@@ -1555,6 +1574,7 @@ function MetricChartCard({
   maxValue?: number;
   formatValue: (value: number) => string;
 }) {
+  const { t: copy } = useI18n();
   const hasData = series.some((item) => item.points.length > 0);
 
   return (
@@ -1565,18 +1585,18 @@ function MetricChartCard({
           <p className="mt-1 text-sm font-black text-[var(--text-muted)]">{value}</p>
         </div>
         <span className="border-2 border-black bg-[var(--accent-bg)] px-2 py-1 text-xs font-black shadow-[var(--shadow-brutal-sm)]">
-          {loading ? "加载中" : "LIVE"}
+          {loading ? copy.serverDetailPage.loading : "LIVE"}
         </span>
       </div>
       {loading ? (
         <div className="flex h-44 items-center justify-center border-2 border-black bg-[var(--accent-bg)] text-sm font-black">
-          正在加载图表...
+          {copy.serverDetailPage.loadingChart}
         </div>
       ) : hasData ? (
         <MiniLineChart series={series} maxValue={maxValue} formatValue={formatValue} />
       ) : (
         <div className="flex h-44 items-center justify-center border-2 border-black bg-[var(--accent-bg)] text-sm font-black">
-          暂无历史数据
+          {copy.serverDetailPage.noHistory}
         </div>
       )}
       {hasData ? (
@@ -1610,30 +1630,31 @@ function ProbeOverlayChartCard({
   latestLatency: string;
   averageLoss?: number;
 }) {
+  const { t: copy } = useI18n();
   const hasData = latencySeries.some((item) => item.points.length > 0) || lossSeries.some((item) => item.points.length > 0);
 
   return (
     <section className="border-2 border-black bg-[var(--bg-card)] p-4 shadow-[var(--shadow-brutal)]">
       <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h3 className="text-xl font-black uppercase">探测延迟 / 丢包率</h3>
+          <h3 className="text-xl font-black uppercase">{copy.serverDetailPage.probeLatencyLoss}</h3>
           <p className="mt-1 text-sm font-black text-[var(--text-muted)]">
             {latestLatency} / {formatPercent(averageLoss)}
           </p>
         </div>
         <span className="border-2 border-black bg-[var(--accent-bg)] px-2 py-1 text-xs font-black shadow-[var(--shadow-brutal-sm)]">
-          {loading ? "加载中" : "LIVE"}
+          {loading ? copy.serverDetailPage.loading : "LIVE"}
         </span>
       </div>
       {loading ? (
         <div className="flex h-56 items-center justify-center border-2 border-black bg-[var(--accent-bg)] text-sm font-black">
-          正在加载图表...
+          {copy.serverDetailPage.loadingChart}
         </div>
       ) : hasData ? (
         <MiniDualAxisChart latencySeries={latencySeries} lossSeries={lossSeries} />
       ) : (
         <div className="flex h-56 items-center justify-center border-2 border-black bg-[var(--accent-bg)] text-sm font-black">
-          暂无探测历史
+          {copy.serverDetailPage.noProbeHistory}
         </div>
       )}
       {hasData ? (
@@ -1641,13 +1662,13 @@ function ProbeOverlayChartCard({
           {latencySeries.map((item) => (
             <span key={item.id ?? item.label} className="inline-flex items-center gap-2 border-2 border-black bg-[var(--accent-bg)] px-2 py-1 text-xs font-black">
               <span className="h-2.5 w-2.5 border-2 border-black" style={{ background: item.color }} />
-              {item.label} 延迟
+              {copy.serverDetailPage.seriesLatencySuffix.replace("{label}", item.label)}
             </span>
           ))}
           {lossSeries.map((item) => (
             <span key={`${item.id ?? item.label}-loss`} className="inline-flex items-center gap-2 border-2 border-black bg-[var(--accent-bg)] px-2 py-1 text-xs font-black">
               <span className="h-2.5 w-2.5 border-2 border-black bg-[#facc15]" />
-              {item.label} 丢包
+              {copy.serverDetailPage.seriesLossSuffix.replace("{label}", item.label)}
             </span>
           ))}
         </div>
@@ -1657,6 +1678,7 @@ function ProbeOverlayChartCard({
 }
 
 const MiniLineChart = memo(function MiniLineChart({ series, maxValue, formatValue }: { series: ChartSeries[]; maxValue?: number; formatValue: (value: number) => string }) {
+  const { t: copy } = useI18n();
   const [hover, setHover] = useState<{
     x: number;
     time: number;
@@ -1671,14 +1693,14 @@ const MiniLineChart = memo(function MiniLineChart({ series, maxValue, formatValu
   if (allPoints.length === 0) {
     return (
       <div className="flex h-44 items-center justify-center border-2 border-black bg-[var(--accent-bg)] text-sm font-black">
-        暂无历史数据
+        {copy.serverDetailPage.noHistory}
       </div>
     );
   }
   const timeValues = Array.from(new Set(allPoints.map((point) => point.time))).sort((a, b) => a - b);
   const minTime = timeValues[0];
   const maxTime = timeValues[timeValues.length - 1];
-  const maxSeriesValue = Math.max(...allPoints.map((point) => point.value), 1);
+  const maxSeriesValue = maxOf(allPoints.map((point) => point.value), 1);
   const yMax = maxValue ?? Math.ceil(maxSeriesValue * 1.2);
   const timeSpan = Math.max(maxTime - minTime, 1);
 
@@ -1727,7 +1749,7 @@ const MiniLineChart = memo(function MiniLineChart({ series, maxValue, formatValu
       className="h-48 w-full border-2 border-black bg-[var(--bg-page)]"
       viewBox={`0 0 ${width} ${height}`}
       role="img"
-      aria-label="指标趋势图"
+      aria-label={copy.serverDetailPage.metricChartAria}
       onMouseMove={handleMove}
       onMouseLeave={() => setHover(null)}
     >
@@ -1799,6 +1821,7 @@ const MiniLineChart = memo(function MiniLineChart({ series, maxValue, formatValu
 });
 
 const MiniDualAxisChart = memo(function MiniDualAxisChart({ latencySeries, lossSeries }: { latencySeries: ChartSeries[]; lossSeries: ChartSeries[] }) {
+  const { t: copy } = useI18n();
   const [hover, setHover] = useState<{
     x: number;
     time: number;
@@ -1816,7 +1839,7 @@ const MiniDualAxisChart = memo(function MiniDualAxisChart({ latencySeries, lossS
   if (allPoints.length === 0) {
     return (
       <div className="flex h-56 items-center justify-center border-2 border-black bg-[var(--accent-bg)] text-sm font-black">
-        暂无探测历史
+        {copy.serverDetailPage.noProbeHistory}
       </div>
     );
   }
@@ -1824,7 +1847,7 @@ const MiniDualAxisChart = memo(function MiniDualAxisChart({ latencySeries, lossS
   const timeValues = Array.from(new Set(allPoints.map((point) => point.time))).sort((a, b) => a - b);
   const minTime = timeValues[0];
   const maxTime = timeValues[timeValues.length - 1];
-  const maxLatency = Math.max(...latencyPoints.map((point) => point.value), 1);
+  const maxLatency = maxOf(latencyPoints.map((point) => point.value), 1);
   const latencyMax = Math.max(1, Math.ceil(maxLatency * 1.2));
   const lossMax = 100;
   const timeSpan = Math.max(maxTime - minTime, 1);
@@ -1855,11 +1878,11 @@ const MiniDualAxisChart = memo(function MiniDualAxisChart({ latencySeries, lossS
     const values = [
       ...latencySeries.map((item) => {
         const point = nearestPoint(item.points, hoverTime);
-        return point ? { label: `${item.label} 延迟`, color: item.color, value: point.value, time: point.time, kind: "latency" as const } : null;
+        return point ? { label: copy.serverDetailPage.seriesLatencySuffix.replace("{label}", item.label), color: item.color, value: point.value, time: point.time, kind: "latency" as const } : null;
       }),
       ...lossSeries.map((item) => {
         const point = nearestPoint(item.points, hoverTime);
-        return point ? { label: `${item.label} 丢包`, color: "#facc15", value: point.value, time: point.time, kind: "loss" as const } : null;
+        return point ? { label: copy.serverDetailPage.seriesLossSuffix.replace("{label}", item.label), color: "#facc15", value: point.value, time: point.time, kind: "loss" as const } : null;
       }),
     ].filter((item): item is { label: string; color: string; value: number; time: number; kind: "latency" | "loss" } => Boolean(item));
     if (!values.length) {
@@ -1884,7 +1907,7 @@ const MiniDualAxisChart = memo(function MiniDualAxisChart({ latencySeries, lossS
       className="h-60 w-full border-2 border-black bg-[var(--bg-page)]"
       viewBox={`0 0 ${width} ${height}`}
       role="img"
-      aria-label="探测延迟与丢包率趋势图"
+      aria-label={copy.serverDetailPage.probeChartAria}
       onMouseMove={handleMove}
       onMouseLeave={() => setHover(null)}
     >
@@ -2308,7 +2331,7 @@ function maxTemperature(state: Record<string, unknown>): number | undefined {
       return optionalNumber(sensor.temperature) ?? optionalNumber(sensor.temp) ?? optionalNumber(sensor.value);
     })
     .filter((value): value is number => value !== undefined);
-  return values.length ? Math.max(...values) : undefined;
+  return values.length ? maxOf(values) : undefined;
 }
 
 function netTotal(state: Record<string, unknown>, field: "bytes_recv" | "bytes_sent", fallbackKey: string): number | undefined {
@@ -2324,11 +2347,11 @@ function latestValue(points: ChartPoint[]): number | undefined {
 }
 
 function minPointValue(points: ChartPoint[]): number | undefined {
-  return points.length ? Math.min(...points.map((point) => point.value)) : undefined;
+  return points.length ? minOf(points.map((point) => point.value)) : undefined;
 }
 
 function maxPointValue(points: ChartPoint[]): number | undefined {
-  return points.length ? Math.max(...points.map((point) => point.value)) : undefined;
+  return points.length ? maxOf(points.map((point) => point.value)) : undefined;
 }
 
 function latestProbeLatency(series: ChartSeries[]): string {
@@ -2337,11 +2360,6 @@ function latestProbeLatency(series: ChartSeries[]): string {
     .sort((a, b) => a.time - b.time)
     .at(-1);
   return latest ? formatMs(Math.round(latest.value)) : "N/A";
-}
-
-function formatRate(value?: number | null): string {
-  if (value === undefined || value === null || Number.isNaN(value)) return "N/A";
-  return `${formatBytes(value)}/s`;
 }
 
 function formatChartTime(value: number): string {
@@ -2388,20 +2406,11 @@ function valueLabel(value: unknown): string | null {
   return null;
 }
 
-function optionalNumber(value: unknown): number | undefined {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string" && value.trim()) {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : undefined;
-  }
-  return undefined;
-}
-
 function stringValue(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
-function parsePlatformDetails(info: Record<string, unknown>): { os: string; version: string; agent: string; report: string; flags: string } {
+function parsePlatformDetails(info: Record<string, unknown>, copy: import("@/lib/i18n").Translations): { os: string; version: string; agent: string; report: string; flags: string } {
   const os = stringValue(info.platform) || stringValue(info.os);
   const rawVersion = stringValue(info.platform_version) || stringValue(info.os_version);
   const parts = rawVersion
@@ -2415,7 +2424,7 @@ function parsePlatformDetails(info: Record<string, unknown>): { os: string; vers
     if (key && rest.length) kv.set(key.trim(), rest.join("=").trim());
   }
   const report = [
-    kv.get("report") ? `主机 ${kv.get("report")}` : "",
+    kv.get("report") ? `${copy.serverDetailPage.reportHostPrefix} ${kv.get("report")}` : "",
     kv.get("ip_report") ? `IP ${kv.get("ip_report")}` : "",
   ]
     .filter(Boolean)
@@ -2426,21 +2435,21 @@ function parsePlatformDetails(info: Record<string, unknown>): { os: string; vers
     agent: kv.get("agent") || "",
     report,
     flags: [
-      flagLabel("auto_update_disabled", "自动更新", kv),
-      flagLabel("force_update_disabled", "强制更新", kv),
-      flagLabel("command_disabled", "命令", kv),
-      flagLabel("nat_disabled", "NAT", kv),
-      flagLabel("send_query_disabled", "查询上报", kv),
+      flagLabel("auto_update_disabled", copy.serverDetailPage.flagAutoUpdate, kv, copy),
+      flagLabel("force_update_disabled", copy.serverDetailPage.flagForceUpdate, kv, copy),
+      flagLabel("command_disabled", copy.serverDetailPage.flagCommand, kv, copy),
+      flagLabel("nat_disabled", "NAT", kv, copy),
+      flagLabel("send_query_disabled", copy.serverDetailPage.flagSendQuery, kv, copy),
     ]
       .filter(Boolean)
       .join(" / "),
   };
 }
 
-function flagLabel(key: string, label: string, values: Map<string, string>): string {
+function flagLabel(key: string, label: string, values: Map<string, string>, copy: import("@/lib/i18n").Translations): string {
   const value = values.get(key);
   if (value === undefined) return "";
-  return `${label}${value === "true" ? "关" : "开"}`;
+  return `${label}${value === "true" ? copy.serverDetailPage.flagOff : copy.serverDetailPage.flagOn}`;
 }
 
 function joinLabels(values: Array<string | undefined>): string {
@@ -2469,17 +2478,6 @@ function diskLabel(state: Record<string, unknown>, info: Record<string, unknown>
   return total > 0 ? formatBytes(total) : "N/A";
 }
 
-function durationLabel(value: unknown): string {
-  const seconds = optionalNumber(value);
-  if (seconds === undefined) return "N/A";
-  const days = Math.floor(seconds / 86400);
-  const hours = Math.floor((seconds % 86400) / 3600);
-  const minutes = Math.floor((seconds % 3600) / 60);
-  if (days > 0) return `${days} 天 ${hours} 小时`;
-  if (hours > 0) return `${hours} 小时 ${minutes} 分钟`;
-  return `${minutes} 分钟`;
-}
-
 function isExpired(value?: string | null): boolean {
   if (!value) return false;
   const date = new Date(value);
@@ -2498,26 +2496,15 @@ function parentPath(value: string): string {
   return index <= 0 ? "/" : trimmed.slice(0, index);
 }
 
-function serverStatusLabel(status: string): string {
+function serverStatusLabel(status: string, copy: import("@/lib/i18n").Translations): string {
   const labels: Record<string, string> = {
-    online: "在线",
-    offline: "离线",
-    revoked: "已撤销",
-    down: "异常",
-    degraded: "降级",
+    online: copy.serverDetailPage.statusOnline,
+    offline: copy.serverDetailPage.statusOffline,
+    revoked: copy.serverDetailPage.statusRevoked,
+    down: copy.serverDetailPage.statusDown,
+    degraded: copy.serverDetailPage.statusDegraded,
   };
   return labels[status] || status;
-}
-
-function configFlagLabel(key: keyof typeof blankConfig): string {
-  const labels: Partial<Record<keyof typeof blankConfig, string>> = {
-    disable_auto_update: "禁用自动更新",
-    disable_force_update: "禁用强制更新",
-    disable_command_execute: "禁用命令执行",
-    disable_nat: "禁用 NAT",
-    disable_send_query: "禁用查询上报",
-  };
-  return labels[key] || key;
 }
 
 function initialShowMissingInfo(): boolean {

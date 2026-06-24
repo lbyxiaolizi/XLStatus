@@ -19,6 +19,9 @@ import {
   responseError,
 } from "@/app/components/M7Primitives";
 import { apiClient } from "@/lib/api";
+import { durationLabel, formatRate } from "@/app/lib/format";
+import type { Translations } from "@/lib/i18n";
+import { useI18n } from "@/lib/use-i18n";
 
 interface PageProps {
   params: Promise<{ id: string }> | { id: string };
@@ -117,6 +120,7 @@ interface ChartSeries {
 
 export default function PublicServerDetailPage({ params }: PageProps) {
   const [serverId, setServerId] = useState("");
+  const { t: copy } = useI18n();
   const [server, setServer] = useState<PublicServerDetail | null>(null);
   const [services, setServices] = useState<PublicService[]>([]);
   const [loading, setLoading] = useState(true);
@@ -128,45 +132,57 @@ export default function PublicServerDetailPage({ params }: PageProps) {
     void Promise.resolve(params).then((value) => setServerId(value.id));
   }, [params]);
 
-  const loadServer = useCallback(async () => {
-    if (!serverId) return;
-    setLoading(true);
-    setError(null);
-    const response = await apiClient.getPublicServer(serverId);
-    setLoading(false);
-    if (response.success && response.data) {
-      setServer(response.data as unknown as PublicServerDetail);
-    } else {
-      setError(responseError(response));
-      setServer(null);
-    }
-  }, [serverId]);
+  const loadServer = useCallback(
+    async (signal?: AbortSignal) => {
+      if (!serverId) return;
+      setLoading(true);
+      setError(null);
+      const response = await apiClient.getPublicServer(serverId, { signal });
+      if (signal?.aborted) return;
+      setLoading(false);
+      if (response.success && response.data) {
+        setServer(response.data as unknown as PublicServerDetail);
+      } else {
+        setError(responseError(response));
+        setServer(null);
+      }
+    },
+    [serverId],
+  );
 
-  const loadServices = useCallback(async () => {
-    if (!serverId) return;
-    setServicesLoading(true);
-    setServicesError(null);
-    const response = await apiClient.getPublicStatus();
-    setServicesLoading(false);
-    if (response.success && response.data) {
-      const publicServices = ((response.data.services as PublicService[]) ?? []).filter((service) =>
-        serviceBelongsToServer(service, serverId),
-      );
-      setServices(publicServices);
-    } else {
-      setServices([]);
-      setServicesError(responseError(response));
-    }
-  }, [serverId]);
+  const loadServices = useCallback(
+    async (signal?: AbortSignal) => {
+      if (!serverId) return;
+      setServicesLoading(true);
+      setServicesError(null);
+      const response = await apiClient.getPublicStatus({ signal });
+      if (signal?.aborted) return;
+      setServicesLoading(false);
+      if (response.success && response.data) {
+        const publicServices = ((response.data.services as PublicService[]) ?? []).filter((service) =>
+          serviceBelongsToServer(service, serverId),
+        );
+        setServices(publicServices);
+      } else {
+        setServices([]);
+        setServicesError(responseError(response));
+      }
+    },
+    [serverId],
+  );
 
   useEffect(() => {
+    const controller = new AbortController();
     // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount is the standard client data-load pattern
-    void loadServer();
+    void loadServer(controller.signal);
+    return () => controller.abort();
   }, [loadServer]);
 
   useEffect(() => {
+    const controller = new AbortController();
     // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount is the standard client data-load pattern
-    void loadServices();
+    void loadServices(controller.signal);
+    return () => controller.abort();
   }, [loadServices]);
 
   const visibleServices = useMemo(
@@ -183,19 +199,19 @@ export default function PublicServerDetailPage({ params }: PageProps) {
       <Navigation />
       <PageShell>
         <PageHeader
-          eyebrow="公开服务器"
+          eyebrow={copy.statusDetailPage.eyebrow}
           title={server?.name || compactId(serverId)}
-          detail={server ? `最后上报 ${formatDate(server.last_seen_at)}` : "公开状态详情"}
+          detail={server ? copy.statusDetailPage.lastSeen.replace("{time}", formatDate(server.last_seen_at)) : copy.statusDetailPage.headerDetailFallback}
           actions={
             <>
-              <Link href="/status" className={buttonClass("secondary")}>返回状态页</Link>
-              {server ? <StatusBadge tone={serverTone(server.status)}>{statusLabel(server.status)}</StatusBadge> : null}
+              <Link href="/status" className={buttonClass("secondary")}>{copy.statusDetailPage.backToStatus}</Link>
+              {server ? <StatusBadge tone={serverTone(server.status)}>{statusLabel(server.status, copy)}</StatusBadge> : null}
             </>
           }
         />
         <InlineError message={error} />
 
-        {loading && !server ? <EmptyState title="正在加载公开服务器" /> : null}
+        {loading && !server ? <EmptyState title={copy.statusDetailPage.loadingServer} /> : null}
 
         {server ? (
           <div className="mt-5 grid gap-5">
@@ -204,10 +220,10 @@ export default function PublicServerDetailPage({ params }: PageProps) {
             {server.metrics?.samples?.length ? <PublicMetricsCharts metrics={server.metrics} /> : null}
             <section>
               <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
-                <h2 className="text-xl font-black uppercase">关联公开服务</h2>
+                <h2 className="text-xl font-black uppercase">{copy.statusDetailPage.relatedServicesHeading}</h2>
                 {servicesLoading ? (
                   <span className="border-2 border-black bg-[var(--accent-bg)] px-2 py-1 text-xs font-black shadow-[var(--shadow-brutal-sm)]">
-                    加载中
+                    {copy.statusDetailPage.loading}
                   </span>
                 ) : null}
               </div>
@@ -219,7 +235,7 @@ export default function PublicServerDetailPage({ params }: PageProps) {
                   ))}
                 </div>
               ) : (
-                <EmptyState title="暂无关联公开服务" detail="仅展示已关联到该服务器的公开服务监控历史。" />
+                <EmptyState title={copy.statusDetailPage.relatedServicesEmptyTitle} detail={copy.statusDetailPage.relatedServicesEmptyDetail} />
               )}
             </section>
           </div>
@@ -230,7 +246,8 @@ export default function PublicServerDetailPage({ params }: PageProps) {
 }
 
 function ServerSummary({ server }: { server: PublicServerDetail }) {
-  const note = server.public_note || server.remark || "公开服务器";
+  const { t: copy } = useI18n();
+  const note = server.public_note || server.remark || copy.statusDetailPage.publicServerNote;
 
   return (
     <section
@@ -243,43 +260,45 @@ function ServerSummary({ server }: { server: PublicServerDetail }) {
           <p className="mt-1 break-all font-mono text-xs font-bold text-[var(--text-muted)]">{server.id}</p>
           <p className="mt-3 max-w-3xl break-words text-sm font-bold text-[var(--text-muted)]">{note}</p>
         </div>
-        <StatusBadge tone={serverTone(server.status)}>{statusLabel(server.status)}</StatusBadge>
+        <StatusBadge tone={serverTone(server.status)}>{statusLabel(server.status, copy)}</StatusBadge>
       </div>
       <div className="mt-4 grid gap-3 sm:grid-cols-2">
-        <InfoTile label="状态" value={statusLabel(server.status)} />
-        <InfoTile label="最后上报" value={formatDate(server.last_seen_at)} />
+        <InfoTile label={copy.statusDetailPage.labelStatus} value={statusLabel(server.status, copy)} />
+        <InfoTile label={copy.statusDetailPage.labelLastSeen} value={formatDate(server.last_seen_at)} />
       </div>
     </section>
   );
 }
 
 function PublicResources({ resources }: { resources: PublicServerResources }) {
+  const { t: copy } = useI18n();
   return (
     <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-      <InfoTile label="CPU" value={formatPercent(resources.cpu_percent)} />
-      <InfoTile label="内存" value={resourceBytes(resources.memory_used, resources.memory_total, resources.memory_percent)} />
-      <InfoTile label="磁盘" value={resourceBytes(resources.disk_used, resources.disk_total, resources.disk_percent)} />
-      <InfoTile label="负载" value={resources.load_1 === undefined || resources.load_1 === null ? "N/A" : resources.load_1.toFixed(2)} />
-      <InfoTile label="下载" value={formatRate(resources.net_rx_bps)} />
-      <InfoTile label="上传" value={formatRate(resources.net_tx_bps)} />
-      <InfoTile label="累计流量" value={`↓${formatBytes(resources.network_in_total)} ↑${formatBytes(resources.network_out_total)}`} />
-      <InfoTile label="运行时间" value={durationLabel(resources.uptime_seconds)} />
-      <InfoTile label="TCP / UDP" value={`${numberLabel(resources.tcp_connections)} / ${numberLabel(resources.udp_connections)}`} />
-      <InfoTile label="进程数" value={numberLabel(resources.process_count)} />
+      <InfoTile label={copy.statusDetailPage.labelCpu} value={formatPercent(resources.cpu_percent)} />
+      <InfoTile label={copy.statusDetailPage.labelMemory} value={resourceBytes(resources.memory_used, resources.memory_total, resources.memory_percent)} />
+      <InfoTile label={copy.statusDetailPage.labelDisk} value={resourceBytes(resources.disk_used, resources.disk_total, resources.disk_percent)} />
+      <InfoTile label={copy.statusDetailPage.labelLoad} value={resources.load_1 === undefined || resources.load_1 === null ? "N/A" : resources.load_1.toFixed(2)} />
+      <InfoTile label={copy.statusDetailPage.labelDownload} value={formatRate(resources.net_rx_bps)} />
+      <InfoTile label={copy.statusDetailPage.labelUpload} value={formatRate(resources.net_tx_bps)} />
+      <InfoTile label={copy.statusDetailPage.labelTotalTraffic} value={`↓${formatBytes(resources.network_in_total)} ↑${formatBytes(resources.network_out_total)}`} />
+      <InfoTile label={copy.statusDetailPage.labelUptime} value={durationLabel(resources.uptime_seconds)} />
+      <InfoTile label={copy.statusDetailPage.labelTcpUdp} value={`${numberLabel(resources.tcp_connections)} / ${numberLabel(resources.udp_connections)}`} />
+      <InfoTile label={copy.statusDetailPage.labelProcessCount} value={numberLabel(resources.process_count)} />
     </section>
   );
 }
 
 function PublicMetricsCharts({ metrics }: { metrics: PublicServerMetrics }) {
+  const { t: copy } = useI18n();
   const charts = buildMetricCharts(metrics.samples);
   const resourceSeries = [
-    { id: "cpu", label: "CPU", color: "var(--accent-color)", points: charts.cpu },
-    { id: "memory", label: "内存", color: "var(--btn-bg)", points: charts.memory },
-    { id: "disk", label: "磁盘", color: "#f97316", points: charts.disk },
+    { id: "cpu", label: copy.statusDetailPage.seriesCpu, color: "var(--accent-color)", points: charts.cpu },
+    { id: "memory", label: copy.statusDetailPage.seriesMemory, color: "var(--btn-bg)", points: charts.memory },
+    { id: "disk", label: copy.statusDetailPage.seriesDisk, color: "#f97316", points: charts.disk },
   ].filter((series) => series.points.length > 0);
   const networkSeries = [
-    { id: "rx", label: "下载", color: "var(--accent-color)", points: charts.rx },
-    { id: "tx", label: "上传", color: "var(--btn-bg)", points: charts.tx },
+    { id: "rx", label: copy.statusDetailPage.seriesDownload, color: "var(--accent-color)", points: charts.rx },
+    { id: "tx", label: copy.statusDetailPage.seriesUpload, color: "var(--btn-bg)", points: charts.tx },
   ].filter((series) => series.points.length > 0);
 
   if (!resourceSeries.length && !networkSeries.length) return null;
@@ -287,17 +306,17 @@ function PublicMetricsCharts({ metrics }: { metrics: PublicServerMetrics }) {
   return (
     <section>
       <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
-        <h2 className="text-xl font-black uppercase">监控图表</h2>
+        <h2 className="text-xl font-black uppercase">{copy.statusDetailPage.chartsHeading}</h2>
         <span className="border-2 border-black bg-[var(--accent-bg)] px-2 py-1 text-xs font-black shadow-[var(--shadow-brutal-sm)]">
           {metrics.range || "1d"}
         </span>
       </div>
       <div className="grid gap-4 lg:grid-cols-2">
         {resourceSeries.length ? (
-          <MetricChartCard title="资源使用率" value={latestPercentLabel(resourceSeries)} series={resourceSeries} maxValue={100} formatValue={formatPercent} />
+          <MetricChartCard title={copy.statusDetailPage.chartResourceUsage} value={latestPercentLabel(resourceSeries)} series={resourceSeries} maxValue={100} formatValue={formatPercent} />
         ) : null}
         {networkSeries.length ? (
-          <MetricChartCard title="网络速率" value={latestRateLabel(networkSeries)} series={networkSeries} formatValue={formatRate} />
+          <MetricChartCard title={copy.statusDetailPage.chartNetworkRate} value={latestRateLabel(networkSeries)} series={networkSeries} formatValue={formatRate} />
         ) : null}
       </div>
     </section>
@@ -342,6 +361,7 @@ function MetricChartCard({
 }
 
 function MiniLineChart({ series, maxValue, formatValue }: { series: ChartSeries[]; maxValue?: number; formatValue: (value?: number | null) => string }) {
+  const { t: copy } = useI18n();
   const width = 640;
   const height = 190;
   const padding = { top: 14, right: 16, bottom: 30, left: 46 };
@@ -351,7 +371,7 @@ function MiniLineChart({ series, maxValue, formatValue }: { series: ChartSeries[
   if (!allPoints.length) {
     return (
       <div className="flex h-44 items-center justify-center border-2 border-black bg-[var(--accent-bg)] text-sm font-black">
-        暂无历史数据
+        {copy.statusDetailPage.noHistory}
       </div>
     );
   }
@@ -373,7 +393,7 @@ function MiniLineChart({ series, maxValue, formatValue }: { series: ChartSeries[
   }
 
   return (
-    <svg className="h-48 w-full border-2 border-black bg-[var(--bg-page)]" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="公开服务器监控趋势图">
+    <svg className="h-48 w-full border-2 border-black bg-[var(--bg-page)]" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={copy.statusDetailPage.chartAriaLabel}>
       {[0, 0.25, 0.5, 0.75, 1].map((ratio) => {
         const lineY = padding.top + plotHeight * ratio;
         return <line key={ratio} x1={padding.left} x2={width - padding.right} y1={lineY} y2={lineY} stroke="var(--border-color)" strokeOpacity="0.18" strokeWidth="2" />;
@@ -405,6 +425,7 @@ function MiniLineChart({ series, maxValue, formatValue }: { series: ChartSeries[
 }
 
 function PublicServiceCard({ service }: { service: PublicService }) {
+  const { t: copy } = useI18n();
   const days = buildPublicServiceDays(service.history ?? []);
   const checks = days.reduce((sum, day) => sum + day.total, 0);
   const avgDelay = averageDelay(service.history ?? []);
@@ -417,14 +438,14 @@ function PublicServiceCard({ service }: { service: PublicService }) {
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <h3 className="break-words text-xl font-black">{service.name}</h3>
-          <p className="mt-1 text-xs font-bold text-[var(--text-muted)]">{serviceKind(service)}</p>
+          <p className="mt-1 text-xs font-bold text-[var(--text-muted)]">{serviceKind(service, copy)}</p>
         </div>
-        <StatusBadge tone={serviceTone(service.last_status ?? undefined)}>{statusLabel(service.last_status ?? undefined)}</StatusBadge>
+        <StatusBadge tone={serviceTone(service.last_status ?? undefined)}>{statusLabel(service.last_status ?? undefined, copy)}</StatusBadge>
       </div>
       <div className="mt-4 grid gap-3 sm:grid-cols-3">
-        <InfoTile label="可用率" value={uptime === undefined ? "N/A" : `${formatPercent(uptime)} 可用`} />
-        <InfoTile label="平均延迟" value={avgDelay === undefined ? "N/A" : formatMs(Math.round(avgDelay))} />
-        <InfoTile label="最近检查" value={formatDate(service.last_check_at)} />
+        <InfoTile label={copy.statusDetailPage.labelUptimeRate} value={uptime === undefined ? "N/A" : copy.statusDetailPage.uptimeSuffix.replace("{percent}", formatPercent(uptime))} />
+        <InfoTile label={copy.statusDetailPage.labelAvgDelay} value={avgDelay === undefined ? "N/A" : formatMs(Math.round(avgDelay))} />
+        <InfoTile label={copy.statusDetailPage.labelLastCheck} value={formatDate(service.last_check_at)} />
       </div>
       <PublicServiceHistory days={days} />
     </BrutalCard>
@@ -432,6 +453,7 @@ function PublicServiceCard({ service }: { service: PublicService }) {
 }
 
 function PublicServiceHistory({ days }: { days: PublicServiceDay[] }) {
+  const { t: copy } = useI18n();
   return (
     <div className="mt-4 border-t-2 border-black pt-3">
       <div className="grid grid-cols-[repeat(30,minmax(0,1fr))] gap-1">
@@ -444,8 +466,8 @@ function PublicServiceHistory({ days }: { days: PublicServiceDay[] }) {
         ))}
       </div>
       <div className="mt-2 flex justify-between text-xs font-black text-[var(--text-muted)]">
-        <span>30 天前</span>
-        <span>今天</span>
+        <span>{copy.statusDetailPage.daysAgo30}</span>
+        <span>{copy.statusDetailPage.today}</span>
       </div>
     </div>
   );
@@ -510,24 +532,9 @@ function resourceBytes(used?: number | null, total?: number | null, percent?: nu
   return "N/A";
 }
 
-function formatRate(value?: number | null): string {
-  if (value === undefined || value === null || Number.isNaN(value)) return "N/A";
-  return `${formatBytes(value)}/s`;
-}
-
 function numberLabel(value?: number | null): string {
   if (value === undefined || value === null || Number.isNaN(value)) return "N/A";
   return String(value);
-}
-
-function durationLabel(value?: number | null): string {
-  if (value === undefined || value === null || Number.isNaN(value)) return "N/A";
-  const days = Math.floor(value / 86400);
-  const hours = Math.floor((value % 86400) / 3600);
-  const minutes = Math.floor((value % 3600) / 60);
-  if (days > 0) return `${days} 天 ${hours} 小时`;
-  if (hours > 0) return `${hours} 小时 ${minutes} 分钟`;
-  return `${minutes} 分钟`;
 }
 
 function formatChartTime(value: number): string {
@@ -546,8 +553,8 @@ function serviceBelongsToServer(service: PublicService, serverId: string): boole
   return service.server_id === serverId || serverIds.includes(serverId);
 }
 
-function serviceKind(service: PublicService): string {
-  return service.service_type || service.kind || service.type || "服务";
+function serviceKind(service: PublicService, copy: Translations): string {
+  return service.service_type || service.kind || service.type || copy.statusDetailPage.serviceKindFallback;
 }
 
 function serverTone(status: string): "green" | "red" | "yellow" | "gray" {
@@ -564,18 +571,18 @@ function serviceTone(status?: string): "green" | "red" | "yellow" | "gray" {
   return "gray";
 }
 
-function statusLabel(status?: string | null): string {
-  if (!status) return "未知";
+function statusLabel(status: string | null | undefined, copy: Translations): string {
+  if (!status) return copy.common.unknown;
   const labels: Record<string, string> = {
-    online: "在线",
-    offline: "离线",
-    down: "异常",
-    degraded: "降级",
-    revoked: "已撤销",
-    success: "成功",
-    up: "正常",
-    failure: "失败",
-    timeout: "超时",
+    online: copy.statusDetailPage.statusOnline,
+    offline: copy.statusDetailPage.statusOffline,
+    down: copy.statusDetailPage.statusDown,
+    degraded: copy.statusDetailPage.statusDegraded,
+    revoked: copy.statusDetailPage.statusRevoked,
+    success: copy.common.success,
+    up: copy.statusDetailPage.statusUp,
+    failure: copy.common.failure,
+    timeout: copy.statusDetailPage.statusTimeout,
   };
   return labels[status] || status;
 }

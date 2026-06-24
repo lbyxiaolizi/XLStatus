@@ -1,3 +1,20 @@
+import { loginPage, loginPageEn } from "./i18n/pages/login";
+import { statusPage, statusPageEn } from "./i18n/pages/status";
+import { statusDetailPage, statusDetailPageEn } from "./i18n/pages/statusDetail";
+import { dashboardPage, dashboardPageEn } from "./i18n/pages/dashboard";
+import { serversPage, serversPageEn } from "./i18n/pages/servers";
+import { serverDetailPage, serverDetailPageEn } from "./i18n/pages/serverDetail";
+import { settingsPage, settingsPageEn } from "./i18n/pages/settings";
+import { servicesPage, servicesPageEn } from "./i18n/pages/services";
+import { tasksPage, tasksPageEn } from "./i18n/pages/tasks";
+import { alertsPage, alertsPageEn } from "./i18n/pages/alerts";
+import { natPage, natPageEn } from "./i18n/pages/nat";
+import { ddnsPage, ddnsPageEn } from "./i18n/pages/ddns";
+import { notificationsPage, notificationsPageEn } from "./i18n/pages/notifications";
+import { terminalPage, terminalPageEn } from "./i18n/pages/terminal";
+import { dialogs, dialogsEn, errorsPage, errorsPageEn } from "./i18n/pages/shared";
+import { worldMap, worldMapEn } from "./i18n/pages/worldMap";
+
 export const supportedLocales = ["zh-CN", "en-US"] as const;
 
 export type Locale = (typeof supportedLocales)[number];
@@ -23,6 +40,9 @@ export const zhCN = {
     disabled: "停用",
     success: "成功",
     failure: "失败",
+    cancel: "取消",
+    confirm: "确认",
+    submit: "确定",
     unknown: "未知",
     never: "从未",
     manual: "手动",
@@ -60,6 +80,23 @@ export const zhCN = {
     commands: "命令",
     searchPlaceholder: "搜索页面或服务器",
   },
+  loginPage,
+  statusPage,
+  statusDetailPage,
+  dashboardPage,
+  serversPage,
+  serverDetailPage,
+  settingsPage,
+  servicesPage,
+  tasksPage,
+  alertsPage,
+  natPage,
+  ddnsPage,
+  notificationsPage,
+  terminalPage,
+  dialogs,
+  errorsPage,
+  worldMap,
 };
 
 export const enUS: typeof zhCN = {
@@ -75,6 +112,9 @@ export const enUS: typeof zhCN = {
     disabled: "Disabled",
     success: "Success",
     failure: "Failure",
+    cancel: "Cancel",
+    confirm: "Confirm",
+    submit: "Submit",
     unknown: "Unknown",
     never: "Never",
     manual: "Manual",
@@ -112,6 +152,23 @@ export const enUS: typeof zhCN = {
     commands: "Commands",
     searchPlaceholder: "Search pages or servers",
   },
+  loginPage: loginPageEn,
+  statusPage: statusPageEn,
+  statusDetailPage: statusDetailPageEn,
+  dashboardPage: dashboardPageEn,
+  serversPage: serversPageEn,
+  serverDetailPage: serverDetailPageEn,
+  settingsPage: settingsPageEn,
+  servicesPage: servicesPageEn,
+  tasksPage: tasksPageEn,
+  alertsPage: alertsPageEn,
+  natPage: natPageEn,
+  ddnsPage: ddnsPageEn,
+  notificationsPage: notificationsPageEn,
+  terminalPage: terminalPageEn,
+  dialogs: dialogsEn,
+  errorsPage: errorsPageEn,
+  worldMap: worldMapEn,
 };
 
 export const translations = {

@@ -1,7 +1,6 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useState } from "react";
-import Navigation from "@/app/components/Navigation";
 import {
   EmptyState,
   Field,
@@ -21,6 +20,8 @@ import {
   thClass,
 } from "@/app/components/M7Primitives";
 import { apiClient, type DdnsConfig, type JsonObject } from "@/lib/api";
+import { useDialogs } from "@/app/components/Dialogs";
+import { useI18n } from "@/lib/use-i18n";
 
 interface DdnsHistory {
   id?: string;
@@ -30,6 +31,8 @@ interface DdnsHistory {
 }
 
 export default function DdnsPage() {
+  const dialogs = useDialogs();
+  const { t: copy } = useI18n();
   const [configs, setConfigs] = useState<DdnsConfig[]>([]);
   const [history, setHistory] = useState<DdnsHistory[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -75,11 +78,11 @@ export default function DdnsPage() {
       enabled = response.data.enabled;
     }
     if (!enabled) return undefined;
-    const code = window.prompt("请输入 6 位 TOTP 验证码");
+    const code = await dialogs.totp();
     if (code === null) return null;
     const trimmed = code.trim();
     if (!/^\d{6}$/.test(trimmed)) {
-      setError("请输入 6 位 TOTP 验证码。");
+      setError(copy.ddnsPage.invalidTotp);
       return null;
     }
     return trimmed;
@@ -104,7 +107,7 @@ export default function DdnsPage() {
     if (totpCode === null) return;
     const response = await apiClient.createDdnsConfig(payload, totpCode);
     if (response.success) {
-      setNotice("DDNS 配置已创建。");
+      setNotice(copy.ddnsPage.configCreated);
       setModal(false);
       await load();
     } else {
@@ -116,7 +119,7 @@ export default function DdnsPage() {
     const totpCode = await sensitiveTotpCode();
     if (totpCode === null) return;
     const response = await apiClient.reloadDdnsProviders(totpCode);
-    if (response.success) setNotice("DDNS Provider 已重载。");
+    if (response.success) setNotice(copy.ddnsPage.providersReloaded);
     else setError(responseError(response));
   }
 
@@ -124,7 +127,7 @@ export default function DdnsPage() {
     const totpCode = await sensitiveTotpCode();
     if (totpCode === null) return;
     const response = await apiClient.checkDdnsNow(totpCode);
-    if (response.success) setNotice("DDNS 检查已触发。");
+    if (response.success) setNotice(copy.ddnsPage.checkTriggered);
     else setError(responseError(response));
   }
 
@@ -132,19 +135,19 @@ export default function DdnsPage() {
     const response = await apiClient.listDdnsHistory(config.id);
     if (response.success && response.data) {
       setHistory((response.data.history as DdnsHistory[]) ?? []);
-      setNotice(`已加载 ${config.name || config.domain || config.id} 的历史。`);
+      setNotice(copy.ddnsPage.historyLoaded.replace("{name}", String(config.name || config.domain || config.id)));
     } else {
       setError(responseError(response));
     }
   }
 
   async function deleteConfig(config: DdnsConfig) {
-    if (!confirm(`确定删除 DDNS 配置「${config.name || config.domain || config.id}」？`)) return;
+    if (!(await dialogs.confirm({ message: copy.ddnsPage.deleteConfigConfirm.replace("{name}", String(config.name || config.domain || config.id)), danger: true }))) return;
     const totpCode = await sensitiveTotpCode();
     if (totpCode === null) return;
     const response = await apiClient.deleteDdnsConfig(config.id, totpCode);
     if (response.success) {
-      setNotice("DDNS 配置已删除。");
+      setNotice(copy.ddnsPage.configDeleted);
       await load();
     } else {
       setError(responseError(response));
@@ -152,18 +155,17 @@ export default function DdnsPage() {
   }
 
   return (
-    <div className="min-h-screen">
-      <Navigation />
+    <div>
       <PageShell>
         <PageHeader
-          eyebrow="DNS"
-          title="DDNS"
-          detail="动态 DNS 配置、重载和更新历史。"
+          eyebrow={copy.ddnsPage.eyebrow}
+          title={copy.ddnsPage.title}
+          detail={copy.ddnsPage.detail}
           actions={
             <>
-              <button className={buttonClass("secondary")} onClick={() => void reload()}>重载</button>
-              <button className={buttonClass("secondary")} onClick={() => void checkNow()}>立即检查</button>
-              <button className={buttonClass("primary")} onClick={() => setModal(true)}>新增配置</button>
+              <button className={buttonClass("secondary")} onClick={() => void reload()}>{copy.ddnsPage.reload}</button>
+              <button className={buttonClass("secondary")} onClick={() => void checkNow()}>{copy.ddnsPage.checkNow}</button>
+              <button className={buttonClass("primary")} onClick={() => setModal(true)}>{copy.ddnsPage.addConfig}</button>
             </>
           }
         />
@@ -173,11 +175,11 @@ export default function DdnsPage() {
         </div>
 
         {configs.length === 0 ? (
-          <EmptyState title="暂无 DDNS 配置" />
+          <EmptyState title={copy.ddnsPage.emptyTitle} />
         ) : (
           <div className="overflow-x-auto border-2 border-black bg-[var(--bg-card)] shadow-[var(--shadow-brutal)]">
             <table className="w-full">
-              <thead><tr><th className={thClass}>名称</th><th className={thClass}>Provider</th><th className={thClass}>域名</th><th className={thClass}>IP</th><th className={thClass}>状态</th><th className={thClass}>操作</th></tr></thead>
+              <thead><tr><th className={thClass}>{copy.ddnsPage.colName}</th><th className={thClass}>{copy.ddnsPage.colProvider}</th><th className={thClass}>{copy.ddnsPage.colDomain}</th><th className={thClass}>{copy.ddnsPage.colIp}</th><th className={thClass}>{copy.ddnsPage.colStatus}</th><th className={thClass}>{copy.ddnsPage.colActions}</th></tr></thead>
               <tbody>
                 {configs.map((config) => (
                   <tr key={config.id}>
@@ -185,10 +187,10 @@ export default function DdnsPage() {
                     <td className={tdClass}>{config.provider || "webhook"}</td>
                     <td className={tdClass}>{config.domain || "-"}</td>
                     <td className={tdClass}>{config.last_applied_ip || config.current_ip || "-"}</td>
-                    <td className={tdClass}><StatusBadge tone={config.enabled === false ? "gray" : "green"}>{config.enabled === false ? "停用" : "启用"}</StatusBadge></td>
+                    <td className={tdClass}><StatusBadge tone={config.enabled === false ? "gray" : "green"}>{config.enabled === false ? copy.ddnsPage.disabled : copy.ddnsPage.enabled}</StatusBadge></td>
                     <td className={`${tdClass} flex flex-wrap gap-2`}>
-                      <button className={buttonClass("secondary")} onClick={() => void showHistory(config)}>历史</button>
-                      <button className={buttonClass("danger")} onClick={() => void deleteConfig(config)}>删除</button>
+                      <button className={buttonClass("secondary")} onClick={() => void showHistory(config)}>{copy.ddnsPage.history}</button>
+                      <button className={buttonClass("danger")} onClick={() => void deleteConfig(config)}>{copy.ddnsPage.delete}</button>
                     </td>
                   </tr>
                 ))}
@@ -199,11 +201,11 @@ export default function DdnsPage() {
 
         {history.length > 0 ? (
           <section className="mt-6">
-            <h2 className="mb-3 text-xl font-black uppercase">历史</h2>
+            <h2 className="mb-3 text-xl font-black uppercase">{copy.ddnsPage.historyHeading}</h2>
             <div className="grid gap-3">
               {history.map((item, index) => (
                 <div key={item.id || index} className="border-2 border-black bg-[var(--bg-card)] p-3 shadow-[var(--shadow-brutal-sm)]">
-                  <StatusBadge tone={item.success ? "green" : "red"}>{item.success ? "成功" : "失败"}</StatusBadge>
+                  <StatusBadge tone={item.success ? "green" : "red"}>{item.success ? copy.ddnsPage.success : copy.ddnsPage.failed}</StatusBadge>
                   <span className="ml-3 text-sm font-black">{formatDate(item.created_at)}</span>
                   <p className="mt-2 text-sm font-bold text-[var(--text-muted)]">{item.message || ""}</p>
                 </div>
@@ -213,27 +215,28 @@ export default function DdnsPage() {
         ) : null}
 
         {modal ? (
-          <Modal title="新增 DDNS 配置" onClose={() => setModal(false)}>
+          <Modal title={copy.ddnsPage.modalTitle} onClose={() => setModal(false)}>
             <form onSubmit={submit} className="space-y-4">
               <div className="grid gap-4 sm:grid-cols-2">
-                <Field label="名称"><input className={inputClass} value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} /></Field>
-                <Field label="Provider"><select className={selectClass} value={form.provider} onChange={(e) => setForm((f) => ({ ...f, provider: e.target.value }))}><option value="webhook">webhook</option><option value="cloudflare">cloudflare</option><option value="aliyun">aliyun</option></select></Field>
+                <Field label={copy.ddnsPage.fieldName}><input className={inputClass} value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} /></Field>
+                <Field label={copy.ddnsPage.fieldProvider}><select className={selectClass} value={form.provider} onChange={(e) => setForm((f) => ({ ...f, provider: e.target.value }))}><option value="webhook">webhook</option><option value="cloudflare">cloudflare</option><option value="aliyun">aliyun</option></select></Field>
               </div>
-              <Field label="Agent ID"><input className={inputClass} value={form.agent_id} onChange={(e) => setForm((f) => ({ ...f, agent_id: e.target.value }))} /></Field>
-              <Field label="域名"><input className={inputClass} value={form.domain} onChange={(e) => setForm((f) => ({ ...f, domain: e.target.value }))} /></Field>
-              <Field label="Webhook URL"><textarea className={`${textareaClass} min-h-24`} value={form.webhook_url} onChange={(e) => setForm((f) => ({ ...f, webhook_url: e.target.value }))} placeholder="https://example.com/update?ip={{ip}}&hostname={{hostname}}" /></Field>
+              <Field label={copy.ddnsPage.fieldAgentId}><input className={inputClass} value={form.agent_id} onChange={(e) => setForm((f) => ({ ...f, agent_id: e.target.value }))} /></Field>
+              <Field label={copy.ddnsPage.fieldDomain}><input className={inputClass} value={form.domain} onChange={(e) => setForm((f) => ({ ...f, domain: e.target.value }))} /></Field>
+              <Field label={copy.ddnsPage.fieldWebhookUrl}><textarea className={`${textareaClass} min-h-24`} value={form.webhook_url} onChange={(e) => setForm((f) => ({ ...f, webhook_url: e.target.value }))} placeholder="https://example.com/update?ip={{ip}}&hostname={{hostname}}" /></Field>
               <div className="grid gap-4 sm:grid-cols-2">
-                <Field label="Record ID"><input className={inputClass} value={form.record_id} onChange={(e) => setForm((f) => ({ ...f, record_id: e.target.value }))} /></Field>
-                <Field label="Zone ID"><input className={inputClass} value={form.zone_id} onChange={(e) => setForm((f) => ({ ...f, zone_id: e.target.value }))} /></Field>
-                <Field label="API Token"><input className={inputClass} value={form.api_token} onChange={(e) => setForm((f) => ({ ...f, api_token: e.target.value }))} /></Field>
-                <Field label="API Key"><input className={inputClass} value={form.api_key} onChange={(e) => setForm((f) => ({ ...f, api_key: e.target.value }))} /></Field>
+                <Field label={copy.ddnsPage.fieldRecordId}><input className={inputClass} value={form.record_id} onChange={(e) => setForm((f) => ({ ...f, record_id: e.target.value }))} /></Field>
+                <Field label={copy.ddnsPage.fieldZoneId}><input className={inputClass} value={form.zone_id} onChange={(e) => setForm((f) => ({ ...f, zone_id: e.target.value }))} /></Field>
+                <Field label={copy.ddnsPage.fieldApiToken}><input className={inputClass} value={form.api_token} onChange={(e) => setForm((f) => ({ ...f, api_token: e.target.value }))} /></Field>
+                <Field label={copy.ddnsPage.fieldApiKey}><input className={inputClass} value={form.api_key} onChange={(e) => setForm((f) => ({ ...f, api_key: e.target.value }))} /></Field>
               </div>
-              <Field label="API Secret"><input className={inputClass} value={form.api_secret} onChange={(e) => setForm((f) => ({ ...f, api_secret: e.target.value }))} /></Field>
-              <button className={buttonClass("primary")}>保存配置</button>
+              <Field label={copy.ddnsPage.fieldApiSecret}><input className={inputClass} value={form.api_secret} onChange={(e) => setForm((f) => ({ ...f, api_secret: e.target.value }))} /></Field>
+              <button className={buttonClass("primary")}>{copy.ddnsPage.saveConfig}</button>
             </form>
           </Modal>
         ) : null}
       </PageShell>
+      {dialogs.element}
     </div>
   );
 }

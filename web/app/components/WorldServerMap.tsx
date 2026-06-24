@@ -5,6 +5,7 @@ import { geoEquirectangular, geoPath } from "d3-geo";
 import { useMemo, useState } from "react";
 import { EmptyState, StatusBadge } from "@/app/components/M7Primitives";
 import worldCountries from "@/app/components/world-countries-110m.json";
+import { useI18n } from "@/lib/use-i18n";
 
 interface ServerLocationLike {
   source?: string | null;
@@ -99,13 +100,15 @@ const countryPaths: CountryPath[] = countryFeatures.map((feature) => {
 export function WorldServerMap<TServer extends MapServerLike>({
   servers,
   title,
-  detailLabel = "服务器",
+  detailLabel,
   ariaLabel,
   serverHref,
 }: WorldServerMapProps<TServer>) {
   const buckets = useMemo(() => buildRegionBuckets(servers), [servers]);
   const highlighted = useMemo(() => new Map(buckets.regions.filter((bucket) => bucket.point.countryCode).map((bucket) => [bucket.point.countryCode as string, bucket])), [buckets.regions]);
   const [tooltip, setTooltip] = useState<TooltipState<TServer> | null>(null);
+  const { t: copy } = useI18n();
+  const detail = detailLabel ?? copy.worldMap.serverUnit;
 
   return (
     <section className="mb-5 border-2 border-black bg-[var(--accent-bg)] p-4 shadow-[var(--shadow-brutal)]">
@@ -113,11 +116,14 @@ export function WorldServerMap<TServer extends MapServerLike>({
         <div>
           <h2 className="text-xl font-black uppercase">{title}</h2>
           <p className="mt-1 text-sm font-bold text-[var(--text-muted)]">
-            {buckets.regions.length} 个已识别地区 / {servers.length} 台{detailLabel}
+            {copy.worldMap.regionsSummary
+              .replace("{regions}", String(buckets.regions.length))
+              .replace("{servers}", String(servers.length))
+              .replace("{detail}", detail)}
           </p>
         </div>
         <span className="border-2 border-black bg-[var(--bg-card)] px-2 py-1 text-xs font-black shadow-[var(--shadow-brutal-sm)]">
-          {buckets.unmatched.length ? `${buckets.unmatched.length} 未识别` : "全部识别"}
+          {buckets.unmatched.length ? copy.worldMap.unmatchedCount.replace("{count}", String(buckets.unmatched.length)) : copy.worldMap.allIdentified}
         </span>
       </div>
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_18rem]">
@@ -162,7 +168,7 @@ export function WorldServerMap<TServer extends MapServerLike>({
                         x: entry.centroidX,
                         y: entry.centroidY,
                         label: bucket.point.label || entry.name,
-                        source: sourceLabel(bucket.point.source),
+                        source: sourceLabel(bucket.point.source, copy),
                         servers: bucket.servers,
                       });
                     }}
@@ -180,7 +186,7 @@ export function WorldServerMap<TServer extends MapServerLike>({
                 <div className="flex items-center justify-between gap-2">
                   <span className="min-w-0 truncate text-sm font-black">{bucket.point.label}</span>
                   <StatusBadge tone={bucket.servers.some((server) => server.status !== "online") ? "yellow" : "green"}>
-                    {bucket.servers.length} 台
+                    {copy.worldMap.serversCount.replace("{count}", String(bucket.servers.length))}
                   </StatusBadge>
                 </div>
                 <div className="mt-2 grid gap-1">
@@ -195,21 +201,21 @@ export function WorldServerMap<TServer extends MapServerLike>({
                       </span>
                     ),
                   )}
-                  {bucket.servers.length > 4 ? <span className="text-xs font-black text-[var(--text-muted)]">+{bucket.servers.length - 4} 台</span> : null}
+                  {bucket.servers.length > 4 ? <span className="text-xs font-black text-[var(--text-muted)]">{copy.worldMap.moreServers.replace("{count}", String(bucket.servers.length - 4))}</span> : null}
                 </div>
               </div>
             ))
           ) : (
-            <EmptyState title="暂无可识别地区" detail="GeoIP 或手动位置字段可用后会点亮地图。" />
+            <EmptyState title={copy.worldMap.emptyTitle} detail={copy.worldMap.emptyDetail} />
           )}
           {buckets.regions.length > 8 ? (
             <div className="border-2 border-black bg-[var(--bg-card)] px-3 py-2 text-xs font-black text-[var(--text-muted)] shadow-[var(--shadow-brutal-sm)]">
-              另有 {buckets.regions.length - 8} 个地区
+              {copy.worldMap.moreRegions.replace("{count}", String(buckets.regions.length - 8))}
             </div>
           ) : null}
           {buckets.unmatched.length ? (
             <div className="border-2 border-black bg-[var(--bg-card)] p-3 shadow-[var(--shadow-brutal-sm)]">
-              <div className="text-sm font-black">未识别</div>
+              <div className="text-sm font-black">{copy.worldMap.unmatchedTitle}</div>
               <div className="mt-2 flex flex-wrap gap-2">
                 {buckets.unmatched.slice(0, 8).map((server) => (
                   <span key={server.id} className="border-2 border-black bg-[var(--accent-bg)] px-2 py-1 text-[11px] font-black">
@@ -232,6 +238,7 @@ function MapTooltip<TServer extends MapServerLike>({
   tooltip: TooltipState<TServer>;
   serverHref?: (server: TServer) => string;
 }) {
+  const { t: copy } = useI18n();
   return (
     <div
       className="pointer-events-auto absolute z-20 hidden max-w-64 border-2 border-black bg-[var(--bg-card)] p-3 text-sm shadow-[var(--shadow-brutal-sm)] lg:block"
@@ -244,7 +251,7 @@ function MapTooltip<TServer extends MapServerLike>({
       <div className="min-w-44">
         <p className="break-words text-sm font-black">{tooltip.label}</p>
         <p className="mt-1 text-xs font-bold text-[var(--text-muted)]">
-          {tooltip.servers.length} 台服务器 · {tooltip.source}
+          {copy.worldMap.tooltipSummary.replace("{servers}", String(tooltip.servers.length)).replace("{source}", tooltip.source)}
         </p>
       </div>
       <div className="mt-2 grid max-h-48 gap-1 overflow-y-auto border-t-2 border-black pt-2">
@@ -375,10 +382,10 @@ function normalizeLocationKey(value?: string | null): string {
     .replace(/[\s_.]+/g, "-");
 }
 
-function sourceLabel(source: RegionPoint["source"]): string {
-  if (source === "manual") return "手动坐标";
+function sourceLabel(source: RegionPoint["source"], copy: ReturnType<typeof useI18n>["t"]): string {
+  if (source === "manual") return copy.worldMap.sourceManual;
   if (source === "geoip") return "GeoIP";
-  return "国家/地区";
+  return copy.worldMap.sourceCountry;
 }
 
 interface LocationCentroid {

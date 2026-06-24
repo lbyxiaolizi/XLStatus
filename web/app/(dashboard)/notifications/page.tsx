@@ -1,7 +1,6 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
-import Navigation from "@/app/components/Navigation";
 import {
   EmptyState,
   Field,
@@ -21,6 +20,9 @@ import {
   thClass,
 } from "@/app/components/M7Primitives";
 import { apiClient, type JsonObject, type TotpStatusResponse } from "@/lib/api";
+import { useDialogs } from "@/app/components/Dialogs";
+import { useI18n } from "@/lib/use-i18n";
+import type { Translations } from "@/lib/i18n";
 
 interface NotificationChannel {
   id: string;
@@ -68,38 +70,40 @@ type ModalState =
 const defaultBodyTemplate =
   '{"title":"{{title}}","message":"{{message}}","severity":"{{severity}}","timestamp":"{{timestamp}}"}';
 
-const fallbackProviders: NotificationProvider[] = [
-  {
-    id: "generic-json",
-    name: "通用 JSON Webhook",
-    request_method: "POST",
-    request_type: "json",
-    body_template: defaultBodyTemplate,
-  },
-  {
-    id: "generic-form",
-    name: "通用表单 Webhook",
-    request_method: "POST",
-    request_type: "form",
-    body_template:
-      "title={{title}}&message={{message}}&severity={{severity}}&timestamp={{timestamp}}",
-  },
-  {
-    id: "custom",
-    name: "自定义 Body",
-    request_method: "POST",
-    request_type: "custom",
-    body_template: "{{message}}",
-  },
-  {
-    id: "email-webhook",
-    name: "Email Webhook",
-    request_method: "POST",
-    request_type: "json",
-    body_template:
-      '{"subject":"{{title}}","text":"{{message}}\\n\\n{{timestamp}}","severity":"{{severity}}"}',
-  },
-];
+function fallbackProviders(copy: Translations): NotificationProvider[] {
+  return [
+    {
+      id: "generic-json",
+      name: copy.notificationsPage.providerGenericJson,
+      request_method: "POST",
+      request_type: "json",
+      body_template: defaultBodyTemplate,
+    },
+    {
+      id: "generic-form",
+      name: copy.notificationsPage.providerGenericForm,
+      request_method: "POST",
+      request_type: "form",
+      body_template:
+        "title={{title}}&message={{message}}&severity={{severity}}&timestamp={{timestamp}}",
+    },
+    {
+      id: "custom",
+      name: copy.notificationsPage.providerCustomBody,
+      request_method: "POST",
+      request_type: "custom",
+      body_template: "{{message}}",
+    },
+    {
+      id: "email-webhook",
+      name: "Email Webhook",
+      request_method: "POST",
+      request_type: "json",
+      body_template:
+        '{"subject":"{{title}}","text":"{{message}}\\n\\n{{timestamp}}","severity":"{{severity}}"}',
+    },
+  ];
+}
 
 const emptyNotificationForm = {
   name: "",
@@ -119,9 +123,12 @@ const emptyGroupForm = {
 const redactedSecret = "[redacted]";
 
 export default function NotificationsPage() {
+  const dialogs = useDialogs();
+  const { t: copy } = useI18n();
+  const defaultProviders = useMemo(() => fallbackProviders(copy), [copy]);
   const [notifications, setNotifications] = useState<NotificationChannel[]>([]);
   const [groups, setGroups] = useState<NotificationGroup[]>([]);
-  const [providers, setProviders] = useState<NotificationProvider[]>(fallbackProviders);
+  const [providers, setProviders] = useState<NotificationProvider[]>(defaultProviders);
   const [selectedMembers, setSelectedMembers] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -235,11 +242,11 @@ export default function NotificationsPage() {
       enabled = response.data.enabled;
     }
     if (!enabled) return undefined;
-    const code = window.prompt("请输入 6 位 TOTP 验证码");
+    const code = await dialogs.totp();
     if (code === null) return null;
     const trimmed = code.trim();
     if (!/^\d{6}$/.test(trimmed)) {
-      setError("请输入 6 位 TOTP 验证码。");
+      setError(copy.notificationsPage.totpInvalid);
       return null;
     }
     return trimmed;
@@ -273,7 +280,7 @@ export default function NotificationsPage() {
         : await apiClient.createNotification(payload, totpCode);
 
     if (response.success) {
-      setNotice(modal?.type === "notification" && modal.item ? "通知渠道已更新。" : "通知渠道已创建。");
+      setNotice(modal?.type === "notification" && modal.item ? copy.notificationsPage.channelUpdated : copy.notificationsPage.channelCreated);
       setModal(null);
       await load();
     } else {
@@ -293,7 +300,7 @@ export default function NotificationsPage() {
         : await apiClient.createNotificationGroup(payload, totpCode);
 
     if (response.success) {
-      setNotice(modal?.type === "group" && modal.item ? "通知组已更新。" : "通知组已创建。");
+      setNotice(modal?.type === "group" && modal.item ? copy.notificationsPage.groupUpdated : copy.notificationsPage.groupCreated);
       setModal(null);
       await load();
     } else {
@@ -307,20 +314,20 @@ export default function NotificationsPage() {
     if (totpCode === null) return;
     const response = await apiClient.testNotification(item.id, totpCode);
     if (response.success) {
-      setNotice(`测试通知已发送：${item.name}`);
+      setNotice(copy.notificationsPage.testSent.replace("{name}", String(item.name)));
     } else {
       setError(responseError(response));
     }
   }
 
   async function deleteNotification(item: NotificationChannel) {
-    if (!confirm(`确定删除通知渠道「${item.name}」？`)) return;
+    if (!(await dialogs.confirm({ message: copy.notificationsPage.deleteChannelConfirm.replace("{name}", String(item.name)), danger: true }))) return;
     setError(null);
     const totpCode = await sensitiveTotpCode();
     if (totpCode === null) return;
     const response = await apiClient.deleteNotification(item.id, totpCode);
     if (response.success) {
-      setNotice("通知渠道已删除。");
+      setNotice(copy.notificationsPage.channelDeleted);
       await load();
     } else {
       setError(responseError(response));
@@ -328,13 +335,13 @@ export default function NotificationsPage() {
   }
 
   async function deleteGroup(item: NotificationGroup) {
-    if (!confirm(`确定删除通知组「${item.name}」？`)) return;
+    if (!(await dialogs.confirm({ message: copy.notificationsPage.deleteGroupConfirm.replace("{name}", String(item.name)), danger: true }))) return;
     setError(null);
     const totpCode = await sensitiveTotpCode();
     if (totpCode === null) return;
     const response = await apiClient.deleteNotificationGroup(item.id, totpCode);
     if (response.success) {
-      setNotice("通知组已删除。");
+      setNotice(copy.notificationsPage.groupDeleted);
       await load();
     } else {
       setError(responseError(response));
@@ -350,7 +357,7 @@ export default function NotificationsPage() {
     const response = await apiClient.addNotificationGroupMember(group.id, notificationId, totpCode);
     if (response.success) {
       const notification = notificationById.get(notificationId);
-      setNotice(`已加入通知组：${notification?.name || notificationId}`);
+      setNotice(copy.notificationsPage.memberAdded.replace("{name}", String(notification?.name || notificationId)));
       setSelectedMembers((current) => ({ ...current, [group.id]: "" }));
       await load();
     } else {
@@ -364,7 +371,7 @@ export default function NotificationsPage() {
     if (totpCode === null) return;
     const response = await apiClient.deleteNotificationGroupMember(group.id, member.id, totpCode);
     if (response.success) {
-      setNotice(`已移出通知组：${member.name}`);
+      setNotice(copy.notificationsPage.memberRemoved.replace("{name}", String(member.name)));
       await load();
     } else {
       setError(responseError(response));
@@ -372,23 +379,22 @@ export default function NotificationsPage() {
   }
 
   return (
-    <div className="min-h-screen">
-      <Navigation />
+    <div>
       <PageShell>
         <PageHeader
           eyebrow="Webhook"
-          title="通知"
-          detail="通知渠道、模板和分组。"
+          title={copy.notificationsPage.title}
+          detail={copy.notificationsPage.detail}
           actions={
             <>
               <button type="button" className={buttonClass("secondary")} onClick={() => void load()}>
-                刷新
+                {copy.notificationsPage.refresh}
               </button>
               <button type="button" className={buttonClass("secondary")} onClick={openCreateGroup}>
-                新增通知组
+                {copy.notificationsPage.addGroup}
               </button>
               <button type="button" className={buttonClass("primary")} onClick={openCreateNotification}>
-                新增渠道
+                {copy.notificationsPage.addChannel}
               </button>
             </>
           }
@@ -402,22 +408,22 @@ export default function NotificationsPage() {
         <div className="grid gap-6 xl:grid-cols-[minmax(0,1.1fr)_minmax(340px,0.9fr)]">
           <section>
             <div className="mb-3 flex items-center justify-between gap-3">
-              <h2 className="text-xl font-black uppercase">渠道</h2>
+              <h2 className="text-xl font-black uppercase">{copy.notificationsPage.channels}</h2>
               <StatusBadge tone="blue">{notifications.length}</StatusBadge>
             </div>
             {notifications.length === 0 ? (
-              <EmptyState title="暂无通知渠道" />
+              <EmptyState title={copy.notificationsPage.noChannels} />
             ) : (
               <div className="overflow-x-auto border-2 border-black bg-[var(--bg-card)] shadow-[var(--shadow-brutal)]">
                 <table className="w-full min-w-[760px]">
                   <thead>
                     <tr>
-                      <th className={thClass}>名称</th>
-                      <th className={thClass}>类型</th>
+                      <th className={thClass}>{copy.notificationsPage.colName}</th>
+                      <th className={thClass}>{copy.notificationsPage.colType}</th>
                       <th className={thClass}>URL</th>
-                      <th className={thClass}>TLS</th>
-                      <th className={thClass}>更新</th>
-                      <th className={thClass}>操作</th>
+                      <th className={thClass}>{copy.notificationsPage.colTls}</th>
+                      <th className={thClass}>{copy.notificationsPage.colUpdated}</th>
+                      <th className={thClass}>{copy.notificationsPage.colActions}</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -435,20 +441,20 @@ export default function NotificationsPage() {
                         </td>
                         <td className={tdClass}>
                           <StatusBadge tone={item.verify_tls === false ? "yellow" : "green"}>
-                            {item.verify_tls === false ? "跳过" : "校验"}
+                            {item.verify_tls === false ? copy.notificationsPage.tlsSkip : copy.notificationsPage.tlsVerify}
                           </StatusBadge>
                         </td>
                         <td className={tdClass}>{formatDate(item.updated_at || item.created_at)}</td>
                         <td className={`${tdClass} min-w-[220px]`}>
                           <div className="flex flex-wrap gap-2">
                             <button type="button" className={buttonClass("secondary")} onClick={() => void testNotification(item)}>
-                              测试
+                              {copy.notificationsPage.test}
                             </button>
                             <button type="button" className={buttonClass("secondary")} onClick={() => openEditNotification(item)}>
-                              编辑
+                              {copy.notificationsPage.edit}
                             </button>
                             <button type="button" className={buttonClass("danger")} onClick={() => void deleteNotification(item)}>
-                              删除
+                              {copy.notificationsPage.delete}
                             </button>
                           </div>
                         </td>
@@ -462,11 +468,11 @@ export default function NotificationsPage() {
 
           <section>
             <div className="mb-3 flex items-center justify-between gap-3">
-              <h2 className="text-xl font-black uppercase">通知组</h2>
+              <h2 className="text-xl font-black uppercase">{copy.notificationsPage.groups}</h2>
               <StatusBadge tone="pink">{groups.length}</StatusBadge>
             </div>
             {groups.length === 0 ? (
-              <EmptyState title="暂无通知组" />
+              <EmptyState title={copy.notificationsPage.noGroups} />
             ) : (
               <div className="grid gap-4">
                 {groups.map((group) => {
@@ -479,15 +485,15 @@ export default function NotificationsPage() {
                         <div className="min-w-0">
                           <h3 className="break-words text-lg font-black text-[var(--text-main)]">{group.name}</h3>
                           <p className="mt-1 text-xs font-black uppercase text-[var(--text-muted)]">
-                            {members.length} 个渠道 / {formatDate(group.updated_at || group.created_at)}
+                            {members.length} {copy.notificationsPage.channelCountSuffix} / {formatDate(group.updated_at || group.created_at)}
                           </p>
                         </div>
                         <div className="flex flex-wrap gap-2">
                           <button type="button" className={buttonClass("secondary")} onClick={() => openEditGroup(group)}>
-                            编辑
+                            {copy.notificationsPage.edit}
                           </button>
                           <button type="button" className={buttonClass("danger")} onClick={() => void deleteGroup(group)}>
-                            删除
+                            {copy.notificationsPage.delete}
                           </button>
                         </div>
                       </div>
@@ -495,7 +501,7 @@ export default function NotificationsPage() {
                       <div className="mt-4 grid gap-2">
                         {members.length === 0 ? (
                           <div className="border-2 border-black bg-[var(--accent-bg)] px-3 py-3 text-sm font-black">
-                            暂无成员
+                            {copy.notificationsPage.noMembers}
                           </div>
                         ) : (
                           members.map((member) => (
@@ -505,7 +511,7 @@ export default function NotificationsPage() {
                                 <p className="break-all text-xs font-bold text-[var(--text-muted)]">{member.url || member.id}</p>
                               </div>
                               <button type="button" className={buttonClass("secondary")} onClick={() => void removeMember(group, member)}>
-                                移出
+                                {copy.notificationsPage.removeMember}
                               </button>
                             </div>
                           ))
@@ -523,7 +529,7 @@ export default function NotificationsPage() {
                             }))
                           }
                         >
-                          <option value="">选择渠道</option>
+                          <option value="">{copy.notificationsPage.selectChannel}</option>
                           {candidates.map((item) => (
                             <option key={item.id} value={item.id}>
                               {item.name}
@@ -536,7 +542,7 @@ export default function NotificationsPage() {
                           disabled={!selectedMembers[group.id] || candidates.length === 0}
                           onClick={() => void addMember(group)}
                         >
-                          加入
+                          {copy.notificationsPage.join}
                         </button>
                       </div>
                     </article>
@@ -548,15 +554,15 @@ export default function NotificationsPage() {
         </div>
 
         {modal?.type === "notification" ? (
-          <Modal title={modal.item ? "编辑通知渠道" : "新增通知渠道"} onClose={() => setModal(null)}>
+          <Modal title={modal.item ? copy.notificationsPage.editChannel : copy.notificationsPage.createChannel} onClose={() => setModal(null)}>
             <form onSubmit={submitNotification} className="space-y-4">
               <div className="grid gap-4 sm:grid-cols-2">
-                <Field label="名称">
+                <Field label={copy.notificationsPage.fieldName}>
                   <input className={inputClass} value={notificationForm.name} onChange={(event) => setNotificationForm((form) => ({ ...form, name: event.target.value }))} required />
                 </Field>
-                <Field label="Provider">
+                <Field label={copy.notificationsPage.fieldProvider}>
                   <select className={selectClass} onChange={(event) => applyProvider(event.target.value)} defaultValue="">
-                    <option value="">保持当前模板</option>
+                    <option value="">{copy.notificationsPage.keepCurrentTemplate}</option>
                     {providers.map((provider) => (
                       <option key={provider.id} value={provider.id}>
                         {provider.name}
@@ -565,11 +571,11 @@ export default function NotificationsPage() {
                   </select>
                 </Field>
               </div>
-              <Field label="URL">
+              <Field label={copy.notificationsPage.fieldUrl}>
                 <input className={inputClass} value={notificationForm.url} onChange={(event) => setNotificationForm((form) => ({ ...form, url: event.target.value }))} required />
               </Field>
               <div className="grid gap-4 sm:grid-cols-2">
-                <Field label="Method">
+                <Field label={copy.notificationsPage.fieldMethod}>
                   <select className={selectClass} value={notificationForm.request_method} onChange={(event) => setNotificationForm((form) => ({ ...form, request_method: event.target.value }))}>
                     <option value="POST">POST</option>
                     <option value="GET">GET</option>
@@ -577,7 +583,7 @@ export default function NotificationsPage() {
                     <option value="PATCH">PATCH</option>
                   </select>
                 </Field>
-                <Field label="Type">
+                <Field label={copy.notificationsPage.fieldType}>
                   <select className={selectClass} value={notificationForm.request_type} onChange={(event) => setNotificationForm((form) => ({ ...form, request_type: event.target.value }))}>
                     <option value="json">json</option>
                     <option value="form">form</option>
@@ -585,42 +591,43 @@ export default function NotificationsPage() {
                   </select>
                 </Field>
               </div>
-              <Field label="Headers JSON">
+              <Field label={copy.notificationsPage.fieldHeadersJson}>
                 <textarea className={`${textareaClass} min-h-24`} value={notificationForm.headers_json} onChange={(event) => setNotificationForm((form) => ({ ...form, headers_json: event.target.value }))} spellCheck={false} />
               </Field>
-              <Field label="Body Template">
+              <Field label={copy.notificationsPage.fieldBodyTemplate}>
                 <textarea className={`${textareaClass} min-h-32`} value={notificationForm.body_template} onChange={(event) => setNotificationForm((form) => ({ ...form, body_template: event.target.value }))} spellCheck={false} />
               </Field>
               <div className="grid gap-3 sm:grid-cols-2">
                 <label className="flex items-center gap-3 border-2 border-black bg-[var(--bg-card)] px-3 py-3 text-sm font-black shadow-[var(--shadow-brutal-sm)]">
                   <input type="checkbox" checked={notificationForm.verify_tls} onChange={(event) => setNotificationForm((form) => ({ ...form, verify_tls: event.target.checked }))} />
-                  TLS 证书校验
+                  {copy.notificationsPage.verifyTlsCert}
                 </label>
                 <label className="flex items-center gap-3 border-2 border-black bg-[var(--bg-card)] px-3 py-3 text-sm font-black shadow-[var(--shadow-brutal-sm)]">
                   <input type="checkbox" checked={notificationForm.format_metric_units} onChange={(event) => setNotificationForm((form) => ({ ...form, format_metric_units: event.target.checked }))} />
-                  格式化指标单位
+                  {copy.notificationsPage.formatMetricUnits}
                 </label>
               </div>
               <button type="submit" className={buttonClass("primary")}>
-                保存渠道
+                {copy.notificationsPage.saveChannel}
               </button>
             </form>
           </Modal>
         ) : null}
 
         {modal?.type === "group" ? (
-          <Modal title={modal.item ? "编辑通知组" : "新增通知组"} onClose={() => setModal(null)}>
+          <Modal title={modal.item ? copy.notificationsPage.editGroup : copy.notificationsPage.createGroup} onClose={() => setModal(null)}>
             <form onSubmit={submitGroup} className="space-y-4">
-              <Field label="名称">
+              <Field label={copy.notificationsPage.fieldName}>
                 <input className={inputClass} value={groupForm.name} onChange={(event) => setGroupForm({ name: event.target.value })} required />
               </Field>
               <button type="submit" className={buttonClass("primary")}>
-                保存通知组
+                {copy.notificationsPage.saveGroup}
               </button>
             </form>
           </Modal>
         ) : null}
       </PageShell>
+      {dialogs.element}
     </div>
   );
 }

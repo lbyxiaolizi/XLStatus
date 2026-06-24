@@ -4,12 +4,23 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { apiClient } from "@/lib/api";
-import { BrutalCard, InlineError, InlineNotice, buttonClass, responseError } from "@/app/components/M7Primitives";
+import {
+  BrutalCard,
+  InlineError,
+  InlineNotice,
+  buttonClass,
+  responseError,
+  setStoredUser,
+  type StoredUser,
+} from "@/app/components/M7Primitives";
+import { sanitizeReturnTo } from "@/app/lib/format";
+import { useI18n } from "@/lib/use-i18n";
 
 export default function OAuthCallbackPage() {
   const router = useRouter();
+  const { t: copy } = useI18n();
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState("正在完成 OAuth 登录...");
+  const [notice, setNotice] = useState(copy.loginPage.oauthCompleting);
 
   useEffect(() => {
     let cancelled = false;
@@ -20,7 +31,7 @@ export default function OAuthCallbackPage() {
       if (status !== "success") {
         if (!cancelled) {
           setNotice("");
-          setError(params.get("message") || "OAuth 登录失败。");
+          setError(params.get("message") || copy.loginPage.oauthFailed);
         }
         return;
       }
@@ -28,8 +39,7 @@ export default function OAuthCallbackPage() {
       const response = await apiClient.getProfile();
       if (cancelled) return;
       if (response.success && response.data) {
-        localStorage.removeItem("session_token");
-        localStorage.setItem("user", JSON.stringify(response.data));
+        setStoredUser(response.data as unknown as StoredUser);
         router.replace(returnTo);
         return;
       }
@@ -41,7 +51,7 @@ export default function OAuthCallbackPage() {
     return () => {
       cancelled = true;
     };
-  }, [router]);
+  }, [router, copy]);
 
   return (
     <main className="flex min-h-screen items-center justify-center px-4 py-10">
@@ -52,28 +62,11 @@ export default function OAuthCallbackPage() {
           <InlineError message={error} />
           {error ? (
             <Link href="/login" className={`${buttonClass("primary")} mt-5 w-full text-center`}>
-              返回登录
+              {copy.loginPage.backToLogin}
             </Link>
           ) : null}
         </BrutalCard>
       </div>
     </main>
   );
-}
-
-function sanitizeReturnTo(value: string | null): string {
-  if (
-    !value ||
-    !value.startsWith("/") ||
-    value.startsWith("//") ||
-    value.includes("\\") ||
-    hasControlCharacter(value)
-  ) {
-    return "/dashboard";
-  }
-  return value;
-}
-
-function hasControlCharacter(value: string): boolean {
-  return /[\u0000-\u001f\u007f]/.test(value);
 }

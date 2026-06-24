@@ -856,10 +856,11 @@ class ApiClient {
     limit = 50,
     offset = 0,
     anonymous = false,
+    options?: { signal?: AbortSignal },
   ): Promise<ApiResponse<ServerListResponse>> {
     return this.request<ServerListResponse>(
       `/api/v1/servers?limit=${limit}&offset=${offset}`,
-      { anonymous },
+      { anonymous, signal: options?.signal },
     );
   }
 
@@ -1135,16 +1136,20 @@ class ApiClient {
     );
   }
 
-  async getPublicStatus(): Promise<ApiResponse<PublicStatusResponse>> {
+  async getPublicStatus(options?: { signal?: AbortSignal }): Promise<ApiResponse<PublicStatusResponse>> {
     return this.request<PublicStatusResponse>("/api/v1/public/status", {
       anonymous: true,
+      signal: options?.signal,
     });
   }
 
-  async getPublicServer(id: string): Promise<ApiResponse<JsonObject>> {
+  async getPublicServer(
+    id: string,
+    options?: { signal?: AbortSignal },
+  ): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
       `/api/v1/public/servers/${encodeURIComponent(id)}`,
-      { anonymous: true },
+      { anonymous: true, signal: options?.signal },
     );
   }
 
@@ -1788,7 +1793,12 @@ function parseJson(text: string): unknown {
 }
 
 function normalizeEnvelope<T>(payload: unknown, status: number): ApiResponse<T> {
-  if (!payload || typeof payload !== "object") {
+  // Bare values (null/primitive) and bare arrays are the data themselves — they
+  // have no { success, data } envelope. Without the Array branch, list
+  // endpoints that return a top-level array (e.g. listPats → PatInfo[]) fell
+  // through to `obj.data`, which is undefined for an array, silently producing
+  // empty lists.
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     return {
       success: status >= 200 && status < 300,
       data: payload as T,

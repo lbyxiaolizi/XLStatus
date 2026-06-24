@@ -4,25 +4,36 @@ import Link from "next/link";
 import { FormEvent, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { apiClient, type OAuthProvider } from "@/lib/api";
-import { BrutalCard, Field, InlineError, buttonClass, inputClass, responseError } from "@/app/components/M7Primitives";
+import {
+  BrutalCard,
+  Field,
+  InlineError,
+  buttonClass,
+  inputClass,
+  responseError,
+  setStoredUser,
+  type StoredUser,
+} from "@/app/components/M7Primitives";
+import { sanitizeReturnTo } from "@/app/lib/format";
+import { useI18n } from "@/lib/use-i18n";
 
 export default function LoginPage() {
   const router = useRouter();
+  const { t: copy } = useI18n();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [totpCode, setTotpCode] = useState("");
   const [mfaRequired, setMfaRequired] = useState(false);
   const [oauthProviders, setOauthProviders] = useState<OAuthProvider[]>([]);
-  const [returnTo, setReturnTo] = useState("/dashboard");
+  // Read return_to synchronously on first client render (no setTimeout(0)
+  // deferral, which left a tick where returnTo was the stale /dashboard).
+  const [returnTo] = useState(() =>
+    typeof window === "undefined"
+      ? "/dashboard"
+      : sanitizeReturnTo(new URLSearchParams(window.location.search).get("return_to")),
+  );
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-
-  useEffect(() => {
-    const timeoutId = window.setTimeout(() => {
-      setReturnTo(sanitizeReturnTo(new URLSearchParams(window.location.search).get("return_to")));
-    }, 0);
-    return () => window.clearTimeout(timeoutId);
-  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -54,8 +65,7 @@ export default function LoginPage() {
         return;
       }
       if (data.user) {
-        localStorage.removeItem("session_token");
-        localStorage.setItem("user", JSON.stringify(data.user));
+        setStoredUser(data.user as StoredUser);
         router.push(returnTo);
         return;
       }
@@ -68,22 +78,22 @@ export default function LoginPage() {
     <main className="flex min-h-screen items-center justify-center px-4 py-10">
       <div className="w-full max-w-md">
         <Link href="/status" className="mb-6 inline-block border-2 border-black bg-[var(--bg-card)] px-3 py-2 text-xs font-black uppercase shadow-[var(--shadow-brutal-sm)]">
-          返回状态页
+          {copy.loginPage.backToStatus}
         </Link>
         <BrutalCard className="p-6 sm:p-8" accent>
           <div className="mb-8">
             <p className="mb-2 inline-block border-2 border-black bg-white px-3 py-1 text-xs font-black uppercase shadow-[var(--shadow-brutal-sm)]">
-              管理员入口
+              {copy.loginPage.adminEntry}
             </p>
             <h1 className="text-5xl font-black uppercase tracking-tight">XLStatus</h1>
             <p className="mt-2 text-sm font-bold text-[var(--text-muted)]">
-              登录后管理服务器、服务、任务和远程运维能力。
+              {copy.loginPage.tagline}
             </p>
           </div>
 
           <form onSubmit={handleSubmit} className="space-y-5">
             <InlineError message={error} />
-            <Field label="用户名">
+            <Field label={copy.loginPage.username}>
               <input
                 value={username}
                 onChange={(event) => setUsername(event.target.value)}
@@ -93,7 +103,7 @@ export default function LoginPage() {
                 placeholder="admin"
               />
             </Field>
-            <Field label="密码">
+            <Field label={copy.loginPage.password}>
               <input
                 type="password"
                 value={password}
@@ -105,11 +115,11 @@ export default function LoginPage() {
                 required
                 autoComplete="current-password"
                 className={inputClass}
-                placeholder="请输入密码"
+                placeholder={copy.loginPage.passwordPlaceholder}
               />
             </Field>
             {mfaRequired ? (
-              <Field label="两步验证码">
+              <Field label={copy.loginPage.totpLabel}>
                 <input
                   value={totpCode}
                   onChange={(event) => setTotpCode(event.target.value.replace(/\D/g, "").slice(0, 6))}
@@ -122,7 +132,7 @@ export default function LoginPage() {
               </Field>
             ) : null}
             <button type="submit" disabled={loading} className={`${buttonClass("primary")} w-full`}>
-              {loading ? "正在登录..." : mfaRequired ? "验证并登录" : "登录"}
+              {loading ? copy.loginPage.loggingIn : mfaRequired ? copy.loginPage.verifyAndLogin : copy.common.login}
             </button>
           </form>
           {oauthProviders.length > 0 ? (
@@ -133,7 +143,7 @@ export default function LoginPage() {
                   className={`${buttonClass("secondary")} text-center`}
                   href={apiClient.getOAuthLoginUrl(provider.id, returnTo)}
                 >
-                  使用 {provider.display_name} 登录
+                  {copy.loginPage.loginWith.replace("{provider}", provider.display_name)}
                 </a>
               ))}
             </div>
@@ -142,18 +152,4 @@ export default function LoginPage() {
       </div>
     </main>
   );
-}
-
-function sanitizeReturnTo(value: string | null): string {
-  if (
-    !value ||
-    !value.startsWith("/") ||
-    value.startsWith("//") ||
-    value.includes("\\") ||
-    /[\u0000-\u001f\u007f]/.test(value) ||
-    value.startsWith("/login")
-  ) {
-    return "/dashboard";
-  }
-  return value;
 }

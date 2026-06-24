@@ -1,7 +1,6 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useState } from "react";
-import Navigation from "@/app/components/Navigation";
 import {
   EmptyState,
   Field,
@@ -19,6 +18,8 @@ import {
   thClass,
 } from "@/app/components/M7Primitives";
 import { apiClient, type JsonObject, type NatMapping, type TotpStatusResponse } from "@/lib/api";
+import { useDialogs } from "@/app/components/Dialogs";
+import { useI18n } from "@/lib/use-i18n";
 
 interface Server {
   id: string;
@@ -27,6 +28,8 @@ interface Server {
 }
 
 export default function NatPage() {
+  const dialogs = useDialogs();
+  const { t: copy } = useI18n();
   const [mappings, setMappings] = useState<NatMapping[]>([]);
   const [servers, setServers] = useState<Server[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -76,7 +79,7 @@ export default function NatPage() {
     if (totpCode === null) return;
     const response = await apiClient.createNatMapping(payload, totpCode);
     if (response.success) {
-      setNotice("NAT 映射已创建。");
+      setNotice(copy.natPage.mappingCreated);
       setModal(false);
       await load();
     } else {
@@ -85,12 +88,12 @@ export default function NatPage() {
   }
 
   async function deleteMapping(mapping: NatMapping) {
-    if (!confirm(`确定删除 NAT 映射「${mapping.description || mapping.id}」？`)) return;
+    if (!(await dialogs.confirm({ message: copy.natPage.deleteMappingConfirm.replace("{name}", String(mapping.description || mapping.id)), danger: true }))) return;
     const totpCode = await sensitiveTotpCode();
     if (totpCode === null) return;
     const response = await apiClient.deleteNatMapping(mapping.id, totpCode);
     if (response.success) {
-      setNotice("NAT 映射已删除。");
+      setNotice(copy.natPage.mappingDeleted);
       await load();
     } else {
       setError(responseError(response));
@@ -109,25 +112,24 @@ export default function NatPage() {
       enabled = response.data.enabled;
     }
     if (!enabled) return undefined;
-    const code = window.prompt("请输入 6 位 TOTP 验证码");
+    const code = await dialogs.totp();
     if (code === null) return null;
     const trimmed = code.trim();
     if (!/^\d{6}$/.test(trimmed)) {
-      setError("请输入 6 位 TOTP 验证码。");
+      setError(copy.natPage.invalidTotp);
       return null;
     }
     return trimmed;
   }
 
   return (
-    <div className="min-h-screen">
-      <Navigation />
+    <div>
       <PageShell>
         <PageHeader
-          eyebrow="网络"
-          title="NAT"
-          detail="Agent loopback 端口映射与远程访问配置。"
-          actions={<button className={buttonClass("primary")} onClick={() => setModal(true)}>新增映射</button>}
+          eyebrow={copy.natPage.eyebrow}
+          title={copy.natPage.title}
+          detail={copy.natPage.detail}
+          actions={<button className={buttonClass("primary")} onClick={() => setModal(true)}>{copy.natPage.addMapping}</button>}
         />
         <div className="mb-5 space-y-3">
           <InlineError message={error} />
@@ -135,12 +137,12 @@ export default function NatPage() {
         </div>
 
         {mappings.length === 0 ? (
-          <EmptyState title="暂无 NAT 映射" detail="创建映射后即可通过隧道暴露 Agent 本机 loopback 目标。" />
+          <EmptyState title={copy.natPage.emptyTitle} detail={copy.natPage.emptyDetail} />
         ) : (
           <div className="overflow-x-auto border-2 border-black bg-[var(--bg-card)] shadow-[var(--shadow-brutal)]">
             <table className="w-full">
               <thead>
-                <tr><th className={thClass}>描述</th><th className={thClass}>Agent</th><th className={thClass}>公网</th><th className={thClass}>本地</th><th className={thClass}>策略</th><th className={thClass}>状态</th><th className={thClass}>操作</th></tr>
+                <tr><th className={thClass}>{copy.natPage.colDescription}</th><th className={thClass}>{copy.natPage.colAgent}</th><th className={thClass}>{copy.natPage.colPublic}</th><th className={thClass}>{copy.natPage.colLocal}</th><th className={thClass}>{copy.natPage.colPolicy}</th><th className={thClass}>{copy.natPage.colStatus}</th><th className={thClass}>{copy.natPage.colActions}</th></tr>
               </thead>
               <tbody>
                 {mappings.map((mapping) => (
@@ -151,18 +153,18 @@ export default function NatPage() {
                     <td className={tdClass}>{mapping.local_host}:{mapping.local_port}</td>
                     <td className={tdClass}>
                       <div className="space-y-1 text-xs font-bold">
-                        <div className="break-all">来源：{mapping.allowed_sources || "全局策略"}</div>
-                        <div>并发：{mapping.max_active_tunnels ?? "全局上限"}</div>
-                        <div>空闲：{mapping.idle_timeout_seconds ? `${mapping.idle_timeout_seconds}s` : "未限制"}</div>
-                        <div>流量：{mapping.max_bytes_per_tunnel ? `${mapping.max_bytes_per_tunnel} bytes` : "未限制"}</div>
-                        <div>带宽：{mapping.max_bandwidth_bytes_per_second ? `${mapping.max_bandwidth_bytes_per_second} B/s` : "未限制"}</div>
-                        <div>窗口：{mapping.rate_limit_window_seconds ? `${mapping.rate_limit_window_seconds}s` : "默认/未启用"}</div>
-                        <div>窗口连接：{mapping.max_connections_per_window ?? "未限制"}</div>
-                        <div>窗口流量：{mapping.max_bytes_per_window ? `${mapping.max_bytes_per_window} bytes` : "未限制"}</div>
+                        <div className="break-all">{copy.natPage.policySource}{mapping.allowed_sources || copy.natPage.policyGlobalPolicy}</div>
+                        <div>{copy.natPage.policyConcurrency}{mapping.max_active_tunnels ?? copy.natPage.policyGlobalLimit}</div>
+                        <div>{copy.natPage.policyIdle}{mapping.idle_timeout_seconds ? `${mapping.idle_timeout_seconds}s` : copy.natPage.policyUnlimited}</div>
+                        <div>{copy.natPage.policyTraffic}{mapping.max_bytes_per_tunnel ? `${mapping.max_bytes_per_tunnel} bytes` : copy.natPage.policyUnlimited}</div>
+                        <div>{copy.natPage.policyBandwidth}{mapping.max_bandwidth_bytes_per_second ? `${mapping.max_bandwidth_bytes_per_second} B/s` : copy.natPage.policyUnlimited}</div>
+                        <div>{copy.natPage.policyWindow}{mapping.rate_limit_window_seconds ? `${mapping.rate_limit_window_seconds}s` : copy.natPage.policyDefaultDisabled}</div>
+                        <div>{copy.natPage.policyWindowConnections}{mapping.max_connections_per_window ?? copy.natPage.policyUnlimited}</div>
+                        <div>{copy.natPage.policyWindowTraffic}{mapping.max_bytes_per_window ? `${mapping.max_bytes_per_window} bytes` : copy.natPage.policyUnlimited}</div>
                       </div>
                     </td>
-                    <td className={tdClass}><StatusBadge tone={mapping.enabled === false ? "gray" : "green"}>{mapping.enabled === false ? "停用" : "启用"}</StatusBadge></td>
-                    <td className={tdClass}><button className={buttonClass("danger")} onClick={() => void deleteMapping(mapping)}>删除</button></td>
+                    <td className={tdClass}><StatusBadge tone={mapping.enabled === false ? "gray" : "green"}>{mapping.enabled === false ? copy.natPage.disabled : copy.natPage.enabled}</StatusBadge></td>
+                    <td className={tdClass}><button className={buttonClass("danger")} onClick={() => void deleteMapping(mapping)}>{copy.natPage.delete}</button></td>
                   </tr>
                 ))}
               </tbody>
@@ -171,37 +173,38 @@ export default function NatPage() {
         )}
 
         {modal ? (
-          <Modal title="新增 NAT 映射" onClose={() => setModal(false)}>
+          <Modal title={copy.natPage.modalTitle} onClose={() => setModal(false)}>
             <form onSubmit={submit} className="space-y-4">
               <div className="grid gap-4 sm:grid-cols-2">
-                <Field label="Agent"><select className={selectClass} value={form.agent_id} onChange={(e) => setForm((f) => ({ ...f, agent_id: e.target.value }))}>{servers.map((server) => <option key={server.id} value={server.id}>{server.name}</option>)}</select></Field>
-                <Field label="描述"><input className={inputClass} value={form.description} onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))} /></Field>
+                <Field label={copy.natPage.fieldAgent}><select className={selectClass} value={form.agent_id} onChange={(e) => setForm((f) => ({ ...f, agent_id: e.target.value }))}>{servers.map((server) => <option key={server.id} value={server.id}>{server.name}</option>)}</select></Field>
+                <Field label={copy.natPage.fieldDescription}><input className={inputClass} value={form.description} onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))} /></Field>
               </div>
               <div className="grid gap-4 sm:grid-cols-3">
-                <Field label="协议"><select className={selectClass} value={form.protocol} onChange={(e) => setForm((f) => ({ ...f, protocol: e.target.value }))}><option value="tcp">tcp</option><option value="udp">udp</option></select></Field>
-                <Field label="公网端口"><input className={inputClass} value={form.public_port} onChange={(e) => setForm((f) => ({ ...f, public_port: e.target.value }))} /></Field>
-                <Field label="本地主机"><input className={inputClass} value={form.local_host} onChange={(e) => setForm((f) => ({ ...f, local_host: e.target.value }))} placeholder="127.0.0.1" /></Field>
+                <Field label={copy.natPage.fieldProtocol}><select className={selectClass} value={form.protocol} onChange={(e) => setForm((f) => ({ ...f, protocol: e.target.value }))}><option value="tcp">tcp</option><option value="udp">udp</option></select></Field>
+                <Field label={copy.natPage.fieldPublicPort}><input className={inputClass} value={form.public_port} onChange={(e) => setForm((f) => ({ ...f, public_port: e.target.value }))} /></Field>
+                <Field label={copy.natPage.fieldLocalHost}><input className={inputClass} value={form.local_host} onChange={(e) => setForm((f) => ({ ...f, local_host: e.target.value }))} placeholder="127.0.0.1" /></Field>
               </div>
               <div className="grid gap-4 sm:grid-cols-3">
-                <Field label="本地端口"><input className={inputClass} value={form.local_port} onChange={(e) => setForm((f) => ({ ...f, local_port: e.target.value }))} /></Field>
-                <Field label="来源 CIDR"><input className={inputClass} value={form.allowed_sources} onChange={(e) => setForm((f) => ({ ...f, allowed_sources: e.target.value }))} placeholder="203.0.113.0/24" /></Field>
-                <Field label="最大并发"><input className={inputClass} value={form.max_active_tunnels} onChange={(e) => setForm((f) => ({ ...f, max_active_tunnels: e.target.value }))} placeholder="2" /></Field>
+                <Field label={copy.natPage.fieldLocalPort}><input className={inputClass} value={form.local_port} onChange={(e) => setForm((f) => ({ ...f, local_port: e.target.value }))} /></Field>
+                <Field label={copy.natPage.fieldSourceCidr}><input className={inputClass} value={form.allowed_sources} onChange={(e) => setForm((f) => ({ ...f, allowed_sources: e.target.value }))} placeholder="203.0.113.0/24" /></Field>
+                <Field label={copy.natPage.fieldMaxConcurrent}><input className={inputClass} value={form.max_active_tunnels} onChange={(e) => setForm((f) => ({ ...f, max_active_tunnels: e.target.value }))} placeholder="2" /></Field>
               </div>
               <div className="grid gap-4 sm:grid-cols-3">
-                <Field label="空闲超时秒"><input className={inputClass} value={form.idle_timeout_seconds} onChange={(e) => setForm((f) => ({ ...f, idle_timeout_seconds: e.target.value }))} placeholder="300" /></Field>
-                <Field label="每隧道字节上限"><input className={inputClass} value={form.max_bytes_per_tunnel} onChange={(e) => setForm((f) => ({ ...f, max_bytes_per_tunnel: e.target.value }))} placeholder="104857600" /></Field>
-                <Field label="带宽 B/s"><input className={inputClass} value={form.max_bandwidth_bytes_per_second} onChange={(e) => setForm((f) => ({ ...f, max_bandwidth_bytes_per_second: e.target.value }))} placeholder="1048576" /></Field>
+                <Field label={copy.natPage.fieldIdleTimeoutSeconds}><input className={inputClass} value={form.idle_timeout_seconds} onChange={(e) => setForm((f) => ({ ...f, idle_timeout_seconds: e.target.value }))} placeholder="300" /></Field>
+                <Field label={copy.natPage.fieldMaxBytesPerTunnel}><input className={inputClass} value={form.max_bytes_per_tunnel} onChange={(e) => setForm((f) => ({ ...f, max_bytes_per_tunnel: e.target.value }))} placeholder="104857600" /></Field>
+                <Field label={copy.natPage.fieldBandwidth}><input className={inputClass} value={form.max_bandwidth_bytes_per_second} onChange={(e) => setForm((f) => ({ ...f, max_bandwidth_bytes_per_second: e.target.value }))} placeholder="1048576" /></Field>
               </div>
               <div className="grid gap-4 sm:grid-cols-3">
-                <Field label="窗口秒"><input className={inputClass} value={form.rate_limit_window_seconds} onChange={(e) => setForm((f) => ({ ...f, rate_limit_window_seconds: e.target.value }))} placeholder="60" /></Field>
-                <Field label="窗口最大连接"><input className={inputClass} value={form.max_connections_per_window} onChange={(e) => setForm((f) => ({ ...f, max_connections_per_window: e.target.value }))} placeholder="30" /></Field>
-                <Field label="窗口最大字节"><input className={inputClass} value={form.max_bytes_per_window} onChange={(e) => setForm((f) => ({ ...f, max_bytes_per_window: e.target.value }))} placeholder="104857600" /></Field>
+                <Field label={copy.natPage.fieldWindowSeconds}><input className={inputClass} value={form.rate_limit_window_seconds} onChange={(e) => setForm((f) => ({ ...f, rate_limit_window_seconds: e.target.value }))} placeholder="60" /></Field>
+                <Field label={copy.natPage.fieldMaxConnectionsPerWindow}><input className={inputClass} value={form.max_connections_per_window} onChange={(e) => setForm((f) => ({ ...f, max_connections_per_window: e.target.value }))} placeholder="30" /></Field>
+                <Field label={copy.natPage.fieldMaxBytesPerWindow}><input className={inputClass} value={form.max_bytes_per_window} onChange={(e) => setForm((f) => ({ ...f, max_bytes_per_window: e.target.value }))} placeholder="104857600" /></Field>
               </div>
-              <button className={buttonClass("primary")}>保存映射</button>
+              <button className={buttonClass("primary")}>{copy.natPage.saveMapping}</button>
             </form>
           </Modal>
         ) : null}
       </PageShell>
+      {dialogs.element}
     </div>
   );
 }

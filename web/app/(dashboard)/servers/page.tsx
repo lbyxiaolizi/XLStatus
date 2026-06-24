@@ -3,7 +3,7 @@
 import Link from "next/link";
 import type { ReactNode } from "react";
 import { memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
-import Navigation from "@/app/components/Navigation";
+import { useDialogs } from "@/app/components/Dialogs";
 import { WorldServerMap } from "@/app/components/WorldServerMap";
 import {
   asRecord,
@@ -14,6 +14,7 @@ import {
   InlineNotice,
   PageHeader,
   PageShell,
+  SkeletonCard,
   StatusBadge,
   buttonClass,
   compactId,
@@ -27,6 +28,11 @@ import {
   useStoredUser,
 } from "@/app/components/M7Primitives";
 import { apiClient, buildWebSocketUrl, type JsonObject, type ServerGroup, type ServerOwnerTransfer } from "@/lib/api";
+import { clampPercent, durationLabel, formatRate, getCookie, optionalNumber } from "@/app/lib/format";
+import { useI18n } from "@/lib/use-i18n";
+import type { Translations } from "@/lib/i18n";
+
+type Copy = Translations;
 
 interface Server {
   id: string;
@@ -135,8 +141,25 @@ type ServerSortKey = "default" | "name" | "status" | "cpu" | "memory" | "load" |
 type SortOrder = "asc" | "desc";
 
 export default function ServersPage() {
+  const dialogs = useDialogs();
+  const { t: copy } = useI18n();
   const storedUser = useStoredUser();
   const canManageTransfers = isAdmin(storedUser);
+  // Single in-flight gate for toolbar mutations so a double-click can't fire
+  // duplicate POSTs. The ref mirrors the state for a synchronous guard.
+  const actionBusyRef = useRef(false);
+  const [actionBusy, setActionBusy] = useState(false);
+  const runExclusive = useCallback(async (fn: () => Promise<void>) => {
+    if (actionBusyRef.current) return;
+    actionBusyRef.current = true;
+    setActionBusy(true);
+    try {
+      await fn();
+    } finally {
+      actionBusyRef.current = false;
+      setActionBusy(false);
+    }
+  }, []);
   const [servers, setServers] = useState<Server[]>([]);
   const [live, setLive] = useState<Record<string, LiveState>>({});
   const [services, setServices] = useState<ServiceSummary[]>([]);
@@ -166,6 +189,12 @@ export default function ServersPage() {
   const [serverGroupEdit, setServerGroupEdit] = useState({ name: "", color: "#2563eb", displayOrder: "" });
   const [conn, setConn] = useState<ConnectionState>("closed");
   const wsRef = useRef<WebSocket | null>(null);
+  const reconnectTimerRef = useRef<number | null>(null);
+  // Coalesce WS frames: buffer host_state events and flush once per animation
+  // frame, so the container's merged/filtered/summary memos recompute once per
+  // frame instead of once per inbound message (the re-render storm).
+  const pendingLiveRef = useRef<Record<string, unknown>[]>([]);
+  const liveRafRef = useRef<number | null>(null);
 
   const loadServers = useCallback(async () => {
     setLoading(true);
@@ -268,6 +297,32 @@ export default function ServersPage() {
     let cancelled = false;
     let backoff = 1000;
 
+    function flushLive() {
+      liveRafRef.current = null;
+      if (cancelled) return;
+      const events = pendingLiveRef.current;
+      if (events.length === 0) return;
+      pendingLiveRef.current = [];
+      setLive((prev) => {
+        const next = { ...prev };
+        for (const item of events) {
+          if (item?.kind === "host_state" && typeof item.agent_id === "string") {
+            next[item.agent_id] = normalizeLiveState(
+              item.payload,
+              String(item.received_at || new Date().toISOString()),
+              next[item.agent_id],
+            );
+          }
+        }
+        return next;
+      });
+    }
+
+    function scheduleFlush() {
+      if (liveRafRef.current !== null || cancelled) return;
+      liveRafRef.current = window.requestAnimationFrame(flushLive);
+    }
+
     function connect() {
       if (cancelled) return;
       setConn("connecting");
@@ -283,20 +338,10 @@ export default function ServersPage() {
         try {
           const msg = JSON.parse(event.data as string) as Record<string, unknown>;
           const events = msg.type === "snapshot" && Array.isArray(msg.events) ? msg.events : msg.type === "event" ? [msg.event] : [];
-          setLive((prev) => {
-            const next = { ...prev };
-            for (const raw of events) {
-              const item = raw as Record<string, unknown>;
-              if (item?.kind === "host_state" && typeof item.agent_id === "string") {
-                next[item.agent_id] = normalizeLiveState(
-                  item.payload,
-                  String(item.received_at || new Date().toISOString()),
-                  next[item.agent_id],
-                );
-              }
-            }
-            return next;
-          });
+          for (const raw of events) {
+            pendingLiveRef.current.push(raw as Record<string, unknown>);
+          }
+          if (pendingLiveRef.current.length > 0) scheduleFlush();
         } catch {
           // Ignore malformed live frames.
         }
@@ -306,13 +351,22 @@ export default function ServersPage() {
         if (cancelled) return;
         setConn("closed");
         backoff = Math.min(backoff * 2, 15000);
-        window.setTimeout(connect, backoff);
+        reconnectTimerRef.current = window.setTimeout(connect, backoff);
       };
     }
 
     connect();
     return () => {
       cancelled = true;
+      if (reconnectTimerRef.current !== null) {
+        window.clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+      if (liveRafRef.current !== null) {
+        window.cancelAnimationFrame(liveRafRef.current);
+        liveRafRef.current = null;
+      }
+      pendingLiveRef.current = [];
       wsRef.current?.close();
     };
   }, []);
@@ -468,7 +522,11 @@ export default function ServersPage() {
       return false;
     }
     const data = response.data as { updated?: number; failed?: number } | undefined;
-    setBatchNotice(`批量操作完成：${data?.updated ?? selectedIds.length} 成功 / ${data?.failed ?? 0} 失败。`);
+    setBatchNotice(
+      copy.serversPage.batchActionDone
+        .replace("{updated}", String(data?.updated ?? selectedIds.length))
+        .replace("{failed}", String(data?.failed ?? 0)),
+    );
     await loadServers();
     if (action === "transfer_owner") {
       await loadOwnerTransfers();
@@ -484,20 +542,15 @@ export default function ServersPage() {
       return null;
     }
     if (!status.data?.enabled) return undefined;
-    const code = window.prompt("请输入 6 位 TOTP 验证码");
+    const code = await dialogs.totp();
     if (code === null) return null;
-    const trimmed = code.trim();
-    if (!/^\d{6}$/.test(trimmed)) {
-      setError("请输入 6 位 TOTP 验证码。");
-      return null;
-    }
-    return trimmed;
+    return code;
   }
 
   async function createServerGroup() {
     const name = newServerGroupName.trim();
     if (!name) {
-      setError("请填写服务器分组名称。");
+      setError(copy.serversPage.groupNameRequired);
       return;
     }
     const totpCode = await sensitiveTotpCodeForAction(true);
@@ -512,18 +565,18 @@ export default function ServersPage() {
       setSelectedServerGroupId(response.data.id);
       setServerGroupEdit(serverGroupDraft(response.data));
     }
-    setBatchNotice(`服务器分组 ${name} 已创建。`);
+    setBatchNotice(copy.serversPage.groupCreated.replace("{name}", name));
     await loadServerGroups();
   }
 
   async function updateSelectedServerGroup() {
     if (!selectedServerGroupId) {
-      setError("请选择要编辑的服务器分组。");
+      setError(copy.serversPage.selectGroupToEdit);
       return;
     }
     const name = serverGroupEdit.name.trim();
     if (!name) {
-      setError("请填写服务器分组名称。");
+      setError(copy.serversPage.groupNameRequired);
       return;
     }
     const displayOrder = serverGroupEdit.displayOrder.trim();
@@ -534,7 +587,7 @@ export default function ServersPage() {
     if (displayOrder) {
       const parsed = Number.parseInt(displayOrder, 10);
       if (!Number.isFinite(parsed)) {
-        setError("排序必须是数字。");
+        setError(copy.serversPage.orderMustBeNumber);
         return;
       }
       payload.display_order = parsed;
@@ -546,17 +599,17 @@ export default function ServersPage() {
       setError(responseError(response));
       return;
     }
-    setBatchNotice(`服务器分组 ${name} 已更新。`);
+    setBatchNotice(copy.serversPage.groupUpdated.replace("{name}", name));
     await loadServerGroups();
   }
 
   async function addSelectedToServerGroup() {
     if (!selectedServerGroupId) {
-      setError("请选择目标服务器分组。");
+      setError(copy.serversPage.selectTargetGroup);
       return;
     }
     if (!selectedIds.length) {
-      setError("请先选择服务器。");
+      setError(copy.serversPage.selectServersFirst);
       return;
     }
     const totpCode = await sensitiveTotpCodeForAction(true);
@@ -566,17 +619,17 @@ export default function ServersPage() {
       setError(responseError(response));
       return;
     }
-    setBatchNotice("已把选中服务器加入分组。");
+    setBatchNotice(copy.serversPage.addedToGroup);
     await loadServerGroups();
   }
 
   async function moveSelectedToServerGroup() {
     if (!selectedServerGroupId) {
-      setError("请选择目标服务器分组。");
+      setError(copy.serversPage.selectTargetGroup);
       return;
     }
     if (!selectedIds.length) {
-      setError("请先选择服务器。");
+      setError(copy.serversPage.selectServersFirst);
       return;
     }
     await runBatchAction("move_group", { group_id: selectedServerGroupId });
@@ -585,11 +638,11 @@ export default function ServersPage() {
 
   async function deleteSelectedServerGroup() {
     if (!selectedServerGroupId) {
-      setError("请选择要删除的服务器分组。");
+      setError(copy.serversPage.selectGroupToDelete);
       return;
     }
     const group = serverGroups.find((item) => item.id === selectedServerGroupId);
-    if (!confirm(`确定删除服务器分组 ${group?.name ?? selectedServerGroupId}？`)) return;
+    if (!(await dialogs.confirm({ message: copy.serversPage.deleteGroupConfirm.replace("{name}", String(group?.name ?? selectedServerGroupId)), danger: true }))) return;
     const totpCode = await sensitiveTotpCodeForAction(true);
     if (totpCode === null) return;
     const response = await apiClient.deleteServerGroup(selectedServerGroupId, totpCode);
@@ -600,16 +653,16 @@ export default function ServersPage() {
     setSelectedServerGroupId("");
     setServerGroupEdit(serverGroupDraft());
     setGroupFilter("all");
-    setBatchNotice("服务器分组已删除。");
+    setBatchNotice(copy.serversPage.groupDeleted);
     await loadServerGroups();
   }
 
   async function deleteSelectedServers() {
     if (!selectedIds.length) {
-      setError("请先选择服务器。");
+      setError(copy.serversPage.selectServersFirst);
       return;
     }
-    if (!confirm(`确定删除选中的 ${selectedIds.length} 台服务器？该操作会移除 Agent 记录及关联分组。`)) return;
+    if (!(await dialogs.confirm({ message: copy.serversPage.deleteServersConfirm.replace("{count}", String(selectedIds.length)), danger: true }))) return;
     const ok = await runBatchAction("delete");
     if (ok) {
       setSelectedIds([]);
@@ -627,7 +680,7 @@ export default function ServersPage() {
   async function runTagBatch(action: "set_tags" | "add_tags" | "remove_tags") {
     const tags = batchTagList();
     if (!tags.length) {
-      setError("请填写至少一个分组标签。");
+      setError(copy.serversPage.tagRequired);
       return;
     }
     await runBatchAction(action, { tags });
@@ -636,7 +689,7 @@ export default function ServersPage() {
   async function transferSelectedOwner() {
     const ownerUserId = batchOwnerUserId.trim();
     if (!ownerUserId) {
-      setError("请填写目标用户 ID。");
+      setError(copy.serversPage.ownerUserIdRequired);
       return;
     }
     await runBatchAction("transfer_owner", { owner_user_id: ownerUserId });
@@ -651,14 +704,14 @@ export default function ServersPage() {
       setTransferError(responseError(response));
       return;
     }
-    setBatchNotice(`转移记录 ${compactId(transfer.id)} 已重试。`);
+    setBatchNotice(copy.serversPage.transferRetried.replace("{id}", compactId(transfer.id)));
     await loadOwnerTransfers();
     await loadServers();
     await loadServerGroups();
   }
 
   async function cancelOwnerTransfer(transfer: ServerOwnerTransfer) {
-    if (!confirm(`确定取消转移记录 ${compactId(transfer.id)}？`)) return;
+    if (!(await dialogs.confirm({ message: copy.serversPage.cancelTransferConfirm.replace("{id}", compactId(transfer.id)), danger: true }))) return;
     setTransferError(null);
     const totpCode = await sensitiveTotpCodeForAction(true);
     if (totpCode === null) return;
@@ -667,33 +720,32 @@ export default function ServersPage() {
       setTransferError(responseError(response));
       return;
     }
-    setBatchNotice(`转移记录 ${compactId(transfer.id)} 已取消。`);
+    setBatchNotice(copy.serversPage.transferCancelled.replace("{id}", compactId(transfer.id)));
     await loadOwnerTransfers();
   }
 
   return (
-    <div className="min-h-screen">
-      <Navigation />
+    <div>
       <PageShell>
         <PageHeader
-          eyebrow={`ws: ${connectionLabel(conn)}`}
-          title="服务器"
-          detail="接入的 Agent、实时主机状态和远程运维入口。"
-          actions={<button type="button" onClick={() => void loadServers()} className={buttonClass("secondary")}>刷新</button>}
+          eyebrow={`ws: ${connectionLabel(conn, copy)}`}
+          title={copy.serversPage.title}
+          detail={copy.serversPage.detail}
+          actions={<button type="button" onClick={() => void loadServers()} className={buttonClass("secondary")}>{copy.serversPage.refresh}</button>}
         />
         <InlineError message={error} />
         {batchNotice ? <div className="mt-3"><InlineNotice tone="green">{batchNotice}</InlineNotice></div> : null}
-        <ServerSummaryGrid summary={summary} />
+        <ServerSummaryGrid summary={summary} copy={copy} />
         <div className="mt-5 mb-5 grid gap-3">
-          <input value={query} onChange={(event) => setQuery(event.target.value)} className={inputClass} placeholder="搜索服务器" />
+          <input value={query} onChange={(event) => setQuery(event.target.value)} className={inputClass} placeholder={copy.serversPage.searchPlaceholder} />
           <div className="flex flex-wrap items-center justify-between gap-3 border-2 border-black bg-[var(--bg-card)] p-3 shadow-[var(--shadow-brutal)]">
             <div className="flex flex-wrap gap-2">
               {(
                 [
-                  ["all", "全部"],
-                  ["online", "在线"],
-                  ["offline", "离线"],
-                  ["other", "其他"],
+                  ["all", copy.serversPage.filterAll],
+                  ["online", copy.serversPage.filterOnline],
+                  ["offline", copy.serversPage.filterOffline],
+                  ["other", copy.serversPage.filterOther],
                 ] as Array<[ServerStatusFilter, string]>
               ).map(([value, label]) => (
                 <button key={value} type="button" onClick={() => setStatusFilter(value)} className={buttonClass(statusFilter === value ? "primary" : "secondary")}>
@@ -703,7 +755,7 @@ export default function ServersPage() {
             </div>
             <div className="grid gap-2 sm:grid-cols-[minmax(9rem,auto)_minmax(9rem,auto)_auto]">
               <select value={groupFilter} onChange={(event) => setGroupFilter(event.target.value)} className={inputClass}>
-                <option value="all">全部分组</option>
+                <option value="all">{copy.serversPage.groupFilterAll}</option>
                 {serverGroups.length ? (
                   <optgroup label="Server groups">
                     {serverGroups.map((group) => (
@@ -720,68 +772,68 @@ export default function ServersPage() {
                 ) : null}
               </select>
               <select value={sortKey} onChange={(event) => setSortKey(event.target.value as ServerSortKey)} className={inputClass}>
-                <option value="default">默认排序</option>
-                <option value="name">名称</option>
-                <option value="status">状态</option>
+                <option value="default">{copy.serversPage.sortDefault}</option>
+                <option value="name">{copy.serversPage.sortName}</option>
+                <option value="status">{copy.serversPage.sortStatus}</option>
                 <option value="cpu">CPU</option>
-                <option value="memory">内存</option>
-                <option value="load">负载</option>
-                <option value="uptime">运行时间</option>
-                <option value="upload">上传速率</option>
-                <option value="download">下载速率</option>
-                <option value="totalUpload">累计上传</option>
-                <option value="totalDownload">累计下载</option>
+                <option value="memory">{copy.serversPage.sortMemory}</option>
+                <option value="load">{copy.serversPage.sortLoad}</option>
+                <option value="uptime">{copy.serversPage.sortUptime}</option>
+                <option value="upload">{copy.serversPage.sortUpload}</option>
+                <option value="download">{copy.serversPage.sortDownload}</option>
+                <option value="totalUpload">{copy.serversPage.sortTotalUpload}</option>
+                <option value="totalDownload">{copy.serversPage.sortTotalDownload}</option>
               </select>
               <button type="button" onClick={() => setSortOrder((current) => (current === "asc" ? "desc" : "asc"))} className={buttonClass("secondary")}>
-                {sortOrder === "asc" ? "升序" : "降序"}
+                {sortOrder === "asc" ? copy.serversPage.sortAsc : copy.serversPage.sortDesc}
               </button>
             </div>
             <div className="flex flex-wrap gap-2">
               <button type="button" onClick={toggleFilteredSelection} className={buttonClass(allFilteredSelected ? "primary" : "secondary")}>
-                {allFilteredSelected ? "取消本页" : "选择本页"}
+                {allFilteredSelected ? copy.serversPage.deselectPage : copy.serversPage.selectPage}
               </button>
-              <button type="button" onClick={() => changeViewMode("cards")} className={buttonClass(viewMode === "cards" ? "primary" : "secondary")}>卡片</button>
-              <button type="button" onClick={() => changeViewMode("compact")} className={buttonClass(viewMode === "compact" ? "primary" : "secondary")}>紧凑</button>
-              <button type="button" onClick={toggleMap} className={buttonClass(showMap ? "primary" : "secondary")}>地图</button>
-              <button type="button" onClick={toggleServices} className={buttonClass(showServices ? "primary" : "secondary")}>服务状态</button>
+              <button type="button" onClick={() => changeViewMode("cards")} className={buttonClass(viewMode === "cards" ? "primary" : "secondary")}>{copy.serversPage.viewCards}</button>
+              <button type="button" onClick={() => changeViewMode("compact")} className={buttonClass(viewMode === "compact" ? "primary" : "secondary")}>{copy.serversPage.viewCompact}</button>
+              <button type="button" onClick={toggleMap} className={buttonClass(showMap ? "primary" : "secondary")}>{copy.serversPage.toggleMap}</button>
+              <button type="button" onClick={toggleServices} className={buttonClass(showServices ? "primary" : "secondary")}>{copy.serversPage.toggleServices}</button>
             </div>
           </div>
           <details className="border-2 border-black bg-[var(--bg-card)] shadow-[var(--shadow-brutal)]">
             <summary className="flex cursor-pointer flex-wrap items-center justify-between gap-3 p-3 text-sm font-black uppercase">
               <span className="flex flex-wrap items-center gap-2">
                 <span>Server groups</span>
-                <StatusBadge tone="blue">{serverGroups.length} 组</StatusBadge>
-                {selectedServerGroup ? <StatusBadge tone="gray">{selectedServerGroup.server_ids.length} 台</StatusBadge> : null}
+                <StatusBadge tone="blue">{copy.serversPage.serverGroupsBadge.replace("{count}", String(serverGroups.length))}</StatusBadge>
+                {selectedServerGroup ? <StatusBadge tone="gray">{copy.serversPage.serverGroupsSelectedCount.replace("{count}", String(selectedServerGroup.server_ids.length))}</StatusBadge> : null}
               </span>
-              <span className="text-xs text-[var(--text-muted)]">展开管理</span>
+              <span className="text-xs text-[var(--text-muted)]">{copy.serversPage.serverGroupsExpand}</span>
             </summary>
             <div className="grid gap-3 border-t-2 border-black p-3">
               <div className="flex justify-end">
                 <button type="button" className={buttonClass("secondary")} onClick={() => void loadServerGroups()}>
-                  刷新组
+                  {copy.serversPage.refreshGroups}
                 </button>
               </div>
               <div className="grid gap-3 xl:grid-cols-[minmax(12rem,1fr)_auto_minmax(12rem,1fr)_minmax(10rem,0.8fr)_7rem_7rem_auto_auto] xl:items-end">
-                <input value={newServerGroupName} onChange={(event) => setNewServerGroupName(event.target.value)} className={inputClass} placeholder="新服务器分组" />
-                <button type="button" className={buttonClass("secondary")} onClick={() => void createServerGroup()}>创建组</button>
+                <input value={newServerGroupName} onChange={(event) => setNewServerGroupName(event.target.value)} className={inputClass} placeholder={copy.serversPage.newServerGroupPlaceholder} />
+                <button type="button" className={buttonClass("secondary")} onClick={() => void runExclusive(createServerGroup)} disabled={actionBusy}>{copy.serversPage.createGroup}</button>
                 <select value={selectedServerGroupId} onChange={(event) => selectServerGroup(event.target.value)} className={inputClass}>
-                  <option value="">选择服务器分组</option>
+                  <option value="">{copy.serversPage.selectServerGroupOption}</option>
                   {serverGroups.map((group) => (
                     <option key={group.id} value={group.id}>{group.name}</option>
                   ))}
                 </select>
-                <input value={serverGroupEdit.name} onChange={(event) => setServerGroupEdit((current) => ({ ...current, name: event.target.value }))} className={inputClass} placeholder="分组名称" disabled={!selectedServerGroupId} />
-                <input value={serverGroupEdit.displayOrder} onChange={(event) => setServerGroupEdit((current) => ({ ...current, displayOrder: event.target.value }))} className={inputClass} inputMode="numeric" placeholder="排序" disabled={!selectedServerGroupId} />
+                <input value={serverGroupEdit.name} onChange={(event) => setServerGroupEdit((current) => ({ ...current, name: event.target.value }))} className={inputClass} placeholder={copy.serversPage.groupNamePlaceholder} disabled={!selectedServerGroupId} />
+                <input value={serverGroupEdit.displayOrder} onChange={(event) => setServerGroupEdit((current) => ({ ...current, displayOrder: event.target.value }))} className={inputClass} inputMode="numeric" placeholder={copy.serversPage.groupOrderPlaceholder} disabled={!selectedServerGroupId} />
                 <input
                   type="color"
                   value={serverGroupEdit.color}
                   onChange={(event) => setServerGroupEdit((current) => ({ ...current, color: event.target.value }))}
                   className="h-11 w-full border-2 border-black bg-[var(--accent-bg)] p-1 shadow-[var(--shadow-brutal-sm)] disabled:opacity-60"
                   disabled={!selectedServerGroupId}
-                  aria-label="分组颜色"
+                  aria-label={copy.serversPage.groupColorAriaLabel}
                 />
-                <button type="button" className={buttonClass("secondary")} onClick={() => void updateSelectedServerGroup()} disabled={!selectedServerGroupId}>保存组</button>
-                <button type="button" className={buttonClass("danger")} onClick={() => void deleteSelectedServerGroup()} disabled={!selectedServerGroupId}>删除组</button>
+                <button type="button" className={buttonClass("secondary")} onClick={() => void updateSelectedServerGroup()} disabled={!selectedServerGroupId}>{copy.serversPage.saveGroup}</button>
+                <button type="button" className={buttonClass("danger")} onClick={() => void deleteSelectedServerGroup()} disabled={!selectedServerGroupId}>{copy.serversPage.deleteGroup}</button>
               </div>
             </div>
           </details>
@@ -789,39 +841,39 @@ export default function ServersPage() {
             <div className="grid gap-3 border-2 border-black bg-[var(--bg-card)] p-3 shadow-[var(--shadow-brutal)]">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <span className="border-2 border-black bg-[var(--accent-bg)] px-3 py-2 text-xs font-black uppercase shadow-[var(--shadow-brutal-sm)]">
-                  已选择 {selectedIds.length} 台
+                  {copy.serversPage.selectedCount.replace("{count}", String(selectedIds.length))}
                 </span>
                 <button type="button" className={buttonClass("secondary")} onClick={() => setSelectedIds([])}>
-                  清空选择
+                  {copy.serversPage.clearSelection}
                 </button>
               </div>
               <div className="grid gap-3 xl:grid-cols-[minmax(12rem,1fr)_auto_auto_auto_auto_auto]">
-                <input value={batchTags} onChange={(event) => setBatchTags(event.target.value)} className={inputClass} placeholder="分组标签，逗号分隔" />
-                <button type="button" className={buttonClass("secondary")} onClick={() => void runTagBatch("set_tags")}>设置分组</button>
-                <button type="button" className={buttonClass("secondary")} onClick={() => void runTagBatch("add_tags")}>追加分组</button>
-                <button type="button" className={buttonClass("secondary")} onClick={() => void runTagBatch("remove_tags")}>移除分组</button>
-                <button type="button" className={buttonClass("good")} onClick={() => void runBatchAction("set_dashboard_visible", { dashboard_visible: true })}>显示状态页</button>
-                <button type="button" className={buttonClass("danger")} onClick={() => void runBatchAction("set_dashboard_visible", { dashboard_visible: false })}>隐藏状态页</button>
+                <input value={batchTags} onChange={(event) => setBatchTags(event.target.value)} className={inputClass} placeholder={copy.serversPage.batchTagsPlaceholder} />
+                <button type="button" className={buttonClass("secondary")} onClick={() => void runTagBatch("set_tags")}>{copy.serversPage.setTags}</button>
+                <button type="button" className={buttonClass("secondary")} onClick={() => void runTagBatch("add_tags")}>{copy.serversPage.addTags}</button>
+                <button type="button" className={buttonClass("secondary")} onClick={() => void runTagBatch("remove_tags")}>{copy.serversPage.removeTags}</button>
+                <button type="button" className={buttonClass("good")} onClick={() => void runBatchAction("set_dashboard_visible", { dashboard_visible: true })}>{copy.serversPage.showOnDashboard}</button>
+                <button type="button" className={buttonClass("danger")} onClick={() => void runBatchAction("set_dashboard_visible", { dashboard_visible: false })}>{copy.serversPage.hideOnDashboard}</button>
               </div>
               <div className="grid gap-3 md:grid-cols-[minmax(12rem,1fr)_auto]">
-                <input value={batchOwnerUserId} onChange={(event) => setBatchOwnerUserId(event.target.value)} className={inputClass} placeholder="目标用户 ID" />
-                <button type="button" className={buttonClass("secondary")} onClick={() => void transferSelectedOwner()}>
-                  转移所有者
+                <input value={batchOwnerUserId} onChange={(event) => setBatchOwnerUserId(event.target.value)} className={inputClass} placeholder={copy.serversPage.ownerUserIdPlaceholder} />
+                <button type="button" className={buttonClass("secondary")} onClick={() => void runExclusive(transferSelectedOwner)} disabled={actionBusy}>
+                  {copy.serversPage.transferOwner}
                 </button>
               </div>
               <div className="grid gap-3 xl:grid-cols-[minmax(12rem,1fr)_auto_auto]">
                 <select value={selectedServerGroupId} onChange={(event) => selectServerGroup(event.target.value)} className={inputClass}>
-                  <option value="">选择服务器分组</option>
+                  <option value="">{copy.serversPage.selectServerGroupOption}</option>
                   {serverGroups.map((group) => (
                     <option key={group.id} value={group.id}>{group.name}</option>
                   ))}
                 </select>
-                <button type="button" className={buttonClass("secondary")} onClick={() => void addSelectedToServerGroup()}>加入组</button>
-                <button type="button" className={buttonClass("secondary")} onClick={() => void moveSelectedToServerGroup()}>移动到组</button>
+                <button type="button" className={buttonClass("secondary")} onClick={() => void addSelectedToServerGroup()}>{copy.serversPage.addToGroup}</button>
+                <button type="button" className={buttonClass("secondary")} onClick={() => void moveSelectedToServerGroup()}>{copy.serversPage.moveToGroup}</button>
               </div>
               <div className="flex flex-wrap justify-end gap-2">
                 <button type="button" className={buttonClass("danger")} onClick={() => void deleteSelectedServers()}>
-                  删除选中服务器
+                  {copy.serversPage.deleteSelectedServers}
                 </button>
               </div>
             </div>
@@ -830,16 +882,17 @@ export default function ServersPage() {
             <details className="border-2 border-black bg-[var(--bg-card)] shadow-[var(--shadow-brutal)]">
               <summary className="flex cursor-pointer flex-wrap items-center justify-between gap-3 p-3 text-sm font-black uppercase">
                 <span className="flex flex-wrap items-center gap-2">
-                  <span>所有权转移</span>
-                  <StatusBadge tone="blue">{ownerTransfers.length} 条</StatusBadge>
+                  <span>{copy.serversPage.ownerTransfersTitle}</span>
+                  <StatusBadge tone="blue">{copy.serversPage.ownerTransfersBadge.replace("{count}", String(ownerTransfers.length))}</StatusBadge>
                 </span>
-                <span className="text-xs text-[var(--text-muted)]">展开处理</span>
+                <span className="text-xs text-[var(--text-muted)]">{copy.serversPage.ownerTransfersExpand}</span>
               </summary>
               <div className="border-t-2 border-black p-3">
                 <OwnerTransferPanel
                   transfers={ownerTransfers}
                   loading={transfersLoading}
                   error={transferError}
+                  copy={copy}
                   onRefresh={() => void loadOwnerTransfers()}
                   onRetry={(transfer) => void retryOwnerTransfer(transfer)}
                   onCancel={(transfer) => void cancelOwnerTransfer(transfer)}
@@ -852,45 +905,58 @@ export default function ServersPage() {
         {showMap ? (
           <WorldServerMap
             servers={filtered}
-            title="服务器地图"
-            ariaLabel="服务器国家和地区分布地图"
+            title={copy.serversPage.mapTitle}
+            ariaLabel={copy.serversPage.mapAriaLabel}
             serverHref={(server) => `/servers/${encodeURIComponent(server.id)}`}
           />
         ) : null}
 
         {showServices ? (
-          <ServiceTrackerPanel loading={servicesLoading} error={serviceError} trackers={visibleServiceTrackers} />
+          <ServiceTrackerPanel loading={servicesLoading} error={serviceError} trackers={visibleServiceTrackers} copy={copy} />
         ) : null}
 
         {loading ? (
-          <BrutalCard>正在加载服务器...</BrutalCard>
+          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+            {Array.from({ length: 6 }).map((_, index) => (
+              <SkeletonCard key={index} lines={6} />
+            ))}
+          </div>
         ) : filtered.length === 0 ? (
-          <EmptyState title="暂无服务器" detail="Agent 连接后会显示在这里。" />
+          <EmptyState title={copy.serversPage.serversEmptyTitle} detail={copy.serversPage.serversEmptyDetail} />
         ) : viewMode === "compact" ? (
           <div className="grid gap-2">
             {filtered.map((server) => (
-              <CompactServerRow key={server.id} server={server} selected={selectedSet.has(server.id)} onToggle={toggleServerSelection} />
+              <CompactServerRow key={server.id} server={server} selected={selectedSet.has(server.id)} onToggle={toggleServerSelection} copy={copy} />
             ))}
           </div>
         ) : (
           <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
             {filtered.map((server) => (
-              <ServerCard key={server.id} server={server} selected={selectedSet.has(server.id)} onToggle={toggleServerSelection} />
+              <ServerCard key={server.id} server={server} selected={selectedSet.has(server.id)} onToggle={toggleServerSelection} copy={copy} />
             ))}
           </div>
         )}
       </PageShell>
+      {dialogs.element}
     </div>
   );
 }
 
-function ServerSummaryGrid({ summary }: { summary: ServerSummary }) {
+function ServerSummaryGrid({ summary, copy }: { summary: ServerSummary; copy: Copy }) {
   return (
     <div className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-      <SummaryTile label="服务器" value={String(summary.total)} detail={`${summary.online} 在线 / ${summary.offline} 离线`} />
-      <SummaryTile label="上传" value={formatRate(summary.uploadSpeed)} detail={`累计 ${formatBytes(summary.totalUpload)}`} />
-      <SummaryTile label="下载" value={formatRate(summary.downloadSpeed)} detail={`累计 ${formatBytes(summary.totalDownload)}`} />
-      <SummaryTile label="状态" value={summary.offline > 0 ? "部分离线" : "运行中"} detail={`ws ${summary.total ? "实时更新" : "等待数据"}`} />
+      <SummaryTile
+        label={copy.serversPage.summaryServers}
+        value={String(summary.total)}
+        detail={copy.serversPage.summaryOnlineOffline.replace("{online}", String(summary.online)).replace("{offline}", String(summary.offline))}
+      />
+      <SummaryTile label={copy.serversPage.summaryUpload} value={formatRate(summary.uploadSpeed)} detail={copy.serversPage.summaryTotal.replace("{total}", formatBytes(summary.totalUpload))} />
+      <SummaryTile label={copy.serversPage.summaryDownload} value={formatRate(summary.downloadSpeed)} detail={copy.serversPage.summaryTotal.replace("{total}", formatBytes(summary.totalDownload))} />
+      <SummaryTile
+        label={copy.serversPage.summaryStatus}
+        value={summary.offline > 0 ? copy.serversPage.summaryPartialOffline : copy.serversPage.summaryRunning}
+        detail={summary.total ? copy.serversPage.summaryWsLive : copy.serversPage.summaryWsWaiting}
+      />
     </div>
   );
 }
@@ -899,6 +965,7 @@ function OwnerTransferPanel({
   transfers,
   loading,
   error,
+  copy,
   onRefresh,
   onRetry,
   onCancel,
@@ -906,6 +973,7 @@ function OwnerTransferPanel({
   transfers: ServerOwnerTransfer[];
   loading: boolean;
   error: string | null;
+  copy: Copy;
   onRefresh: () => void;
   onRetry: (transfer: ServerOwnerTransfer) => void;
   onCancel: (transfer: ServerOwnerTransfer) => void;
@@ -915,18 +983,18 @@ function OwnerTransferPanel({
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-2">
           <span className="border-2 border-black bg-[var(--accent-bg)] px-3 py-2 text-xs font-black uppercase shadow-[var(--shadow-brutal-sm)]">
-            所有权转移
+            {copy.serversPage.ownerTransfersTitle}
           </span>
-          <StatusBadge tone="blue">{transfers.length} 条</StatusBadge>
-          {loading ? <StatusBadge tone="gray">加载中</StatusBadge> : null}
+          <StatusBadge tone="blue">{copy.serversPage.ownerTransfersBadge.replace("{count}", String(transfers.length))}</StatusBadge>
+          {loading ? <StatusBadge tone="gray">{copy.serversPage.ownerTransfersLoading}</StatusBadge> : null}
         </div>
         <button type="button" className={buttonClass("secondary")} onClick={onRefresh}>
-          刷新记录
+          {copy.serversPage.ownerTransfersRefresh}
         </button>
       </div>
       <InlineError message={error} />
       {transfers.length === 0 ? (
-        <EmptyState title="暂无转移记录" detail="批量转移服务器所有者后会显示在这里。" />
+        <EmptyState title={copy.serversPage.ownerTransfersEmptyTitle} detail={copy.serversPage.ownerTransfersEmptyDetail} />
       ) : (
         <div className="grid gap-2">
           {transfers.map((transfer) => (
@@ -950,14 +1018,14 @@ function OwnerTransferPanel({
                 {transfer.status !== "completed" ? (
                   <>
                     <button type="button" className={buttonClass("secondary")} onClick={() => onRetry(transfer)}>
-                      重试
+                      {copy.serversPage.retry}
                     </button>
                     <button type="button" className={buttonClass("danger")} onClick={() => onCancel(transfer)}>
-                      取消
+                      {copy.serversPage.cancel}
                     </button>
                   </>
                 ) : (
-                  <StatusBadge tone="green">完成</StatusBadge>
+                  <StatusBadge tone="green">{copy.serversPage.completed}</StatusBadge>
                 )}
               </div>
             </div>
@@ -978,35 +1046,36 @@ function SummaryTile({ label, value, detail }: { label: string; value: string; d
   );
 }
 
-function ServiceTrackerPanel({ loading, error, trackers }: { loading: boolean; error: string | null; trackers: ServiceTrackerItem[] }) {
+function ServiceTrackerPanel({ loading, error, trackers, copy }: { loading: boolean; error: string | null; trackers: ServiceTrackerItem[]; copy: Copy }) {
   return (
     <section className="mb-5 border-2 border-black bg-[var(--accent-bg)] p-4 shadow-[var(--shadow-brutal)]">
       <div className="mb-3 flex flex-wrap items-center justify-between gap-3 border-b-4 border-black pb-3">
-        <h2 className="text-xl font-black uppercase">服务状态</h2>
+        <h2 className="text-xl font-black uppercase">{copy.serversPage.servicesTitle}</h2>
         <span className="border-2 border-black bg-[var(--bg-card)] px-2 py-1 text-xs font-black shadow-[var(--shadow-brutal-sm)]">
-          {loading ? "加载中" : `${trackers.length} 项`}
+          {loading ? copy.serversPage.servicesLoading : copy.serversPage.servicesItemCount.replace("{count}", String(trackers.length))}
         </span>
       </div>
       <InlineError message={error} />
       {loading && trackers.length === 0 ? (
-        <BrutalCard>正在加载服务状态...</BrutalCard>
+        <BrutalCard>{copy.serversPage.servicesLoadingCard}</BrutalCard>
       ) : trackers.length === 0 ? (
-        <EmptyState title="暂无服务状态" detail="创建服务监控后会显示最近状态。" />
+        // Don't double up the empty state under an error banner.
+        error ? null : <EmptyState title={copy.serversPage.servicesEmptyTitle} detail={copy.serversPage.servicesEmptyDetail} />
       ) : (
         <div className="grid gap-3 lg:grid-cols-2">
           {trackers.map((tracker) => (
-            <ServiceTrackerCard key={tracker.id} tracker={tracker} />
+            <ServiceTrackerCard key={tracker.id} tracker={tracker} copy={copy} />
           ))}
         </div>
       )}
       <div className="mt-3 border-2 border-black bg-[var(--bg-card)] px-3 py-2 text-xs font-black text-[var(--text-muted)] shadow-[var(--shadow-brutal-sm)]">
-        周期流量统计：暂无数据
+        {copy.serversPage.servicesTrafficSummary}
       </div>
     </section>
   );
 }
 
-function ServiceTrackerCard({ tracker }: { tracker: ServiceTrackerItem }) {
+function ServiceTrackerCard({ tracker, copy }: { tracker: ServiceTrackerItem; copy: Copy }) {
   return (
     <div className="border-2 border-black bg-[var(--bg-card)] p-3 shadow-[var(--shadow-brutal-sm)]">
       <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
@@ -1028,8 +1097,8 @@ function ServiceTrackerCard({ tracker }: { tracker: ServiceTrackerItem }) {
         ))}
       </div>
       <div className="mt-2 flex justify-between text-xs font-black text-[var(--text-muted)]">
-        <span>30 天前</span>
-        <span>今天</span>
+        <span>{copy.serversPage.serviceDays30Ago}</span>
+        <span>{copy.serversPage.serviceDaysToday}</span>
       </div>
     </div>
   );
@@ -1039,10 +1108,12 @@ const ServerCard = memo(function ServerCard({
   server,
   selected,
   onToggle,
+  copy,
 }: {
   server: Server;
   selected: boolean;
   onToggle: (id: string) => void;
+  copy: Copy;
 }) {
   const remark = optionalMetaLabel(server.remark) ?? optionalMetaLabel(server.note);
   const expiresAt = server.expires_at || server.expired_at || null;
@@ -1052,25 +1123,25 @@ const ServerCard = memo(function ServerCard({
   const expired = isExpired(expiresAt);
   const tags = Array.isArray(server.tags) ? server.tags.filter(Boolean) : [];
   const metaRows = [
-    { label: "备注", value: remark },
-    { label: "供应商", value: optionalMetaLabel(server.provider) },
-    { label: "地区", value: optionalMetaLabel(server.region) },
-    { label: "套餐", value: optionalMetaLabel(server.plan) },
-    { label: "到期", value: optionalMetaLabel(expiresAt ? formatDate(expiresAt) : null), danger: expired },
-    { label: "续费", value: optionalMetaLabel(renewalPrice) },
+    { label: copy.serversPage.metaRemark, value: remark },
+    { label: copy.serversPage.metaProvider, value: optionalMetaLabel(server.provider) },
+    { label: copy.serversPage.metaRegion, value: optionalMetaLabel(server.region) },
+    { label: copy.serversPage.metaPlan, value: optionalMetaLabel(server.plan) },
+    { label: copy.serversPage.metaExpires, value: optionalMetaLabel(expiresAt ? formatDate(expiresAt) : null), danger: expired },
+    { label: copy.serversPage.metaRenewal, value: optionalMetaLabel(renewalPrice) },
   ].filter((row): row is { label: string; value: string; danger?: boolean } => row.value !== null);
 
   return (
     <article className="grid h-full gap-2">
       <label className="flex items-center gap-2 border-2 border-black bg-[var(--bg-card)] px-3 py-2 text-xs font-black uppercase shadow-[var(--shadow-brutal-sm)]">
         <input type="checkbox" checked={selected} onChange={() => onToggle(server.id)} />
-        选择
+        {copy.serversPage.cardSelect}
       </label>
       <Link
         href={`/servers/${encodeURIComponent(server.id)}`}
-        className="group block h-full border-2 border-black bg-[var(--bg-card)] p-4 text-[var(--text-main)] shadow-[var(--shadow-brutal)] transition hover:-translate-x-1 hover:-translate-y-1 hover:shadow-[8px_8px_0_0_var(--border-color)] focus:outline-none focus:ring-4 focus:ring-[var(--accent-color)]"
+        className="group block h-full border-2 border-black bg-[var(--bg-card)] p-4 text-[var(--text-main)] shadow-[var(--shadow-brutal)] transition-shadow hover:shadow-[8px_8px_0_0_var(--border-color)] focus:outline-none focus:ring-4 focus:ring-[var(--accent-color)]"
         style={{ borderTopColor: server.accent_color || "var(--border-color)", borderTopWidth: "8px" }}
-        aria-label={`打开服务器 ${server.name}`}
+        aria-label={copy.serversPage.cardOpenAria.replace("{name}", server.name)}
       >
         <div className="flex h-full flex-col gap-4">
         <div className="flex items-start justify-between gap-3">
@@ -1078,14 +1149,14 @@ const ServerCard = memo(function ServerCard({
             <div className="mb-2 flex items-center gap-2">
               <span className={`h-3 w-3 shrink-0 border-2 border-black ${isOnline ? "bg-[var(--accent-color)]" : "bg-[var(--btn-bg)]"}`} />
               <StatusBadge tone={isOnline ? "green" : server.status === "revoked" ? "yellow" : "red"}>
-                {serverStatusLabel(server.status)}
+                {serverStatusLabel(server.status, copy)}
               </StatusBadge>
             </div>
             <h2 className="break-words text-2xl font-black uppercase">{server.name}</h2>
             <p className="mt-1 break-all font-mono text-[11px] font-bold text-[var(--text-muted)]">{server.id}</p>
           </div>
           <span className="border-2 border-black bg-[var(--accent-bg)] px-2 py-1 text-xs font-black shadow-[var(--shadow-brutal-sm)] transition group-hover:bg-[var(--accent-color)] group-hover:text-[var(--btn-text)]">
-            详情
+            {copy.serversPage.cardDetail}
           </span>
         </div>
 
@@ -1107,18 +1178,18 @@ const ServerCard = memo(function ServerCard({
         ) : null}
 
         <div className="mt-auto grid grid-cols-2 gap-3">
-          <MetricBlock label="CPU" value={formatPercent(server.cpu_percent)}>
+          <MetricBlock label={copy.serversPage.metricCpu} value={formatPercent(server.cpu_percent)}>
             <UsageBar value={server.cpu_percent} />
           </MetricBlock>
-          <MetricBlock label="内存" value={memoryLabel(server)}>
+          <MetricBlock label={copy.serversPage.metricMemory} value={memoryLabel(server)}>
             <UsageBar value={memoryPercent} />
           </MetricBlock>
-          <MetricBlock label="负载" value={server.load_1 === undefined || server.load_1 === null ? "N/A" : server.load_1.toFixed(2)} />
-          <MetricBlock label="运行时间" value={durationLabel(server.uptime_seconds)} />
-          <MetricBlock label="上传" value={formatRate(server.net_tx_bps)} />
-          <MetricBlock label="下载" value={formatRate(server.net_rx_bps)} />
-          <MetricBlock label="累计上传" value={formatBytes(server.network_out_total)} />
-          <MetricBlock label="累计下载" value={formatBytes(server.network_in_total)} />
+          <MetricBlock label={copy.serversPage.metricLoad} value={server.load_1 === undefined || server.load_1 === null ? "N/A" : server.load_1.toFixed(2)} />
+          <MetricBlock label={copy.serversPage.metricUptime} value={durationLabel(server.uptime_seconds)} />
+          <MetricBlock label={copy.serversPage.metricUpload} value={formatRate(server.net_tx_bps)} />
+          <MetricBlock label={copy.serversPage.metricDownload} value={formatRate(server.net_rx_bps)} />
+          <MetricBlock label={copy.serversPage.metricTotalUpload} value={formatBytes(server.network_out_total)} />
+          <MetricBlock label={copy.serversPage.metricTotalDownload} value={formatBytes(server.network_in_total)} />
         </div>
         </div>
       </Link>
@@ -1130,21 +1201,23 @@ const CompactServerRow = memo(function CompactServerRow({
   server,
   selected,
   onToggle,
+  copy,
 }: {
   server: Server;
   selected: boolean;
   onToggle: (id: string) => void;
+  copy: Copy;
 }) {
   const isOnline = server.status === "online";
   return (
     <div className="grid gap-2 sm:grid-cols-[auto_minmax(0,1fr)]">
       <label className="flex items-center justify-center border-2 border-black bg-[var(--bg-card)] px-3 py-2 shadow-[var(--shadow-brutal-sm)]">
-        <input type="checkbox" checked={selected} onChange={() => onToggle(server.id)} aria-label={`选择 ${server.name}`} />
+        <input type="checkbox" checked={selected} onChange={() => onToggle(server.id)} aria-label={copy.serversPage.cardSelectAria.replace("{name}", server.name)} />
       </label>
       <Link
         href={`/servers/${encodeURIComponent(server.id)}`}
-        className="grid gap-3 border-2 border-black bg-[var(--bg-card)] p-3 text-[var(--text-main)] shadow-[var(--shadow-brutal-sm)] transition hover:-translate-x-0.5 hover:-translate-y-0.5 hover:shadow-[var(--shadow-brutal)] lg:grid-cols-[minmax(12rem,1.4fr)_repeat(8,minmax(5.5rem,1fr))]"
-        aria-label={`打开服务器 ${server.name}`}
+        className="grid gap-3 border-2 border-black bg-[var(--bg-card)] p-3 text-[var(--text-main)] shadow-[var(--shadow-brutal-sm)] transition-shadow hover:shadow-[var(--shadow-brutal)] lg:grid-cols-[minmax(12rem,1.4fr)_repeat(8,minmax(5.5rem,1fr))]"
+        aria-label={copy.serversPage.cardOpenAria.replace("{name}", server.name)}
       >
         <div className="min-w-0">
           <div className="flex items-center gap-2">
@@ -1153,14 +1226,14 @@ const CompactServerRow = memo(function CompactServerRow({
           </div>
           <div className="mt-1 truncate font-mono text-[11px] font-bold text-[var(--text-muted)]">{compactId(server.id)}</div>
         </div>
-        <CompactMetric label="状态" value={serverStatusLabel(server.status)} />
-        <CompactMetric label="CPU" value={formatPercent(server.cpu_percent)} />
-        <CompactMetric label="内存" value={memoryLabel(server)} />
-        <CompactMetric label="负载" value={server.load_1 === undefined || server.load_1 === null ? "N/A" : server.load_1.toFixed(2)} />
-        <CompactMetric label="运行" value={durationLabel(server.uptime_seconds)} />
-        <CompactMetric label="上传" value={formatRate(server.net_tx_bps)} />
-        <CompactMetric label="下载" value={formatRate(server.net_rx_bps)} />
-        <CompactMetric label="流量" value={`↑${formatBytes(server.network_out_total)} ↓${formatBytes(server.network_in_total)}`} />
+        <CompactMetric label={copy.serversPage.metricStatus} value={serverStatusLabel(server.status, copy)} />
+        <CompactMetric label={copy.serversPage.metricCpu} value={formatPercent(server.cpu_percent)} />
+        <CompactMetric label={copy.serversPage.metricMemory} value={memoryLabel(server)} />
+        <CompactMetric label={copy.serversPage.metricLoad} value={server.load_1 === undefined || server.load_1 === null ? "N/A" : server.load_1.toFixed(2)} />
+        <CompactMetric label={copy.serversPage.metricUptimeShort} value={durationLabel(server.uptime_seconds)} />
+        <CompactMetric label={copy.serversPage.metricUpload} value={formatRate(server.net_tx_bps)} />
+        <CompactMetric label={copy.serversPage.metricDownload} value={formatRate(server.net_rx_bps)} />
+        <CompactMetric label={copy.serversPage.metricTraffic} value={`↑${formatBytes(server.network_out_total)} ↓${formatBytes(server.network_in_total)}`} />
       </Link>
     </div>
   );
@@ -1211,11 +1284,6 @@ function memoryLabel(server: Server): string {
 function memoryPercentValue(server: Server): number | null {
   if (server.memory_used === undefined || server.memory_used === null || !server.memory_total) return null;
   return (server.memory_used / server.memory_total) * 100;
-}
-
-function clampPercent(value?: number | null): number {
-  if (value === undefined || value === null || Number.isNaN(value)) return 0;
-  return Math.max(0, Math.min(100, value));
 }
 
 function isExpired(value?: string | null): boolean {
@@ -1343,7 +1411,7 @@ function normalizeLiveState(payload: unknown, receivedAt: string, previous?: Liv
   const netOutTotal = optionalNumber(state.network_out_total) ?? netIoTotal(state, "bytes_sent");
   const netRxBps = optionalNumber(state.net_rx_bps) ?? rateFromTotalDelta(netInTotal, previous?.network_in_total, receivedAt, previous?.received_at);
   const netTxBps = optionalNumber(state.net_tx_bps) ?? rateFromTotalDelta(netOutTotal, previous?.network_out_total, receivedAt, previous?.received_at);
-  return {
+  const next: LiveState = {
     cpu_percent: optionalNumber(state.cpu_percent),
     memory_used: optionalNumber(state.memory_used),
     memory_total: optionalNumber(state.memory_total),
@@ -1355,6 +1423,26 @@ function normalizeLiveState(payload: unknown, receivedAt: string, previous?: Liv
     uptime_seconds: optionalNumber(state.uptime_seconds),
     received_at: receivedAt,
   };
+  // Reuse the previous object identity when nothing meaningful changed (idle /
+  // offline agents re-reporting the same values). This keeps the mergedCache
+  // hit so that row's memoized card doesn't re-render. received_at is ignored
+  // on purpose — only the displayed values matter.
+  if (previous && liveStateValuesEqual(previous, next)) return previous;
+  return next;
+}
+
+function liveStateValuesEqual(a: LiveState, b: LiveState): boolean {
+  return (
+    a.cpu_percent === b.cpu_percent &&
+    a.memory_used === b.memory_used &&
+    a.memory_total === b.memory_total &&
+    a.load_1 === b.load_1 &&
+    a.net_rx_bps === b.net_rx_bps &&
+    a.net_tx_bps === b.net_tx_bps &&
+    a.network_in_total === b.network_in_total &&
+    a.network_out_total === b.network_out_total &&
+    a.uptime_seconds === b.uptime_seconds
+  );
 }
 
 function normalizeServiceResult(result: unknown): ServiceResult | null {
@@ -1392,7 +1480,9 @@ function buildServiceDays(results: ServiceResult[]): ServiceDay[] {
     const date = new Date(result.created_at);
     if (Number.isNaN(date.getTime())) continue;
     const key = dayKey(date);
-    buckets.set(key, [...(buckets.get(key) ?? []), result]);
+    const bucket = buckets.get(key);
+    if (bucket) bucket.push(result);
+    else buckets.set(key, [result]);
   }
 
   return Array.from({ length: 30 }, (_, index) => {
@@ -1438,30 +1528,6 @@ function dayKey(date: Date): string {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
 }
 
-function formatRate(value?: number | null): string {
-  if (value === undefined || value === null || Number.isNaN(value)) return "N/A";
-  return `${formatBytes(value)}/s`;
-}
-
-function durationLabel(value?: number | null): string {
-  if (value === undefined || value === null || Number.isNaN(value)) return "N/A";
-  const days = Math.floor(value / 86400);
-  const hours = Math.floor((value % 86400) / 3600);
-  const minutes = Math.floor((value % 3600) / 60);
-  if (days > 0) return `${days} 天 ${hours} 小时`;
-  if (hours > 0) return `${hours} 小时 ${minutes} 分钟`;
-  return `${minutes} 分钟`;
-}
-
-function optionalNumber(value: unknown): number | undefined {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string" && value.trim()) {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : undefined;
-  }
-  return undefined;
-}
-
 function netIoTotal(state: Record<string, unknown>, field: "bytes_recv" | "bytes_sent"): number | undefined {
   const netIo = Array.isArray(state.net_io) ? state.net_io : Array.isArray(state.network_interfaces) ? state.network_interfaces : [];
   if (!netIo.length) return undefined;
@@ -1497,29 +1563,25 @@ function initialShowServerMap(): boolean {
   return window.localStorage.getItem("xlstatus_show_server_map") === "1";
 }
 
-function connectionLabel(conn: ConnectionState): string {
+function connectionLabel(conn: ConnectionState, copy: Copy): string {
   const labels: Record<ConnectionState, string> = {
-    connecting: "连接中",
-    open: "已连接",
-    closed: "已关闭",
-    error: "错误",
+    connecting: copy.serversPage.connConnecting,
+    open: copy.serversPage.connOpen,
+    closed: copy.serversPage.connClosed,
+    error: copy.serversPage.connError,
   };
   return labels[conn];
 }
 
-function serverStatusLabel(status: string): string {
+function serverStatusLabel(status: string, copy: Copy): string {
   const labels: Record<string, string> = {
-    online: "在线",
-    offline: "离线",
-    revoked: "已撤销",
-    down: "异常",
-    degraded: "降级",
+    online: copy.serversPage.statusOnline,
+    offline: copy.serversPage.statusOffline,
+    revoked: copy.serversPage.statusRevoked,
+    down: copy.serversPage.statusDown,
+    degraded: copy.serversPage.statusDegraded,
   };
   return labels[status] || status;
-}
-
-function getCookie(name: string): string | null {
-  return document.cookie.split("; ").find((row) => row.startsWith(`${name}=`))?.split("=")[1] ?? null;
 }
 
 function hasBrowserSessionSignal(): boolean {

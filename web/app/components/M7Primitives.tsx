@@ -1,54 +1,21 @@
 "use client";
 
-import { ReactNode, useEffect, useState } from "react";
+import { ReactNode } from "react";
 import type { ApiResponse } from "@/lib/api";
 import { formatLocaleDate, getTranslations } from "@/lib/i18n";
 
-export interface StoredUser {
-  id: string;
-  username: string;
-  role: string;
-}
-
-declare global {
-  interface Window {
-    applyBoldTheme?: () => void;
-  }
-}
-
-export function useStoredUser(): StoredUser | null {
-  const [user, setUser] = useState<StoredUser | null>(null);
-
-  useEffect(() => {
-    const timeoutId = window.setTimeout(() => {
-      setUser(readStoredUser());
-    }, 0);
-    return () => window.clearTimeout(timeoutId);
-  }, []);
-
-  return user;
-}
-
-export function readStoredUser(): StoredUser | null {
-  if (typeof window === "undefined") {
-    return null;
-  }
-
-  const userStr = window.localStorage.getItem("user");
-  if (!userStr) {
-    return null;
-  }
-
-  try {
-    return JSON.parse(userStr) as StoredUser;
-  } catch {
-    return null;
-  }
-}
-
-export function isAdmin(user: StoredUser | null): boolean {
-  return user?.role?.toLowerCase() === "admin";
-}
+// Auth identity + theme hooks now live in the synchronous client store (they
+// used to read via setTimeout(0) here, which caused a logged-out/light flash on
+// every mount). Re-exported so existing import sites keep working unchanged.
+export {
+  useStoredUser,
+  readStoredUser,
+  isAdmin,
+  useBoldTheme,
+  setStoredUser,
+  clearStoredUser,
+} from "@/app/lib/client-store";
+export type { StoredUser } from "@/app/lib/client-store";
 
 export function responseError(response: ApiResponse<unknown>): string {
   const copy = getTranslations();
@@ -99,25 +66,6 @@ export function asString(value: unknown, fallback = ""): string {
 
 export function asNumber(value: unknown, fallback = 0): number {
   return typeof value === "number" && !Number.isNaN(value) ? value : fallback;
-}
-
-export function useBoldTheme(): ["light" | "dark", (mode: "light" | "dark") => void] {
-  const [mode, setModeState] = useState<"light" | "dark">("light");
-
-  useEffect(() => {
-    const timeoutId = window.setTimeout(() => {
-      setModeState(localStorage.getItem("darkMode") === "true" ? "dark" : "light");
-    }, 0);
-    return () => window.clearTimeout(timeoutId);
-  }, []);
-
-  function setMode(nextMode: "light" | "dark") {
-    localStorage.setItem("darkMode", nextMode === "dark" ? "true" : "false");
-    window.applyBoldTheme?.();
-    setModeState(nextMode);
-  }
-
-  return [mode, setMode];
 }
 
 export function StatusBadge({
@@ -186,6 +134,27 @@ export function EmptyState({
     <div className="border-2 border-black bg-[var(--bg-card)] px-4 py-12 text-center shadow-[var(--shadow-brutal)]">
       <p className="text-lg font-black uppercase text-[var(--text-main)]">{title}</p>
       {detail ? <p className="mx-auto mt-2 max-w-2xl text-sm font-bold text-[var(--text-muted)]">{detail}</p> : null}
+    </div>
+  );
+}
+
+// Animated placeholder block for loading states. Replaces bare "正在加载..."
+// text so the layout doesn't jump when data arrives.
+export function Skeleton({ className = "" }: { className?: string }) {
+  return <div className={`animate-pulse bg-black/10 ${className}`} aria-hidden />;
+}
+
+// A card-shaped skeleton matching the brutalist card frame, for list grids.
+export function SkeletonCard({ lines = 4 }: { lines?: number }) {
+  return (
+    <div className="border-2 border-black bg-[var(--bg-card)] p-4 shadow-[var(--shadow-brutal)]">
+      <Skeleton className="h-6 w-1/2" />
+      <Skeleton className="mt-3 h-4 w-3/4" />
+      <div className="mt-4 grid grid-cols-2 gap-3">
+        {Array.from({ length: lines }).map((_, index) => (
+          <Skeleton key={index} className="h-8" />
+        ))}
+      </div>
     </div>
   );
 }

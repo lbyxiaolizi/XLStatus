@@ -1,7 +1,6 @@
 "use client";
 
 import { FormEvent, KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import Navigation from "@/app/components/Navigation";
 import {
   BrutalCard,
   EmptyState,
@@ -18,6 +17,8 @@ import {
   selectClass,
 } from "@/app/components/M7Primitives";
 import { apiClient, buildWebSocketUrl, type TotpStatusResponse } from "@/lib/api";
+import { useDialogs } from "@/app/components/Dialogs";
+import { useI18n } from "@/lib/use-i18n";
 
 interface Server {
   id: string;
@@ -34,6 +35,8 @@ interface TerminalLine {
 }
 
 export default function TerminalPage() {
+  const dialogs = useDialogs();
+  const { t: copy } = useI18n();
   const [servers, setServers] = useState<Server[]>([]);
   const [agentId, setAgentId] = useState("");
   const [cols, setCols] = useState(100);
@@ -46,7 +49,7 @@ export default function TerminalPage() {
   const [error, setError] = useState<string | null>(null);
   const [totpStatus, setTotpStatus] = useState<TotpStatusResponse | null>(null);
   const [lines, setLines] = useState<TerminalLine[]>([
-    { id: 1, direction: "system", text: "请选择 Agent 并打开终端会话。" },
+    { id: 1, direction: "system", text: copy.terminalPage.selectAgentPrompt },
   ]);
   const wsRef = useRef<WebSocket | null>(null);
   const lineIdRef = useRef(2);
@@ -91,7 +94,7 @@ export default function TerminalPage() {
   async function openTerminal(event?: FormEvent) {
     event?.preventDefault();
     if (!agentId) {
-      setError("打开终端前请选择 Agent。");
+      setError(copy.terminalPage.selectAgentBeforeOpen);
       return;
     }
 
@@ -101,7 +104,7 @@ export default function TerminalPage() {
     if (totpCode === null) return;
     setOpening(true);
     setStatus("connecting");
-    setLines([{ id: lineIdRef.current++, direction: "system", text: `正在打开 ${selectedAgent?.name || compactId(agentId)} (${cols}x${rows})...` }]);
+    setLines([{ id: lineIdRef.current++, direction: "system", text: copy.terminalPage.opening.replace("{name}", String(selectedAgent?.name || compactId(agentId))).replace("{cols}", String(cols)).replace("{rows}", String(rows)) }]);
 
     const response = await apiClient.createTerminalSession(agentId, cols, rows, totpCode);
     if (!response.success) {
@@ -116,7 +119,7 @@ export default function TerminalPage() {
     if (!nextSessionId) {
       setOpening(false);
       setStatus("error");
-      setError("终端会话响应缺少 session id。");
+      setError(copy.terminalPage.missingSessionId);
       return;
     }
 
@@ -136,11 +139,11 @@ export default function TerminalPage() {
       enabled = response.data.enabled;
     }
     if (!enabled) return undefined;
-    const code = window.prompt("请输入 6 位 TOTP 验证码");
+    const code = await dialogs.totp();
     if (code === null) return null;
     const trimmed = code.trim();
     if (!/^\d{6}$/.test(trimmed)) {
-      setError("请输入 6 位 TOTP 验证码。");
+      setError(copy.terminalPage.totpInvalid);
       return null;
     }
     return trimmed;
@@ -153,19 +156,19 @@ export default function TerminalPage() {
     ws.onopen = () => {
       setOpening(false);
       setStatus("open");
-      appendLine("system", `已连接到会话 ${compactId(nextSessionId)}。`);
+      appendLine("system", copy.terminalPage.connected.replace("{id}", String(compactId(nextSessionId))));
       sendFrame({ type: "terminal.resize", cols, rows });
     };
     ws.onmessage = (event) => void handleTerminalMessage(event.data);
     ws.onerror = () => {
       setOpening(false);
       setStatus("error");
-      appendLine("error", "WebSocket 错误。");
+      appendLine("error", copy.terminalPage.wsError);
     };
     ws.onclose = () => {
       setOpening(false);
       setStatus((current) => (current === "error" ? "error" : "closed"));
-      appendLine("system", "终端已关闭。");
+      appendLine("system", copy.terminalPage.terminalClosed);
       wsRef.current = null;
     };
   }
@@ -185,12 +188,12 @@ export default function TerminalPage() {
         return;
       }
       if (type === "terminal.closed" || type === "closed") {
-        appendLine("system", String(msg.reason || "服务端已关闭终端。"));
+        appendLine("system", String(msg.reason || copy.terminalPage.serverClosed));
         closeSocket();
         return;
       }
       if (type === "terminal.error" || type === "error") {
-        appendLine("error", String(msg.error || msg.message || "终端错误。"));
+        appendLine("error", String(msg.error || msg.message || copy.terminalPage.terminalError));
         return;
       }
       appendLine("system", data);
@@ -210,7 +213,7 @@ export default function TerminalPage() {
   function resizeTerminal() {
     if (status !== "open") return;
     sendFrame({ type: "terminal.resize", cols, rows });
-    appendLine("system", `已调整为 ${cols}x${rows}。`);
+    appendLine("system", copy.terminalPage.resized.replace("{cols}", String(cols)).replace("{rows}", String(rows)));
   }
 
   function sendFrame(frame: Record<string, unknown>) {
@@ -227,47 +230,46 @@ export default function TerminalPage() {
   }
 
   return (
-    <div className="min-h-screen">
-      <Navigation />
+    <div>
       <PageShell>
         <PageHeader
-          eyebrow="远程 Shell"
-          title="终端"
-          detail="通过后端 WebSocket 建立 agent 终端会话。"
-          actions={<StatusBadge tone={status === "open" ? "green" : status === "error" ? "red" : "gray"}>{terminalStatusLabel(status)}</StatusBadge>}
+          eyebrow={copy.terminalPage.eyebrow}
+          title={copy.terminalPage.title}
+          detail={copy.terminalPage.detail}
+          actions={<StatusBadge tone={status === "open" ? "green" : status === "error" ? "red" : "gray"}>{terminalStatusLabel(status, copy)}</StatusBadge>}
         />
         <InlineError message={error} />
 
         <div className="mt-5 grid gap-6 lg:grid-cols-[360px_minmax(0,1fr)]">
           <BrutalCard>
             <form onSubmit={openTerminal} className="space-y-4">
-                <Field label="Agent">
+                <Field label={copy.terminalPage.fieldAgent}>
                 <select className={selectClass} value={agentId} onChange={(e) => setAgentId(e.target.value)}>
                   {servers.map((server) => (
-                    <option key={server.id} value={server.id}>{server.name} ({server.status || "未知"})</option>
+                    <option key={server.id} value={server.id}>{server.name} ({server.status || copy.terminalPage.agentUnknownStatus})</option>
                   ))}
                 </select>
               </Field>
               <div className="grid grid-cols-2 gap-3">
-                <Field label="列数">
+                <Field label={copy.terminalPage.fieldCols}>
                   <input className={inputClass} value={cols} onChange={(e) => setCols(Number(e.target.value) || 100)} />
                 </Field>
-                <Field label="行数">
+                <Field label={copy.terminalPage.fieldRows}>
                   <input className={inputClass} value={rows} onChange={(e) => setRows(Number(e.target.value) || 30)} />
                 </Field>
               </div>
               <div className="flex flex-wrap gap-2">
-                <button disabled={opening || loading} className={buttonClass("primary")}>打开会话</button>
-                <button type="button" onClick={resizeTerminal} className={buttonClass("secondary")}>调整大小</button>
-                <button type="button" onClick={closeSocket} className={buttonClass("danger")}>关闭</button>
+                <button disabled={opening || loading} className={buttonClass("primary")}>{copy.terminalPage.openSession}</button>
+                <button type="button" onClick={resizeTerminal} className={buttonClass("secondary")}>{copy.terminalPage.resize}</button>
+                <button type="button" onClick={closeSocket} className={buttonClass("danger")}>{copy.terminalPage.close}</button>
               </div>
-              {sessionId ? <InlineNotice tone="pink">会话 {compactId(sessionId)}</InlineNotice> : null}
+              {sessionId ? <InlineNotice tone="pink">{copy.terminalPage.sessionLabel.replace("{id}", String(compactId(sessionId)))}</InlineNotice> : null}
             </form>
           </BrutalCard>
 
           <BrutalCard className="p-0">
             <div ref={outputRef} className="h-[520px] overflow-auto bg-black p-4 font-mono text-sm text-green-300">
-              {lines.length === 0 ? <EmptyState title="暂无终端输出" /> : null}
+              {lines.length === 0 ? <EmptyState title={copy.terminalPage.noOutput} /> : null}
               {lines.map((line) => (
                 <div key={line.id} className={line.direction === "error" ? "text-red-300" : line.direction === "input" ? "text-pink-300" : ""}>
                   {line.text}
@@ -281,15 +283,16 @@ export default function TerminalPage() {
                 onKeyDown={onInputKeyDown}
                 disabled={status !== "open"}
                 className="min-w-0 flex-1 bg-[var(--bg-card)] px-4 py-3 font-mono text-sm font-bold outline-none"
-                placeholder={status === "open" ? "输入命令并按 Enter" : "请先打开终端"}
+                placeholder={status === "open" ? copy.terminalPage.inputPlaceholderOpen : copy.terminalPage.inputPlaceholderClosed}
               />
               <button type="button" onClick={sendInput} disabled={status !== "open"} className="border-l-4 border-black bg-[var(--accent-color)] px-5 font-black uppercase text-white">
-                发送
+                {copy.terminalPage.send}
               </button>
             </div>
           </BrutalCard>
         </div>
       </PageShell>
+      {dialogs.element}
     </div>
   );
 }
@@ -298,13 +301,13 @@ function buildTerminalWsUrl(sessionId: string): string {
   return buildWebSocketUrl(`/ws/terminal/${encodeURIComponent(sessionId)}`);
 }
 
-function terminalStatusLabel(status: TerminalStatus): string {
+function terminalStatusLabel(status: TerminalStatus, copy: ReturnType<typeof useI18n>["t"]): string {
   const labels: Record<TerminalStatus, string> = {
-    idle: "空闲",
-    connecting: "连接中",
-    open: "已连接",
-    closed: "已关闭",
-    error: "错误",
+    idle: copy.terminalPage.statusIdle,
+    connecting: copy.terminalPage.statusConnecting,
+    open: copy.terminalPage.statusOpen,
+    closed: copy.terminalPage.statusClosed,
+    error: copy.terminalPage.statusError,
   };
   return labels[status];
 }

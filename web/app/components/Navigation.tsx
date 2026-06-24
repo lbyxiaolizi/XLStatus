@@ -6,7 +6,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { apiClient, type ThemeDefinition } from "@/lib/api";
 import { type Locale, type Translations } from "@/lib/i18n";
 import { useI18n } from "@/lib/use-i18n";
-import { compactId, inputClass, isAdmin, useBoldTheme, useStoredUser } from "./M7Primitives";
+import { clearStoredUser, compactId, inputClass, isAdmin, useBoldTheme, useStoredUser } from "./M7Primitives";
 
 type NavItem = { name: string; href: string; adminOnly?: boolean };
 
@@ -57,9 +57,8 @@ export default function Navigation() {
 
   const handleLogout = async () => {
     await apiClient.logout();
-    localStorage.removeItem("session_token");
-    localStorage.removeItem("user");
-    window.location.href = "/login";
+    clearStoredUser();
+    router.replace("/login");
   };
 
   const navigation = useMemo(() => navigationFor(copy), [copy]);
@@ -85,33 +84,28 @@ export default function Navigation() {
 
   useEffect(() => {
     if (!commandOpen) return;
-    const timeoutId = window.setTimeout(() => commandInputRef.current?.focus(), 0);
-    return () => window.clearTimeout(timeoutId);
+    commandInputRef.current?.focus();
   }, [commandOpen]);
 
   useEffect(() => {
     if (!commandOpen || !user || commandLoaded || commandLoading) return;
-    let cancelled = false;
-    const timeoutId = window.setTimeout(() => {
-      setCommandLoading(true);
-      setCommandError(null);
-      apiClient.listServers(200, 0).then((response) => {
-        if (cancelled) return;
-        setCommandLoading(false);
-        setCommandLoaded(true);
-        if (response.success && response.data) {
-          setCommandServers(
-            ((response.data.servers as CommandServer[]) ?? []).filter((server) => server.id && server.name),
-          );
-        } else {
-          setCommandError(response.error || copy.common.requestFailed);
-        }
-      });
-    }, 0);
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timeoutId);
-    };
+    const controller = new AbortController();
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- lazy fetch on command-palette open
+    setCommandLoading(true);
+    setCommandError(null);
+    apiClient.listServers(200, 0, false, { signal: controller.signal }).then((response) => {
+      if (controller.signal.aborted) return;
+      setCommandLoading(false);
+      setCommandLoaded(true);
+      if (response.success && response.data) {
+        setCommandServers(
+          ((response.data.servers as CommandServer[]) ?? []).filter((server) => server.id && server.name),
+        );
+      } else {
+        setCommandError(response.error || copy.common.requestFailed);
+      }
+    });
+    return () => controller.abort();
   }, [commandLoaded, commandLoading, commandOpen, copy.common.requestFailed, user]);
 
   useEffect(() => {

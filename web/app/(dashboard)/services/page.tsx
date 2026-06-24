@@ -1,7 +1,6 @@
 "use client";
 
 import { FormEvent, useCallback, useDeferredValue, useEffect, useMemo, useState } from "react";
-import Navigation from "@/app/components/Navigation";
 import {
   BrutalCard,
   EmptyState,
@@ -21,6 +20,10 @@ import {
   thClass,
 } from "@/app/components/M7Primitives";
 import { apiClient, type JsonObject, type TotpStatusResponse } from "@/lib/api";
+import { useDialogs } from "@/app/components/Dialogs";
+import { useI18n } from "@/lib/use-i18n";
+import type { Translations } from "@/lib/i18n";
+import type { servicesPage } from "@/lib/i18n/pages/services";
 
 type ServiceKind = "http" | "tcp" | "icmp";
 type ServiceCoverMode = "local" | "all" | "specific" | "exclude";
@@ -82,6 +85,8 @@ const blankForm: ServiceForm = {
 };
 
 export default function ServicesPage() {
+  const dialogs = useDialogs();
+  const { t: copy } = useI18n();
   const [services, setServices] = useState<Service[]>([]);
   const [servers, setServers] = useState<ServerOption[]>([]);
   const [loading, setLoading] = useState(true);
@@ -129,16 +134,16 @@ export default function ServicesPage() {
       [
         service.name,
         service.target,
-        serviceKind(service),
+        serviceKind(copy, service),
         service.last_status,
         ...serviceConfigWarnings(service),
         ...serviceServerIds(service),
-        serviceServerLabel(servers, service),
+        serviceServerLabel(copy, servers, service),
       ]
         .filter(Boolean)
         .some((value) => String(value).toLowerCase().includes(needle)),
     );
-  }, [deferredQuery, services, servers]);
+  }, [deferredQuery, services, servers, copy]);
 
   function openCreate() {
     setEditing(null);
@@ -151,7 +156,7 @@ export default function ServicesPage() {
     setEditing(service);
     setForm({
       name: service.name || "",
-      service_type: normalizeKind(serviceKind(service)),
+      service_type: normalizeKind(serviceKind(copy, service)),
       target: service.target || "",
       cover_mode: normalizeCoverMode(service.cover_mode, serviceServerIds(service)),
       server_ids: serviceServerIds(service),
@@ -183,7 +188,7 @@ export default function ServicesPage() {
 
     if (response.success) {
       setModal(null);
-      setNotice(modal === "edit" ? "服务已更新。" : "服务已创建。");
+      setNotice(modal === "edit" ? copy.servicesPage.noticeUpdated : copy.servicesPage.noticeCreated);
       await loadServices();
     } else {
       setError(responseError(response));
@@ -202,11 +207,11 @@ export default function ServicesPage() {
       enabled = response.data.enabled;
     }
     if (!enabled) return undefined;
-    const code = window.prompt("请输入 6 位 TOTP 验证码");
+    const code = await dialogs.totp();
     if (code === null) return null;
     const trimmed = code.trim();
     if (!/^\d{6}$/.test(trimmed)) {
-      setError("请输入 6 位 TOTP 验证码。");
+      setError(copy.servicesPage.totpInvalid);
       return null;
     }
     return trimmed;
@@ -223,24 +228,33 @@ export default function ServicesPage() {
     }, totpCode);
     setTesting(false);
     if (response.success && response.data) {
-      const status = response.data.success ? "成功" : "失败";
+      const status = response.data.success ? copy.servicesPage.probeSuccess : copy.servicesPage.probeFailure;
       const latency = response.data.latency_ms ? `, ${response.data.latency_ms} ms` : "";
       const code = response.data.status_code ? `, HTTP ${response.data.status_code}` : "";
       const reason = response.data.error ? `, ${response.data.error}` : "";
-      const cert = response.data.cert_not_after ? `, TLS 到期 ${formatDate(response.data.cert_not_after)}` : "";
-      setProbeResult(`探测${status}${latency}${code}${cert}${reason}`);
+      const cert = response.data.cert_not_after
+        ? copy.servicesPage.certExpiry.replace("{date}", String(formatDate(response.data.cert_not_after)))
+        : "";
+      setProbeResult(
+        copy.servicesPage.probeResult
+          .replace("{status}", status)
+          .replace("{latency}", latency)
+          .replace("{code}", code)
+          .replace("{cert}", cert)
+          .replace("{reason}", reason),
+      );
     } else {
       setProbeResult(responseError(response));
     }
   }
 
   async function deleteService(service: Service) {
-    if (!confirm(`确定删除服务「${service.name}」？`)) return;
+    if (!(await dialogs.confirm({ message: copy.servicesPage.deleteConfirm.replace("{name}", String(service.name)), danger: true }))) return;
     const totpCode = await sensitiveTotpCode();
     if (totpCode === null) return;
     const response = await apiClient.deleteService(service.id, totpCode);
     if (response.success) {
-      setNotice("服务已删除。");
+      setNotice(copy.servicesPage.noticeDeleted);
       await loadServices();
     } else {
       setError(responseError(response));
@@ -248,37 +262,36 @@ export default function ServicesPage() {
   }
 
   return (
-    <div className="min-h-screen">
-      <Navigation />
+    <div>
       <PageShell>
         <PageHeader
-          eyebrow="监控"
-          title="服务"
-          detail="HTTP、TCP、ICMP 服务监控与探测测试。"
-          actions={<button type="button" onClick={openCreate} className={buttonClass("primary")}>新增服务</button>}
+          eyebrow={copy.servicesPage.eyebrow}
+          title={copy.servicesPage.title}
+          detail={copy.servicesPage.detail}
+          actions={<button type="button" onClick={openCreate} className={buttonClass("primary")}>{copy.servicesPage.newService}</button>}
         />
         <div className="mb-5 space-y-3">
-          <input value={query} onChange={(event) => setQuery(event.target.value)} className={inputClass} placeholder="搜索服务" />
+          <input value={query} onChange={(event) => setQuery(event.target.value)} className={inputClass} placeholder={copy.servicesPage.searchPlaceholder} />
           <InlineError message={error} />
           {notice ? <InlineNotice tone="green">{notice}</InlineNotice> : null}
         </div>
 
         {loading ? (
-          <BrutalCard>正在加载服务...</BrutalCard>
+          <BrutalCard>{copy.servicesPage.loading}</BrutalCard>
         ) : filtered.length === 0 ? (
-          <EmptyState title="暂无服务配置" detail="新增监控项或先执行一次探测测试。" />
+          <EmptyState title={copy.servicesPage.emptyTitle} detail={copy.servicesPage.emptyDetail} />
         ) : (
           <div className="overflow-x-auto border-2 border-black bg-[var(--bg-card)] shadow-[var(--shadow-brutal)]">
             <table className="w-full">
               <thead>
                 <tr>
-                  <th className={thClass}>名称</th>
-                  <th className={thClass}>目标</th>
-                  <th className={thClass}>探测服务器</th>
-                  <th className={thClass}>类型</th>
-                  <th className={thClass}>状态</th>
-                  <th className={thClass}>TLS</th>
-                  <th className={thClass}>操作</th>
+                  <th className={thClass}>{copy.servicesPage.colName}</th>
+                  <th className={thClass}>{copy.servicesPage.colTarget}</th>
+                  <th className={thClass}>{copy.servicesPage.colProbeServers}</th>
+                  <th className={thClass}>{copy.servicesPage.colType}</th>
+                  <th className={thClass}>{copy.servicesPage.colStatus}</th>
+                  <th className={thClass}>{copy.servicesPage.colTls}</th>
+                  <th className={thClass}>{copy.servicesPage.colActions}</th>
                 </tr>
               </thead>
               <tbody>
@@ -289,19 +302,19 @@ export default function ServicesPage() {
                         <div>{service.name}</div>
                         {serviceConfigWarnings(service).length ? (
                           <div className="text-xs font-bold text-[var(--text-muted)]">
-                            {serviceWarningText(service)}
+                            {serviceWarningText(copy, service)}
                           </div>
                         ) : null}
                       </div>
                     </td>
                     <td className={tdClass}>{service.target}</td>
-                    <td className={tdClass}>{serviceServerLabel(servers, service)}</td>
-                    <td className={tdClass}>{serviceKind(service)}</td>
-                    <td className={tdClass}><StatusBadge tone={serviceTone(service.last_status)}>{statusLabel(service.last_status)}</StatusBadge></td>
+                    <td className={tdClass}>{serviceServerLabel(copy, servers, service)}</td>
+                    <td className={tdClass}>{serviceKind(copy, service)}</td>
+                    <td className={tdClass}><StatusBadge tone={serviceTone(service.last_status)}>{statusLabel(copy.servicesPage, service.last_status)}</StatusBadge></td>
                     <td className={tdClass}>{service.cert_not_after ? formatDate(service.cert_not_after) : "N/A"}</td>
                     <td className={`${tdClass} flex flex-wrap gap-2`}>
-                      <button className={buttonClass("secondary")} onClick={() => openEdit(service)}>编辑</button>
-                      <button className={buttonClass("danger")} onClick={() => void deleteService(service)}>删除</button>
+                      <button className={buttonClass("secondary")} onClick={() => openEdit(service)}>{copy.servicesPage.edit}</button>
+                      <button className={buttonClass("danger")} onClick={() => void deleteService(service)}>{copy.servicesPage.delete}</button>
                     </td>
                   </tr>
                 ))}
@@ -311,16 +324,16 @@ export default function ServicesPage() {
         )}
 
         {modal ? (
-          <Modal title={modal === "edit" ? "编辑服务" : "新增服务"} onClose={() => setModal(null)}>
+          <Modal title={modal === "edit" ? copy.servicesPage.modalTitleEdit : copy.servicesPage.modalTitleCreate} onClose={() => setModal(null)}>
             <form onSubmit={submitForm} className="space-y-4">
               {editing && serviceConfigWarnings(editing).length ? (
-                <InlineNotice tone="yellow">{serviceWarningText(editing)}</InlineNotice>
+                <InlineNotice tone="yellow">{serviceWarningText(copy, editing)}</InlineNotice>
               ) : null}
               <div className="grid gap-4 sm:grid-cols-2">
-                <Field label="名称">
+                <Field label={copy.servicesPage.fieldName}>
                   <input className={inputClass} value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} required />
                 </Field>
-                <Field label="类型">
+                <Field label={copy.servicesPage.fieldType}>
                   <select className={selectClass} value={form.service_type} onChange={(e) => setForm((f) => ({ ...f, service_type: e.target.value as ServiceKind }))}>
                     <option value="http">HTTP</option>
                     <option value="tcp">TCP</option>
@@ -328,21 +341,21 @@ export default function ServicesPage() {
                   </select>
                 </Field>
               </div>
-              <Field label="目标">
+              <Field label={copy.servicesPage.fieldTarget}>
                 <input className={inputClass} value={form.target} onChange={(e) => setForm((f) => ({ ...f, target: e.target.value }))} required />
               </Field>
               <div className="grid gap-4 sm:grid-cols-2">
-                <Field label="覆盖模式">
+                <Field label={copy.servicesPage.fieldCoverMode}>
                   <select className={selectClass} value={form.cover_mode} onChange={(e) => setForm((f) => ({ ...f, cover_mode: e.target.value as ServiceCoverMode }))}>
-                    <option value="local">主控探测</option>
-                    <option value="all">全部在线服务器</option>
-                    <option value="specific">指定服务器</option>
-                    <option value="exclude">排除指定服务器</option>
+                    <option value="local">{copy.servicesPage.coverLocal}</option>
+                    <option value="all">{copy.servicesPage.coverAll}</option>
+                    <option value="specific">{copy.servicesPage.coverSpecific}</option>
+                    <option value="exclude">{copy.servicesPage.coverExclude}</option>
                   </select>
                 </Field>
               </div>
               {form.cover_mode === "specific" ? (
-                <Field label="指定服务器">
+                <Field label={copy.servicesPage.fieldSpecificServers}>
                   <ServerMultiPicker
                     servers={servers}
                     selected={form.server_ids}
@@ -351,7 +364,7 @@ export default function ServicesPage() {
                 </Field>
               ) : null}
               {form.cover_mode === "exclude" ? (
-                <Field label="排除服务器">
+                <Field label={copy.servicesPage.fieldExcludeServers}>
                   <ServerMultiPicker
                     servers={servers}
                     selected={form.exclude_server_ids}
@@ -360,51 +373,52 @@ export default function ServicesPage() {
                 </Field>
               ) : null}
               <div className="grid gap-4 sm:grid-cols-2">
-                <Field label="检查间隔（秒）">
+                <Field label={copy.servicesPage.fieldInterval}>
                   <input className={inputClass} value={form.interval_seconds} onChange={(e) => setForm((f) => ({ ...f, interval_seconds: e.target.value }))} />
                 </Field>
-                <Field label="超时（秒）">
+                <Field label={copy.servicesPage.fieldTimeout}>
                   <input className={inputClass} value={form.timeout_seconds} onChange={(e) => setForm((f) => ({ ...f, timeout_seconds: e.target.value }))} />
                 </Field>
               </div>
               <label className="flex items-center gap-2 text-sm font-black">
                 <input type="checkbox" checked={form.enabled} onChange={(e) => setForm((f) => ({ ...f, enabled: e.target.checked }))} />
-                启用
+                {copy.servicesPage.fieldEnabled}
               </label>
               <div className="grid gap-4 sm:grid-cols-2">
-                <Field label="失败任务 IDs">
+                <Field label={copy.servicesPage.fieldFailureTaskIds}>
                   <input className={inputClass} value={form.failure_task_ids} onChange={(e) => setForm((f) => ({ ...f, failure_task_ids: e.target.value }))} />
                 </Field>
-                <Field label="恢复任务 IDs">
+                <Field label={copy.servicesPage.fieldRecoveryTaskIds}>
                   <input className={inputClass} value={form.recovery_task_ids} onChange={(e) => setForm((f) => ({ ...f, recovery_task_ids: e.target.value }))} />
                 </Field>
               </div>
               {probeResult ? <InlineNotice tone="pink">{probeResult}</InlineNotice> : null}
               <div className="flex flex-wrap gap-2">
-                <button type="submit" disabled={saving} className={buttonClass("primary")}>{saving ? "保存中..." : "保存"}</button>
-                <button type="button" disabled={testing} onClick={() => void testProbe()} className={buttonClass("secondary")}>{testing ? "测试中..." : "测试探测"}</button>
+                <button type="submit" disabled={saving} className={buttonClass("primary")}>{saving ? copy.servicesPage.saving : copy.servicesPage.save}</button>
+                <button type="button" disabled={testing} onClick={() => void testProbe()} className={buttonClass("secondary")}>{testing ? copy.servicesPage.testing : copy.servicesPage.testProbe}</button>
               </div>
             </form>
           </Modal>
         ) : null}
       </PageShell>
+      {dialogs.element}
     </div>
   );
 }
 
-function serviceKind(service: Service): string {
-  return service.service_type || service.kind || service.type || "服务";
+function serviceKind(copy: Translations, service: Service): string {
+  return service.service_type || service.kind || service.type || copy.servicesPage.defaultKind;
 }
 
-function statusLabel(status?: string): string {
-  if (!status) return "未知";
+function statusLabel(copy: typeof servicesPage, status?: string): string {
+  if (!status) return copy.statusUnknown;
   const labels: Record<string, string> = {
-    success: "成功",
-    up: "正常",
-    failure: "失败",
-    down: "异常",
-    timeout: "超时",
-    degraded: "降级",
+    success: copy.statusSuccess,
+    up: copy.statusUp,
+    failure: copy.statusFailure,
+    down: copy.statusDown,
+    timeout: copy.statusTimeout,
+    degraded: copy.statusDegraded,
   };
   return labels[status] || status;
 }
@@ -452,6 +466,7 @@ function ServerMultiPicker({
   selected: string[];
   onChange: (serverIds: string[]) => void;
 }) {
+  const { t: copy } = useI18n();
   return (
     <div className="space-y-3">
       <button
@@ -463,11 +478,11 @@ function ServerMultiPicker({
             : "bg-[var(--accent-bg)] text-[var(--text-main)]"
         }`}
       >
-        主控/未指定
+        {copy.servicesPage.pickerMasterUnassigned}
       </button>
       <div className="grid max-h-56 gap-2 overflow-auto border-2 border-black bg-[var(--bg-page)] p-3">
         {servers.length === 0 ? (
-          <div className="text-sm font-black text-[var(--text-muted)]">暂无可选服务器</div>
+          <div className="text-sm font-black text-[var(--text-muted)]">{copy.servicesPage.pickerNoServers}</div>
         ) : (
           servers.map((server) => {
             const checked = selected.includes(server.id);
@@ -514,21 +529,21 @@ function serviceConfigWarnings(service: Service): string[] {
     : [];
 }
 
-function serviceWarningText(service: Service): string {
+function serviceWarningText(copy: Translations, service: Service): string {
   const warnings = serviceConfigWarnings(service);
   if (!warnings.length) return "";
-  return `历史配置异常：${warnings.join("；")}`;
+  return `${copy.servicesPage.warningPrefix}${warnings.join("；")}`;
 }
 
-function serviceServerLabel(servers: ServerOption[], service: Service): string {
-  if (service.cover_mode === "all") return "全部在线服务器";
+function serviceServerLabel(copy: Translations, servers: ServerOption[], service: Service): string {
+  if (service.cover_mode === "all") return copy.servicesPage.serverLabelAllOnline;
   if (service.cover_mode === "exclude") {
     const excluded = service.exclude_server_ids ?? [];
-    if (!excluded.length) return "全部在线服务器";
-    return `排除：${excluded.map((id) => serverName(servers, id)).join("、")}`;
+    if (!excluded.length) return copy.servicesPage.serverLabelAllOnline;
+    return `${copy.servicesPage.serverLabelExcludePrefix}${excluded.map((id) => serverName(servers, id)).join("、")}`;
   }
   const ids = serviceServerIds(service);
-  if (!ids.length) return "主控探测";
+  if (!ids.length) return copy.servicesPage.serverLabelLocal;
   return ids.map((id) => serverName(servers, id)).join("、");
 }
 
