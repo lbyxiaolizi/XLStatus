@@ -144,10 +144,8 @@ export default function TasksPage() {
   }, []);
 
   useEffect(() => {
-    const timeoutId = window.setTimeout(() => {
-      void loadTasks();
-    }, 0);
-    return () => window.clearTimeout(timeoutId);
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount is the standard client data-load pattern
+    void loadTasks();
   }, [loadTasks]);
 
   const filtered = useMemo(() => {

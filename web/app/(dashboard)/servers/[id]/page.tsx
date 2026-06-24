@@ -360,24 +360,18 @@ export default function ServerDetailPage({ params }: PageProps) {
   }, [metricsRange, serverId]);
 
   useEffect(() => {
-    const timeoutId = window.setTimeout(() => {
-      void loadServer();
-    }, 0);
-    return () => window.clearTimeout(timeoutId);
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount is the standard client data-load pattern
+    void loadServer();
   }, [loadServer]);
 
   useEffect(() => {
-    const timeoutId = window.setTimeout(() => {
-      void loadMetrics();
-    }, 0);
-    return () => window.clearTimeout(timeoutId);
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount is the standard client data-load pattern
+    void loadMetrics();
   }, [loadMetrics]);
 
   useEffect(() => {
-    const timeoutId = window.setTimeout(() => {
-      void loadProbeHistory();
-    }, 0);
-    return () => window.clearTimeout(timeoutId);
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount is the standard client data-load pattern
+    void loadProbeHistory();
   }, [loadProbeHistory]);
 
   const statusTone = server?.status === "online" ? "green" : server?.status === "revoked" ? "yellow" : "red";
@@ -2328,8 +2322,8 @@ function latestProbeLatency(series: ChartSeries[]): string {
   return latest ? formatMs(Math.round(latest.value)) : "N/A";
 }
 
-function formatRate(value?: number): string {
-  if (value === undefined || Number.isNaN(value)) return "N/A";
+function formatRate(value?: number | null): string {
+  if (value === undefined || value === null || Number.isNaN(value)) return "N/A";
   return `${formatBytes(value)}/s`;
 }
 

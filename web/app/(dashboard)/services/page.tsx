@@ -116,11 +116,9 @@ export default function ServicesPage() {
   }, []);
 
   useEffect(() => {
-    const timeoutId = window.setTimeout(() => {
-      void loadServices();
-      void loadServers();
-    }, 0);
-    return () => window.clearTimeout(timeoutId);
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount is the standard client data-load pattern
+    void loadServices();
+    void loadServers();
   }, [loadServices, loadServers]);
 
   const filtered = useMemo(() => {

@@ -180,10 +180,8 @@ export default function ServersPage() {
   }, []);
 
   useEffect(() => {
-    const timeoutId = window.setTimeout(() => {
-      void loadServers();
-    }, 0);
-    return () => window.clearTimeout(timeoutId);
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount is the standard client data-load pattern
+    void loadServers();
   }, [loadServers]);
 
   const loadServerGroups = useCallback(async () => {
@@ -194,10 +192,8 @@ export default function ServersPage() {
   }, []);
 
   useEffect(() => {
-    const timeoutId = window.setTimeout(() => {
-      void loadServerGroups();
-    }, 0);
-    return () => window.clearTimeout(timeoutId);
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount is the standard client data-load pattern
+    void loadServerGroups();
   }, [loadServerGroups]);
 
   const loadOwnerTransfers = useCallback(async () => {
@@ -218,10 +214,8 @@ export default function ServersPage() {
 
   useEffect(() => {
     if (!canManageTransfers) return;
-    const timeoutId = window.setTimeout(() => {
-      void loadOwnerTransfers();
-    }, 0);
-    return () => window.clearTimeout(timeoutId);
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount is the standard client data-load pattern
+    void loadOwnerTransfers();
   }, [canManageTransfers, loadOwnerTransfers]);
 
   const loadServices = useCallback(async () => {
@@ -261,10 +255,8 @@ export default function ServersPage() {
   }, []);
 
   useEffect(() => {
-    const timeoutId = window.setTimeout(() => {
-      void loadServices();
-    }, 0);
-    return () => window.clearTimeout(timeoutId);
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount is the standard client data-load pattern
+    void loadServices();
   }, [loadServices]);
 
   useEffect(() => {

@@ -79,6 +79,23 @@ const pathGenerator = geoPath(projection);
 const countryFeatures = (worldCountries.features as CountryFeature[]).filter((feature) => feature.properties.iso2);
 const countryFeatureByIso2 = new Map(countryFeatures.map((feature) => [feature.properties.iso2.toUpperCase(), feature]));
 
+// Precompute each country's projected SVG path + centroid once at module load.
+// geoPath is deterministic given a fixed projection, so re-running it on every
+// render (177 countries × per WS frame) was pure waste. Look these up by iso2.
+interface CountryPath {
+  iso2: string;
+  name: string;
+  d: string;
+  centroidX: number;
+  centroidY: number;
+}
+const countryPaths: CountryPath[] = countryFeatures.map((feature) => {
+  const iso2 = feature.properties.iso2.toUpperCase();
+  const d = pathGenerator(feature) ?? "";
+  const [centroidX = 0, centroidY = 0] = pathGenerator.centroid(feature);
+  return { iso2, name: feature.properties.name, d, centroidX, centroidY };
+});
+
 export function WorldServerMap<TServer extends MapServerLike>({
   servers,
   title,
@@ -120,14 +137,14 @@ export function WorldServerMap<TServer extends MapServerLike>({
             <rect width={width} height={height} fill="var(--bg-page)" />
             <rect width={width} height={height} fill="url(#world-map-grid)" />
             <g>
-              {countryFeatures.map((feature) => {
-                const countryCode = feature.properties.iso2.toUpperCase();
+              {countryPaths.map((entry) => {
+                const countryCode = entry.iso2;
                 const bucket = highlighted.get(countryCode);
                 const isHighlighted = Boolean(bucket);
                 return (
                   <path
                     key={countryCode}
-                    d={pathGenerator(feature) ?? ""}
+                    d={entry.d}
                     className={`transition-colors duration-150 ${
                       isHighlighted
                         ? "cursor-pointer fill-[var(--accent-color)] stroke-[var(--border-color)]"
@@ -141,11 +158,10 @@ export function WorldServerMap<TServer extends MapServerLike>({
                         setTooltip(null);
                         return;
                       }
-                      const [x, y] = pathGenerator.centroid(feature);
                       setTooltip({
-                        x,
-                        y,
-                        label: bucket.point.label || feature.properties.name,
+                        x: entry.centroidX,
+                        y: entry.centroidY,
+                        label: bucket.point.label || entry.name,
                         source: sourceLabel(bucket.point.source),
                         servers: bucket.servers,
                       });

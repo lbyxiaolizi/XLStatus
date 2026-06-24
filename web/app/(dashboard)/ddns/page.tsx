@@ -59,10 +59,8 @@ export default function DdnsPage() {
   }, []);
 
   useEffect(() => {
-    const timeoutId = window.setTimeout(() => {
-      void load();
-    }, 0);
-    return () => window.clearTimeout(timeoutId);
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount is the standard client data-load pattern
+    void load();
   }, [load]);
 
   async function sensitiveTotpCode(): Promise<string | undefined | null> {
