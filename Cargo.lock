@@ -4202,7 +4202,7 @@ dependencies = [
 
 [[package]]
 name = "xlstatus-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4228,7 +4228,7 @@ dependencies = [
 
 [[package]]
 name = "xlstatus-proto-gen"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "prost",
  "prost-types",
@@ -4238,7 +4238,7 @@ dependencies = [
 
 [[package]]
 name = "xlstatus-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -4287,7 +4287,7 @@ dependencies = [
 
 [[package]]
 name = "xlstatus-shared"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "serde",
@@ -4298,7 +4298,7 @@ dependencies = [
 
 [[package]]
 name = "xlstatus-tsdb"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "parking_lot",
@@ -4310,7 +4310,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
