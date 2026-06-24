@@ -863,8 +863,8 @@ class ApiClient {
     );
   }
 
-  async getServer(id: string): Promise<ApiResponse<JsonObject>> {
-    return this.request<JsonObject>(`/api/v1/servers/${encodeURIComponent(id)}`);
+  async getServer(id: string, options?: { signal?: AbortSignal }): Promise<ApiResponse<JsonObject>> {
+    return this.request<JsonObject>(`/api/v1/servers/${encodeURIComponent(id)}`, options);
   }
 
   async updateServer(
@@ -993,9 +993,11 @@ class ApiClient {
   async getServerMetrics(
     id: string,
     range = "1d",
+    options?: { signal?: AbortSignal },
   ): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
       `/api/v1/servers/${encodeURIComponent(id)}/metrics?range=${encodeURIComponent(range)}`,
+      options,
     );
   }
 
@@ -1125,10 +1127,11 @@ class ApiClient {
     limit = 50,
     offset = 0,
     anonymous = false,
+    options?: { signal?: AbortSignal },
   ): Promise<ApiResponse<ServiceListResponse>> {
     return this.request<ServiceListResponse>(
       `/api/v1/services?limit=${limit}&offset=${offset}`,
-      { anonymous },
+      { anonymous, ...options },
     );
   }
 
@@ -1191,9 +1194,11 @@ class ApiClient {
   async getServiceHistory(
     id: string,
     limit = 30,
+    options?: { signal?: AbortSignal },
   ): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
       `/api/v1/services/${encodeURIComponent(id)}/history?limit=${limit}`,
+      options,
     );
   }
 

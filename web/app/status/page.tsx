@@ -392,7 +392,7 @@ function PublicServerResourceStrip({ resources }: { resources: PublicServerResou
 }
 
 function PublicServerMiniCharts({ metrics, compact = false }: { metrics: PublicServerMetrics; compact?: boolean }) {
-  const charts = buildMetricCharts(metrics.samples);
+  const charts = useMemo(() => buildMetricCharts(metrics.samples), [metrics.samples]);
   const resourceSeries = [
     { id: "cpu", label: "CPU", color: "var(--accent-color)", points: charts.cpu },
     { id: "memory", label: "内存", color: "var(--btn-bg)", points: charts.memory },

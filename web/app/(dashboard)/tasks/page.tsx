@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useDeferredValue, useEffect, useMemo, useState } from "react";
 import Navigation from "@/app/components/Navigation";
 import {
   BrutalCard,
@@ -148,12 +148,13 @@ export default function TasksPage() {
     void loadTasks();
   }, [loadTasks]);
 
+  const deferredQuery = useDeferredValue(query);
   const filtered = useMemo(() => {
-    const needle = query.trim().toLowerCase();
+    const needle = deferredQuery.trim().toLowerCase();
     return !needle
       ? tasks
       : tasks.filter((task) => [task.name, task.task_type, task.schedule, task.last_result].filter(Boolean).some((value) => String(value).toLowerCase().includes(needle)));
-  }, [query, tasks]);
+  }, [deferredQuery, tasks]);
 
   function openCreate() {
     setEditing(null);

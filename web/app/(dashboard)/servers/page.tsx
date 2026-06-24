@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import type { ReactNode } from "react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import Navigation from "@/app/components/Navigation";
 import { WorldServerMap } from "@/app/components/WorldServerMap";
 import {
@@ -218,10 +218,11 @@ export default function ServersPage() {
     void loadOwnerTransfers();
   }, [canManageTransfers, loadOwnerTransfers]);
 
-  const loadServices = useCallback(async () => {
+  const loadServices = useCallback(async (signal?: AbortSignal) => {
     setServicesLoading(true);
     setServiceError(null);
-    const response = await apiClient.listServices(200, 0);
+    const response = await apiClient.listServices(200, 0, false, { signal });
+    if (signal?.aborted) return;
     if (!response.success || !response.data) {
       setServices([]);
       setServiceTrackers([]);
@@ -234,7 +235,7 @@ export default function ServersPage() {
     setServices(nextServices);
     const histories = await Promise.all(
       nextServices.map(async (service) => {
-        const history = await apiClient.getServiceHistory(service.id, 1200);
+        const history = await apiClient.getServiceHistory(service.id, 1200, { signal });
         if (!history.success || !history.data) return null;
         const results = Array.isArray(history.data.results) ? history.data.results : [];
         return {
@@ -245,6 +246,7 @@ export default function ServersPage() {
         };
       }),
     );
+    if (signal?.aborted) return;
 
     setServiceTrackers(
       histories
@@ -255,8 +257,10 @@ export default function ServersPage() {
   }, []);
 
   useEffect(() => {
+    const controller = new AbortController();
     // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount is the standard client data-load pattern
-    void loadServices();
+    void loadServices(controller.signal);
+    return () => controller.abort();
   }, [loadServices]);
 
   useEffect(() => {
@@ -313,26 +317,43 @@ export default function ServersPage() {
     };
   }, []);
 
-  const merged = useMemo(
-    () =>
-      servers.map((server) => {
-        const state = live[server.id];
-        return {
-          ...server,
-          cpu_percent: state?.cpu_percent ?? server.cpu_percent,
-          memory_used: state?.memory_used ?? server.memory_used,
-          memory_total: state?.memory_total ?? server.memory_total,
-          load_1: state?.load_1 ?? server.load_1,
-          net_rx_bps: state?.net_rx_bps ?? server.net_rx_bps,
-          net_tx_bps: state?.net_tx_bps ?? server.net_tx_bps,
-          network_in_total: state?.network_in_total ?? server.network_in_total,
-          network_out_total: state?.network_out_total ?? server.network_out_total,
-          uptime_seconds: state?.uptime_seconds ?? server.uptime_seconds,
-          last_event_at: state?.received_at ?? server.last_event_at,
-        };
-      }),
-    [live, servers],
-  );
+  const mergedCacheRef = useRef<Map<string, { server: Server; state: LiveState | undefined; merged: Server }>>(new Map());
+  const merged = useMemo(() => {
+    const cache = mergedCacheRef.current;
+    const nextIds = new Set<string>();
+    const result = servers.map((server) => {
+      const state = live[server.id];
+      nextIds.add(server.id);
+      const cached = cache.get(server.id);
+      // Reuse the previous merged object when neither the base server row nor
+      // its live state changed identity. This keeps object references stable
+      // across WS frames so memoized ServerCard rows don't all re-render when
+      // a single agent reports in.
+      if (cached && cached.server === server && cached.state === state) {
+        return cached.merged;
+      }
+      const mergedServer: Server = {
+        ...server,
+        cpu_percent: state?.cpu_percent ?? server.cpu_percent,
+        memory_used: state?.memory_used ?? server.memory_used,
+        memory_total: state?.memory_total ?? server.memory_total,
+        load_1: state?.load_1 ?? server.load_1,
+        net_rx_bps: state?.net_rx_bps ?? server.net_rx_bps,
+        net_tx_bps: state?.net_tx_bps ?? server.net_tx_bps,
+        network_in_total: state?.network_in_total ?? server.network_in_total,
+        network_out_total: state?.network_out_total ?? server.network_out_total,
+        uptime_seconds: state?.uptime_seconds ?? server.uptime_seconds,
+        last_event_at: state?.received_at ?? server.last_event_at,
+      };
+      cache.set(server.id, { server, state, merged: mergedServer });
+      return mergedServer;
+    });
+    // Drop cache entries for servers that no longer exist.
+    for (const id of cache.keys()) {
+      if (!nextIds.has(id)) cache.delete(id);
+    }
+    return result;
+  }, [live, servers]);
 
   const tagGroups = useMemo(() => buildServerGroups(merged), [merged]);
   const groupMembership = useMemo(
@@ -350,14 +371,17 @@ export default function ServersPage() {
     [selectedServerGroupId, serverGroups],
   );
   const summary = useMemo(() => buildServerSummary(merged), [merged]);
+  // Defer the text filter so typing stays responsive even with a live WS feed
+  // re-deriving `merged`; React filters in the background off the latest input.
+  const deferredQuery = useDeferredValue(query);
   const filtered = useMemo(
     () =>
       merged
-        .filter((server) => serverMatchesQuery(server, query))
+        .filter((server) => serverMatchesQuery(server, deferredQuery))
         .filter((server) => statusFilter === "all" || serverStatusGroup(server.status) === statusFilter)
         .filter((server) => serverMatchesGroupFilter(server, groupFilter, groupMembership))
         .sort((a, b) => compareServers(a, b, sortKey, sortOrder)),
-    [groupFilter, groupMembership, merged, query, sortKey, sortOrder, statusFilter],
+    [groupFilter, groupMembership, merged, deferredQuery, sortKey, sortOrder, statusFilter],
   );
   const selectedSet = useMemo(() => new Set(selectedIds), [selectedIds]);
   const filteredIds = useMemo(() => filtered.map((server) => server.id), [filtered]);
@@ -391,11 +415,11 @@ export default function ServersPage() {
     });
   }
 
-  function toggleServerSelection(id: string) {
+  const toggleServerSelection = useCallback((id: string) => {
     setSelectedIds((current) =>
       current.includes(id) ? current.filter((item) => item !== id) : [...current, id],
     );
-  }
+  }, []);
 
   function serverGroupDraft(group?: ServerGroup) {
     return {
@@ -845,13 +869,13 @@ export default function ServersPage() {
         ) : viewMode === "compact" ? (
           <div className="grid gap-2">
             {filtered.map((server) => (
-              <CompactServerRow key={server.id} server={server} selected={selectedSet.has(server.id)} onSelect={() => toggleServerSelection(server.id)} />
+              <CompactServerRow key={server.id} server={server} selected={selectedSet.has(server.id)} onToggle={toggleServerSelection} />
             ))}
           </div>
         ) : (
           <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
             {filtered.map((server) => (
-              <ServerCard key={server.id} server={server} selected={selectedSet.has(server.id)} onSelect={() => toggleServerSelection(server.id)} />
+              <ServerCard key={server.id} server={server} selected={selectedSet.has(server.id)} onToggle={toggleServerSelection} />
             ))}
           </div>
         )}
@@ -1011,14 +1035,14 @@ function ServiceTrackerCard({ tracker }: { tracker: ServiceTrackerItem }) {
   );
 }
 
-function ServerCard({
+const ServerCard = memo(function ServerCard({
   server,
   selected,
-  onSelect,
+  onToggle,
 }: {
   server: Server;
   selected: boolean;
-  onSelect: () => void;
+  onToggle: (id: string) => void;
 }) {
   const remark = optionalMetaLabel(server.remark) ?? optionalMetaLabel(server.note);
   const expiresAt = server.expires_at || server.expired_at || null;
@@ -1039,7 +1063,7 @@ function ServerCard({
   return (
     <article className="grid h-full gap-2">
       <label className="flex items-center gap-2 border-2 border-black bg-[var(--bg-card)] px-3 py-2 text-xs font-black uppercase shadow-[var(--shadow-brutal-sm)]">
-        <input type="checkbox" checked={selected} onChange={onSelect} />
+        <input type="checkbox" checked={selected} onChange={() => onToggle(server.id)} />
         选择
       </label>
       <Link
@@ -1100,22 +1124,22 @@ function ServerCard({
       </Link>
     </article>
   );
-}
+});
 
-function CompactServerRow({
+const CompactServerRow = memo(function CompactServerRow({
   server,
   selected,
-  onSelect,
+  onToggle,
 }: {
   server: Server;
   selected: boolean;
-  onSelect: () => void;
+  onToggle: (id: string) => void;
 }) {
   const isOnline = server.status === "online";
   return (
     <div className="grid gap-2 sm:grid-cols-[auto_minmax(0,1fr)]">
       <label className="flex items-center justify-center border-2 border-black bg-[var(--bg-card)] px-3 py-2 shadow-[var(--shadow-brutal-sm)]">
-        <input type="checkbox" checked={selected} onChange={onSelect} aria-label={`选择 ${server.name}`} />
+        <input type="checkbox" checked={selected} onChange={() => onToggle(server.id)} aria-label={`选择 ${server.name}`} />
       </label>
       <Link
         href={`/servers/${encodeURIComponent(server.id)}`}
@@ -1140,7 +1164,7 @@ function CompactServerRow({
       </Link>
     </div>
   );
-}
+});
 
 function CompactMetric({ label, value }: { label: string; value: string }) {
   return (

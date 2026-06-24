@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useDeferredValue, useEffect, useMemo, useState } from "react";
 import Navigation from "@/app/components/Navigation";
 import {
   BrutalCard,
@@ -121,8 +121,9 @@ export default function ServicesPage() {
     void loadServers();
   }, [loadServices, loadServers]);
 
+  const deferredQuery = useDeferredValue(query);
   const filtered = useMemo(() => {
-    const needle = query.trim().toLowerCase();
+    const needle = deferredQuery.trim().toLowerCase();
     if (!needle) return services;
     return services.filter((service) =>
       [
@@ -137,7 +138,7 @@ export default function ServicesPage() {
         .filter(Boolean)
         .some((value) => String(value).toLowerCase().includes(needle)),
     );
-  }, [query, services, servers]);
+  }, [deferredQuery, services, servers]);
 
   function openCreate() {
     setEditing(null);

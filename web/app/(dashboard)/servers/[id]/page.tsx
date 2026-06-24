@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { FormEvent, MouseEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, MouseEvent, memo, useCallback, useEffect, useMemo, useState } from "react";
 import Navigation from "@/app/components/Navigation";
 import {
   asRecord,
@@ -224,11 +224,12 @@ export default function ServerDetailPage({ params }: PageProps) {
     void Promise.resolve(params).then((value) => setServerId(value.id));
   }, [params]);
 
-  const loadServer = useCallback(async () => {
+  const loadServer = useCallback(async (signal?: AbortSignal) => {
     if (!serverId) return;
     setLoading(true);
     setError(null);
-    const response = await apiClient.getServer(serverId);
+    const response = await apiClient.getServer(serverId, { signal });
+    if (signal?.aborted) return;
     setLoading(false);
     if (response.success && response.data) {
       const detail = response.data as unknown as ServerDetail;
@@ -280,11 +281,12 @@ export default function ServerDetailPage({ params }: PageProps) {
     [serverId],
   );
 
-  const loadMetrics = useCallback(async () => {
+  const loadMetrics = useCallback(async (signal?: AbortSignal) => {
     if (!serverId) return;
     setMetricsLoading(true);
     setMonitorError(null);
-    const response = await apiClient.getServerMetrics(serverId, metricsRange);
+    const response = await apiClient.getServerMetrics(serverId, metricsRange, { signal });
+    if (signal?.aborted) return;
     setMetricsLoading(false);
     if (response.success && response.data) {
       const series = asRecord(response.data.series);
@@ -296,11 +298,12 @@ export default function ServerDetailPage({ params }: PageProps) {
     }
   }, [metricsRange, serverId]);
 
-  const loadProbeHistory = useCallback(async () => {
+  const loadProbeHistory = useCallback(async (signal?: AbortSignal) => {
     if (!serverId) return;
     setProbeLoading(true);
     setMonitorError(null);
-    const servicesResponse = await apiClient.listServices(200, 0);
+    const servicesResponse = await apiClient.listServices(200, 0, false, { signal });
+    if (signal?.aborted) return;
     if (!servicesResponse.success || !servicesResponse.data) {
       setProbeHistories([]);
       setProbeLoading(false);
@@ -313,7 +316,7 @@ export default function ServerDetailPage({ params }: PageProps) {
     );
     const histories = await Promise.all(
       services.map(async (service) => {
-        const response = await apiClient.getServiceHistory(service.id, historyLimitForRange(metricsRange));
+        const response = await apiClient.getServiceHistory(service.id, historyLimitForRange(metricsRange), { signal });
         if (!response.success || !response.data) return null;
         const results = Array.isArray(response.data.results) ? response.data.results : [];
         return {
@@ -325,6 +328,7 @@ export default function ServerDetailPage({ params }: PageProps) {
         };
       }),
     );
+    if (signal?.aborted) return;
 
     const nextHistories = histories
       .filter((item): item is { service: ServiceSummary; results: ServiceResult[] } => Boolean(item && item.results.length))
@@ -360,18 +364,24 @@ export default function ServerDetailPage({ params }: PageProps) {
   }, [metricsRange, serverId]);
 
   useEffect(() => {
+    const controller = new AbortController();
     // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount is the standard client data-load pattern
-    void loadServer();
+    void loadServer(controller.signal);
+    return () => controller.abort();
   }, [loadServer]);
 
   useEffect(() => {
+    const controller = new AbortController();
     // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount is the standard client data-load pattern
-    void loadMetrics();
+    void loadMetrics(controller.signal);
+    return () => controller.abort();
   }, [loadMetrics]);
 
   useEffect(() => {
+    const controller = new AbortController();
     // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount is the standard client data-load pattern
-    void loadProbeHistory();
+    void loadProbeHistory(controller.signal);
+    return () => controller.abort();
   }, [loadProbeHistory]);
 
   const statusTone = server?.status === "online" ? "green" : server?.status === "revoked" ? "yellow" : "red";
@@ -700,6 +710,13 @@ const chartColors = [
   "#a855f7",
 ];
 
+// Module-level chart value formatters: stable references so memoized chart
+// components don't re-render when the parent rebuilds its chart config array.
+const formatChartPercent = (value: number) => `${value.toFixed(1)}%`;
+const formatChartFixed2 = (value: number) => value.toFixed(2);
+const formatChartRound = (value: number) => String(Math.round(value));
+const formatChartTemperature = (value: number) => `${value.toFixed(1)} °C`;
+
 function SecondaryPanelNav({ active, onOpen }: { active: SecondaryPanel; onOpen: (panel: SecondaryPanel) => void }) {
   return (
     <div className="flex flex-wrap gap-3 border-2 border-black bg-[var(--bg-card)] p-3 shadow-[var(--shadow-brutal)]">
@@ -931,7 +948,7 @@ function MonitoringCharts({
       value: formatPercent(metricCharts.latestCpu),
       series: [{ id: "cpu", label: "CPU", color: "var(--accent-color)", points: metricCharts.cpu }],
       maxValue: 100,
-      formatValue: (value: number) => `${value.toFixed(1)}%`,
+      formatValue: formatChartPercent,
     },
     {
       key: "memory",
@@ -939,14 +956,14 @@ function MonitoringCharts({
       value: formatPercent(metricCharts.latestMemory),
       series: [{ id: "memory", label: "内存", color: "var(--btn-bg)", points: metricCharts.memory }],
       maxValue: 100,
-      formatValue: (value: number) => `${value.toFixed(1)}%`,
+      formatValue: formatChartPercent,
     },
     {
       key: "load",
       title: "负载",
       value: metricCharts.latestLoad === undefined ? "N/A" : metricCharts.latestLoad.toFixed(2),
       series: [{ id: "load", label: "负载", color: "#0ea5e9", points: metricCharts.load }],
-      formatValue: (value: number) => value.toFixed(2),
+      formatValue: formatChartFixed2,
     },
     {
       key: "disk",
@@ -954,7 +971,7 @@ function MonitoringCharts({
       value: formatPercent(metricCharts.latestDisk),
       series: [{ id: "disk", label: "磁盘", color: "#f97316", points: metricCharts.disk }],
       maxValue: 100,
-      formatValue: (value: number) => `${value.toFixed(1)}%`,
+      formatValue: formatChartPercent,
     },
     {
       key: "swap",
@@ -962,14 +979,14 @@ function MonitoringCharts({
       value: formatPercent(metricCharts.latestSwap),
       series: [{ id: "swap", label: "Swap", color: "#a855f7", points: metricCharts.swap }],
       maxValue: 100,
-      formatValue: (value: number) => `${value.toFixed(1)}%`,
+      formatValue: formatChartPercent,
     },
     {
       key: "process",
       title: "进程",
       value: metricCharts.latestProcess === undefined ? "N/A" : String(Math.round(metricCharts.latestProcess)),
       series: [{ id: "process", label: "进程", color: "#10b981", points: metricCharts.process }],
-      formatValue: (value: number) => String(Math.round(value)),
+      formatValue: formatChartRound,
     },
     {
       key: "connection",
@@ -979,14 +996,14 @@ function MonitoringCharts({
         { id: "tcp", label: "TCP", color: "var(--accent-color)", points: metricCharts.tcp },
         { id: "udp", label: "UDP", color: "var(--border-color)", points: metricCharts.udp },
       ],
-      formatValue: (value: number) => String(Math.round(value)),
+      formatValue: formatChartRound,
     },
     {
       key: "temperature",
       title: "温度",
       value: metricCharts.latestTemperature === undefined ? "N/A" : `${metricCharts.latestTemperature.toFixed(1)} °C`,
       series: [{ id: "temperature", label: "温度", color: "#dc2626", points: metricCharts.temperature }],
-      formatValue: (value: number) => `${value.toFixed(1)} °C`,
+      formatValue: formatChartTemperature,
     },
     {
       key: "gpu",
@@ -994,7 +1011,7 @@ function MonitoringCharts({
       value: formatPercent(metricCharts.latestGpu),
       series: [{ id: "gpu", label: "GPU", color: "#ef4444", points: metricCharts.gpu }],
       maxValue: 100,
-      formatValue: (value: number) => `${value.toFixed(1)}%`,
+      formatValue: formatChartPercent,
     },
   ];
   const visibleResourceCharts = metricsLoading ? resourceCharts : resourceCharts.filter((chart) => chartHasData(chart.series));
@@ -1639,7 +1656,7 @@ function ProbeOverlayChartCard({
   );
 }
 
-function MiniLineChart({ series, maxValue, formatValue }: { series: ChartSeries[]; maxValue?: number; formatValue: (value: number) => string }) {
+const MiniLineChart = memo(function MiniLineChart({ series, maxValue, formatValue }: { series: ChartSeries[]; maxValue?: number; formatValue: (value: number) => string }) {
   const [hover, setHover] = useState<{
     x: number;
     time: number;
@@ -1779,9 +1796,9 @@ function MiniLineChart({ series, maxValue, formatValue }: { series: ChartSeries[
       ) : null}
     </svg>
   );
-}
+});
 
-function MiniDualAxisChart({ latencySeries, lossSeries }: { latencySeries: ChartSeries[]; lossSeries: ChartSeries[] }) {
+const MiniDualAxisChart = memo(function MiniDualAxisChart({ latencySeries, lossSeries }: { latencySeries: ChartSeries[]; lossSeries: ChartSeries[] }) {
   const [hover, setHover] = useState<{
     x: number;
     time: number;
@@ -1948,7 +1965,7 @@ function MiniDualAxisChart({ latencySeries, lossSeries }: { latencySeries: Chart
       ) : null}
     </svg>
   );
-}
+});
 
 function nearestPoint(points: ChartPoint[], targetTime: number): ChartPoint | null {
   let best: ChartPoint | null = null;
