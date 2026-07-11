@@ -10,8 +10,9 @@ pub use models::*;
 pub use repository::*;
 
 use anyhow::Context;
+use sqlx::postgres::PgConnectOptions;
 use sqlx::sqlite::SqliteConnectOptions;
-use sqlx::{ConnectOptions, Pool, Postgres, Row, Sqlite};
+use sqlx::{Pool, Postgres, Row, Sqlite};
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::str::FromStr;
@@ -41,13 +42,15 @@ impl DatabaseBackend {
     pub async fn connect(database_url: &str, create_if_missing: bool) -> anyhow::Result<Self> {
         if database_url.starts_with("sqlite:") {
             let options = prepare_sqlite_options(database_url, create_if_missing)?;
-            let pool = sqlx::SqlitePool::connect_with(options).await?;
+            let pool =
+                redact_database_connection_error(sqlx::SqlitePool::connect_with(options).await)?;
             Ok(DatabaseBackend::Sqlite(pool))
         } else if database_url.starts_with("postgres:") || database_url.starts_with("postgresql:") {
-            let pool = sqlx::PgPool::connect(database_url).await?;
+            let options = prepare_postgres_options(database_url)?;
+            let pool = redact_database_connection_error(sqlx::PgPool::connect_with(options).await)?;
             Ok(DatabaseBackend::Postgres(pool))
         } else {
-            anyhow::bail!("Unsupported database URL: {}", database_url)
+            anyhow::bail!("Unsupported database URL scheme")
         }
     }
 
@@ -429,7 +432,7 @@ fn prepare_sqlite_options(
     create_if_missing: bool,
 ) -> anyhow::Result<SqliteConnectOptions> {
     let options = SqliteConnectOptions::from_str(database_url)
-        .with_context(|| format!("Invalid SQLite database URL: {database_url}"))?;
+        .map_err(|_| anyhow::anyhow!("Invalid SQLite database URL"))?;
     let db_path = options.get_filename().to_path_buf();
 
     if is_special_sqlite_path(&db_path) || db_path.exists() {
@@ -460,6 +463,18 @@ fn prepare_sqlite_options(
         "SQLite database file does not exist: {}. Create it first, add `?mode=rwc` to DATABASE_URL, set `[database] create_if_missing = true`, or set DATABASE_CREATE_IF_MISSING=true.",
         db_path.display()
     );
+}
+
+fn prepare_postgres_options(database_url: &str) -> anyhow::Result<PgConnectOptions> {
+    let silent_dispatch = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    tracing::dispatcher::with_default(&silent_dispatch, || {
+        PgConnectOptions::from_str(database_url)
+    })
+    .map_err(|_| anyhow::anyhow!("Invalid PostgreSQL database URL"))
+}
+
+fn redact_database_connection_error<T, E>(result: Result<T, E>) -> anyhow::Result<T> {
+    result.map_err(|_| anyhow::anyhow!("Failed to connect to database"))
 }
 
 fn sqlite_url_has_create_mode(database_url: &str) -> bool {
@@ -502,8 +517,12 @@ fn confirm_create_sqlite_database(path: &Path) -> anyhow::Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_special_sqlite_path, sqlite_url_has_create_mode, DatabaseBackend};
+    use super::{
+        is_special_sqlite_path, prepare_postgres_options, prepare_sqlite_options,
+        redact_database_connection_error, sqlite_url_has_create_mode, DatabaseBackend,
+    };
     use chrono::{DateTime, Duration, Utc};
+    use sqlx::postgres::PgSslMode;
     use sqlx::Row;
     use std::path::Path;
     use uuid::Uuid;
@@ -529,6 +548,101 @@ mod tests {
         assert!(!is_special_sqlite_path(Path::new(
             "/var/lib/xlstatus/xlstatus.db"
         )));
+    }
+
+    #[test]
+    fn postgres_url_parser_preserves_sqlx_connection_semantics() {
+        let options = prepare_postgres_options(
+            "postgresql://user%40example:password@db.example:6543/database%2Fname\
+             ?sslmode=require\
+             &application_name=xlstatus\
+             &options=-c%20statement_timeout%3D5s\
+             &options=--search_path%3Dpublic\
+             &options%5Block_timeout%5D=2s\
+             &sslpassword=audit-secret",
+        )
+        .unwrap();
+
+        assert_eq!(options.get_host(), "db.example");
+        assert_eq!(options.get_port(), 6543);
+        assert_eq!(options.get_username(), "user@example");
+        assert_eq!(options.get_database(), Some("database/name"));
+        assert!(matches!(options.get_ssl_mode(), PgSslMode::Require));
+        assert_eq!(options.get_application_name(), Some("xlstatus"));
+        assert_eq!(
+            options.get_options(),
+            Some("-c statement_timeout=5s --search_path=public -c lock_timeout=2s")
+        );
+    }
+
+    #[test]
+    fn postgres_url_parser_rejects_invalid_values_without_echoing_credentials() {
+        let cases = [
+            "postgres://audit-user:audit-secret@localhost/db?sslmode=audit-secret",
+            "postgres://audit-user:audit-secret@localhost/db?port=70000",
+            "postgres://audit-user:audit-secret@localhost/db?hostaddr=audit-secret",
+            "postgres://audit-user:audit-secret@localhost/db?statement-cache-capacity=audit-secret",
+            "postgres://audit-user:audit-secret@localhost/%FF",
+        ];
+
+        for database_url in cases {
+            let error = prepare_postgres_options(database_url).unwrap_err();
+            assert_eq!(error.to_string(), "Invalid PostgreSQL database URL");
+            assert!(!format!("{error:#}").contains("audit-secret"));
+            assert_eq!(error.chain().count(), 1);
+        }
+    }
+
+    #[test]
+    fn sqlite_path_never_contains_successfully_parsed_query_values() {
+        let database_path =
+            std::env::temp_dir().join(format!("xlstatus-redaction-missing-{}.db", Uuid::now_v7()));
+        let database_url = format!(
+            "sqlite://{}?mode=rwc&vfs=audit-secret",
+            database_path.to_string_lossy()
+        );
+
+        let options = prepare_sqlite_options(&database_url, true).unwrap();
+        let filename = options.get_filename().to_string_lossy();
+
+        assert!(!filename.contains("audit-secret"));
+    }
+
+    #[tokio::test]
+    async fn database_backend_rejects_urls_without_echoing_credentials() {
+        let cases = [
+            (
+                "mysql://audit-user:audit-secret@db.example/xlstatus",
+                "Unsupported database URL scheme",
+            ),
+            (
+                "sqlite://audit.db?mode=invalid&password=audit-secret",
+                "Invalid SQLite database URL",
+            ),
+        ];
+
+        for (database_url, expected) in cases {
+            let error = DatabaseBackend::connect(database_url, false)
+                .await
+                .err()
+                .expect("database URL should be rejected");
+            assert_eq!(error.to_string(), expected);
+            assert!(!format!("{error:#}").contains("audit-secret"));
+            assert!(!format!("{error:#}").contains("audit-user"));
+            assert_eq!(error.chain().count(), 1);
+        }
+    }
+
+    #[test]
+    fn database_connection_errors_discard_the_underlying_cause() {
+        let error = redact_database_connection_error::<(), _>(Err(anyhow::anyhow!(
+            "audit-secret connection failure"
+        )))
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "Failed to connect to database");
+        assert!(!format!("{error:#}").contains("audit-secret"));
+        assert_eq!(error.chain().count(), 1);
     }
 
     #[test]

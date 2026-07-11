@@ -1279,9 +1279,9 @@ fn parse_public_server_id_path(uri: &Uri) -> Result<AgentId, AppError> {
 
 fn parse_public_server_id(id: &str) -> Result<AgentId, AppError> {
     if id.len() != PUBLIC_SERVER_ID_PATH_BYTES {
-        return Err(AppError::BadRequest(format!(
-            "public server id must be a canonical UUID"
-        )));
+        return Err(AppError::BadRequest(
+            "public server id must be a canonical UUID".to_string(),
+        ));
     }
     let parsed = Uuid::parse_str(id)
         .map_err(|_| AppError::BadRequest("public server id must be a canonical UUID".into()))?;
@@ -1540,9 +1540,11 @@ fn disk_totals(value: &serde_json::Value) -> (Option<i64>, Option<i64>) {
             found = true;
         }
     }
-    found
-        .then_some((Some(used), Some(total)))
-        .unwrap_or((None, None))
+    if found {
+        (Some(used), Some(total))
+    } else {
+        (None, None)
+    }
 }
 
 fn network_rates_from_store(
@@ -1989,9 +1991,10 @@ mod tests {
             .unwrap();
         }
 
-        let history = public_service_history_sqlite(&pool, &service_id, &[public_server.clone()])
-            .await
-            .unwrap();
+        let history =
+            public_service_history_sqlite(&pool, &service_id, std::slice::from_ref(&public_server))
+                .await
+                .unwrap();
 
         assert_eq!(history.len(), PUBLIC_SERVICE_HISTORY_LIMIT as usize);
         assert!(history

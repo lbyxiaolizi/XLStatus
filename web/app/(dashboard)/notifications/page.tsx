@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   EmptyState,
   Field,
@@ -141,14 +141,18 @@ export default function NotificationsPage() {
     body_template: "",
   });
   const [groupForm, setGroupForm] = useState(emptyGroupForm);
+  const loadRequestIdRef = useRef(0);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (force = false) => {
+    const requestId = loadRequestIdRef.current + 1;
+    loadRequestIdRef.current = requestId;
     setError(null);
     const [notificationResponse, groupResponse, providerResponse] = await Promise.all([
       apiClient.listNotifications(200, 0),
-      apiClient.listNotificationGroups(200, 0),
+      apiClient.listNotificationGroups(200, 0, { bypassClientCache: force }),
       apiClient.listNotificationProviders(),
     ]);
+    if (requestId !== loadRequestIdRef.current) return;
     let nextError: string | null = null;
 
     if (notificationResponse.success && notificationResponse.data) {
@@ -174,6 +178,9 @@ export default function NotificationsPage() {
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount is the standard client data-load pattern
     void load();
+    return () => {
+      loadRequestIdRef.current += 1;
+    };
   }, [load]);
 
   const notificationById = useMemo(
@@ -387,7 +394,7 @@ export default function NotificationsPage() {
           detail={copy.notificationsPage.detail}
           actions={
             <>
-              <button type="button" className={buttonClass("secondary")} onClick={() => void load()}>
+              <button type="button" className={buttonClass("secondary")} onClick={() => void load(true)}>
                 {copy.notificationsPage.refresh}
               </button>
               <button type="button" className={buttonClass("secondary")} onClick={openCreateGroup}>

@@ -6,7 +6,15 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { apiClient, type ThemeDefinition } from "@/lib/api";
 import { type Locale, type Translations } from "@/lib/i18n";
 import { useI18n } from "@/lib/use-i18n";
-import { clearStoredUser, compactId, inputClass, isAdmin, useBoldTheme, useStoredUser } from "./M7Primitives";
+import { clearStoredUser, compactId, inputClass, isAdmin, readStoredUser, useBoldTheme, useStoredUser } from "./M7Primitives";
+import {
+  applyDashboardTheme,
+  cacheDashboardTheme,
+  clearDashboardThemeCache,
+  DASHBOARD_THEME_CACHE_KEY,
+  DASHBOARD_THEME_EVENT,
+  readCachedDashboardTheme,
+} from "@/app/lib/dashboard-theme";
 
 type NavItem = { name: string; href: string; adminOnly?: boolean };
 
@@ -39,30 +47,51 @@ interface CommandServer {
   region?: string | null;
 }
 
+const EMPTY_COMMAND_SERVERS: CommandServer[] = [];
+
+interface OwnedDashboardTheme {
+  userId: string;
+  theme: ThemeDefinition | null;
+}
+
 export default function Navigation() {
   const pathname = usePathname();
+  const dashboardPath = isDashboardPath(pathname);
   const router = useRouter();
   const user = useStoredUser();
   const { locale, locales, setLocale, t: copy } = useI18n();
   const [theme, setTheme] = useBoldTheme();
-  const [dashboardTheme, setDashboardTheme] = useState<ThemeDefinition | null>(null);
+  const [dashboardTheme, setDashboardTheme] = useState<OwnedDashboardTheme>(() => {
+    const storedUser = readStoredUser();
+    return {
+      userId: storedUser?.id ?? "",
+      theme: storedUser ? readCachedDashboardTheme(storedUser.id) : null,
+    };
+  });
   const [open, setOpen] = useState(false);
   const [commandOpen, setCommandOpen] = useState(false);
   const [commandQuery, setCommandQuery] = useState("");
   const [commandServers, setCommandServers] = useState<CommandServer[]>([]);
-  const [commandLoading, setCommandLoading] = useState(false);
-  const [commandLoaded, setCommandLoaded] = useState(false);
-  const [commandError, setCommandError] = useState<string | null>(null);
+  const [commandLoadingUserId, setCommandLoadingUserId] = useState("");
+  const [commandLoadedUserId, setCommandLoadedUserId] = useState("");
+  const [commandError, setCommandError] = useState<{ userId: string; message: string } | null>(null);
   const commandInputRef = useRef<HTMLInputElement | null>(null);
+  const commandRequestUserIdRef = useRef("");
+  const dashboardThemeRevisionRef = useRef(0);
 
   const handleLogout = async () => {
     await apiClient.logout();
+    applyDashboardTheme(null);
+    clearDashboardThemeCache();
     clearStoredUser();
     router.replace("/login");
   };
 
   const navigation = useMemo(() => navigationFor(copy), [copy]);
   const publicNavigation = useMemo(() => publicNavigationFor(copy), [copy]);
+  const commandLoading = Boolean(user && commandLoadingUserId === user.id);
+  const visibleCommandServers = user && commandLoadedUserId === user.id ? commandServers : EMPTY_COMMAND_SERVERS;
+  const visibleCommandError = user && commandError?.userId === user.id ? commandError.message : null;
   const visibleNavigation = user
     ? navigation.filter((item) => !item.adminOnly || isAdmin(user))
     : publicNavigation;
@@ -88,55 +117,122 @@ export default function Navigation() {
   }, [commandOpen]);
 
   useEffect(() => {
-    if (!commandOpen || !user || commandLoaded || commandLoading) return;
+    if (!commandOpen || !user || commandLoadedUserId === user.id) return;
+    if (commandRequestUserIdRef.current === user.id) return;
+    const requestUserId = user.id;
     const controller = new AbortController();
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- lazy fetch on command-palette open
-    setCommandLoading(true);
+    commandRequestUserIdRef.current = requestUserId;
+    setCommandLoadingUserId(requestUserId);
+    setCommandServers([]);
     setCommandError(null);
     apiClient.listServers(200, 0, false, { signal: controller.signal }).then((response) => {
       if (controller.signal.aborted) return;
-      setCommandLoading(false);
-      setCommandLoaded(true);
+      if (commandRequestUserIdRef.current === requestUserId) commandRequestUserIdRef.current = "";
+      setCommandLoadingUserId((current) => current === requestUserId ? "" : current);
       if (response.success && response.data) {
+        setCommandLoadedUserId(requestUserId);
         setCommandServers(
           ((response.data.servers as CommandServer[]) ?? []).filter((server) => server.id && server.name),
         );
       } else {
-        setCommandError(response.error || copy.common.requestFailed);
+        setCommandError({ userId: requestUserId, message: response.error || copy.common.requestFailed });
       }
     });
-    return () => controller.abort();
-  }, [commandLoaded, commandLoading, commandOpen, copy.common.requestFailed, user]);
+    return () => {
+      controller.abort();
+      if (commandRequestUserIdRef.current === requestUserId) commandRequestUserIdRef.current = "";
+    };
+  }, [commandLoadedUserId, commandOpen, copy.common.requestFailed, user]);
 
   useEffect(() => {
-    if (!user) {
+    if (!dashboardPath) {
       applyDashboardTheme(null);
       return;
     }
+    if (!user) {
+      // useStoredUser hydrates from a null server snapshot. Keep the inline
+      // cached theme intact until the client identity snapshot arrives.
+      if (readStoredUser()) return;
+      applyDashboardTheme(null);
+      clearDashboardThemeCache();
+      return;
+    }
+    const cachedTheme = readCachedDashboardTheme(user.id);
+    applyDashboardTheme(cachedTheme);
     let cancelled = false;
-    apiClient.listThemes().then((response) => {
-      if (cancelled) return;
+    const requestRevision = dashboardThemeRevisionRef.current;
+    apiClient.listThemes({ bypassClientCache: true }).then((response) => {
+      if (cancelled || requestRevision !== dashboardThemeRevisionRef.current) return;
       if (response.success && response.data) {
         const selected = response.data.themes.find(
           (item) => item.id === response.data?.selected_dashboard_theme_id,
         );
         const nextTheme = selected ?? null;
-        setDashboardTheme(nextTheme);
+        cacheDashboardTheme(user.id, nextTheme);
+        setDashboardTheme({ userId: user.id, theme: nextTheme });
         applyDashboardTheme(nextTheme);
       }
     });
     return () => {
       cancelled = true;
     };
-  }, [user]);
+  }, [dashboardPath, user]);
 
   useEffect(() => {
-    applyDashboardTheme(dashboardTheme);
-  }, [dashboardTheme, theme]);
+    if (!dashboardPath) return;
+    return () => applyDashboardTheme(null);
+  }, [dashboardPath]);
+
+  useEffect(() => {
+    if (!user) return;
+    const handleThemeChange = (event: Event) => {
+      if (event.type === "storage") {
+        const storageKey = (event as StorageEvent).key;
+        if (storageKey === "user") {
+          apiClient.invalidateCachedReads();
+          return;
+        }
+        if (storageKey !== DASHBOARD_THEME_CACHE_KEY) return;
+        apiClient.invalidateCachedReads();
+      }
+      const detail = (event as CustomEvent<{
+        userId?: string;
+        theme?: ThemeDefinition | null;
+      }>).detail;
+      if (event.type !== "storage" && detail?.userId && detail.userId !== user.id) return;
+      dashboardThemeRevisionRef.current += 1;
+      const nextTheme = detail && "theme" in detail
+        ? detail.theme ?? null
+        : readCachedDashboardTheme(user.id);
+      setDashboardTheme({ userId: user.id, theme: nextTheme });
+      if (dashboardPath) applyDashboardTheme(nextTheme);
+    };
+    window.addEventListener(DASHBOARD_THEME_EVENT, handleThemeChange);
+    window.addEventListener("storage", handleThemeChange);
+    return () => {
+      window.removeEventListener(DASHBOARD_THEME_EVENT, handleThemeChange);
+      window.removeEventListener("storage", handleThemeChange);
+    };
+  }, [dashboardPath, user]);
+
+  useEffect(() => {
+    if (!dashboardPath) {
+      applyDashboardTheme(null);
+      return;
+    }
+    if (!user) {
+      if (!readStoredUser()) applyDashboardTheme(null);
+      return;
+    }
+    const nextTheme = dashboardTheme.userId === user.id
+      ? dashboardTheme.theme
+      : readCachedDashboardTheme(user.id);
+    applyDashboardTheme(nextTheme);
+  }, [dashboardPath, dashboardTheme, theme, user]);
 
   const commandItems = useMemo(
-    () => buildCommandItems(visibleNavigation, commandServers, commandQuery, copy),
-    [commandQuery, commandServers, copy, visibleNavigation],
+    () => buildCommandItems(visibleNavigation, visibleCommandServers, commandQuery, copy),
+    [commandQuery, copy, visibleCommandServers, visibleNavigation],
   );
 
   function closeCommand() {
@@ -280,7 +376,7 @@ export default function Navigation() {
         inputRef={commandInputRef}
         items={commandItems}
         loading={commandLoading}
-        error={commandError}
+        error={visibleCommandError}
         copy={copy}
         onClose={closeCommand}
         onRun={runCommand}
@@ -521,45 +617,6 @@ function LocaleSegment({
   );
 }
 
-function applyDashboardTheme(theme: ThemeDefinition | null) {
-  if (typeof document === "undefined") return;
-  const root = document.documentElement;
-  const body = document.body;
-  root.dataset.xlstatusDashboardThemeId = theme?.id ?? "";
-  const previousKeys = (root.dataset.xlstatusDashboardThemeVars || "")
-    .split(",")
-    .map((key) => key.trim())
-    .filter(Boolean);
-  for (const key of previousKeys) {
-    root.style.removeProperty(key);
-    body?.style.removeProperty(key);
-  }
-  root.dataset.xlstatusDashboardThemeVars = "";
-
-  const styleId = "xlstatus-dashboard-theme-style";
-  document.getElementById(styleId)?.remove();
-
-  if (!theme) return;
-  const isDark = root.classList.contains("dark-mode");
-  const activeVariables = themeVariablesForMode(theme, isDark);
-  const nextKeys: string[] = [];
-  for (const [key, value] of Object.entries(activeVariables)) {
-    if (!key.startsWith("--") || !value) continue;
-    root.style.setProperty(key, value);
-    body?.style.setProperty(key, value);
-    nextKeys.push(key);
-  }
-  root.dataset.xlstatusDashboardThemeVars = nextKeys.join(",");
-
-}
-
-function themeVariablesForMode(theme: ThemeDefinition, isDark: boolean): Record<string, string> {
-  const base = theme.variables ?? {};
-  const light = Object.keys(theme.light_variables ?? {}).length ? theme.light_variables ?? {} : base;
-  const dark = Object.keys(theme.dark_variables ?? {}).length ? theme.dark_variables ?? {} : light;
-  return isDark ? { ...base, ...dark } : { ...base, ...light };
-}
-
 function NavLink({
   href,
   active,
@@ -588,4 +645,23 @@ function NavLink({
 
 function isActive(pathname: string, href: string): boolean {
   return pathname === href || (href !== "/status" && pathname.startsWith(`${href}/`));
+}
+
+const DASHBOARD_PATH_PREFIXES = [
+  "/dashboard",
+  "/servers",
+  "/services",
+  "/tasks",
+  "/terminal",
+  "/alerts",
+  "/notifications",
+  "/nat",
+  "/ddns",
+  "/settings",
+] as const;
+
+function isDashboardPath(pathname: string): boolean {
+  return DASHBOARD_PATH_PREFIXES.some(
+    (prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`),
+  );
 }

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useSyncExternalStore } from "react";
 import {
   getLocale,
   getTranslations,
@@ -10,23 +10,18 @@ import {
 } from "@/lib/i18n";
 
 export function useI18n() {
-  const [locale, setLocaleState] = useState<Locale>(() => getLocale());
+  const locale = useSyncExternalStore(
+    subscribeLocale,
+    getLocale,
+    getLocaleServerSnapshot,
+  );
 
   useEffect(() => {
-    function onLocaleChange() {
-      setLocaleState(getLocale());
-    }
-    window.addEventListener("xlstatus:locale-change", onLocaleChange);
-    window.addEventListener("storage", onLocaleChange);
-    return () => {
-      window.removeEventListener("xlstatus:locale-change", onLocaleChange);
-      window.removeEventListener("storage", onLocaleChange);
-    };
-  }, []);
+    document.documentElement.lang = locale;
+  }, [locale]);
 
   function setLocale(locale: Locale) {
     persistLocale(locale);
-    setLocaleState(locale);
   }
 
   return {
@@ -36,3 +31,14 @@ export function useI18n() {
     t: getTranslations(locale),
   };
 }
+
+function subscribeLocale(onLocaleChange: () => void): () => void {
+  window.addEventListener("xlstatus:locale-change", onLocaleChange);
+  window.addEventListener("storage", onLocaleChange);
+  return () => {
+    window.removeEventListener("xlstatus:locale-change", onLocaleChange);
+    window.removeEventListener("storage", onLocaleChange);
+  };
+}
+
+const getLocaleServerSnapshot = (): Locale => supportedLocales[0];

@@ -34,7 +34,7 @@ pub enum CoverMode {
 }
 
 /// Server selector
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ServerSelector {
     /// Specific server IDs (when cover_mode = specific)
     #[serde(default)]
@@ -59,19 +59,6 @@ pub struct ServerSelector {
     /// When a task is fired by a server-scoped alert/service event, target that source server.
     #[serde(default)]
     pub source_server: bool,
-}
-
-impl Default for ServerSelector {
-    fn default() -> Self {
-        Self {
-            server_ids: Vec::new(),
-            exclude_server_ids: Vec::new(),
-            group_ids: Vec::new(),
-            tag_names: Vec::new(),
-            tags: HashMap::new(),
-            source_server: false,
-        }
-    }
 }
 
 /// Shell command task payload

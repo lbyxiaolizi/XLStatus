@@ -531,10 +531,8 @@ async fn resolve_server_ids(
         } else {
             candidates.extend(tag_matched);
         }
-    } else if !has_include_selector {
-        if matches!(cover_mode, CoverMode::All | CoverMode::Any) {
-            candidates.extend(records.iter().map(|record| record.id.clone()));
-        }
+    } else if !has_include_selector && matches!(cover_mode, CoverMode::All | CoverMode::Any) {
+        candidates.extend(records.iter().map(|record| record.id.clone()));
     }
 
     let excluded: HashSet<String> = selector.exclude_server_ids.iter().cloned().collect();
@@ -752,11 +750,7 @@ fn agent_tags(record: &AgentSelectorRecord) -> HashSet<String> {
         parse_agent_telemetry_json::<serde_json::Value>(record.last_info_json.as_deref()),
         parse_agent_telemetry_json::<serde_json::Value>(record.last_state_json.as_deref()),
     ];
-    for tag in sources
-        .iter()
-        .flatten()
-        .flat_map(|value| tags_from_json_source(value))
-    {
+    for tag in sources.iter().flatten().flat_map(tags_from_json_source) {
         if let Some(tag) = normalize_tag_filter(&tag) {
             out.insert(tag);
         }

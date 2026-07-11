@@ -25,6 +25,8 @@ jobs:
         run: cargo fmt --check
       - name: Check workspace
         run: cargo check --workspace
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::too_many_arguments -A clippy::type_complexity
       - name: Test workspace
         run: cargo test --workspace
 

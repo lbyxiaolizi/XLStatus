@@ -1,6 +1,6 @@
 "use client";
 
-import { ReactNode } from "react";
+import { type HTMLAttributes, ReactNode } from "react";
 import type { ApiResponse } from "@/lib/api";
 import { formatLocaleDate, getTranslations } from "@/lib/i18n";
 
@@ -159,6 +159,42 @@ export function SkeletonCard({ lines = 4 }: { lines?: number }) {
   );
 }
 
+export function TableSkeleton({
+  columns = 5,
+  rows = 5,
+}: {
+  columns?: number;
+  rows?: number;
+}) {
+  const gridStyle = { gridTemplateColumns: `repeat(${columns}, minmax(8rem, 1fr))` };
+  return (
+    <div
+      className="overflow-hidden border-2 border-black bg-[var(--bg-card)] shadow-[var(--shadow-brutal)]"
+      aria-busy="true"
+      aria-label={getTranslations().common.loading}
+    >
+      <div className="min-w-max">
+        <div className="grid border-b-2 border-black bg-[var(--accent-bg)]" style={gridStyle}>
+          {Array.from({ length: columns }).map((_, index) => (
+            <div key={index} className="border-r-2 border-black p-3 last:border-r-0">
+              <Skeleton className="h-4 w-20" />
+            </div>
+          ))}
+        </div>
+        {Array.from({ length: rows }).map((_, row) => (
+          <div key={row} className="grid border-b border-black/20 last:border-b-0" style={gridStyle}>
+            {Array.from({ length: columns }).map((_, column) => (
+              <div key={column} className="p-3">
+                <Skeleton className={`h-5 ${column === 0 ? "w-28" : "w-20"}`} />
+              </div>
+            ))}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export function Field({
   label,
   error,
@@ -244,13 +280,15 @@ export function BrutalCard({
   children,
   className = "",
   accent = false,
+  ...props
 }: {
   children: ReactNode;
   className?: string;
   accent?: boolean;
-}) {
+} & Omit<HTMLAttributes<HTMLDivElement>, "children" | "className">) {
   return (
     <div
+      {...props}
       className={`border-2 border-black ${accent ? "bg-[var(--accent-bg)]" : "bg-[var(--bg-card)]"} p-4 shadow-[var(--shadow-brutal)] ${className}`}
     >
       {children}

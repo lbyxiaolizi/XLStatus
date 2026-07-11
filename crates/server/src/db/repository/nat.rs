@@ -328,7 +328,7 @@ impl NatMappingRepository {
     /// Helper to convert SQLite row to NatMapping
     fn sqlite_row_to_mapping(row: SqliteRow) -> Result<NatMapping> {
         let protocol_str: String = row.try_get("protocol")?;
-        let protocol = Protocol::from_str(&protocol_str)
+        let protocol = Protocol::parse(&protocol_str)
             .with_context(|| format!("invalid NAT mapping protocol: {protocol_str}"))?;
 
         let mapping = NatMapping {
@@ -378,7 +378,7 @@ impl NatMappingRepository {
     /// Helper to convert Postgres row to NatMapping
     fn postgres_row_to_mapping(row: PgRow) -> Result<NatMapping> {
         let protocol_str: String = row.try_get("protocol")?;
-        let protocol = Protocol::from_str(&protocol_str)
+        let protocol = Protocol::parse(&protocol_str)
             .with_context(|| format!("invalid NAT mapping protocol: {protocol_str}"))?;
         let id: uuid::Uuid = row.try_get("id")?;
         let agent_id: uuid::Uuid = row.try_get("agent_id")?;

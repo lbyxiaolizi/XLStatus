@@ -155,13 +155,17 @@ impl Config {
             std::env::var("CONFIG_FILE").unwrap_or_else(|_| "config.toml".to_string());
         if Path::new(&config_path).exists() {
             let content = fs::read_to_string(&config_path)?;
-            let config: Config = toml::from_str(&content)?;
+            let config = Self::parse_toml(&content)?;
             config.validate_deployment_security()?;
             return Ok(config);
         }
 
         // Default config for development
         Ok(Self::default())
+    }
+
+    fn parse_toml(content: &str) -> anyhow::Result<Self> {
+        toml::from_str(content).map_err(|_| anyhow::anyhow!("Failed to parse configuration file"))
     }
 
     fn validate_deployment_security(&self) -> anyhow::Result<()> {
@@ -494,5 +498,18 @@ mod tests {
             Some("replace-with-a-different-32-byte-random-hex-secret".to_string());
 
         assert!(config.validate_deployment_security().is_err());
+    }
+
+    #[test]
+    fn toml_parse_error_never_contains_database_credentials() {
+        let secret = "audit-secret-do-not-log";
+        let content =
+            format!("[database]\nurl = \"postgresql://audit-user:{secret}@db.example/xlstatus\n");
+
+        let error = Config::parse_toml(&content).unwrap_err().to_string();
+
+        assert_eq!(error, "Failed to parse configuration file");
+        assert!(!error.contains(secret));
+        assert!(!error.contains("postgresql://"));
     }
 }

@@ -181,7 +181,7 @@ fn run_mock_agents(args: MockAgentsArgs) -> Result<()> {
                 samples.len()
             } else {
                 store
-                    .write_json_batch(samples.into_iter())
+                    .write_json_batch(samples)
                     .context("failed to write mock samples")?
             };
             total_samples += written;
@@ -395,6 +395,6 @@ fn seed_bench_store(agents: usize, samples: usize) -> Result<MetricStore> {
             ));
         }
     }
-    store.write_json_batch(batch.into_iter())?;
+    store.write_json_batch(batch)?;
     Ok(store)
 }

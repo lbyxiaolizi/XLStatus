@@ -1705,7 +1705,7 @@ mod tests {
             .unwrap();
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let authorization_url = payload["data"]["authorization_url"].as_str().unwrap();
-        let parsed = reqwest::Url::parse(&authorization_url).unwrap();
+        let parsed = reqwest::Url::parse(authorization_url).unwrap();
         assert_eq!(
             parsed.as_str().split('?').next().unwrap(),
             provider.auth_url

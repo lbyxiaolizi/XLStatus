@@ -30,6 +30,7 @@ test-run/           可重复验收脚本
 ```bash
 cargo fmt
 cargo check --workspace
+cargo clippy --workspace --all-targets -- -D warnings -A clippy::too_many_arguments -A clippy::type_complexity
 cargo test --workspace
 
 cd web

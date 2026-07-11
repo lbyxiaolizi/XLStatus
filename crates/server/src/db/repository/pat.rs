@@ -34,7 +34,7 @@ impl PATRepository {
                 let server_ids_json = input
                     .server_ids
                     .as_ref()
-                    .map(|ids| serde_json::to_string(ids))
+                    .map(serde_json::to_string)
                     .transpose()?;
 
                 sqlx::query(
@@ -60,7 +60,7 @@ impl PATRepository {
                 let server_ids_json = input
                     .server_ids
                     .as_ref()
-                    .map(|ids| serde_json::to_value(ids))
+                    .map(serde_json::to_value)
                     .transpose()?;
                 let id_uuid = parse_pat_uuid(&id, "id")?;
 

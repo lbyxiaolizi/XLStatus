@@ -3173,12 +3173,9 @@ fn metadata_tags(sources: &[Option<&serde_json::Value>]) -> Vec<String> {
 
 fn tags_from_json(value: &serde_json::Value) -> Vec<String> {
     match value {
-        serde_json::Value::Array(items) => normalize_tags(
-            items
-                .iter()
-                .filter_map(|item| json_label(item))
-                .collect::<Vec<_>>(),
-        ),
+        serde_json::Value::Array(items) => {
+            normalize_tags(items.iter().filter_map(json_label).collect::<Vec<_>>())
+        }
         serde_json::Value::String(value) => normalize_tags(
             value
                 .split([',', ';', '，', '、'])

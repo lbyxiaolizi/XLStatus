@@ -68,7 +68,7 @@ impl DdnsManager {
         let mut providers = self.providers.write().await;
         providers.clear();
         for row in rows {
-            let provider_type = match ProviderType::from_str(&row.provider) {
+            let provider_type = match ProviderType::parse(&row.provider) {
                 Some(t) => t,
                 None => {
                     error!("Unknown DDNS provider type: {}", row.provider);

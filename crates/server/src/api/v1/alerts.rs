@@ -104,7 +104,7 @@ pub async fn create_alert_rule(
             &recovery_task_ids,
         )
         .await
-        .map_err(|e| AppError::Database(e))?;
+        .map_err(AppError::Database)?;
     Ok(Json(ApiResponse::success(row_to_view(&row))))
 }
 
@@ -1064,7 +1064,7 @@ mod tests {
             "agent_id": "00000000-0000-0000-0000-000000000101",
             "offline_seconds": 60
         });
-        assert!(parse_conditions(&[condition.clone()]).is_ok());
+        assert!(parse_conditions(std::slice::from_ref(&condition)).is_ok());
 
         let too_many = vec![condition.clone(); ALERT_MAX_CONDITIONS + 1];
         assert!(parse_conditions(&too_many).is_err());

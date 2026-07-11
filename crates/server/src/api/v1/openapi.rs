@@ -1003,7 +1003,7 @@ fn path_parameters(path: &str) -> Option<Value> {
         }));
         rest = &after_start[end + 1..];
     }
-    (!params.is_empty()).then(|| Value::Array(params))
+    (!params.is_empty()).then_some(Value::Array(params))
 }
 
 #[cfg(test)]

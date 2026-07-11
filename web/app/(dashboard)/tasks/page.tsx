@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useCallback, useDeferredValue, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import {
   BrutalCard,
   EmptyState,
@@ -11,6 +11,7 @@ import {
   PageHeader,
   PageShell,
   StatusBadge,
+  TableSkeleton,
   buttonClass,
   compactId,
   formatDate,
@@ -111,6 +112,10 @@ export default function TasksPage() {
   const [notificationGroups, setNotificationGroups] = useState<NotificationGroup[]>([]);
   const [runs, setRuns] = useState<TaskRun[]>([]);
   const [loading, setLoading] = useState(true);
+  const [optionsLoading, setOptionsLoading] = useState(false);
+  const [optionsError, setOptionsError] = useState<string | null>(null);
+  const [runsLoading, setRunsLoading] = useState(false);
+  const [runsError, setRunsError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [runningTaskId, setRunningTaskId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -120,36 +125,67 @@ export default function TasksPage() {
   const [form, setForm] = useState<TaskForm>(blankForm);
   const [query, setQuery] = useState("");
   const [totpStatus, setTotpStatus] = useState<TotpStatusResponse | null>(null);
+  const runsRequestId = useRef(0);
+  const runsAbortRef = useRef<AbortController | null>(null);
+  const initialLoadRef = useRef(true);
+  const optionsLoadedRef = useRef(false);
+  const tasksLoadRequestIdRef = useRef(0);
 
-  const loadTasks = useCallback(async () => {
-    setLoading(true);
+  const loadTasks = useCallback(async (signal?: AbortSignal) => {
+    const requestId = tasksLoadRequestIdRef.current + 1;
+    tasksLoadRequestIdRef.current = requestId;
+    if (initialLoadRef.current) setLoading(true);
     setError(null);
-    const [tasksResponse, serversResponse, groupsResponse, notificationGroupsResponse] = await Promise.all([
-      apiClient.listTasks(200, 0),
-      apiClient.listServers(200, 0),
-      apiClient.listServerGroups(),
-      apiClient.listNotificationGroups(200, 0),
-    ]);
+    const tasksResponse = await apiClient.listTasks(200, 0, { signal });
+    if (signal?.aborted || requestId !== tasksLoadRequestIdRef.current) return;
     if (tasksResponse.success && tasksResponse.data) {
       setTasks((tasksResponse.data.tasks as Task[]) ?? []);
     } else {
       setError(responseError(tasksResponse));
     }
-    if (serversResponse.success && serversResponse.data) {
-      setServers((serversResponse.data.servers as Server[]) ?? []);
-    }
-    if (groupsResponse.success && groupsResponse.data) {
-      setServerGroups(groupsResponse.data.groups ?? []);
-    }
-    if (notificationGroupsResponse.success && notificationGroupsResponse.data) {
-      setNotificationGroups((notificationGroupsResponse.data.groups as NotificationGroup[]) ?? []);
-    }
+    initialLoadRef.current = false;
     setLoading(false);
   }, []);
 
+  const loadTaskOptions = useCallback(async () => {
+    if (optionsLoadedRef.current) return;
+    setOptionsLoading(true);
+    setOptionsError(null);
+    const [serversResponse, groupsResponse, notificationGroupsResponse] = await Promise.all([
+      apiClient.listServers(200, 0),
+      apiClient.listServerGroups(),
+      apiClient.listNotificationGroups(200, 0),
+    ]);
+    const optionErrors: string[] = [];
+    if (serversResponse.success && serversResponse.data) {
+      setServers((serversResponse.data.servers as Server[]) ?? []);
+    } else {
+      optionErrors.push(responseError(serversResponse));
+    }
+    if (groupsResponse.success && groupsResponse.data) {
+      setServerGroups(groupsResponse.data.groups ?? []);
+    } else {
+      optionErrors.push(responseError(groupsResponse));
+    }
+    if (notificationGroupsResponse.success && notificationGroupsResponse.data) {
+      setNotificationGroups((notificationGroupsResponse.data.groups as NotificationGroup[]) ?? []);
+    } else {
+      optionErrors.push(responseError(notificationGroupsResponse));
+    }
+    setOptionsError(optionErrors[0] ?? null);
+    optionsLoadedRef.current = optionErrors.length === 0;
+    setOptionsLoading(false);
+  }, []);
+
   useEffect(() => {
+    const controller = new AbortController();
     // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount is the standard client data-load pattern
-    void loadTasks();
+    void loadTasks(controller.signal);
+    return () => {
+      controller.abort();
+      tasksLoadRequestIdRef.current += 1;
+      runsAbortRef.current?.abort();
+    };
   }, [loadTasks]);
 
   const deferredQuery = useDeferredValue(query);
@@ -164,6 +200,7 @@ export default function TasksPage() {
     setEditing(null);
     setForm(blankForm);
     setModal("create");
+    void loadTaskOptions();
   }
 
   function openEdit(task: Task) {
@@ -186,18 +223,28 @@ export default function TasksPage() {
       enabled: task.enabled,
     });
     setModal("edit");
+    void loadTaskOptions();
   }
 
   async function openRuns(task: Task) {
+    runsAbortRef.current?.abort();
+    const controller = new AbortController();
+    runsAbortRef.current = controller;
+    const requestId = runsRequestId.current + 1;
+    runsRequestId.current = requestId;
     setEditing(task);
     setRuns([]);
+    setRunsError(null);
+    setRunsLoading(true);
     setModal("runs");
-    const response = await apiClient.listTaskRuns(task.id, 30);
+    const response = await apiClient.listTaskRuns(task.id, 30, { signal: controller.signal });
+    if (controller.signal.aborted || requestId !== runsRequestId.current) return;
     if (response.success && response.data) {
       setRuns((response.data.runs as TaskRun[]) ?? []);
     } else {
-      setError(responseError(response));
+      setRunsError(responseError(response));
     }
+    setRunsLoading(false);
   }
 
   async function submitForm(event: FormEvent) {
@@ -289,12 +336,12 @@ export default function TasksPage() {
         </div>
 
         {loading ? (
-          <BrutalCard>{copy.tasksPage.loading}</BrutalCard>
+          <TableSkeleton columns={5} rows={5} />
         ) : filtered.length === 0 ? (
           <EmptyState title={copy.tasksPage.emptyTitle} detail={copy.tasksPage.emptyDetail} />
         ) : (
           <div className="overflow-x-auto border-2 border-black bg-[var(--bg-card)] shadow-[var(--shadow-brutal)]">
-            <table className="w-full">
+            <table className="w-full min-w-[52rem]">
               <thead>
                 <tr>
                   <th className={thClass}>{copy.tasksPage.colName}</th>
@@ -326,21 +373,39 @@ export default function TasksPage() {
 
         {modal === "create" || modal === "edit" ? (
           <Modal title={modal === "edit" ? copy.tasksPage.modalTitleEdit : copy.tasksPage.modalTitleCreate} onClose={() => setModal(null)}>
-            <TaskFormView
-              form={form}
-              setForm={setForm}
-              servers={servers}
-              serverGroups={serverGroups}
-              notificationGroups={notificationGroups}
-              saving={saving}
-              onSubmit={submitForm}
-            />
+            {optionsLoading ? (
+              <TableSkeleton columns={2} rows={4} />
+            ) : (
+              <>
+                <InlineError message={optionsError} />
+                <TaskFormView
+                  form={form}
+                  setForm={setForm}
+                  servers={servers}
+                  serverGroups={serverGroups}
+                  notificationGroups={notificationGroups}
+                  saving={saving}
+                  onSubmit={submitForm}
+                />
+              </>
+            )}
           </Modal>
         ) : null}
 
         {modal === "runs" ? (
-          <Modal title={copy.tasksPage.runsTitle.replace("{name}", String(editing?.name || ""))} onClose={() => setModal(null)}>
-            {runs.length === 0 ? (
+          <Modal
+            title={copy.tasksPage.runsTitle.replace("{name}", String(editing?.name || ""))}
+            onClose={() => {
+              runsRequestId.current += 1;
+              runsAbortRef.current?.abort();
+              setModal(null);
+            }}
+          >
+            {runsLoading ? (
+              <TableSkeleton columns={2} rows={3} />
+            ) : runsError ? (
+              <InlineError message={runsError} />
+            ) : runs.length === 0 ? (
               <EmptyState title={copy.tasksPage.runsEmpty} />
             ) : (
               <div className="grid gap-3">

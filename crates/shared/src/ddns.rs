@@ -34,7 +34,7 @@ impl ProviderType {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "cloudflare" => Some(ProviderType::Cloudflare),
             "tencent_cloud" => Some(ProviderType::TencentCloud),
@@ -43,6 +43,11 @@ impl ProviderType {
             "dummy" => Some(ProviderType::Dummy),
             _ => None,
         }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        Self::parse(s)
     }
 }
 
@@ -124,14 +129,14 @@ mod tests {
         assert_eq!(ProviderType::TencentCloud.as_str(), "tencent_cloud");
 
         assert!(matches!(
-            ProviderType::from_str("cloudflare"),
+            ProviderType::parse("cloudflare"),
             Some(ProviderType::Cloudflare)
         ));
         assert!(matches!(
-            ProviderType::from_str("webhook"),
+            ProviderType::parse("webhook"),
             Some(ProviderType::Webhook)
         ));
-        assert!(ProviderType::from_str("invalid").is_none());
+        assert!(ProviderType::parse("invalid").is_none());
     }
 
     #[test]

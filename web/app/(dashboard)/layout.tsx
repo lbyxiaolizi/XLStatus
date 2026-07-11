@@ -1,5 +1,7 @@
 import { ReactNode } from "react";
+import DashboardIdentityBoundary from "@/app/components/DashboardIdentityBoundary";
 import Navigation from "@/app/components/Navigation";
+import { ServerDataProvider } from "@/app/components/ServerDataProvider";
 
 // Shared chrome for all dashboard routes. Navigation was previously rendered
 // by every page individually inside its own `min-h-screen` wrapper; hoisting it
@@ -7,8 +9,12 @@ import Navigation from "@/app/components/Navigation";
 export default function DashboardLayout({ children }: { children: ReactNode }) {
   return (
     <div className="min-h-screen">
-      <Navigation />
-      {children}
+      <DashboardIdentityBoundary>
+        <ServerDataProvider>
+          <Navigation />
+          {children}
+        </ServerDataProvider>
+      </DashboardIdentityBoundary>
     </div>
   );
 }

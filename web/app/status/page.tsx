@@ -25,6 +25,7 @@ import { apiClient, type PublicSiteBranding, type ThemeDefinition } from "@/lib/
 import { formatRate, maxOf, minOf } from "@/app/lib/format";
 import type { Translations } from "@/lib/i18n";
 import { useI18n } from "@/lib/use-i18n";
+import { useStoredPreference } from "@/app/lib/client-store";
 
 interface Server {
   id: string;
@@ -117,6 +118,8 @@ interface ChartSeries {
 }
 
 type PublicServerViewMode = "cards" | "compact";
+const PUBLIC_SERVER_VIEW_MODES = ["cards", "compact"] as const;
+const BINARY_PREFERENCE_VALUES = ["0", "1"] as const;
 
 const defaultSiteBranding: PublicSiteBranding = {
   site_name: "XLStatus",
@@ -153,8 +156,9 @@ export default function StatusPage() {
   const [updatedAt, setUpdatedAt] = useState("");
   const [site, setSite] = useState<PublicSiteBranding>(defaultSiteBranding);
   const [theme, setTheme] = useState<ThemeDefinition | null>(null);
-  const [showServices, setShowServices] = useState(() => initialPublicShowServices());
-  const [serverViewMode, setServerViewMode] = useState<PublicServerViewMode>(() => initialPublicServerViewMode());
+  const [showServicesPreference, setShowServicesPreference] = useStoredPreference("xlstatus_public_show_services", "0", BINARY_PREFERENCE_VALUES);
+  const [serverViewMode, setServerViewMode] = useStoredPreference<PublicServerViewMode>("xlstatus_public_server_view", "cards", PUBLIC_SERVER_VIEW_MODES);
+  const showServices = showServicesPreference === "1";
   // Stabilize server object identity across 30s polls so unchanged cards/charts
   // (memoized below) skip re-rendering instead of fully repainting every tick.
   const serverCacheRef = useRef<Map<string, { raw: string; value: Server }>>(new Map());
@@ -163,8 +167,22 @@ export default function StatusPage() {
   useEffect(() => {
     let stopped = false;
     let controller: AbortController | null = null;
+    let timer: number | null = null;
 
-    async function load() {
+    function stopPolling() {
+      if (timer !== null) {
+        window.clearInterval(timer);
+        timer = null;
+      }
+    }
+
+    function startPolling() {
+      stopPolling();
+      if (document.visibilityState !== "visible") return;
+      timer = window.setInterval(() => void load(), 30000);
+    }
+
+    async function load(bypassClientCache = false) {
       controller?.abort();
       controller = new AbortController();
       const signal = controller.signal;
@@ -172,7 +190,7 @@ export default function StatusPage() {
       // place without flipping the top-level loading state.
       if (initialLoadRef.current) setLoading(true);
       setError(null);
-      const response = await apiClient.getPublicStatus({ signal });
+      const response = await apiClient.getPublicStatus({ signal, bypassClientCache });
 
       if (signal.aborted || stopped) return;
 
@@ -184,20 +202,37 @@ export default function StatusPage() {
         setTheme(response.data.theme ?? null);
       } else {
         setError(responseError(response));
-        setUpdatedAt(new Date().toISOString());
-        setTheme(null);
       }
 
       initialLoadRef.current = false;
       setLoading(false);
     }
 
-    void load();
-    const timer = window.setInterval(() => void load(), 30000);
+    function handleVisibilityChange() {
+      if (document.visibilityState !== "visible") {
+        stopPolling();
+        controller?.abort();
+        controller = null;
+        return;
+      }
+
+      // A background tab may have missed several polling cycles. Skip the
+      // short-lived client cache so the first visible frame gets fresh data.
+      void load(true);
+      startPolling();
+    }
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    if (document.visibilityState === "visible") {
+      void load();
+      startPolling();
+    }
+
     return () => {
       stopped = true;
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      stopPolling();
       controller?.abort();
-      window.clearInterval(timer);
     };
   }, []);
 
@@ -218,15 +253,10 @@ export default function StatusPage() {
 
   function changeServerViewMode(next: PublicServerViewMode) {
     setServerViewMode(next);
-    window.localStorage.setItem("xlstatus_public_server_view", next);
   }
 
   function toggleServices() {
-    setShowServices((current) => {
-      const next = !current;
-      window.localStorage.setItem("xlstatus_public_show_services", next ? "1" : "0");
-      return next;
-    });
+    setShowServicesPreference(showServices ? "0" : "1");
   }
 
   return (
@@ -299,7 +329,13 @@ export default function StatusPage() {
 
           {showServices ? <section>
             <h2 className="mb-3 text-xl font-black uppercase">{copy.statusPage.servicesHeading}</h2>
-            {services.length === 0 ? (
+            {loading && services.length === 0 ? (
+              <div className="grid gap-4">
+                {Array.from({ length: 3 }).map((_, index) => (
+                  <SkeletonCard key={index} lines={4} />
+                ))}
+              </div>
+            ) : services.length === 0 ? (
               <EmptyState title={copy.statusPage.servicesEmptyTitle} detail={copy.statusPage.servicesEmptyDetail} />
             ) : (
               <div className="grid gap-4">
@@ -754,11 +790,6 @@ function averageDelay(results: PublicServiceResult[]): number | undefined {
   return values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : undefined;
 }
 
-function initialPublicShowServices(): boolean {
-  if (typeof window === "undefined") return false;
-  return window.localStorage.getItem("xlstatus_public_show_services") === "1";
-}
-
 function publicPageStyle(site: PublicSiteBranding, theme?: ThemeDefinition | null): CSSProperties {
   const style: CSSProperties & Record<string, string> = {};
   if (theme) {
@@ -832,12 +863,6 @@ function themeModeCss(selector: string, variables: Record<string, string>, prefi
     .map(([key, value]) => `${key}: ${value};`);
   if (!lines.length) return "";
   return `${prefix} ${selector} { ${lines.join(" ")} }`;
-}
-
-function initialPublicServerViewMode(): PublicServerViewMode {
-  if (typeof window === "undefined") return "cards";
-  const stored = window.localStorage.getItem("xlstatus_public_server_view");
-  return stored === "compact" ? "compact" : "cards";
 }
 
 function serviceOk(status: string): boolean {

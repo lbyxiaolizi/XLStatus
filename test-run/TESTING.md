@@ -1,8 +1,8 @@
 # XLStatus 测试报告
 
-**测试日期**: 2026-06-17
+**测试日期**: 2026-07-10
 **测试环境**: macOS (Darwin 25.5.0)
-**编译器**: rustc 1.75+
+**编译器**: Rust stable
 
 ## 📋 测试摘要
 
@@ -27,7 +27,7 @@ $ ls -lh target/release/xlstatus-server
 -rwxr-xr-x  8.9M  xlstatus-server
 ```
 
-**警告统计**: 166 个警告（主要是未使用的代码）
+**静态检查**: 通过 `cargo check --workspace`、严格 Clippy 门禁和 `cargo test --workspace`。
 
 ### Agent
 
@@ -39,7 +39,7 @@ $ ls -lh target/release/xlstatus-agent
 -rwxr-xr-x  994K  xlstatus-agent
 ```
 
-**警告统计**: 36 个警告
+**静态检查**: Agent 已纳入 workspace 统一的 `cargo check`、Clippy 和测试。
 
 ## 🚀 启动测试
 
@@ -49,7 +49,7 @@ $ ls -lh target/release/xlstatus-agent
 $ DATABASE_URL="sqlite:///path/to/xlstatus.db" \
   HTTP_BIND="127.0.0.1:8080" \
   GRPC_BIND="127.0.0.1:50051" \
-  SESSION_SECRET="test-secret" \
+  SESSION_SECRET="$(openssl rand -hex 32)" \
   ./target/release/xlstatus-server
 
 [INFO] Starting XLStatus server
@@ -71,11 +71,7 @@ $ ls -lh test-run/xlstatus.db
 ```
 
 **迁移执行**:
-- ✅ 001_initial.sql - 用户表、会话表
-- ✅ 002_agents.sql - Agent 表、度量表
-- ✅ 003_services.sql - 服务监控表
-- ✅ 004_nat.sql - NAT 配置表
-- ✅ 005_tasks.sql - 任务表、审计日志表
+- ✅ 当前 migrations 目录中的全部迁移脚本
 
 ### 端口监听测试
 
@@ -101,14 +97,16 @@ xlstatus-s 73950 user   11u  IPv4 0x1234567890      0t0  TCP localhost:50051 (LI
 DATABASE_URL="sqlite://dev.db"
 HTTP_BIND="0.0.0.0:8080"
 GRPC_BIND="0.0.0.0:50051"
-SESSION_SECRET="secret"
+SESSION_SECRET="$(openssl rand -hex 32)"
 ```
 
 ### 方法 2: 配置文件
 
 ✅ **可用**
 
-```toml
+```bash
+SESSION_SECRET="$(openssl rand -hex 32)"
+cat > config.toml <<EOF
 [server]
 http_bind = "0.0.0.0:8080"
 grpc_bind = "0.0.0.0:50051"
@@ -117,47 +115,18 @@ grpc_bind = "0.0.0.0:50051"
 url = "sqlite:///var/lib/xlstatus/xlstatus.db"
 
 [security]
-session_secret = "your-secret-key"
+session_secret = "$SESSION_SECRET"
 session_ttl_hours = 24
+EOF
 ```
 
 **注意**: SQLite URL 需要使用三个斜杠 `sqlite:///` 表示绝对路径
 
 ## ⚠️ 已知限制
 
-### 1. HTTP 路由
+### 1. 历史验收记录
 
-当前服务器启动成功，但大部分 HTTP 端点返回 404：
-
-```bash
-$ curl http://127.0.0.1:8080/health
-HTTP/1.1 404 Not Found
-```
-
-**原因**:
-- 路由配置存在但未完全实现
-- 这是正常的开发状态
-- 核心功能（gRPC、数据库）正常工作
-
-**解决方案**: 在实际部署前需要实现完整的 HTTP API 端点
-
-### 2. 编译警告
-
-大量"未使用代码"警告：
-
-```
-warning: struct `TaskScheduler` is never constructed
-warning: function `list_files` is never used
-warning: function `trigger_task` is never used
-```
-
-**原因**:
-- 为未来功能预留的代码
-- 架构已完成但未集成到主流程
-
-**影响**:
-- 不影响已实现功能的运行
-- 可通过 `cargo fix` 清理
+本文档记录可重复的构建和启动验收步骤。HTTP API、Web UI 与 Agent 工作流的当前覆盖范围以 `docs/api.md`、`docs/web.md` 和 `test-run/verify-m*.sh` 为准。
 
 ### 3. Agent 版本标志
 
@@ -259,18 +228,16 @@ error: unexpected argument '--version' found
 - ✅ 核心后端服务可以启动
 - ✅ 数据库系统正常工作
 - ✅ 基础架构完整
-- ⚠️ API 端点需要完善
-- ⚠️ 前端界面未完成
+- ✅ HTTP API、前端和 Agent 工作流均已有实现；发布前运行对应验证脚本
 
 ### 推荐下一步
 
 1. **短期** (1-2 天):
-   - 实现完整的 HTTP API 端点
-   - 修复编译警告
-   - 添加基本的集成测试
+   - 运行并维护 M0-M9 验收脚本
+   - 为新增功能补充集成测试
 
 2. **中期** (1-2 周):
-   - 完成前端界面
+   - 完善前端交互与端到端测试
    - 端到端功能测试
    - 性能基准测试
 
@@ -288,10 +255,8 @@ error: unexpected argument '--version' found
 - gRPC 服务框架
 
 ⏳ **需要完善**:
-- HTTP API 实现
-- Web 界面
-- 完整的认证流程
-- 实际的监控数据流
+- 跨平台端到端验收
+- 长时间稳定性与性能基准
 
 ## 📝 测试命令参考
 

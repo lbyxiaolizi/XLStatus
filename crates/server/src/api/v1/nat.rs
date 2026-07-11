@@ -794,7 +794,7 @@ fn normalize_nat_resource_uuid(value: String, field: &str) -> Result<String, Str
 
 fn normalize_nat_protocol(value: &str) -> Result<Protocol, String> {
     let value = normalize_required_nat_text(value.to_string(), NAT_MAX_PROTOCOL_BYTES, "protocol")?;
-    Protocol::from_str(&value).ok_or_else(|| "protocol must be tcp or udp".to_string())
+    Protocol::parse(&value).ok_or_else(|| "protocol must be tcp or udp".to_string())
 }
 
 fn normalize_required_nat_text(
@@ -888,12 +888,12 @@ async fn load_authorized_nat_agent_or_403(
         .await
         .map_err(|e| internal_with(e.to_string()))?
         .ok_or_else(|| forbidden_with("agent not found".to_string()))?;
-    if auth_user.is_pat() || !auth_user.user.role.is_admin() {
-        if agent.owner_user_id != auth_user.user.id {
-            return Err(forbidden_with(
-                "agent is not owned by the calling user".to_string(),
-            ));
-        }
+    if (auth_user.is_pat() || !auth_user.user.role.is_admin())
+        && agent.owner_user_id != auth_user.user.id
+    {
+        return Err(forbidden_with(
+            "agent is not owned by the calling user".to_string(),
+        ));
     }
 
     Ok(agent)
@@ -934,6 +934,39 @@ async fn require_active_nat_agent_or_403(
         return Err(forbidden_with("agent has been revoked".to_string()));
     }
     Ok(())
+}
+
+fn forbidden_with(msg: String) -> (StatusCode, Json<ApiResponse<()>>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(msg),
+        }),
+    )
+}
+
+fn bad_request_with(msg: String) -> (StatusCode, Json<ApiResponse<()>>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(msg),
+        }),
+    )
+}
+
+fn internal_with(msg: String) -> (StatusCode, Json<ApiResponse<()>>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(msg),
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -1520,37 +1553,4 @@ mod tests {
             .await
             .unwrap();
     }
-}
-
-fn forbidden_with(msg: String) -> (StatusCode, Json<ApiResponse<()>>) {
-    (
-        StatusCode::FORBIDDEN,
-        Json(ApiResponse {
-            success: false,
-            data: None,
-            error: Some(msg),
-        }),
-    )
-}
-
-fn bad_request_with(msg: String) -> (StatusCode, Json<ApiResponse<()>>) {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(ApiResponse {
-            success: false,
-            data: None,
-            error: Some(msg),
-        }),
-    )
-}
-
-fn internal_with(msg: String) -> (StatusCode, Json<ApiResponse<()>>) {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ApiResponse {
-            success: false,
-            data: None,
-            error: Some(msg),
-        }),
-    )
 }

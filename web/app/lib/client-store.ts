@@ -11,6 +11,7 @@
 // so SSR markup matches the very first client paint before hydration.
 
 import { useSyncExternalStore } from "react";
+import { clearAllCachedServerLists } from "@/app/lib/server-cache";
 
 export interface StoredUser {
   id: string;
@@ -26,6 +27,7 @@ declare global {
 
 const USER_EVENT = "xlstatus:user-change";
 const THEME_EVENT = "xlstatus:theme-change";
+const PREFERENCE_EVENT = "xlstatus:preference-change";
 
 // --- shared subscription helper -------------------------------------------
 
@@ -66,7 +68,21 @@ export function readStoredUser(): StoredUser | null {
   return cachedUser;
 }
 
-const subscribeUser = makeSubscribe(USER_EVENT);
+const subscribeUser = (callback: () => void) => {
+  if (typeof window === "undefined") return () => {};
+  const handleChange = (event: Event) => {
+    if (event.type === "storage" && (event as StorageEvent).key === "user") {
+      clearAllCachedServerLists();
+    }
+    callback();
+  };
+  window.addEventListener("storage", handleChange);
+  window.addEventListener(USER_EVENT, handleChange);
+  return () => {
+    window.removeEventListener("storage", handleChange);
+    window.removeEventListener(USER_EVENT, handleChange);
+  };
+};
 const getUserServerSnapshot = (): StoredUser | null => null;
 
 export function useStoredUser(): StoredUser | null {
@@ -81,6 +97,7 @@ export function isAdmin(user: StoredUser | null): boolean {
 // `storage` event only fires in other tabs).
 export function setStoredUser(user: StoredUser): void {
   if (typeof window === "undefined") return;
+  clearAllCachedServerLists();
   window.localStorage.setItem("user", JSON.stringify(user));
   window.localStorage.removeItem("session_token");
   window.dispatchEvent(new Event(USER_EVENT));
@@ -88,6 +105,7 @@ export function setStoredUser(user: StoredUser): void {
 
 export function clearStoredUser(): void {
   if (typeof window === "undefined") return;
+  clearAllCachedServerLists();
   window.localStorage.removeItem("user");
   window.localStorage.removeItem("session_token");
   window.dispatchEvent(new Event(USER_EVENT));
@@ -113,4 +131,31 @@ export function useBoldTheme(): ["light" | "dark", (mode: "light" | "dark") => v
   }
 
   return [mode, setMode];
+}
+
+// --- string preferences ---------------------------------------------------
+
+const subscribePreference = makeSubscribe(PREFERENCE_EVENT);
+
+export function useStoredPreference<T extends string>(
+  key: string,
+  fallback: T,
+  allowedValues?: readonly T[],
+): [T, (value: T) => void] {
+  const getSnapshot = (): T => {
+    if (typeof window === "undefined") return fallback;
+    const value = window.localStorage.getItem(key) as T | null;
+    if (value === null) return fallback;
+    return !allowedValues || allowedValues.includes(value) ? value : fallback;
+  };
+  const getServerSnapshot = (): T => fallback;
+  const value = useSyncExternalStore(subscribePreference, getSnapshot, getServerSnapshot);
+
+  function setValue(nextValue: T) {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(key, nextValue);
+    window.dispatchEvent(new Event(PREFERENCE_EVENT));
+  }
+
+  return [value, setValue];
 }

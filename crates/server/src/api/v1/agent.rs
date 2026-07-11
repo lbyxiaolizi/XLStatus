@@ -116,7 +116,7 @@ pub async fn enroll(
             CreateAgentInput {
                 name: normalized.name.clone(),
                 public_key: normalized.public_key,
-                owner_user_id: token.created_by_user_id.clone(),
+                owner_user_id: token.created_by_user_id,
             },
         )
         .await?;

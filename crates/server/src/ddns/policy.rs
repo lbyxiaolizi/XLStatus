@@ -45,7 +45,7 @@ pub(crate) fn normalize_optional_ddns_text(
 pub(crate) fn normalize_ddns_provider(value: &str) -> Result<String, String> {
     let provider =
         normalize_required_ddns_text(value.to_string(), DDNS_MAX_PROVIDER_BYTES, "provider")?;
-    ProviderType::from_str(&provider)
+    ProviderType::parse(&provider)
         .map(|provider| provider.as_str().to_string())
         .ok_or_else(|| {
             "provider must be one of: cloudflare, tencent_cloud, he, webhook, dummy".to_string()

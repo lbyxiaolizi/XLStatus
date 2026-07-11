@@ -406,6 +406,118 @@ impl TemporaryTransferTokenRepository {
         Ok(affected == 1)
     }
 
+    pub async fn reserve_upload_once(
+        &self,
+        id: &str,
+        used_ip: Option<&str>,
+        reservation_id: &str,
+    ) -> Result<bool> {
+        let now = Utc::now();
+        let affected = match &self.db {
+            DatabaseBackend::Sqlite(pool) => sqlx::query(
+                r#"
+                    UPDATE temporary_transfer_tokens
+                    SET used_at = ?, used_ip = ?, used_status = 'receiving',
+                        agent_task_id = ?
+                    WHERE id = ? AND op = 'upload' AND used_at IS NULL
+                        AND revoked_at IS NULL AND expires_at > ?
+                    "#,
+            )
+            .bind(now.to_rfc3339())
+            .bind(used_ip)
+            .bind(reservation_id)
+            .bind(id)
+            .bind(now.to_rfc3339())
+            .execute(pool)
+            .await?
+            .rows_affected(),
+            DatabaseBackend::Postgres(pool) => sqlx::query(
+                r#"
+                    UPDATE temporary_transfer_tokens
+                    SET used_at = $1, used_ip = $2, used_status = 'receiving',
+                        agent_task_id = $3
+                    WHERE id = $4 AND op = 'upload' AND used_at IS NULL
+                        AND revoked_at IS NULL AND expires_at > $1
+                    "#,
+            )
+            .bind(now)
+            .bind(used_ip)
+            .bind(reservation_id)
+            .bind(id)
+            .execute(pool)
+            .await?
+            .rows_affected(),
+        };
+        Ok(affected == 1)
+    }
+
+    pub async fn commit_upload_reservation(&self, id: &str, reservation_id: &str) -> Result<bool> {
+        let now = Utc::now();
+        let affected = match &self.db {
+            DatabaseBackend::Sqlite(pool) => sqlx::query(
+                r#"
+                    UPDATE temporary_transfer_tokens
+                    SET used_status = 'started', agent_task_id = NULL
+                    WHERE id = ? AND used_status = 'receiving' AND agent_task_id = ?
+                        AND revoked_at IS NULL AND expires_at > ?
+                    "#,
+            )
+            .bind(id)
+            .bind(reservation_id)
+            .bind(now.to_rfc3339())
+            .execute(pool)
+            .await?
+            .rows_affected(),
+            DatabaseBackend::Postgres(pool) => sqlx::query(
+                r#"
+                    UPDATE temporary_transfer_tokens
+                    SET used_status = 'started', agent_task_id = NULL
+                    WHERE id = $1 AND used_status = 'receiving' AND agent_task_id = $2
+                        AND revoked_at IS NULL AND expires_at > $3
+                    "#,
+            )
+            .bind(id)
+            .bind(reservation_id)
+            .bind(now)
+            .execute(pool)
+            .await?
+            .rows_affected(),
+        };
+        Ok(affected == 1)
+    }
+
+    pub async fn release_upload_reservation(&self, id: &str, reservation_id: &str) -> Result<bool> {
+        let affected = match &self.db {
+            DatabaseBackend::Sqlite(pool) => sqlx::query(
+                r#"
+                    UPDATE temporary_transfer_tokens
+                    SET used_at = NULL, used_ip = NULL, used_status = NULL,
+                        agent_task_id = NULL
+                    WHERE id = ? AND used_status = 'receiving' AND agent_task_id = ?
+                    "#,
+            )
+            .bind(id)
+            .bind(reservation_id)
+            .execute(pool)
+            .await?
+            .rows_affected(),
+            DatabaseBackend::Postgres(pool) => sqlx::query(
+                r#"
+                    UPDATE temporary_transfer_tokens
+                    SET used_at = NULL, used_ip = NULL, used_status = NULL,
+                        agent_task_id = NULL
+                    WHERE id = $1 AND used_status = 'receiving' AND agent_task_id = $2
+                    "#,
+            )
+            .bind(id)
+            .bind(reservation_id)
+            .execute(pool)
+            .await?
+            .rows_affected(),
+        };
+        Ok(affected == 1)
+    }
+
     pub async fn record_use_result(
         &self,
         id: &str,
@@ -610,6 +722,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_reservation_is_exclusive_releasable_and_committable() {
+        let (repo, created, _) = seeded_upload_token("xlt_upload_reservation").await;
+
+        assert!(repo
+            .reserve_upload_once(&created.id, Some("203.0.113.10"), "reservation-a")
+            .await
+            .unwrap());
+        assert!(!repo
+            .reserve_upload_once(&created.id, Some("203.0.113.11"), "reservation-b")
+            .await
+            .unwrap());
+        assert!(!repo
+            .release_upload_reservation(&created.id, "reservation-b")
+            .await
+            .unwrap());
+        assert!(repo
+            .release_upload_reservation(&created.id, "reservation-a")
+            .await
+            .unwrap());
+
+        assert!(repo
+            .reserve_upload_once(&created.id, Some("203.0.113.12"), "reservation-c")
+            .await
+            .unwrap());
+        assert!(repo
+            .commit_upload_reservation(&created.id, "reservation-c")
+            .await
+            .unwrap());
+        assert!(!repo
+            .release_upload_reservation(&created.id, "reservation-c")
+            .await
+            .unwrap());
+
+        let stored = repo.find_by_id(&created.id).await.unwrap().unwrap();
+        assert!(stored.used_at.is_some());
+        assert_eq!(stored.used_ip.as_deref(), Some("203.0.113.12"));
+        assert_eq!(stored.used_status.as_deref(), Some("started"));
+        assert!(stored.agent_task_id.is_none());
+    }
+
+    #[tokio::test]
     async fn temporary_transfer_list_filters_by_owner_and_server_allowlist_in_sql() {
         let db = test_db().await;
         let user_repo = UserRepository::new(db.clone());
@@ -727,6 +880,31 @@ mod tests {
             })
             .await
             .unwrap();
+        (repo, created, token_hash)
+    }
+
+    async fn seeded_upload_token(
+        token: &str,
+    ) -> (
+        TemporaryTransferTokenRepository,
+        TemporaryTransferToken,
+        String,
+    ) {
+        let (repo, _, _) = seeded_token("xlt_upload_seed").await;
+        let owner = UserRepository::new(repo.db.clone())
+            .find_by_username("owner")
+            .await
+            .unwrap()
+            .unwrap();
+        let agent = AgentRepository::new(repo.db.clone())
+            .list_by_owner(owner.id, 1, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let token_hash = hash_token(token);
+        let created = create_token_for(&repo, token, owner.id, agent.id, "upload").await;
         (repo, created, token_hash)
     }
 

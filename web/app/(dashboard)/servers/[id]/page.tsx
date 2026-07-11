@@ -29,6 +29,9 @@ import {
 import { apiClient, type FileEntry, type JsonObject } from "@/lib/api";
 import { durationLabel, formatRate, maxOf, minOf, optionalNumber } from "@/app/lib/format";
 import { useI18n } from "@/lib/use-i18n";
+import { useStoredPreference } from "@/app/lib/client-store";
+
+const BINARY_PREFERENCE_VALUES = ["0", "1"] as const;
 
 interface ServerDetail {
   id: string;
@@ -220,7 +223,8 @@ export default function ServerDetailPage({ params }: PageProps) {
   const [probeHistories, setProbeHistories] = useState<ProbeHistory[]>([]);
   const [selectedProbeIds, setSelectedProbeIds] = useState<string[]>([]);
   const [probePeakCutEnabled, setProbePeakCutEnabled] = useState(false);
-  const [showMissingInfo, setShowMissingInfo] = useState(() => initialShowMissingInfo());
+  const [showMissingInfoPreference, setShowMissingInfoPreference] = useStoredPreference("xlstatus_detail_show_missing", "0", BINARY_PREFERENCE_VALUES);
+  const showMissingInfo = showMissingInfoPreference === "1";
   const [probeLoading, setProbeLoading] = useState(false);
   const [monitorError, setMonitorError] = useState<string | null>(null);
 
@@ -440,8 +444,7 @@ export default function ServerDetailPage({ params }: PageProps) {
   }
 
   function changeShowMissingInfo(next: boolean) {
-    setShowMissingInfo(next);
-    window.localStorage.setItem("xlstatus_detail_show_missing", next ? "1" : "0");
+    setShowMissingInfoPreference(next ? "1" : "0");
   }
 
   async function readSelectedFile(nextPath: string) {
@@ -2505,9 +2508,4 @@ function serverStatusLabel(status: string, copy: import("@/lib/i18n").Translatio
     degraded: copy.serverDetailPage.statusDegraded,
   };
   return labels[status] || status;
-}
-
-function initialShowMissingInfo(): boolean {
-  if (typeof window === "undefined") return false;
-  return window.localStorage.getItem("xlstatus_detail_show_missing") === "1";
 }

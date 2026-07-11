@@ -33,11 +33,18 @@ const DOWNLOAD_TIMEOUT_SECS: u64 = 60;
 const UPLOAD_TIMEOUT_SECS: u64 = 120;
 const TEMP_TRANSFER_RATE_LIMIT: u32 = 10;
 const TEMP_TRANSFER_RATE_WINDOW_SECS: u64 = 60;
+const TEMP_TRANSFER_RATE_CLEANUP_INTERVAL: u32 = 64;
 const TEMP_TRANSFER_SMALL_RESULT_MAX_BYTES: usize = 4096;
 
+#[derive(Default)]
+struct TemporaryTransferRateState {
+    entries: HashMap<String, (std::time::Instant, u32)>,
+    checks_since_cleanup: u32,
+}
+
 static TEMP_TRANSFER_RATE_STATE: once_cell::sync::Lazy<
-    std::sync::Mutex<HashMap<String, (std::time::Instant, u32)>>,
-> = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+    std::sync::Mutex<TemporaryTransferRateState>,
+> = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(TemporaryTransferRateState::default()));
 
 #[derive(Debug, Deserialize)]
 pub struct TempTransferQuery {
@@ -404,21 +411,22 @@ async fn run_temp_upload(
     let path = transfer.path;
     let server_id = transfer.server_id;
     check_rate_limit(&query.token)?;
-    consume_temporary_transfer(&state, &transfer.token_id, Some(&client_ip)).await?;
+    let reservation_id = uuid::Uuid::now_v7().to_string();
+    reserve_temporary_upload(
+        &state,
+        &transfer.token_id,
+        Some(&client_ip),
+        &reservation_id,
+    )
+    .await?;
     let body = match read_limited_upload_body(body).await {
         Ok(body) => body,
         Err(err) => {
-            record_temporary_transfer_result(
-                &state,
-                &transfer.token_id,
-                "failed",
-                None,
-                Some(&err.1),
-            )
-            .await;
+            release_temporary_upload(&state, &transfer.token_id, &reservation_id).await;
             return Err(err);
         }
     };
+    commit_temporary_upload(&state, &transfer.token_id, &reservation_id).await?;
     let dispatched = match dispatch_server_task(
         &state,
         &server_id,
@@ -779,6 +787,61 @@ async fn consume_temporary_transfer(
     }
 }
 
+async fn reserve_temporary_upload(
+    state: &AppState,
+    token_id: &str,
+    used_ip: Option<&str>,
+    reservation_id: &str,
+) -> Result<(), (StatusCode, String)> {
+    if TemporaryTransferTokenRepository::new(state.db.clone())
+        .reserve_upload_once(token_id, used_ip, reservation_id)
+        .await
+        .map_err(internal_error)?
+    {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            "invalid or already used temporary URL".to_string(),
+        ))
+    }
+}
+
+async fn commit_temporary_upload(
+    state: &AppState,
+    token_id: &str,
+    reservation_id: &str,
+) -> Result<(), (StatusCode, String)> {
+    let repo = TemporaryTransferTokenRepository::new(state.db.clone());
+    if repo
+        .commit_upload_reservation(token_id, reservation_id)
+        .await
+        .map_err(internal_error)?
+    {
+        Ok(())
+    } else {
+        if let Err(err) = repo
+            .release_upload_reservation(token_id, reservation_id)
+            .await
+        {
+            tracing::warn!(token_id = %token_id, "failed to release uncommitted upload reservation: {err}");
+        }
+        Err((
+            StatusCode::FORBIDDEN,
+            "temporary URL expired or was revoked during upload".to_string(),
+        ))
+    }
+}
+
+async fn release_temporary_upload(state: &AppState, token_id: &str, reservation_id: &str) {
+    if let Err(err) = TemporaryTransferTokenRepository::new(state.db.clone())
+        .release_upload_reservation(token_id, reservation_id)
+        .await
+    {
+        tracing::warn!(token_id = %token_id, "failed to release upload reservation: {err}");
+    }
+}
+
 async fn record_temporary_transfer_result(
     state: &AppState,
     token_id: &str,
@@ -820,11 +883,31 @@ fn check_rate_limit(token: &str) -> Result<(), (StatusCode, String)> {
             "rate limiter unavailable".to_string(),
         )
     })?;
-    let entry = state
-        .entry(token.to_string())
-        .or_insert_with(|| (std::time::Instant::now(), 0));
-    if entry.0.elapsed() >= std::time::Duration::from_secs(TEMP_TRANSFER_RATE_WINDOW_SECS) {
-        entry.0 = std::time::Instant::now();
+    check_rate_limit_in(&mut state, token, std::time::Instant::now())
+}
+
+fn check_rate_limit_in(
+    state: &mut TemporaryTransferRateState,
+    token: &str,
+    now: std::time::Instant,
+) -> Result<(), (StatusCode, String)> {
+    let window = std::time::Duration::from_secs(TEMP_TRANSFER_RATE_WINDOW_SECS);
+    state.checks_since_cleanup = state.checks_since_cleanup.saturating_add(1);
+    if state.checks_since_cleanup >= TEMP_TRANSFER_RATE_CLEANUP_INTERVAL {
+        state.entries.retain(|_, (started_at, _)| {
+            now.checked_duration_since(*started_at)
+                .map(|elapsed| elapsed < window)
+                .unwrap_or(false)
+        });
+        state.checks_since_cleanup = 0;
+    }
+    let entry = state.entries.entry(token.to_string()).or_insert((now, 0));
+    if now
+        .checked_duration_since(entry.0)
+        .map(|elapsed| elapsed >= window)
+        .unwrap_or(true)
+    {
+        entry.0 = now;
         entry.1 = 0;
     }
     entry.1 = entry.1.saturating_add(1);
@@ -1002,7 +1085,7 @@ fn insert_no_store_headers(headers: &mut HeaderMap) {
 
 fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
     let bytes = input.as_bytes();
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err("length is not a multiple of 4".to_string());
     }
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
@@ -1156,6 +1239,34 @@ mod tests {
         let err = read_limited_body(too_large, 16).await.unwrap_err();
         assert_eq!(err.0, StatusCode::PAYLOAD_TOO_LARGE);
         assert!(err.1.contains("upload is larger than"));
+    }
+
+    #[test]
+    fn temporary_transfer_rate_limiter_discards_expired_entries() {
+        let now = std::time::Instant::now();
+        let mut state = TemporaryTransferRateState {
+            entries: HashMap::from([
+                (
+                    "expired".to_string(),
+                    (
+                        now - std::time::Duration::from_secs(TEMP_TRANSFER_RATE_WINDOW_SECS),
+                        1,
+                    ),
+                ),
+                ("active".to_string(), (now, 1)),
+            ]),
+            checks_since_cleanup: TEMP_TRANSFER_RATE_CLEANUP_INTERVAL - 1,
+        };
+
+        check_rate_limit_in(&mut state, "current", now).unwrap();
+
+        assert!(!state.entries.contains_key("expired"));
+        assert!(state.entries.contains_key("active"));
+        assert_eq!(
+            state.entries.get("current").map(|(_, count)| *count),
+            Some(1)
+        );
+        assert_eq!(state.checks_since_cleanup, 0);
     }
 
     #[test]

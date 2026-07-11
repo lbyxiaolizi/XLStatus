@@ -167,6 +167,16 @@ pub fn set_nat_manager(mgr: Arc<crate::nat::tunnel::NatTunnelManager>) {
     let _ = NAT_MANAGER.set(mgr);
 }
 
+fn database_backend_label(database_url: &str) -> &'static str {
+    if database_url.starts_with("sqlite:") {
+        "sqlite"
+    } else if database_url.starts_with("postgres:") || database_url.starts_with("postgresql:") {
+        "postgresql"
+    } else {
+        "unknown"
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize tracing
@@ -185,7 +195,10 @@ async fn main() -> anyhow::Result<()> {
     // Connect to database
     let db = db::DatabaseBackend::connect(&config.database.url, config.database.create_if_missing)
         .await?;
-    tracing::info!("Connected to database: {}", config.database.url);
+    tracing::info!(
+        database_backend = database_backend_label(&config.database.url),
+        "Connected to database"
+    );
 
     // Run migrations
     db.run_migrations().await?;
@@ -1777,5 +1790,24 @@ mod tests {
         assert!(compose.contains("\"127.0.0.1:5432:5432\""));
         assert!(!compose.contains("\"5432:5432\""));
         assert!(!compose.contains("- 5432:5432"));
+    }
+
+    #[test]
+    fn database_log_label_never_contains_connection_credentials() {
+        let url = "postgresql://user:super-secret@db.example/xlstatus?sslmode=require";
+        let label = database_backend_label(url);
+
+        assert_eq!(label, "postgresql");
+        assert!(!label.contains("user"));
+        assert!(!label.contains("super-secret"));
+        assert_eq!(
+            database_backend_label("sqlite:///data/xlstatus.db"),
+            "sqlite"
+        );
+        assert_eq!(
+            database_backend_label("postgres://db/xlstatus"),
+            "postgresql"
+        );
+        assert_eq!(database_backend_label("mysql://db/xlstatus"), "unknown");
     }
 }

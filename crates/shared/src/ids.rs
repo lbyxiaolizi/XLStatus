@@ -13,15 +13,33 @@ pub struct UserId(pub uuid::Uuid);
 #[serde(transparent)]
 pub struct AgentId(pub uuid::Uuid);
 
+impl Default for ServerId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ServerId {
     pub fn new() -> Self {
         Self(uuid::Uuid::now_v7())
     }
 }
 
+impl Default for UserId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UserId {
     pub fn new() -> Self {
         Self(uuid::Uuid::now_v7())
+    }
+}
+
+impl Default for AgentId {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

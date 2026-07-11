@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { useDialogs } from "@/app/components/Dialogs";
 import {
   BrutalCard,
@@ -36,9 +36,17 @@ import {
   type TsdbRetentionResponse,
 } from "@/lib/api";
 import { useI18n } from "@/lib/use-i18n";
+import {
+  cacheDashboardTheme,
+  DASHBOARD_THEME_CACHE_KEY,
+} from "@/app/lib/dashboard-theme";
+import { readStoredUser } from "@/app/lib/client-store";
 
 const DEFAULT_AGENT_VERSION = "v0.1";
 const GITHUB_RELEASES_API = "https://api.github.com/repos/lbyxiaolizi/XLStatus/releases?per_page=20";
+const GITHUB_RELEASE_CACHE_KEY = "xlstatus:agent-latest-release:v1";
+const GITHUB_RELEASE_CACHE_TTL_MS = 45 * 60 * 1000;
+const HYDRATION_API_BASE_URL = (process.env.NEXT_PUBLIC_API_URL?.trim() || "http://localhost:8080").replace(/\/+$/, "");
 
 interface UserAccount {
   id: string;
@@ -80,19 +88,22 @@ export default function SettingsPage() {
   const { t: copy } = useI18n();
   const [name, setName] = useState("");
   const [scopes, setScopes] = useState("server:read service:read task:* nat:* ddns:*");
-  const [patExpiresAt, setPatExpiresAt] = useState(() => defaultPatExpiresAt());
+  const hydratedPatExpiresAt = useHydratedPatExpiresAt();
+  const [patExpiresAtOverride, setPatExpiresAt] = useState<string | null>(null);
+  const patExpiresAt = patExpiresAtOverride ?? hydratedPatExpiresAt;
   const [patServerIds, setPatServerIds] = useState("");
   const [tokens, setTokens] = useState<PatInfo[]>([]);
+  const [tokensLoading, setTokensLoading] = useState(true);
   const [createdToken, setCreatedToken] = useState("");
   const [users, setUsers] = useState<UserAccount[]>([]);
-  const [usersLoading, setUsersLoading] = useState(false);
+  const [usersLoading, setUsersLoading] = useState(true);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
-  const [sessionsLoading, setSessionsLoading] = useState(false);
+  const [sessionsLoading, setSessionsLoading] = useState(true);
   const [wafBans, setWafBans] = useState<WafBan[]>([]);
-  const [wafLoading, setWafLoading] = useState(false);
+  const [wafLoading, setWafLoading] = useState(true);
   const [wafBanDraft, setWafBanDraft] = useState({ ips: "", reason: "manual WAF ban", minutes: "30" });
   const [maintenanceStatus, setMaintenanceStatus] = useState<MaintenanceStatusResponse | null>(null);
-  const [maintenanceLoading, setMaintenanceLoading] = useState(false);
+  const [maintenanceLoading, setMaintenanceLoading] = useState(true);
   const [restoreFile, setRestoreFile] = useState<File | null>(null);
   const [restoreResult, setRestoreResult] = useState<MaintenanceRestoreResponse | null>(null);
   const [tsdbCompactResult, setTsdbCompactResult] = useState<TsdbCompactResponse | null>(null);
@@ -101,7 +112,7 @@ export default function SettingsPage() {
   const [totpStatus, setTotpStatus] = useState<TotpStatusResponse | null>(null);
   const [totpSetup, setTotpSetup] = useState<TotpSetupResponse | null>(null);
   const [totpCode, setTotpCode] = useState("");
-  const [totpLoading, setTotpLoading] = useState(false);
+  const [totpLoading, setTotpLoading] = useState(true);
   const [oauthProviders, setOauthProviders] = useState<OAuthProvider[]>([]);
   const [oauthBindings, setOauthBindings] = useState<OAuthAccount[]>([]);
   const [geoIp, setGeoIp] = useState({ ip: "1.1.1.1", provider: "mmdb", token: "" });
@@ -114,8 +125,9 @@ export default function SettingsPage() {
   const [ddnsResolverUrl, setDdnsResolverUrl] = useState("");
   const [cloudflaredStatus, setCloudflaredStatus] = useState<CloudflaredStatusResponse | null>(null);
   const [cloudflaredToken, setCloudflaredToken] = useState("");
-  const [cloudflaredLoading, setCloudflaredLoading] = useState(false);
+  const [cloudflaredLoading, setCloudflaredLoading] = useState(true);
   const [geoIpLoading, setGeoIpLoading] = useState(false);
+  const [geoIpStatusLoading, setGeoIpStatusLoading] = useState(true);
   const [systemSettings, setSystemSettings] = useState<SystemSettingsResponse | null>(null);
   const [publicBranding, setPublicBranding] = useState({
     siteName: "XLStatus",
@@ -131,12 +143,17 @@ export default function SettingsPage() {
   const [selectedDashboardThemeId, setSelectedDashboardThemeId] = useState("");
   const [themeImportText, setThemeImportText] = useState(() => defaultThemeImportText());
   const [themeLoading, setThemeLoading] = useState(false);
+  const [themesLoaded, setThemesLoaded] = useState(false);
+  const [themeError, setThemeError] = useState<string | null>(null);
   const [notificationGroups, setNotificationGroups] = useState<NotificationGroup[]>([]);
-  const [settingsLoading, setSettingsLoading] = useState(false);
+  const [settingsLoading, setSettingsLoading] = useState(true);
   const [newUser, setNewUser] = useState({ username: "", password: "", role: "member" });
   const [passwordEdits, setPasswordEdits] = useState<Record<string, string>>({});
-  const [agentServerUrl, setAgentServerUrl] = useState(() => getApiBaseUrl());
-  const [agentGrpcUrl, setAgentGrpcUrl] = useState(() => defaultGrpcUrl(getApiBaseUrl()));
+  const runtimeApiBaseUrl = useRuntimeApiBaseUrl();
+  const [agentServerUrlOverride, setAgentServerUrl] = useState<string | null>(null);
+  const [agentGrpcUrlOverride, setAgentGrpcUrl] = useState<string | null>(null);
+  const agentServerUrl = agentServerUrlOverride ?? runtimeApiBaseUrl;
+  const agentGrpcUrl = agentGrpcUrlOverride ?? defaultGrpcUrl(runtimeApiBaseUrl);
   const [agentName, setAgentName] = useState("$(hostname)");
   const [agentVersion, setAgentVersion] = useState(DEFAULT_AGENT_VERSION);
   const [agentUseLatestVersion, setAgentUseLatestVersion] = useState(true);
@@ -147,44 +164,88 @@ export default function SettingsPage() {
   const [enrollmentExpiresAt, setEnrollmentExpiresAt] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const loadedResourcesRef = useRef(new Set<string>());
+  const themesLoadRequestIdRef = useRef(0);
   const installScriptUrl = apiClient.getAgentInstallScriptUrl({
     server_url: agentServerUrl,
     grpc_server: agentGrpcUrl,
     enrollment_token: enrollmentToken || "xle_...",
     agent_name: agentName,
     version: agentVersion,
-  });
+  }, runtimeApiBaseUrl);
   const githubScriptUrl = `https://github.com/lbyxiaolizi/XLStatus/releases/download/${encodeURIComponent(agentVersion)}/install-agent.sh`;
   const agentInstallCommand = buildAgentInstallCommand({
     installScriptUrl,
   });
 
   useEffect(() => {
-    void loadTokens();
-    void loadUsers();
-    void loadSessions();
-    void loadWafBans();
-    void loadMaintenanceStatus();
-    void loadTotpStatus();
-    void loadOAuthProviders();
-    void loadOAuthBindings();
-    void loadSystemSettings();
-    void loadGeoIpStatus();
-    void loadNotificationGroups();
-    void loadCloudflaredStatus();
-    void loadThemes();
+    const loaders: Record<string, () => void> = {
+      themes: () => void loadThemes(),
+      cloudflare: () => void loadCloudflaredStatus(),
+      security: () => void Promise.all([loadTotpStatus(), loadOAuthProviders(), loadOAuthBindings()]),
+      system: () => void loadSystemSettings(),
+      users: () => void loadUsers(),
+      sessions: () => void loadSessions(),
+      waf: () => void loadWafBans(),
+      maintenance: () => void loadMaintenanceStatus(),
+      geoip: () => {
+        loadResource("system");
+        void Promise.all([loadGeoIpStatus(), loadNotificationGroups()]);
+      },
+      tokens: () => void loadTokens(),
+    };
+
+    function loadResource(resource: string) {
+      if (loadedResourcesRef.current.has(resource)) return;
+      const loader = loaders[resource];
+      if (!loader) return;
+      loadedResourcesRef.current.add(resource);
+      loader();
+    }
+
+    const targets = document.querySelectorAll<HTMLElement>("[data-settings-resource]");
+    if (!("IntersectionObserver" in window)) {
+      targets.forEach((target) => loadResource(target.dataset.settingsResource ?? ""));
+      return;
+    }
+
+    const observer = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        const target = entry.target as HTMLElement;
+        loadResource(target.dataset.settingsResource ?? "");
+        observer.unobserve(target);
+      }
+    }, { rootMargin: "400px 0px" });
+    targets.forEach((target) => observer.observe(target));
+    return () => observer.disconnect();
   }, []);
 
   useEffect(() => {
-    if (agentUseLatestVersion) {
-      void refreshLatestAgentVersion();
-    }
-    // Refresh only when the auto-latest switch changes.
+    if (!agentUseLatestVersion) return;
+    return scheduleWhenIdle(() => void refreshLatestAgentVersion());
+    // The refresh function intentionally runs only when the auto-latest switch changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agentUseLatestVersion]);
 
+  useEffect(() => {
+    function handleThemeStorage(event: StorageEvent) {
+      if (event.key !== DASHBOARD_THEME_CACHE_KEY) return;
+      loadedResourcesRef.current.add("themes");
+      void loadThemes(true);
+    }
+
+    window.addEventListener("storage", handleThemeStorage);
+    return () => {
+      themesLoadRequestIdRef.current += 1;
+      window.removeEventListener("storage", handleThemeStorage);
+    };
+  }, []);
+
   async function loadTokens() {
+    setTokensLoading(true);
     const response = await apiClient.listPats();
+    setTokensLoading(false);
     if (response.success && response.data) {
       setTokens(response.data);
     } else {
@@ -250,9 +311,9 @@ export default function SettingsPage() {
     }
   }
 
-  async function loadTotpStatus() {
+  async function loadTotpStatus(force = false) {
     setTotpLoading(true);
-    const response = await apiClient.getTotpStatus();
+    const response = await apiClient.getTotpStatus({ bypassClientCache: force });
     setTotpLoading(false);
     if (response.success && response.data) {
       setTotpStatus(response.data);
@@ -277,9 +338,9 @@ export default function SettingsPage() {
     }
   }
 
-  async function loadSystemSettings() {
+  async function loadSystemSettings(force = false) {
     setSettingsLoading(true);
-    const response = await apiClient.getSettings();
+    const response = await apiClient.getSettings({ bypassClientCache: force });
     setSettingsLoading(false);
     if (response.success && response.data) {
       const settings = response.data;
@@ -306,16 +367,32 @@ export default function SettingsPage() {
     }
   }
 
-  async function loadThemes() {
+  async function loadThemes(force = false, broadcast = false) {
+    const requestUserId = readStoredUser()?.id;
+    const requestId = themesLoadRequestIdRef.current + 1;
+    themesLoadRequestIdRef.current = requestId;
     setThemeLoading(true);
-    const response = await apiClient.listThemes();
+    setThemeError(null);
+    const response = await apiClient.listThemes({ bypassClientCache: force });
+    if (requestId !== themesLoadRequestIdRef.current) return;
     setThemeLoading(false);
+    if (!requestUserId || readStoredUser()?.id !== requestUserId) return;
+    setThemesLoaded(true);
     if (response.success && response.data) {
-      setThemes(response.data.themes ?? []);
+      const nextThemes = response.data.themes ?? [];
+      const dashboardThemeId = response.data.selected_dashboard_theme_id || "";
+      setThemes(nextThemes);
       setSelectedPublicThemeId(response.data.selected_public_theme_id || "");
-      setSelectedDashboardThemeId(response.data.selected_dashboard_theme_id || "");
+      setSelectedDashboardThemeId(dashboardThemeId);
+      cacheDashboardTheme(
+        requestUserId,
+        nextThemes.find((theme) => theme.id === dashboardThemeId) ?? null,
+        broadcast,
+      );
     } else {
-      setError(responseError(response));
+      const message = responseError(response);
+      setThemeError(message);
+      setError(message);
     }
   }
 
@@ -336,14 +413,20 @@ export default function SettingsPage() {
     }
     const totpCode = await sensitiveTotpCode();
     if (totpCode === null) return;
+    const requestUserId = readStoredUser()?.id;
+    if (!requestUserId) return;
     setThemeLoading(true);
+    setThemeError(null);
     const response = await apiClient.importTheme(candidate as ImportThemeRequest["theme"], totpCode);
     setThemeLoading(false);
+    if (readStoredUser()?.id !== requestUserId) return;
     if (response.success && response.data) {
       setNotice(copy.settingsPage.themeImported.replace("{name}", String(response.data.name)));
       await loadThemes();
     } else {
-      setError(responseError(response));
+      const message = responseError(response);
+      setThemeError(message);
+      setError(message);
     }
   }
 
@@ -359,16 +442,29 @@ export default function SettingsPage() {
   async function selectTheme(theme: ThemeDefinition, target: "public" | "dashboard" | "both") {
     const totpCode = await sensitiveTotpCode();
     if (totpCode === null) return;
+    const requestUserId = readStoredUser()?.id;
+    if (!requestUserId) return;
     setThemeLoading(true);
+    setThemeError(null);
     const response = await apiClient.selectTheme(theme.id, target, totpCode);
     setThemeLoading(false);
+    if (readStoredUser()?.id !== requestUserId) return;
     if (response.success && response.data) {
-      setThemes(response.data.themes ?? []);
+      const nextThemes = response.data.themes ?? [];
+      const dashboardThemeId = response.data.selected_dashboard_theme_id || "";
+      setThemes(nextThemes);
       setSelectedPublicThemeId(response.data.selected_public_theme_id || "");
-      setSelectedDashboardThemeId(response.data.selected_dashboard_theme_id || "");
+      setSelectedDashboardThemeId(dashboardThemeId);
+      cacheDashboardTheme(
+        requestUserId,
+        nextThemes.find((item) => item.id === dashboardThemeId) ?? null,
+        true,
+      );
       setNotice(copy.settingsPage.themeApplied.replace("{name}", String(theme.name)));
     } else {
-      setError(responseError(response));
+      const message = responseError(response);
+      setThemeError(message);
+      setError(message);
     }
   }
 
@@ -376,14 +472,20 @@ export default function SettingsPage() {
     if (!(await dialogs.confirm({ message: copy.settingsPage.deleteThemeConfirm.replace("{name}", String(theme.name)), danger: true }))) return;
     const totpCode = await sensitiveTotpCode();
     if (totpCode === null) return;
+    const requestUserId = readStoredUser()?.id;
+    if (!requestUserId) return;
     setThemeLoading(true);
+    setThemeError(null);
     const response = await apiClient.deleteTheme(theme.id, totpCode);
     setThemeLoading(false);
+    if (readStoredUser()?.id !== requestUserId) return;
     if (response.success) {
       setNotice(copy.settingsPage.themeDeleted.replace("{name}", String(theme.name)));
-      await loadThemes();
+      await loadThemes(true, true);
     } else {
-      setError(responseError(response));
+      const message = responseError(response);
+      setThemeError(message);
+      setError(message);
     }
   }
 
@@ -395,7 +497,9 @@ export default function SettingsPage() {
   }
 
   async function loadGeoIpStatus() {
+    setGeoIpStatusLoading(true);
     const response = await apiClient.getGeoIpStatus();
+    setGeoIpStatusLoading(false);
     if (response.success && response.data) {
       setGeoIpMmdbStatus(response.data);
     }
@@ -948,11 +1052,21 @@ export default function SettingsPage() {
     }
   }
 
-  async function refreshLatestAgentVersion() {
+  async function refreshLatestAgentVersion({ forceNetwork = false }: { forceNetwork?: boolean } = {}) {
+    if (!forceNetwork) {
+      const cachedVersion = readCachedLatestAgentVersion();
+      if (cachedVersion) {
+        setAgentVersion(cachedVersion);
+        setAgentLatestVersionStatus(copy.settingsPage.agentLatestFetched.replace("{tag}", String(cachedVersion)));
+        return;
+      }
+    }
+
     setAgentLatestVersionLoading(true);
     try {
       const response = await fetch(GITHUB_RELEASES_API, {
         headers: { Accept: "application/vnd.github+json" },
+        cache: forceNetwork ? "no-store" : "default",
       });
       if (!response.ok) {
         throw new Error(copy.settingsPage.githubHttpError.replace("{status}", String(response.status)));
@@ -963,6 +1077,7 @@ export default function SettingsPage() {
       if (!tagName) {
         throw new Error(copy.settingsPage.githubNoTagName);
       }
+      cacheLatestAgentVersion(tagName);
       setAgentVersion(tagName);
       setAgentLatestVersionStatus(copy.settingsPage.agentLatestFetched.replace("{tag}", String(tagName)));
     } catch (err) {
@@ -1054,7 +1169,7 @@ export default function SettingsPage() {
                 <button
                   type="button"
                   className={buttonClass("secondary")}
-                  onClick={() => void refreshLatestAgentVersion()}
+                  onClick={() => void refreshLatestAgentVersion({ forceNetwork: true })}
                   disabled={agentLatestVersionLoading}
                 >
                   {agentLatestVersionLoading ? copy.settingsPage.fetching : copy.settingsPage.refreshVersion}
@@ -1092,18 +1207,25 @@ export default function SettingsPage() {
           </div>
         </BrutalCard>
 
-        <BrutalCard className="mb-6">
+        <BrutalCard data-settings-resource="themes" className="mb-6">
           <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
             <div>
               <h2 className="text-xl font-black uppercase">{copy.settingsPage.themeTemplates}</h2>
             </div>
-            <button type="button" className={buttonClass("secondary")} onClick={() => void loadThemes()} disabled={themeLoading}>
+            <button type="button" className={buttonClass("secondary")} onClick={() => void loadThemes(true)} disabled={themeLoading}>
               {themeLoading ? copy.settingsPage.loading : copy.settingsPage.refresh}
             </button>
           </div>
+          <InlineError message={themeError} />
           <div className="grid gap-5 xl:grid-cols-[minmax(0,1.2fr)_minmax(0,0.8fr)]">
             <div className="grid content-start gap-3">
-              {themes.length === 0 ? (
+              {(!themesLoaded || themeLoading) && themes.length === 0 ? (
+                <div className="grid gap-3" aria-busy="true">
+                  {Array.from({ length: 3 }).map((_, index) => (
+                    <div key={index} className="h-36 animate-pulse border-2 border-black bg-[var(--accent-bg)] shadow-[var(--shadow-brutal-sm)]" />
+                  ))}
+                </div>
+              ) : themeError && themes.length === 0 ? null : themes.length === 0 ? (
                 <p className="text-sm font-bold text-[var(--text-muted)]">{copy.settingsPage.noThemes}</p>
               ) : (
                 themes.map((theme) => (
@@ -1197,19 +1319,19 @@ export default function SettingsPage() {
           </div>
         </BrutalCard>
 
-        <BrutalCard className="mb-6">
+        <BrutalCard data-settings-resource="cloudflare" className="mb-6">
           <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
             <div>
               <h2 className="text-xl font-black uppercase">{copy.settingsPage.cloudflareTunnel}</h2>
             </div>
-            <button type="button" className={buttonClass("secondary")} onClick={() => void loadCloudflaredStatus()}>
+            <button type="button" className={buttonClass("secondary")} onClick={() => void loadCloudflaredStatus()} disabled={cloudflaredLoading}>
               {cloudflaredLoading ? copy.settingsPage.loading : copy.settingsPage.refresh}
             </button>
           </div>
           <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-end">
             <div className="grid gap-3 md:grid-cols-3">
-              <MaintenanceCapability label={copy.settingsPage.runningStatus} enabled={Boolean(cloudflaredStatus?.running)} copy={copy} />
-              <MaintenanceCapability label={copy.settingsPage.tokenLabel} enabled={Boolean(cloudflaredStatus?.token_configured)} copy={copy} />
+              <MaintenanceCapability label={copy.settingsPage.runningStatus} enabled={cloudflaredStatus ? Boolean(cloudflaredStatus.running) : undefined} copy={copy} />
+              <MaintenanceCapability label={copy.settingsPage.tokenLabel} enabled={cloudflaredStatus ? Boolean(cloudflaredStatus.token_configured) : undefined} copy={copy} />
               <div className="border-2 border-black bg-[var(--accent-bg)] p-3 shadow-[var(--shadow-brutal-sm)]">
                 <div className="text-[11px] font-black uppercase text-[var(--text-muted)]">PID</div>
                 <div className="mt-2 text-sm font-black">{cloudflaredStatus?.pid ?? "N/A"}</div>
@@ -1248,12 +1370,12 @@ export default function SettingsPage() {
           ) : null}
         </BrutalCard>
 
-        <BrutalCard className="mb-6">
+        <BrutalCard data-settings-resource="security" className="mb-6">
           <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
             <div>
               <h2 className="text-xl font-black uppercase">{copy.settingsPage.accountSecurity}</h2>
             </div>
-            <button type="button" className={buttonClass("secondary")} onClick={() => void loadTotpStatus()}>
+            <button type="button" className={buttonClass("secondary")} onClick={() => void loadTotpStatus(true)} disabled={totpLoading}>
               {totpLoading ? copy.settingsPage.loading : copy.settingsPage.refresh}
             </button>
           </div>
@@ -1261,7 +1383,7 @@ export default function SettingsPage() {
             <div className="min-w-0">
               <div className="mb-3 flex flex-wrap items-center gap-2">
                 <StatusBadge tone={totpStatus?.enabled ? "green" : "gray"}>
-                  {totpStatus?.enabled ? copy.settingsPage.totpEnabledBadge : copy.settingsPage.totpDisabledBadge}
+                  {totpStatus ? (totpStatus.enabled ? copy.settingsPage.totpEnabledBadge : copy.settingsPage.totpDisabledBadge) : copy.common.notAvailable}
                 </StatusBadge>
                 {totpStatus?.setup_pending ? <StatusBadge tone="yellow">{copy.settingsPage.pendingVerification}</StatusBadge> : null}
               </div>
@@ -1380,19 +1502,19 @@ export default function SettingsPage() {
           </div>
         </BrutalCard>
 
-        <BrutalCard className="mb-6">
+        <BrutalCard data-settings-resource="system" className="mb-6">
           <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
             <div>
               <h2 className="text-xl font-black uppercase">{copy.settingsPage.publicStatusPage}</h2>
             </div>
-            <button type="button" className={buttonClass("secondary")} onClick={() => void loadSystemSettings()}>
+            <button type="button" className={buttonClass("secondary")} onClick={() => void loadSystemSettings(true)} disabled={settingsLoading}>
               {settingsLoading ? copy.settingsPage.loading : copy.settingsPage.refresh}
             </button>
           </div>
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="flex flex-wrap items-center gap-2">
-              <StatusBadge tone={systemSettings?.public_site_enabled ? "green" : "red"}>
-                {systemSettings?.public_site_enabled ? copy.settingsPage.public : copy.settingsPage.private}
+              <StatusBadge tone={systemSettings ? (systemSettings.public_site_enabled ? "green" : "red") : "gray"}>
+                {systemSettings ? (systemSettings.public_site_enabled ? copy.settingsPage.public : copy.settingsPage.private) : copy.common.notAvailable}
               </StatusBadge>
               <span className="text-sm font-bold text-[var(--text-muted)]">
                 {copy.settingsPage.publicSiteToggleHint}
@@ -1411,7 +1533,7 @@ export default function SettingsPage() {
           <div className="mt-3 flex flex-wrap items-center justify-between gap-3 border-t-2 border-black pt-3">
             <div className="flex flex-wrap items-center gap-2">
               <StatusBadge tone={systemSettings?.public_server_details_enabled ? "green" : "gray"}>
-                {systemSettings?.public_server_details_enabled ? copy.settingsPage.showDetails : copy.settingsPage.hideDetails}
+                {systemSettings ? (systemSettings.public_server_details_enabled ? copy.settingsPage.showDetails : copy.settingsPage.hideDetails) : copy.common.notAvailable}
               </StatusBadge>
               <span className="text-sm font-bold text-[var(--text-muted)]">
                 {copy.settingsPage.publicDetailsToggleHint}
@@ -1486,12 +1608,12 @@ export default function SettingsPage() {
           </div>
         </BrutalCard>
 
-        <BrutalCard className="mb-6">
+        <BrutalCard data-settings-resource="users" className="mb-6">
           <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
             <div>
               <h2 className="text-xl font-black uppercase">{copy.settingsPage.userManagement}</h2>
             </div>
-            <button type="button" className={buttonClass("secondary")} onClick={() => void loadUsers()}>
+            <button type="button" className={buttonClass("secondary")} onClick={() => void loadUsers()} disabled={usersLoading}>
               {usersLoading ? copy.settingsPage.loading : copy.settingsPage.refresh}
             </button>
           </div>
@@ -1511,7 +1633,9 @@ export default function SettingsPage() {
             <button className={buttonClass("primary")}>{copy.settingsPage.createUser}</button>
           </form>
           <div className="grid gap-3">
-            {users.length === 0 ? (
+            {usersLoading && users.length === 0 ? (
+              <SettingsListSkeleton />
+            ) : users.length === 0 ? (
               <p className="text-sm font-bold text-[var(--text-muted)]">{copy.settingsPage.noUsers}</p>
             ) : (
               users.map((user) => (
@@ -1549,17 +1673,19 @@ export default function SettingsPage() {
           </div>
         </BrutalCard>
 
-        <BrutalCard className="mb-6">
+        <BrutalCard data-settings-resource="sessions" className="mb-6">
           <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
             <div>
               <h2 className="text-xl font-black uppercase">{copy.settingsPage.activeSessions}</h2>
             </div>
-            <button type="button" className={buttonClass("secondary")} onClick={() => void loadSessions()}>
+            <button type="button" className={buttonClass("secondary")} onClick={() => void loadSessions()} disabled={sessionsLoading}>
               {sessionsLoading ? copy.settingsPage.loading : copy.settingsPage.refresh}
             </button>
           </div>
           <div className="grid gap-3">
-            {sessions.length === 0 ? (
+            {sessionsLoading && sessions.length === 0 ? (
+              <SettingsListSkeleton />
+            ) : sessions.length === 0 ? (
               <p className="text-sm font-bold text-[var(--text-muted)]">{copy.settingsPage.noActiveSessions}</p>
             ) : (
               sessions.map((session) => (
@@ -1593,12 +1719,12 @@ export default function SettingsPage() {
           </div>
         </BrutalCard>
 
-        <BrutalCard className="mb-6">
+        <BrutalCard data-settings-resource="waf" className="mb-6">
           <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
             <div>
               <h2 className="text-xl font-black uppercase">{copy.settingsPage.wafBans}</h2>
             </div>
-            <button type="button" className={buttonClass("secondary")} onClick={() => void loadWafBans()}>
+            <button type="button" className={buttonClass("secondary")} onClick={() => void loadWafBans()} disabled={wafLoading}>
               {wafLoading ? copy.settingsPage.loading : copy.settingsPage.refresh}
             </button>
           </div>
@@ -1633,7 +1759,9 @@ export default function SettingsPage() {
             </button>
           </div>
           <div className="grid gap-3">
-            {wafBans.length === 0 ? (
+            {wafLoading && wafBans.length === 0 ? (
+              <SettingsListSkeleton />
+            ) : wafBans.length === 0 ? (
               <p className="text-sm font-bold text-[var(--text-muted)]">{copy.settingsPage.noActiveBans}</p>
             ) : (
               wafBans.map((ban) => (
@@ -1659,12 +1787,12 @@ export default function SettingsPage() {
           </div>
         </BrutalCard>
 
-        <BrutalCard className="mb-6">
+        <BrutalCard data-settings-resource="maintenance" className="mb-6">
           <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
             <div>
               <h2 className="text-xl font-black uppercase">{copy.settingsPage.backupAndMaintenance}</h2>
             </div>
-            <button type="button" className={buttonClass("secondary")} onClick={() => void loadMaintenanceStatus()}>
+            <button type="button" className={buttonClass("secondary")} onClick={() => void loadMaintenanceStatus()} disabled={maintenanceLoading}>
               {maintenanceLoading ? copy.settingsPage.loading : copy.settingsPage.refresh}
             </button>
           </div>
@@ -1684,12 +1812,12 @@ export default function SettingsPage() {
                       {copy.settingsPage.retentionDays.replace("{days}", String(maintenanceStatus?.tsdb_retention_days ?? "N/A"))}
                     </div>
                   </div>
-                  <MaintenanceCapability label={copy.settingsPage.backupDownload} enabled={Boolean(maintenanceStatus?.backup_supported)} copy={copy} />
-                  <MaintenanceCapability label={copy.settingsPage.fullArchive} enabled={Boolean(maintenanceStatus?.archive_supported)} copy={copy} />
-                  <MaintenanceCapability label={copy.settingsPage.backupRestore} enabled={Boolean(maintenanceStatus?.restore_supported)} copy={copy} />
-                  <MaintenanceCapability label={copy.settingsPage.sqliteVacuum} enabled={Boolean(maintenanceStatus?.vacuum_supported)} copy={copy} />
-                  <MaintenanceCapability label={copy.settingsPage.tsdbCompact} enabled={Boolean(maintenanceStatus?.tsdb_compact_supported)} copy={copy} />
-                  <MaintenanceCapability label={copy.settingsPage.tsdbRetention} enabled={Boolean(maintenanceStatus?.tsdb_retention_configurable)} copy={copy} />
+                  <MaintenanceCapability label={copy.settingsPage.backupDownload} enabled={maintenanceStatus ? Boolean(maintenanceStatus.backup_supported) : undefined} copy={copy} />
+                  <MaintenanceCapability label={copy.settingsPage.fullArchive} enabled={maintenanceStatus ? Boolean(maintenanceStatus.archive_supported) : undefined} copy={copy} />
+                  <MaintenanceCapability label={copy.settingsPage.backupRestore} enabled={maintenanceStatus ? Boolean(maintenanceStatus.restore_supported) : undefined} copy={copy} />
+                  <MaintenanceCapability label={copy.settingsPage.sqliteVacuum} enabled={maintenanceStatus ? Boolean(maintenanceStatus.vacuum_supported) : undefined} copy={copy} />
+                  <MaintenanceCapability label={copy.settingsPage.tsdbCompact} enabled={maintenanceStatus ? Boolean(maintenanceStatus.tsdb_compact_supported) : undefined} copy={copy} />
+                  <MaintenanceCapability label={copy.settingsPage.tsdbRetention} enabled={maintenanceStatus ? Boolean(maintenanceStatus.tsdb_retention_configurable) : undefined} copy={copy} />
                 </div>
             <div className="flex flex-wrap gap-2 xl:justify-end">
               <input
@@ -1802,23 +1930,25 @@ export default function SettingsPage() {
           </p>
         </BrutalCard>
 
-        <BrutalCard className="mb-6">
+        <BrutalCard data-settings-resource="geoip" className="mb-6">
           <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
             <div>
               <h2 className="text-xl font-black uppercase">{copy.settingsPage.geoIp}</h2>
               <div className="mt-2 flex flex-wrap gap-2">
-                <StatusBadge tone="blue">{copy.settingsPage.defaultProvider.replace("{provider}", String(systemSettings?.geoip_provider ?? "empty"))}</StatusBadge>
+                <StatusBadge tone="blue">{systemSettings ? copy.settingsPage.defaultProvider.replace("{provider}", String(systemSettings.geoip_provider || "empty")) : copy.common.notAvailable}</StatusBadge>
                 <StatusBadge tone={systemSettings?.geoip_ipinfo_token_configured ? "green" : "gray"}>
-                  {systemSettings?.geoip_ipinfo_token_configured ? copy.settingsPage.ipinfoTokenConfigured : copy.settingsPage.ipinfoTokenNotConfigured}
+                  {systemSettings ? (systemSettings.geoip_ipinfo_token_configured ? copy.settingsPage.ipinfoTokenConfigured : copy.settingsPage.ipinfoTokenNotConfigured) : copy.common.notAvailable}
                 </StatusBadge>
                 <StatusBadge tone={geoIpMmdbStatus?.configured ? "green" : "gray"}>
-                  {geoIpMmdbStatus?.configured ? copy.settingsPage.mmdbConfigured.replace("{type}", String(geoIpMmdbStatus.database_type || "ready")) : copy.settingsPage.mmdbNotConfigured}
+                  {geoIpMmdbStatus
+                    ? (geoIpMmdbStatus.configured ? copy.settingsPage.mmdbConfigured.replace("{type}", String(geoIpMmdbStatus.database_type || "ready")) : copy.settingsPage.mmdbNotConfigured)
+                    : geoIpStatusLoading ? copy.settingsPage.loading : copy.common.notAvailable}
                 </StatusBadge>
               </div>
             </div>
             <div className="flex flex-wrap gap-2">
               <button type="button" className={buttonClass("secondary")} onClick={() => void saveGeoIpSettings()} disabled={settingsLoading}>
-                {settingsLoading ? copy.settingsPage.saving : copy.settingsPage.saveDefault}
+                {settingsLoading ? (systemSettings ? copy.settingsPage.saving : copy.settingsPage.loading) : copy.settingsPage.saveDefault}
               </button>
               <button type="button" className={buttonClass("secondary")} onClick={() => void updateGeoIpDatabase()} disabled={geoIpLoading}>
                 {copy.settingsPage.mmdbUpdate}
@@ -1939,12 +2069,12 @@ export default function SettingsPage() {
               <h2 className="text-xl font-black uppercase">{copy.settingsPage.ddns}</h2>
               <div className="mt-2 flex flex-wrap gap-2">
                 <StatusBadge tone={ddnsResolverUrl.trim() ? "green" : "gray"}>
-                  {ddnsResolverUrl.trim() ? copy.settingsPage.resolverConfigured : copy.settingsPage.resolverSystem}
+                  {systemSettings ? (ddnsResolverUrl.trim() ? copy.settingsPage.resolverConfigured : copy.settingsPage.resolverSystem) : copy.common.notAvailable}
                 </StatusBadge>
               </div>
             </div>
             <button type="button" className={buttonClass("secondary")} onClick={() => void saveGeoIpSettings()} disabled={settingsLoading}>
-              {settingsLoading ? copy.settingsPage.saving : copy.settingsPage.saveDdns}
+              {settingsLoading ? (systemSettings ? copy.settingsPage.saving : copy.settingsPage.loading) : copy.settingsPage.saveDdns}
             </button>
           </div>
           <Field label={copy.settingsPage.dohResolverUrl}>
@@ -1952,7 +2082,7 @@ export default function SettingsPage() {
           </Field>
         </BrutalCard>
 
-        <div className="grid gap-6 lg:grid-cols-2">
+        <div data-settings-resource="tokens" className="grid gap-6 lg:grid-cols-2">
           <BrutalCard accent>
             <h2 className="mb-4 text-xl font-black uppercase">{copy.settingsPage.createPat}</h2>
             <form onSubmit={createToken} className="space-y-4">
@@ -1972,7 +2102,9 @@ export default function SettingsPage() {
           <BrutalCard>
             <h2 className="mb-4 text-xl font-black uppercase">{copy.settingsPage.existingTokens}</h2>
             <div className="grid gap-3">
-              {tokens.length === 0 ? (
+              {tokensLoading && tokens.length === 0 ? (
+                <SettingsListSkeleton rows={2} />
+              ) : tokens.length === 0 ? (
                 <p className="text-sm font-bold text-[var(--text-muted)]">{copy.settingsPage.noTokens}</p>
               ) : (
                 tokens.map((token) => {
@@ -2011,21 +2143,96 @@ export default function SettingsPage() {
   );
 }
 
+function readCachedLatestAgentVersion(): string | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.sessionStorage.getItem(GITHUB_RELEASE_CACHE_KEY);
+    if (!raw) return null;
+    const cached = JSON.parse(raw) as { tag?: unknown; cachedAt?: unknown };
+    if (
+      typeof cached.tag !== "string"
+      || !cached.tag.trim()
+      || typeof cached.cachedAt !== "number"
+      || Date.now() - cached.cachedAt >= GITHUB_RELEASE_CACHE_TTL_MS
+    ) {
+      window.sessionStorage.removeItem(GITHUB_RELEASE_CACHE_KEY);
+      return null;
+    }
+    return cached.tag.trim();
+  } catch {
+    return null;
+  }
+}
+
+function cacheLatestAgentVersion(tag: string) {
+  if (typeof window === "undefined") return;
+  try {
+    window.sessionStorage.setItem(GITHUB_RELEASE_CACHE_KEY, JSON.stringify({
+      tag,
+      cachedAt: Date.now(),
+    }));
+  } catch {
+    // Storage can be unavailable in private or restricted browser contexts.
+  }
+}
+
+function scheduleWhenIdle(callback: () => void): () => void {
+  if ("requestIdleCallback" in window) {
+    const requestId = window.requestIdleCallback(callback, { timeout: 1500 });
+    return () => window.cancelIdleCallback(requestId);
+  }
+  const timeoutId = setTimeout(callback, 250);
+  return () => clearTimeout(timeoutId);
+}
+
+function subscribeRuntimeValue(): () => void {
+  return () => {};
+}
+
+function useRuntimeApiBaseUrl(): string {
+  return useSyncExternalStore(subscribeRuntimeValue, getApiBaseUrl, () => HYDRATION_API_BASE_URL);
+}
+
+let cachedClientPatExpiresAt: string | null = null;
+
+function useHydratedPatExpiresAt(): string {
+  return useSyncExternalStore(
+    subscribeRuntimeValue,
+    () => {
+      cachedClientPatExpiresAt ??= defaultPatExpiresAt();
+      return cachedClientPatExpiresAt;
+    },
+    () => "",
+  );
+}
+
 function MaintenanceCapability({
   label,
   enabled,
   copy,
 }: {
   label: string;
-  enabled: boolean;
+  enabled?: boolean;
   copy: ReturnType<typeof useI18n>["t"];
 }) {
   return (
     <div className="border-2 border-black bg-[var(--accent-bg)] p-3 shadow-[var(--shadow-brutal-sm)]">
       <div className="text-[11px] font-black uppercase text-[var(--text-muted)]">{label}</div>
       <div className="mt-2">
-        <StatusBadge tone={enabled ? "green" : "gray"}>{enabled ? copy.settingsPage.supported : copy.settingsPage.unsupported}</StatusBadge>
+        <StatusBadge tone={enabled ? "green" : "gray"}>
+          {enabled === undefined ? copy.common.notAvailable : enabled ? copy.settingsPage.supported : copy.settingsPage.unsupported}
+        </StatusBadge>
       </div>
+    </div>
+  );
+}
+
+function SettingsListSkeleton({ rows = 3 }: { rows?: number }) {
+  return (
+    <div className="grid gap-3" aria-busy="true">
+      {Array.from({ length: rows }).map((_, index) => (
+        <div key={index} className="h-20 animate-pulse border-2 border-black bg-[var(--accent-bg)] shadow-[var(--shadow-brutal-sm)]" />
+      ))}
     </div>
   );
 }

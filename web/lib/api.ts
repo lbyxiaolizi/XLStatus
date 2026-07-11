@@ -493,13 +493,41 @@ export type JsonObject = Record<string, unknown>;
 type ApiRequestOptions = RequestInit & {
   anonymous?: boolean;
   skipAuthRedirect?: boolean;
+  clientCacheTtlMs?: number;
+  bypassClientCache?: boolean;
 };
+
+type ApiReadOptions = {
+  signal?: AbortSignal;
+  bypassClientCache?: boolean;
+};
+
+interface ClientCacheEntry {
+  expiresAt: number;
+  response: ApiResponse<unknown>;
+}
+
+const CLIENT_CACHE_MAX_ENTRIES = 64;
+const CLIENT_CACHE_EPOCH_MAX_ENTRIES = 128;
+const CACHE_TTL_FAST_MS = 5_000;
+const CACHE_TTL_STANDARD_MS = 15_000;
+const CACHE_TTL_STABLE_MS = 60_000;
+const CACHE_TTL_STATIC_MS = 5 * 60_000;
 
 class ApiClient {
   private baseUrl: string;
+  private responseCache = new Map<string, ClientCacheEntry>();
+  private inFlightRequests = new Map<string, Promise<ApiResponse<unknown>>>();
+  private latestCacheRequestEpoch = new Map<string, number>();
+  private cacheGeneration = 0;
+  private cacheRequestSequence = 0;
 
   constructor(baseUrl: string = API_BASE_URL) {
     this.baseUrl = baseUrl;
+  }
+
+  invalidateCachedReads(): void {
+    this.invalidateClientCache();
   }
 
   private async request<T>(
@@ -507,59 +535,191 @@ class ApiClient {
     options: ApiRequestOptions = {},
   ): Promise<ApiResponse<T>> {
     const url = `${this.baseUrl}${path}`;
-    const { anonymous, headers, skipAuthRedirect, ...fetchOptions } = options;
+    const {
+      anonymous,
+      headers,
+      skipAuthRedirect,
+      clientCacheTtlMs = 0,
+      bypassClientCache = false,
+      ...fetchOptions
+    } = options;
     const csrfToken = getCookie("xlstatus_csrf");
     const hasBody = fetchOptions.body !== undefined && fetchOptions.body !== null;
     const isFormData = typeof FormData !== "undefined" && fetchOptions.body instanceof FormData;
+    const method = (fetchOptions.method ?? "GET").toUpperCase();
+    const cacheable = method === "GET" && !hasBody && clientCacheTtlMs > 0;
+    const cacheScope = anonymous ? "public" : `private:${csrfToken || "no-session"}`;
+    const cacheKey = cacheable ? `${cacheScope}:${url}` : "";
     const defaultHeaders: HeadersInit = hasBody && !isFormData
       ? { "Content-Type": "application/json" }
       : {};
 
-    try {
-      const response = await fetch(url, {
-        ...fetchOptions,
-        headers: {
-          ...defaultHeaders,
-          ...(csrfToken && !anonymous ? { "x-csrf-token": csrfToken } : {}),
-          ...headers,
-        },
-        credentials: anonymous ? "omit" : "include",
-      });
-
-      const text = await response.text();
-      const payload = parseJson(text);
-      const envelope = normalizeEnvelope<T>(payload, response.status);
-
-      if (response.ok) {
-        return envelope.success
-          ? envelope
-          : {
-              success: true,
-              data: payload as T,
-              status: response.status,
-            };
+    if (cacheable && !bypassClientCache) {
+      const cached = this.responseCache.get(cacheKey);
+      if (cached && cached.expiresAt > Date.now()) {
+        return this.waitForSharedRequest(
+          Promise.resolve(cached.response as ApiResponse<T>),
+          fetchOptions.signal,
+        );
       }
-
-      if (response.status === 401 && !anonymous && !skipAuthRedirect) {
-        redirectToLogin();
-      }
-
-      return {
-        success: false,
-        data: envelope.data,
-        error:
-          envelope.error ||
-          response.statusText ||
-          `Request failed with ${response.status}`,
-        status: response.status,
-        request_id: envelope.request_id,
-      };
-    } catch (error) {
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : getTranslations().common.networkError,
-      };
+      if (cached) this.responseCache.delete(cacheKey);
     }
+
+    if (method !== "GET") {
+      this.invalidateClientCache();
+    }
+
+    const execute = async (): Promise<ApiResponse<T>> => {
+      try {
+        const response = await fetch(url, {
+          ...fetchOptions,
+          // Cached requests are shared. A component abort only stops its own
+          // wait; it must not cancel the request another mounted view is using.
+          ...(cacheable && !bypassClientCache ? { signal: undefined } : {}),
+          headers: {
+            ...defaultHeaders,
+            ...(csrfToken && !anonymous ? { "x-csrf-token": csrfToken } : {}),
+            ...headers,
+          },
+          credentials: anonymous ? "omit" : "include",
+        });
+
+        const text = await response.text();
+        const payload = parseJson(text);
+        const envelope = normalizeEnvelope<T>(payload, response.status);
+
+        if (response.ok) {
+          return envelope.success
+            ? envelope
+            : {
+                success: true,
+                data: payload as T,
+                status: response.status,
+              };
+        }
+
+        if (response.status === 401 && !anonymous && !skipAuthRedirect) {
+          this.invalidateClientCache();
+          redirectToLogin();
+        }
+
+        return {
+          success: false,
+          data: envelope.data,
+          error:
+            envelope.error ||
+            response.statusText ||
+            `Request failed with ${response.status}`,
+          status: response.status,
+          request_id: envelope.request_id,
+        };
+      } catch (error) {
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : getTranslations().common.networkError,
+        };
+      }
+    };
+
+    if (!cacheable) {
+      const result = await execute();
+      // A read started while a mutation was in flight may have captured the
+      // pre-mutation state. Invalidate again after the write settles so that
+      // the next read cannot reuse that snapshot.
+      if (method !== "GET") this.invalidateClientCache();
+      return result;
+    }
+
+    const requestGeneration = this.cacheGeneration;
+    const executeAndCache = async (requestEpoch: number): Promise<ApiResponse<T>> => {
+      const result = await execute();
+      if (
+        result.success
+        && requestGeneration === this.cacheGeneration
+        && this.latestCacheRequestEpoch.get(cacheKey) === requestEpoch
+      ) {
+        this.storeClientCache(cacheKey, result, clientCacheTtlMs);
+      }
+      return result;
+    };
+
+    if (bypassClientCache) {
+      const requestEpoch = this.beginCacheRequest(cacheKey);
+      return this.waitForSharedRequest(executeAndCache(requestEpoch), fetchOptions.signal);
+    }
+
+    // Generation-scoped keys prevent a post-mutation reload from joining a
+    // request that began before the mutation.
+    const inFlightKey = `${requestGeneration}:${cacheKey}`;
+    let shared = this.inFlightRequests.get(inFlightKey) as Promise<ApiResponse<T>> | undefined;
+    if (!shared) {
+      const requestEpoch = this.beginCacheRequest(cacheKey);
+      shared = executeAndCache(requestEpoch);
+      this.inFlightRequests.set(inFlightKey, shared as Promise<ApiResponse<unknown>>);
+      void shared.finally(() => {
+        if (this.inFlightRequests.get(inFlightKey) === shared) {
+          this.inFlightRequests.delete(inFlightKey);
+        }
+      });
+    }
+
+    return this.waitForSharedRequest(shared, fetchOptions.signal);
+  }
+
+  private invalidateClientCache(): void {
+    this.cacheGeneration += 1;
+    this.responseCache.clear();
+    this.latestCacheRequestEpoch.clear();
+  }
+
+  private beginCacheRequest(key: string): number {
+    this.cacheRequestSequence += 1;
+    if (
+      this.latestCacheRequestEpoch.size >= CLIENT_CACHE_EPOCH_MAX_ENTRIES
+      && !this.latestCacheRequestEpoch.has(key)
+    ) {
+      const oldestKey = this.latestCacheRequestEpoch.keys().next().value as string | undefined;
+      if (oldestKey) this.latestCacheRequestEpoch.delete(oldestKey);
+    }
+    this.latestCacheRequestEpoch.delete(key);
+    this.latestCacheRequestEpoch.set(key, this.cacheRequestSequence);
+    return this.cacheRequestSequence;
+  }
+
+  private storeClientCache<T>(key: string, response: ApiResponse<T>, ttlMs: number): void {
+    const now = Date.now();
+    for (const [cachedKey, entry] of this.responseCache) {
+      if (entry.expiresAt <= now) this.responseCache.delete(cachedKey);
+    }
+    if (this.responseCache.size >= CLIENT_CACHE_MAX_ENTRIES) {
+      const oldestKey = this.responseCache.keys().next().value as string | undefined;
+      if (oldestKey) this.responseCache.delete(oldestKey);
+    }
+    this.responseCache.set(key, {
+      expiresAt: now + ttlMs,
+      response: response as ApiResponse<unknown>,
+    });
+  }
+
+  private async waitForSharedRequest<T>(
+    request: Promise<ApiResponse<T>>,
+    signal?: AbortSignal | null,
+  ): Promise<ApiResponse<T>> {
+    if (!signal) return request;
+    if (signal.aborted) return { success: false, error: "Request aborted" };
+
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (response: ApiResponse<T>) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        resolve(response);
+      };
+      const onAbort = () => finish({ success: false, error: "Request aborted" });
+      signal.addEventListener("abort", onAbort, { once: true });
+      void request.then(finish);
+    });
   }
 
   private async requestWithFallback<T>(
@@ -667,13 +827,17 @@ class ApiClient {
     });
   }
 
-  async getProfile(): Promise<ApiResponse<JsonObject>> {
-    return this.request<JsonObject>("/api/v1/profile");
+  async getProfile(options?: ApiReadOptions): Promise<ApiResponse<JsonObject>> {
+    return this.request<JsonObject>("/api/v1/profile", {
+      ...options,
+      clientCacheTtlMs: CACHE_TTL_STANDARD_MS,
+    });
   }
 
   async listOAuthProviders(): Promise<ApiResponse<OAuthProviderListResponse>> {
     return this.request<OAuthProviderListResponse>("/api/v1/oauth2/providers", {
       anonymous: true,
+      clientCacheTtlMs: CACHE_TTL_STATIC_MS,
     });
   }
 
@@ -787,8 +951,11 @@ class ApiClient {
     });
   }
 
-  async getTotpStatus(): Promise<ApiResponse<TotpStatusResponse>> {
-    return this.request<TotpStatusResponse>("/api/v1/auth/totp/status");
+  async getTotpStatus(options?: ApiReadOptions): Promise<ApiResponse<TotpStatusResponse>> {
+    return this.request<TotpStatusResponse>("/api/v1/auth/totp/status", {
+      ...options,
+      clientCacheTtlMs: CACHE_TTL_STANDARD_MS,
+    });
   }
 
   async setupTotp(code?: string): Promise<ApiResponse<TotpSetupResponse>> {
@@ -835,9 +1002,9 @@ class ApiClient {
     });
   }
 
-  getAgentInstallScriptUrl(params: Record<string, string>): string {
+  getAgentInstallScriptUrl(params: Record<string, string>, baseUrl = this.baseUrl): string {
     const query = new URLSearchParams(params);
-    return `${this.baseUrl}/api/v1/agents/install.sh?${query.toString()}`;
+    return `${baseUrl.replace(/\/+$/, "")}/api/v1/agents/install.sh?${query.toString()}`;
   }
 
   async createEnrollmentToken(
@@ -856,11 +1023,15 @@ class ApiClient {
     limit = 50,
     offset = 0,
     anonymous = false,
-    options?: { signal?: AbortSignal },
+    options?: ApiReadOptions,
   ): Promise<ApiResponse<ServerListResponse>> {
     return this.request<ServerListResponse>(
       `/api/v1/servers?limit=${limit}&offset=${offset}`,
-      { anonymous, signal: options?.signal },
+      {
+        anonymous,
+        ...options,
+        clientCacheTtlMs: CACHE_TTL_FAST_MS,
+      },
     );
   }
 
@@ -933,8 +1104,11 @@ class ApiClient {
     );
   }
 
-  async listServerGroups(): Promise<ApiResponse<ServerGroupListResponse>> {
-    return this.request<ServerGroupListResponse>("/api/v1/server-groups");
+  async listServerGroups(options?: ApiReadOptions): Promise<ApiResponse<ServerGroupListResponse>> {
+    return this.request<ServerGroupListResponse>("/api/v1/server-groups", {
+      ...options,
+      clientCacheTtlMs: CACHE_TTL_STANDARD_MS,
+    });
   }
 
   async createServerGroup(group: JsonObject, totpCode?: string): Promise<ApiResponse<ServerGroup>> {
@@ -1128,28 +1302,37 @@ class ApiClient {
     limit = 50,
     offset = 0,
     anonymous = false,
-    options?: { signal?: AbortSignal },
+    options?: ApiReadOptions,
   ): Promise<ApiResponse<ServiceListResponse>> {
     return this.request<ServiceListResponse>(
       `/api/v1/services?limit=${limit}&offset=${offset}`,
-      { anonymous, ...options },
+      {
+        anonymous,
+        ...options,
+        clientCacheTtlMs: CACHE_TTL_STANDARD_MS,
+      },
     );
   }
 
-  async getPublicStatus(options?: { signal?: AbortSignal }): Promise<ApiResponse<PublicStatusResponse>> {
+  async getPublicStatus(options?: ApiReadOptions): Promise<ApiResponse<PublicStatusResponse>> {
     return this.request<PublicStatusResponse>("/api/v1/public/status", {
       anonymous: true,
-      signal: options?.signal,
+      ...options,
+      clientCacheTtlMs: CACHE_TTL_FAST_MS,
     });
   }
 
   async getPublicServer(
     id: string,
-    options?: { signal?: AbortSignal },
+    options?: ApiReadOptions,
   ): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
       `/api/v1/public/servers/${encodeURIComponent(id)}`,
-      { anonymous: true, signal: options?.signal },
+      {
+        anonymous: true,
+        ...options,
+        clientCacheTtlMs: CACHE_TTL_FAST_MS,
+      },
     );
   }
 
@@ -1199,11 +1382,11 @@ class ApiClient {
   async getServiceHistory(
     id: string,
     limit = 30,
-    options?: { signal?: AbortSignal },
+    options?: ApiReadOptions,
   ): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
       `/api/v1/services/${encodeURIComponent(id)}/history?limit=${limit}`,
-      options,
+      { ...options, clientCacheTtlMs: CACHE_TTL_FAST_MS },
     );
   }
 
@@ -1245,9 +1428,13 @@ class ApiClient {
     );
   }
 
-  async listAlertEvents(limit = 20): Promise<ApiResponse<AlertEventListResponse>> {
+  async listAlertEvents(
+    limit = 20,
+    options?: ApiReadOptions,
+  ): Promise<ApiResponse<AlertEventListResponse>> {
     return this.request<AlertEventListResponse>(
       `/api/v1/alert-events?limit=${limit}`,
+      { ...options, clientCacheTtlMs: CACHE_TTL_FAST_MS },
     );
   }
 
@@ -1302,9 +1489,11 @@ class ApiClient {
   async listNotificationGroups(
     limit = 100,
     offset = 0,
+    options?: ApiReadOptions,
   ): Promise<ApiResponse<NotificationGroupListResponse>> {
     return this.request<NotificationGroupListResponse>(
       `/api/v1/notification-groups?limit=${limit}&offset=${offset}`,
+      { ...options, clientCacheTtlMs: CACHE_TTL_STANDARD_MS },
     );
   }
 
@@ -1375,9 +1564,11 @@ class ApiClient {
   async listTasks(
     limit = 50,
     offset = 0,
+    options?: ApiReadOptions,
   ): Promise<ApiResponse<TaskListResponse>> {
     return this.request<TaskListResponse>(
       `/api/v1/tasks?limit=${limit}&offset=${offset}`,
+      options,
     );
   }
 
@@ -1441,9 +1632,11 @@ class ApiClient {
   async listTaskRuns(
     id: string,
     limit = 20,
+    options?: ApiReadOptions,
   ): Promise<ApiResponse<TaskRunListResponse>> {
     return this.request<TaskRunListResponse>(
       `/api/v1/tasks/${encodeURIComponent(id)}/runs?limit=${limit}`,
+      options,
     );
   }
 
@@ -1693,8 +1886,11 @@ class ApiClient {
     });
   }
 
-  async getSettings(): Promise<ApiResponse<SystemSettingsResponse>> {
-    return this.request<SystemSettingsResponse>("/api/v1/settings");
+  async getSettings(options?: ApiReadOptions): Promise<ApiResponse<SystemSettingsResponse>> {
+    return this.request<SystemSettingsResponse>("/api/v1/settings", {
+      ...options,
+      clientCacheTtlMs: CACHE_TTL_STANDARD_MS,
+    });
   }
 
   async updateSettings(
@@ -1709,8 +1905,11 @@ class ApiClient {
     );
   }
 
-  async listThemes(): Promise<ApiResponse<ThemeListResponse>> {
-    return this.request<ThemeListResponse>("/api/v1/themes");
+  async listThemes(options?: ApiReadOptions): Promise<ApiResponse<ThemeListResponse>> {
+    return this.request<ThemeListResponse>("/api/v1/themes", {
+      ...options,
+      clientCacheTtlMs: CACHE_TTL_STABLE_MS,
+    });
   }
 
   async importTheme(

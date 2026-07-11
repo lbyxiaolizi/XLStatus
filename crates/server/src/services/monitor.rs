@@ -524,7 +524,7 @@ impl ServiceMonitor {
                 .bind(result.status_code)
                 .bind(&result.error)
                 .bind(&result.cert_fingerprint)
-                .bind(result.cert_not_after.clone())
+                .bind(result.cert_not_after)
                 .bind(now)
                 .execute(pool)
                 .await?;

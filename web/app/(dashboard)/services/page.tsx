@@ -1,8 +1,7 @@
 "use client";
 
-import { FormEvent, useCallback, useDeferredValue, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import {
-  BrutalCard,
   EmptyState,
   Field,
   InlineError,
@@ -11,6 +10,7 @@ import {
   PageHeader,
   PageShell,
   StatusBadge,
+  TableSkeleton,
   buttonClass,
   formatDate,
   inputClass,
@@ -93,6 +93,7 @@ export default function ServicesPage() {
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [serverError, setServerError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [modal, setModal] = useState<"create" | "edit" | null>(null);
   const [editing, setEditing] = useState<Service | null>(null);
@@ -100,11 +101,18 @@ export default function ServicesPage() {
   const [totpStatus, setTotpStatus] = useState<TotpStatusResponse | null>(null);
   const [probeResult, setProbeResult] = useState<string | null>(null);
   const [query, setQuery] = useState("");
+  const initialLoadRef = useRef(true);
+  const servicesLoadRequestIdRef = useRef(0);
+  const serversLoadRequestIdRef = useRef(0);
 
-  const loadServices = useCallback(async () => {
+  const loadServices = useCallback(async (signal?: AbortSignal) => {
+    const requestId = servicesLoadRequestIdRef.current + 1;
+    servicesLoadRequestIdRef.current = requestId;
     setError(null);
-    setLoading(true);
-    const response = await apiClient.listServices(200, 0);
+    if (initialLoadRef.current) setLoading(true);
+    const response = await apiClient.listServices(200, 0, false, { signal });
+    if (signal?.aborted || requestId !== servicesLoadRequestIdRef.current) return;
+    initialLoadRef.current = false;
     setLoading(false);
     if (response.success && response.data) {
       setServices((response.data.services as Service[]) ?? []);
@@ -113,17 +121,29 @@ export default function ServicesPage() {
     }
   }, []);
 
-  const loadServers = useCallback(async () => {
-    const response = await apiClient.listServers(200, 0);
+  const loadServers = useCallback(async (signal?: AbortSignal) => {
+    const requestId = serversLoadRequestIdRef.current + 1;
+    serversLoadRequestIdRef.current = requestId;
+    setServerError(null);
+    const response = await apiClient.listServers(200, 0, false, { signal });
+    if (signal?.aborted || requestId !== serversLoadRequestIdRef.current) return;
     if (response.success && response.data) {
       setServers((response.data.servers as ServerOption[]) ?? []);
+    } else {
+      setServerError(responseError(response));
     }
   }, []);
 
   useEffect(() => {
+    const controller = new AbortController();
     // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount is the standard client data-load pattern
-    void loadServices();
-    void loadServers();
+    void loadServices(controller.signal);
+    void loadServers(controller.signal);
+    return () => {
+      controller.abort();
+      servicesLoadRequestIdRef.current += 1;
+      serversLoadRequestIdRef.current += 1;
+    };
   }, [loadServices, loadServers]);
 
   const deferredQuery = useDeferredValue(query);
@@ -273,16 +293,17 @@ export default function ServicesPage() {
         <div className="mb-5 space-y-3">
           <input value={query} onChange={(event) => setQuery(event.target.value)} className={inputClass} placeholder={copy.servicesPage.searchPlaceholder} />
           <InlineError message={error} />
+          <InlineError message={serverError} />
           {notice ? <InlineNotice tone="green">{notice}</InlineNotice> : null}
         </div>
 
         {loading ? (
-          <BrutalCard>{copy.servicesPage.loading}</BrutalCard>
+          <TableSkeleton columns={7} rows={5} />
         ) : filtered.length === 0 ? (
           <EmptyState title={copy.servicesPage.emptyTitle} detail={copy.servicesPage.emptyDetail} />
         ) : (
           <div className="overflow-x-auto border-2 border-black bg-[var(--bg-card)] shadow-[var(--shadow-brutal)]">
-            <table className="w-full">
+            <table className="w-full min-w-[64rem]">
               <thead>
                 <tr>
                   <th className={thClass}>{copy.servicesPage.colName}</th>
@@ -326,6 +347,7 @@ export default function ServicesPage() {
         {modal ? (
           <Modal title={modal === "edit" ? copy.servicesPage.modalTitleEdit : copy.servicesPage.modalTitleCreate} onClose={() => setModal(null)}>
             <form onSubmit={submitForm} className="space-y-4">
+              <InlineError message={serverError} />
               {editing && serviceConfigWarnings(editing).length ? (
                 <InlineNotice tone="yellow">{serviceWarningText(copy, editing)}</InlineNotice>
               ) : null}

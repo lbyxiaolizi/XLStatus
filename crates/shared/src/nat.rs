@@ -47,12 +47,17 @@ impl Protocol {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "tcp" => Some(Protocol::Tcp),
             "udp" => Some(Protocol::Udp),
             _ => None,
         }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        Self::parse(s)
     }
 }
 
@@ -103,10 +108,10 @@ mod tests {
         assert_eq!(Protocol::Tcp.as_str(), "tcp");
         assert_eq!(Protocol::Udp.as_str(), "udp");
 
-        assert!(matches!(Protocol::from_str("tcp"), Some(Protocol::Tcp)));
-        assert!(matches!(Protocol::from_str("TCP"), Some(Protocol::Tcp)));
-        assert!(matches!(Protocol::from_str("udp"), Some(Protocol::Udp)));
-        assert!(Protocol::from_str("invalid").is_none());
+        assert!(matches!(Protocol::parse("tcp"), Some(Protocol::Tcp)));
+        assert!(matches!(Protocol::parse("TCP"), Some(Protocol::Tcp)));
+        assert!(matches!(Protocol::parse("udp"), Some(Protocol::Udp)));
+        assert!(Protocol::parse("invalid").is_none());
     }
 
     #[test]

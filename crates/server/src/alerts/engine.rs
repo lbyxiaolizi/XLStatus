@@ -263,7 +263,7 @@ impl AlertEngine {
             }
         }
         let fallback_source_agent_id =
-            source_agent_id.or_else(|| infer_condition_agent_id(trusted_conditions.into_iter()));
+            source_agent_id.or_else(|| infer_condition_agent_id(trusted_conditions));
 
         match rule.trigger_mode {
             TriggerMode::Once => {

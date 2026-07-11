@@ -925,8 +925,8 @@ mod tests {
 
     #[test]
     fn parses_bool_json_setting() {
-        assert_eq!(serde_json::from_str::<bool>("true").unwrap(), true);
-        assert_eq!(serde_json::from_str::<bool>("false").unwrap(), false);
+        assert!(serde_json::from_str::<bool>("true").unwrap());
+        assert!(!serde_json::from_str::<bool>("false").unwrap());
     }
 
     #[test]

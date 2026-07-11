@@ -67,9 +67,9 @@ fn active_crypto() -> Result<&'static SecretCrypto> {
                 "xlstatus-test-secret-encryption-key-32-bytes-minimum",
             )?);
         }
-        return TEST_SECRET_CRYPTO
+        TEST_SECRET_CRYPTO
             .get()
-            .ok_or_else(|| anyhow!("failed to initialize test secret crypto"));
+            .ok_or_else(|| anyhow!("failed to initialize test secret crypto"))
     }
 
     #[cfg(not(test))]

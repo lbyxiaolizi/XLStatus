@@ -1,10 +1,16 @@
 "use client";
 
 import Link from "next/link";
+import dynamic from "next/dynamic";
 import type { ReactNode } from "react";
 import { memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { useDialogs } from "@/app/components/Dialogs";
-import { WorldServerMap } from "@/app/components/WorldServerMap";
+import {
+  type LiveState,
+  type Server,
+  type ServerConnectionState,
+  useServerData,
+} from "@/app/components/ServerDataProvider";
 import {
   asRecord,
   asString,
@@ -14,6 +20,7 @@ import {
   InlineNotice,
   PageHeader,
   PageShell,
+  Skeleton,
   SkeletonCard,
   StatusBadge,
   buttonClass,
@@ -27,71 +34,22 @@ import {
   responseError,
   useStoredUser,
 } from "@/app/components/M7Primitives";
-import { apiClient, buildWebSocketUrl, type JsonObject, type ServerGroup, type ServerOwnerTransfer } from "@/lib/api";
-import { clampPercent, durationLabel, formatRate, getCookie, optionalNumber } from "@/app/lib/format";
+import { apiClient, type JsonObject, type ServerGroup, type ServerOwnerTransfer } from "@/lib/api";
+import { clampPercent, durationLabel, formatRate, optionalNumber } from "@/app/lib/format";
 import { useI18n } from "@/lib/use-i18n";
 import type { Translations } from "@/lib/i18n";
+import { useStoredPreference } from "@/app/lib/client-store";
+import { useServerRealtime } from "@/app/lib/use-server-realtime";
+
+const WorldServerMap = dynamic(
+  () => import("@/app/components/WorldServerMap").then((module) => module.WorldServerMap),
+  {
+    ssr: false,
+    loading: () => <WorldMapSkeleton />,
+  },
+);
 
 type Copy = Translations;
-
-interface Server {
-  id: string;
-  name: string;
-  remark?: string | null;
-  note?: string | null;
-  expires_at?: string | null;
-  expired_at?: string | null;
-  renewal_price?: string | number | null;
-  price?: string | number | null;
-  provider?: string | null;
-  region?: string | null;
-  country?: string | null;
-  city?: string | null;
-  latitude?: number | null;
-  longitude?: number | null;
-  location?: ServerLocation | null;
-  plan?: string | null;
-  tags?: string[];
-  accent_color?: string | null;
-  dashboard_visible?: boolean | null;
-  display_order?: number | null;
-  status: string;
-  cpu_percent?: number;
-  memory_used?: number;
-  memory_total?: number;
-  load_1?: number;
-  net_rx_bps?: number | null;
-  net_tx_bps?: number | null;
-  network_in_total?: number | null;
-  network_out_total?: number | null;
-  uptime_seconds?: number | null;
-  last_seen_at?: string;
-  last_event_at?: string;
-}
-
-interface ServerLocation {
-  source?: string | null;
-  provider?: string | null;
-  country?: string | null;
-  region?: string | null;
-  city?: string | null;
-  latitude?: number | null;
-  longitude?: number | null;
-  timezone?: string | null;
-}
-
-interface LiveState {
-  cpu_percent?: number;
-  memory_used?: number;
-  memory_total?: number;
-  load_1?: number;
-  net_rx_bps?: number;
-  net_tx_bps?: number;
-  network_in_total?: number;
-  network_out_total?: number;
-  uptime_seconds?: number;
-  received_at: string;
-}
 
 interface ServiceSummary {
   id: string;
@@ -134,17 +92,29 @@ interface ServerSummary {
   totalDownload: number;
 }
 
-type ConnectionState = "connecting" | "open" | "closed" | "error";
 type ServerStatusFilter = "all" | "online" | "offline" | "other";
 type ServerViewMode = "cards" | "compact";
 type ServerSortKey = "default" | "name" | "status" | "cpu" | "memory" | "load" | "uptime" | "upload" | "download" | "totalUpload" | "totalDownload";
 type SortOrder = "asc" | "desc";
+const SERVER_VIEW_MODES = ["cards", "compact"] as const;
+const BINARY_PREFERENCE_VALUES = ["0", "1"] as const;
 
 export default function ServersPage() {
   const dialogs = useDialogs();
   const { t: copy } = useI18n();
   const storedUser = useStoredUser();
   const canManageTransfers = isAdmin(storedUser);
+  const {
+    servers,
+    observedAt: serversObservedAt,
+    loading,
+    error: serverLoadError,
+    realtimeScope,
+    realtimeRevision,
+    refresh: loadServers,
+    revalidate: revalidateServers,
+  } = useServerData();
+  const { live, connection: conn, now: realtimeNow } = useServerRealtime(realtimeScope, realtimeRevision);
   // Single in-flight gate for toolbar mutations so a double-click can't fire
   // duplicate POSTs. The ref mirrors the state for a synchronous guard.
   const actionBusyRef = useRef(false);
@@ -160,12 +130,9 @@ export default function ServersPage() {
       setActionBusy(false);
     }
   }, []);
-  const [servers, setServers] = useState<Server[]>([]);
-  const [live, setLive] = useState<Record<string, LiveState>>({});
   const [services, setServices] = useState<ServiceSummary[]>([]);
   const [serviceTrackers, setServiceTrackers] = useState<ServiceTrackerItem[]>([]);
   const [ownerTransfers, setOwnerTransfers] = useState<ServerOwnerTransfer[]>([]);
-  const [loading, setLoading] = useState(true);
   const [servicesLoading, setServicesLoading] = useState(false);
   const [transfersLoading, setTransfersLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -175,9 +142,11 @@ export default function ServersPage() {
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<ServerStatusFilter>("all");
   const [groupFilter, setGroupFilter] = useState("all");
-  const [viewMode, setViewMode] = useState<ServerViewMode>(() => initialServerViewMode());
-  const [showServices, setShowServices] = useState(() => initialShowServices());
-  const [showMap, setShowMap] = useState(() => initialShowServerMap());
+  const [viewMode, setViewMode] = useStoredPreference<ServerViewMode>("xlstatus_server_view", "cards", SERVER_VIEW_MODES);
+  const [showServicesPreference, setShowServicesPreference] = useStoredPreference("xlstatus_show_services", "0", BINARY_PREFERENCE_VALUES);
+  const [showMapPreference, setShowMapPreference] = useStoredPreference("xlstatus_show_server_map", "0", BINARY_PREFERENCE_VALUES);
+  const showServices = showServicesPreference === "1";
+  const showMap = showMapPreference === "1";
   const [sortKey, setSortKey] = useState<ServerSortKey>("default");
   const [sortOrder, setSortOrder] = useState<SortOrder>("asc");
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
@@ -187,34 +156,19 @@ export default function ServersPage() {
   const [newServerGroupName, setNewServerGroupName] = useState("");
   const [selectedServerGroupId, setSelectedServerGroupId] = useState("");
   const [serverGroupEdit, setServerGroupEdit] = useState({ name: "", color: "#2563eb", displayOrder: "" });
-  const [conn, setConn] = useState<ConnectionState>("closed");
-  const wsRef = useRef<WebSocket | null>(null);
-  const reconnectTimerRef = useRef<number | null>(null);
-  // Coalesce WS frames: buffer host_state events and flush once per animation
-  // frame, so the container's merged/filtered/summary memos recompute once per
-  // frame instead of once per inbound message (the re-render storm).
-  const pendingLiveRef = useRef<Record<string, unknown>[]>([]);
-  const liveRafRef = useRef<number | null>(null);
-
-  const loadServers = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    const response = await apiClient.listServers(200, 0);
-    setLoading(false);
-    if (response.success && response.data) {
-      setServers((response.data.servers as Server[]) ?? []);
-    } else {
-      setError(responseError(response));
-    }
-  }, []);
+  const servicesLoadedRef = useRef(false);
+  const serverGroupsLoadRequestIdRef = useRef(0);
+  const servicesPending = showServices && !servicesLoadedRef.current && !serviceError;
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount is the standard client data-load pattern
-    void loadServers();
-  }, [loadServers]);
+    void revalidateServers();
+  }, [revalidateServers]);
 
-  const loadServerGroups = useCallback(async () => {
-    const response = await apiClient.listServerGroups();
+  const loadServerGroups = useCallback(async (force = false) => {
+    const requestId = serverGroupsLoadRequestIdRef.current + 1;
+    serverGroupsLoadRequestIdRef.current = requestId;
+    const response = await apiClient.listServerGroups({ bypassClientCache: force });
+    if (requestId !== serverGroupsLoadRequestIdRef.current) return;
     if (response.success && response.data) {
       setServerGroups(response.data.groups ?? []);
     }
@@ -223,6 +177,9 @@ export default function ServersPage() {
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount is the standard client data-load pattern
     void loadServerGroups();
+    return () => {
+      serverGroupsLoadRequestIdRef.current += 1;
+    };
   }, [loadServerGroups]);
 
   const loadOwnerTransfers = useCallback(async () => {
@@ -262,8 +219,11 @@ export default function ServersPage() {
 
     const nextServices = ((response.data.services as ServiceSummary[]) ?? []).filter((service) => service.id);
     setServices(nextServices);
-    const histories = await Promise.all(
-      nextServices.map(async (service) => {
+    const histories = await mapWithConcurrency(
+      nextServices,
+      6,
+      async (service) => {
+        if (signal?.aborted) return null;
         const history = await apiClient.getServiceHistory(service.id, 1200, { signal });
         if (!history.success || !history.data) return null;
         const results = Array.isArray(history.data.results) ? history.data.results : [];
@@ -273,7 +233,7 @@ export default function ServersPage() {
             .map((result) => normalizeServiceResult(result))
             .filter((result): result is ServiceResult => Boolean(result)),
         };
-      }),
+      },
     );
     if (signal?.aborted) return;
 
@@ -282,112 +242,36 @@ export default function ServersPage() {
         .filter((item): item is { service: ServiceSummary; results: ServiceResult[] } => Boolean(item))
         .map(({ service, results }) => buildServiceTracker(service, results)),
     );
+    servicesLoadedRef.current = true;
     setServicesLoading(false);
   }, []);
 
   useEffect(() => {
+    if (!showServices || servicesLoadedRef.current) return;
     const controller = new AbortController();
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount is the standard client data-load pattern
     void loadServices(controller.signal);
     return () => controller.abort();
-  }, [loadServices]);
+  }, [loadServices, showServices]);
 
-  useEffect(() => {
-    if (typeof window === "undefined" || !hasBrowserSessionSignal()) return;
-    let cancelled = false;
-    let backoff = 1000;
-
-    function flushLive() {
-      liveRafRef.current = null;
-      if (cancelled) return;
-      const events = pendingLiveRef.current;
-      if (events.length === 0) return;
-      pendingLiveRef.current = [];
-      setLive((prev) => {
-        const next = { ...prev };
-        for (const item of events) {
-          if (item?.kind === "host_state" && typeof item.agent_id === "string") {
-            next[item.agent_id] = normalizeLiveState(
-              item.payload,
-              String(item.received_at || new Date().toISOString()),
-              next[item.agent_id],
-            );
-          }
-        }
-        return next;
-      });
-    }
-
-    function scheduleFlush() {
-      if (liveRafRef.current !== null || cancelled) return;
-      liveRafRef.current = window.requestAnimationFrame(flushLive);
-    }
-
-    function connect() {
-      if (cancelled) return;
-      setConn("connecting");
-      const ws = new WebSocket(buildWsUrl());
-      wsRef.current = ws;
-      ws.onopen = () => {
-        if (cancelled) return;
-        setConn("open");
-        backoff = 1000;
-      };
-      ws.onmessage = (event) => {
-        if (cancelled) return;
-        try {
-          const msg = JSON.parse(event.data as string) as Record<string, unknown>;
-          const events = msg.type === "snapshot" && Array.isArray(msg.events) ? msg.events : msg.type === "event" ? [msg.event] : [];
-          for (const raw of events) {
-            pendingLiveRef.current.push(raw as Record<string, unknown>);
-          }
-          if (pendingLiveRef.current.length > 0) scheduleFlush();
-        } catch {
-          // Ignore malformed live frames.
-        }
-      };
-      ws.onerror = () => setConn("error");
-      ws.onclose = () => {
-        if (cancelled) return;
-        setConn("closed");
-        backoff = Math.min(backoff * 2, 15000);
-        reconnectTimerRef.current = window.setTimeout(connect, backoff);
-      };
-    }
-
-    connect();
-    return () => {
-      cancelled = true;
-      if (reconnectTimerRef.current !== null) {
-        window.clearTimeout(reconnectTimerRef.current);
-        reconnectTimerRef.current = null;
-      }
-      if (liveRafRef.current !== null) {
-        window.cancelAnimationFrame(liveRafRef.current);
-        liveRafRef.current = null;
-      }
-      pendingLiveRef.current = [];
-      wsRef.current?.close();
-    };
-  }, []);
-
-  const mergedCacheRef = useRef<Map<string, { server: Server; state: LiveState | undefined; merged: Server }>>(new Map());
+  const mergedCacheRef = useRef<Map<string, { server: Server; state: LiveState | undefined; status: string; merged: Server }>>(new Map());
   const merged = useMemo(() => {
     const cache = mergedCacheRef.current;
     const nextIds = new Set<string>();
     const result = servers.map((server) => {
       const state = live[server.id];
+      const status = currentServerStatus(server, state, realtimeNow, serversObservedAt);
       nextIds.add(server.id);
       const cached = cache.get(server.id);
       // Reuse the previous merged object when neither the base server row nor
       // its live state changed identity. This keeps object references stable
       // across WS frames so memoized ServerCard rows don't all re-render when
       // a single agent reports in.
-      if (cached && cached.server === server && cached.state === state) {
+      if (cached && cached.server === server && cached.state === state && cached.status === status) {
         return cached.merged;
       }
       const mergedServer: Server = {
         ...server,
+        status,
         cpu_percent: state?.cpu_percent ?? server.cpu_percent,
         memory_used: state?.memory_used ?? server.memory_used,
         memory_total: state?.memory_total ?? server.memory_total,
@@ -399,7 +283,7 @@ export default function ServersPage() {
         uptime_seconds: state?.uptime_seconds ?? server.uptime_seconds,
         last_event_at: state?.received_at ?? server.last_event_at,
       };
-      cache.set(server.id, { server, state, merged: mergedServer });
+      cache.set(server.id, { server, state, status, merged: mergedServer });
       return mergedServer;
     });
     // Drop cache entries for servers that no longer exist.
@@ -407,7 +291,7 @@ export default function ServersPage() {
       if (!nextIds.has(id)) cache.delete(id);
     }
     return result;
-  }, [live, servers]);
+  }, [live, realtimeNow, servers, serversObservedAt]);
 
   const tagGroups = useMemo(() => buildServerGroups(merged), [merged]);
   const groupMembership = useMemo(
@@ -450,23 +334,18 @@ export default function ServersPage() {
 
   function changeViewMode(next: ServerViewMode) {
     setViewMode(next);
-    window.localStorage.setItem("xlstatus_server_view", next);
   }
 
   function toggleServices() {
-    setShowServices((current) => {
-      const next = !current;
-      window.localStorage.setItem("xlstatus_show_services", next ? "1" : "0");
-      return next;
-    });
+    if (!showServices && !servicesLoadedRef.current) {
+      setServiceError(null);
+      setServicesLoading(true);
+    }
+    setShowServicesPreference(showServices ? "0" : "1");
   }
 
   function toggleMap() {
-    setShowMap((current) => {
-      const next = !current;
-      window.localStorage.setItem("xlstatus_show_server_map", next ? "1" : "0");
-      return next;
-    });
+    setShowMapPreference(showMap ? "0" : "1");
   }
 
   const toggleServerSelection = useCallback((id: string) => {
@@ -731,9 +610,9 @@ export default function ServersPage() {
           eyebrow={`ws: ${connectionLabel(conn, copy)}`}
           title={copy.serversPage.title}
           detail={copy.serversPage.detail}
-          actions={<button type="button" onClick={() => void loadServers()} className={buttonClass("secondary")}>{copy.serversPage.refresh}</button>}
+          actions={<button type="button" onClick={() => { setError(null); void loadServers(true); }} className={buttonClass("secondary")}>{copy.serversPage.refresh}</button>}
         />
-        <InlineError message={error} />
+        <InlineError message={error ?? serverLoadError} />
         {batchNotice ? <div className="mt-3"><InlineNotice tone="green">{batchNotice}</InlineNotice></div> : null}
         <ServerSummaryGrid summary={summary} copy={copy} />
         <div className="mt-5 mb-5 grid gap-3">
@@ -809,7 +688,7 @@ export default function ServersPage() {
             </summary>
             <div className="grid gap-3 border-t-2 border-black p-3">
               <div className="flex justify-end">
-                <button type="button" className={buttonClass("secondary")} onClick={() => void loadServerGroups()}>
+                <button type="button" className={buttonClass("secondary")} onClick={() => void loadServerGroups(true)}>
                   {copy.serversPage.refreshGroups}
                 </button>
               </div>
@@ -912,7 +791,7 @@ export default function ServersPage() {
         ) : null}
 
         {showServices ? (
-          <ServiceTrackerPanel loading={servicesLoading} error={serviceError} trackers={visibleServiceTrackers} copy={copy} />
+          <ServiceTrackerPanel loading={servicesLoading || servicesPending} error={serviceError} trackers={visibleServiceTrackers} copy={copy} />
         ) : null}
 
         {loading ? (
@@ -958,6 +837,28 @@ function ServerSummaryGrid({ summary, copy }: { summary: ServerSummary; copy: Co
         detail={summary.total ? copy.serversPage.summaryWsLive : copy.serversPage.summaryWsWaiting}
       />
     </div>
+  );
+}
+
+function WorldMapSkeleton() {
+  return (
+    <section className="mb-5 border-2 border-black bg-[var(--accent-bg)] p-4 shadow-[var(--shadow-brutal)]" aria-busy="true">
+      <div className="mb-3 flex items-end justify-between gap-3 border-b-4 border-black pb-3">
+        <div className="grid gap-2">
+          <Skeleton className="h-7 w-44" />
+          <Skeleton className="h-4 w-64 max-w-full" />
+        </div>
+        <Skeleton className="h-7 w-20" />
+      </div>
+      <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_18rem]">
+        <Skeleton className="aspect-[9/5] min-h-72 w-full" />
+        <div className="grid content-start gap-3">
+          {Array.from({ length: 3 }).map((_, index) => (
+            <Skeleton key={index} className="h-24 w-full" />
+          ))}
+        </div>
+      </div>
+    </section>
   );
 }
 
@@ -1132,7 +1033,7 @@ const ServerCard = memo(function ServerCard({
   ].filter((row): row is { label: string; value: string; danger?: boolean } => row.value !== null);
 
   return (
-    <article className="grid h-full gap-2">
+    <article className="grid h-full gap-2 [contain-intrinsic-size:auto_34rem] [content-visibility:auto]">
       <label className="flex items-center gap-2 border-2 border-black bg-[var(--bg-card)] px-3 py-2 text-xs font-black uppercase shadow-[var(--shadow-brutal-sm)]">
         <input type="checkbox" checked={selected} onChange={() => onToggle(server.id)} />
         {copy.serversPage.cardSelect}
@@ -1210,7 +1111,7 @@ const CompactServerRow = memo(function CompactServerRow({
 }) {
   const isOnline = server.status === "online";
   return (
-    <div className="grid gap-2 sm:grid-cols-[auto_minmax(0,1fr)]">
+    <div className="grid gap-2 [contain-intrinsic-size:auto_5rem] [content-visibility:auto] sm:grid-cols-[auto_minmax(0,1fr)]">
       <label className="flex items-center justify-center border-2 border-black bg-[var(--bg-card)] px-3 py-2 shadow-[var(--shadow-brutal-sm)]">
         <input type="checkbox" checked={selected} onChange={() => onToggle(server.id)} aria-label={copy.serversPage.cardSelectAria.replace("{name}", server.name)} />
       </label>
@@ -1405,46 +1306,6 @@ function statusRank(status: string): number {
   return 3;
 }
 
-function normalizeLiveState(payload: unknown, receivedAt: string, previous?: LiveState): LiveState {
-  const state = asRecord(payload);
-  const netInTotal = optionalNumber(state.network_in_total) ?? netIoTotal(state, "bytes_recv");
-  const netOutTotal = optionalNumber(state.network_out_total) ?? netIoTotal(state, "bytes_sent");
-  const netRxBps = optionalNumber(state.net_rx_bps) ?? rateFromTotalDelta(netInTotal, previous?.network_in_total, receivedAt, previous?.received_at);
-  const netTxBps = optionalNumber(state.net_tx_bps) ?? rateFromTotalDelta(netOutTotal, previous?.network_out_total, receivedAt, previous?.received_at);
-  const next: LiveState = {
-    cpu_percent: optionalNumber(state.cpu_percent),
-    memory_used: optionalNumber(state.memory_used),
-    memory_total: optionalNumber(state.memory_total),
-    load_1: optionalNumber(state.load_1),
-    net_rx_bps: netRxBps,
-    net_tx_bps: netTxBps,
-    network_in_total: netInTotal,
-    network_out_total: netOutTotal,
-    uptime_seconds: optionalNumber(state.uptime_seconds),
-    received_at: receivedAt,
-  };
-  // Reuse the previous object identity when nothing meaningful changed (idle /
-  // offline agents re-reporting the same values). This keeps the mergedCache
-  // hit so that row's memoized card doesn't re-render. received_at is ignored
-  // on purpose — only the displayed values matter.
-  if (previous && liveStateValuesEqual(previous, next)) return previous;
-  return next;
-}
-
-function liveStateValuesEqual(a: LiveState, b: LiveState): boolean {
-  return (
-    a.cpu_percent === b.cpu_percent &&
-    a.memory_used === b.memory_used &&
-    a.memory_total === b.memory_total &&
-    a.load_1 === b.load_1 &&
-    a.net_rx_bps === b.net_rx_bps &&
-    a.net_tx_bps === b.net_tx_bps &&
-    a.network_in_total === b.network_in_total &&
-    a.network_out_total === b.network_out_total &&
-    a.uptime_seconds === b.uptime_seconds
-  );
-}
-
 function normalizeServiceResult(result: unknown): ServiceResult | null {
   const row = asRecord(result);
   const serviceId = asString(row.service_id);
@@ -1471,6 +1332,29 @@ function buildServiceTracker(service: ServiceSummary, results: ServiceResult[]):
     avgDelay: delays.length ? delays.reduce((sum, value) => sum + value, 0) / delays.length : undefined,
     days,
   };
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  mapper: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  if (items.length === 0) return [];
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await mapper(items[index], index);
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: Math.min(Math.max(1, limit), items.length) }, () => worker()),
+  );
+  return results;
 }
 
 function buildServiceDays(results: ServiceResult[]): ServiceDay[] {
@@ -1503,7 +1387,9 @@ function buildServiceDays(results: ServiceResult[]): ServiceDay[] {
 }
 
 function serviceBelongsToVisibleServer(service: ServiceSummary, visibleServerIds: Set<string>): boolean {
-  const ids = Array.isArray(service.server_ids) ? service.server_ids : [];
+  const ids = Array.isArray(service.server_ids)
+    ? service.server_ids.filter((id) => typeof id === "string" && id.trim().length > 0)
+    : [];
   if (service.server_id) ids.push(service.server_id);
   if (!ids.length) return true;
   return ids.some((id) => visibleServerIds.has(id));
@@ -1528,49 +1414,33 @@ function dayKey(date: Date): string {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
 }
 
-function netIoTotal(state: Record<string, unknown>, field: "bytes_recv" | "bytes_sent"): number | undefined {
-  const netIo = Array.isArray(state.net_io) ? state.net_io : Array.isArray(state.network_interfaces) ? state.network_interfaces : [];
-  if (!netIo.length) return undefined;
-  return netIo.reduce((sum, item) => sum + (optionalNumber(asRecord(item)[field]) ?? 0), 0);
-}
-
-function rateFromTotalDelta(
-  current?: number,
-  previous?: number,
-  currentAt?: string,
-  previousAt?: string,
-): number | undefined {
-  if (current === undefined || previous === undefined || !currentAt || !previousAt) return undefined;
-  const delta = current - previous;
-  const elapsedMs = new Date(currentAt).getTime() - new Date(previousAt).getTime();
-  if (delta < 0 || elapsedMs <= 0 || Number.isNaN(elapsedMs)) return undefined;
-  return delta / (elapsedMs / 1000);
-}
-
-function initialServerViewMode(): ServerViewMode {
-  if (typeof window === "undefined") return "cards";
-  const stored = window.localStorage.getItem("xlstatus_server_view");
-  return stored === "compact" ? "compact" : "cards";
-}
-
-function initialShowServices(): boolean {
-  if (typeof window === "undefined") return false;
-  return window.localStorage.getItem("xlstatus_show_services") === "1";
-}
-
-function initialShowServerMap(): boolean {
-  if (typeof window === "undefined") return false;
-  return window.localStorage.getItem("xlstatus_show_server_map") === "1";
-}
-
-function connectionLabel(conn: ConnectionState, copy: Copy): string {
-  const labels: Record<ConnectionState, string> = {
+function connectionLabel(conn: ServerConnectionState, copy: Copy): string {
+  const labels: Record<ServerConnectionState, string> = {
     connecting: copy.serversPage.connConnecting,
     open: copy.serversPage.connOpen,
     closed: copy.serversPage.connClosed,
     error: copy.serversPage.connError,
   };
   return labels[conn];
+}
+
+function currentServerStatus(
+  server: Server,
+  state: LiveState | undefined,
+  now: number,
+  serversObservedAt: number | null,
+): string {
+  if (server.status === "revoked") return server.status;
+
+  if (state?.confirmed_at && timestampIsRecent(state.confirmed_at, now)) return "online";
+  if (server.status !== "online") return server.status;
+  return serversObservedAt && timestampIsRecent(serversObservedAt, now) ? "online" : "offline";
+}
+
+function timestampIsRecent(timestamp: number, now: number): boolean {
+  if (!Number.isFinite(timestamp)) return false;
+  const age = now - timestamp;
+  return age >= -5_000 && age <= 30_000;
 }
 
 function serverStatusLabel(status: string, copy: Copy): string {
@@ -1582,12 +1452,4 @@ function serverStatusLabel(status: string, copy: Copy): string {
     degraded: copy.serversPage.statusDegraded,
   };
   return labels[status] || status;
-}
-
-function hasBrowserSessionSignal(): boolean {
-  return Boolean(getCookie("xlstatus_csrf"));
-}
-
-function buildWsUrl(): string {
-  return buildWebSocketUrl("/ws/servers");
 }
