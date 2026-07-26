@@ -2,6 +2,9 @@ use crate::api::types::*;
 use crate::api::v1::auth::{require_sensitive_totp, AppError, AppState};
 use crate::api::v1::notifications::ensure_notification_group_owned_by;
 use crate::api::v1::servers::agent_visible;
+use crate::api::v1::service_history::{
+    service_result_from_postgres_row, service_result_from_sqlite_row, ServiceResult,
+};
 use crate::api::v1::tasks::{ensure_task_ids_visible_to_auth_session, require_task_uuid_text};
 use crate::auth::middleware::{AuthKind, AuthSession};
 use crate::auth::rbac::has_scope;
@@ -16,6 +19,7 @@ use axum::{
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
@@ -24,6 +28,29 @@ pub struct ListServicesQuery {
     pub limit: i64,
     #[serde(default)]
     pub offset: i64,
+    // Kept as raw text because query strings spell booleans as "1"/"true"/"on".
+    #[serde(default)]
+    pub include_history: Option<String>,
+    #[serde(default)]
+    pub history_limit: Option<i64>,
+}
+
+impl ListServicesQuery {
+    fn wants_history(&self) -> bool {
+        matches!(
+            self.include_history
+                .as_deref()
+                .map(|value| value.trim().to_ascii_lowercase())
+                .as_deref(),
+            Some("1" | "true" | "yes" | "on")
+        )
+    }
+
+    fn history_limit(&self) -> i64 {
+        self.history_limit
+            .unwrap_or(SERVICE_HISTORY_DEFAULT_LIMIT)
+            .clamp(1, SERVICE_HISTORY_MAX_LIMIT)
+    }
 }
 
 fn default_limit() -> i64 {
@@ -89,6 +116,10 @@ pub struct ServiceResponse {
     pub cert_not_after: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    // Omitted entirely unless include_history was requested, so existing clients
+    // keep receiving the exact same payload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history: Option<Vec<ServiceResult>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -156,6 +187,8 @@ pub(crate) const SERVICE_MAX_SERVER_IDS: usize = 64;
 pub(crate) const SERVICE_MAX_TASK_IDS: usize = 32;
 pub(crate) const SERVICE_MAX_TARGETS_PER_PROBE: usize = 64;
 const SERVICE_UUID_TEXT_LEN: usize = 36;
+const SERVICE_HISTORY_DEFAULT_LIMIT: i64 = 100;
+const SERVICE_HISTORY_MAX_LIMIT: i64 = 2_000;
 const SERVICE_SERVER_IDS_JSON_MAX_BYTES: usize = 8 * 1024;
 const SERVICE_TASK_IDS_JSON_MAX_BYTES: usize = 4 * 1024;
 
@@ -197,9 +230,11 @@ pub async fn list_services(
     require_scope(&auth, "service:read")?;
     let limit = q.limit.clamp(1, 500);
     let offset = q.offset.max(0);
-    Ok(Json(ApiResponse::success(
-        list_services_for_auth(&state.db, &auth, limit, offset).await?,
-    )))
+    let mut response = list_services_for_auth(&state.db, &auth, limit, offset).await?;
+    if q.wants_history() {
+        attach_service_history(&state.db, &auth, &mut response.services, q.history_limit()).await?;
+    }
+    Ok(Json(ApiResponse::success(response)))
 }
 
 async fn list_services_for_auth(
@@ -948,6 +983,7 @@ fn service_from_sqlite_row(row: sqlx::sqlite::SqliteRow) -> ServiceResponse {
         cert_not_after: row.try_get("cert_not_after").ok(),
         created_at: row.try_get("created_at").unwrap_or_default(),
         updated_at: row.try_get("updated_at").unwrap_or_default(),
+        history: None,
     }
 }
 
@@ -1009,6 +1045,7 @@ fn service_from_postgres_row(row: sqlx::postgres::PgRow) -> ServiceResponse {
         cert_not_after: row.try_get("cert_not_after").ok(),
         created_at: row.try_get("created_at").unwrap_or_default(),
         updated_at: row.try_get("updated_at").unwrap_or_default(),
+        history: None,
     }
 }
 
@@ -1122,6 +1159,179 @@ async fn load_latest_service_result_for_servers(
             }))
         }
     }
+}
+
+/// Loads recent results for every listed service in a single round-trip so callers
+/// do not need one `/services/{id}/history` request per service. Visibility matches
+/// the single-service history endpoint: non-global sessions only see results that
+/// belong to servers they can read.
+async fn attach_service_history(
+    db: &crate::db::Db,
+    auth: &AuthSession,
+    services: &mut [ServiceResponse],
+    history_limit: i64,
+) -> Result<(), AppError> {
+    if services.is_empty() {
+        return Ok(());
+    }
+
+    let visible_server_ids = if auth_has_global_service_visibility(auth) {
+        None
+    } else {
+        let ids = visible_server_ids_for_auth(db, auth).await?;
+        if ids.is_empty() {
+            for service in services {
+                service.history = Some(Vec::new());
+            }
+            return Ok(());
+        }
+        Some(ids)
+    };
+
+    let service_ids = services
+        .iter()
+        .map(|service| service.id.clone())
+        .collect::<Vec<_>>();
+    let mut grouped = match db {
+        crate::db::DatabaseBackend::Sqlite(pool) => {
+            fetch_service_history_batch_sqlite(
+                pool,
+                &service_ids,
+                visible_server_ids.as_deref(),
+                history_limit,
+            )
+            .await?
+        }
+        crate::db::DatabaseBackend::Postgres(pool) => {
+            fetch_service_history_batch_postgres(
+                pool,
+                &service_ids,
+                visible_server_ids.as_deref(),
+                history_limit,
+            )
+            .await?
+        }
+    };
+
+    for service in services {
+        service.history = Some(grouped.remove(&service.id).unwrap_or_default());
+    }
+
+    Ok(())
+}
+
+async fn fetch_service_history_batch_sqlite(
+    pool: &sqlx::SqlitePool,
+    service_ids: &[String],
+    visible_server_ids: Option<&[String]>,
+    history_limit: i64,
+) -> Result<HashMap<String, Vec<ServiceResult>>, AppError> {
+    // ROW_NUMBER() keeps the per-service cap inside SQLite (3.25+) instead of
+    // fetching every row and trimming in Rust.
+    let mut sql = format!(
+        r#"
+                SELECT id, service_id, server_id, status, delay_ms, status_code, error,
+                       cert_fingerprint, cert_not_after, created_at
+                FROM (
+                    SELECT sr.*, ROW_NUMBER() OVER (
+                        PARTITION BY sr.service_id ORDER BY sr.created_at DESC
+                    ) AS row_index
+                    FROM service_results sr
+                    WHERE sr.service_id IN ({})
+        "#,
+        placeholders("?", service_ids.len())
+    );
+    if let Some(ids) = visible_server_ids {
+        sql.push_str(" AND sr.server_id IN (");
+        sql.push_str(&placeholders("?", ids.len()));
+        sql.push(')');
+    }
+    sql.push_str(" ) t WHERE t.row_index <= ? ORDER BY t.service_id ASC, t.created_at DESC");
+
+    let mut query = sqlx::query(&sql);
+    for service_id in service_ids {
+        query = query.bind(service_id);
+    }
+    if let Some(ids) = visible_server_ids {
+        for server_id in ids {
+            query = query.bind(server_id);
+        }
+    }
+    let rows = query
+        .bind(history_limit)
+        .fetch_all(pool)
+        .await
+        .map_err(db_err)?;
+
+    Ok(group_service_history(
+        rows.into_iter().map(service_result_from_sqlite_row),
+    ))
+}
+
+async fn fetch_service_history_batch_postgres(
+    pool: &sqlx::PgPool,
+    service_ids: &[String],
+    visible_server_ids: Option<&[String]>,
+    history_limit: i64,
+) -> Result<HashMap<String, Vec<ServiceResult>>, AppError> {
+    let parsed_service_ids = service_ids
+        .iter()
+        .map(|id| {
+            Uuid::parse_str(id)
+                .map_err(|e| AppError::BadRequest(format!("invalid service id: {e}")))
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
+    let parsed_server_ids = visible_server_ids.map(parse_uuid_ids).transpose()?;
+
+    let mut sql = String::from(
+        r#"
+                SELECT id::text AS id, service_id::text AS service_id, server_id::text AS server_id,
+                       status, delay_ms, status_code, error, cert_fingerprint,
+                       cert_not_after::text AS cert_not_after, created_at::text AS created_at
+                FROM (
+                    SELECT sr.*, ROW_NUMBER() OVER (
+                        PARTITION BY sr.service_id ORDER BY sr.created_at DESC
+                    ) AS row_index
+                    FROM service_results sr
+                    WHERE sr.service_id = ANY($1::uuid[])
+        "#,
+    );
+    let limit_index = if parsed_server_ids.is_some() {
+        sql.push_str(" AND sr.server_id = ANY($2::uuid[])");
+        3
+    } else {
+        2
+    };
+    sql.push_str(&format!(
+        " ) t WHERE t.row_index <= ${limit_index} ORDER BY t.service_id ASC, t.created_at DESC"
+    ));
+
+    let mut query = sqlx::query(&sql).bind(parsed_service_ids);
+    if let Some(ids) = parsed_server_ids {
+        query = query.bind(ids);
+    }
+    let rows = query
+        .bind(history_limit)
+        .fetch_all(pool)
+        .await
+        .map_err(db_err)?;
+
+    Ok(group_service_history(
+        rows.into_iter().map(service_result_from_postgres_row),
+    ))
+}
+
+fn group_service_history(
+    results: impl Iterator<Item = ServiceResult>,
+) -> HashMap<String, Vec<ServiceResult>> {
+    let mut grouped: HashMap<String, Vec<ServiceResult>> = HashMap::new();
+    for result in results {
+        grouped
+            .entry(result.service_id.clone())
+            .or_default()
+            .push(result);
+    }
+    grouped
 }
 
 pub(crate) async fn visible_server_ids_for_auth(
@@ -1921,6 +2131,142 @@ mod tests {
             detail.cert_not_after.as_deref(),
             Some("2026-03-01T00:00:00Z")
         );
+    }
+
+    #[tokio::test]
+    async fn batch_service_history_caps_rows_and_skips_hidden_servers() {
+        let db = test_db().await;
+        let admin = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let allowed_server = Uuid::parse_str("00000000-0000-0000-0000-000000000101").unwrap();
+        let blocked_server = Uuid::parse_str("00000000-0000-0000-0000-000000000202").unwrap();
+        let service_id = "00000000-0000-0000-0000-000000000301";
+
+        seed_user(&db, admin, "admin", "admin").await;
+        seed_agent(&db, allowed_server, admin, "allowed").await;
+        seed_agent(&db, blocked_server, admin, "blocked").await;
+        seed_service(
+            &db,
+            service_id,
+            "svc",
+            allowed_server,
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+
+        for (index, created_at) in [
+            "2026-01-02T00:00:00Z",
+            "2026-01-03T00:00:00Z",
+            "2026-01-04T00:00:00Z",
+        ]
+        .iter()
+        .enumerate()
+        {
+            seed_service_result(
+                &db,
+                &format!("00000000-0000-0000-0000-00000000040{}", index + 1),
+                service_id,
+                allowed_server,
+                "success",
+                "allowed-cert",
+                "2026-03-01T00:00:00Z",
+                created_at,
+            )
+            .await;
+        }
+        seed_service_result(
+            &db,
+            "00000000-0000-0000-0000-000000000409",
+            service_id,
+            blocked_server,
+            "failure",
+            "blocked-cert",
+            "2026-03-01T00:00:00Z",
+            "2026-01-05T00:00:00Z",
+        )
+        .await;
+
+        let auth = admin_pat_session(admin, vec![allowed_server.to_string()]);
+        let mut response = list_services_for_auth(&db, &auth, 10, 0).await.unwrap();
+        attach_service_history(&db, &auth, &mut response.services, 2)
+            .await
+            .unwrap();
+
+        let allowed_text = allowed_server.to_string();
+        let history = response.services[0]
+            .history
+            .as_ref()
+            .expect("history attached");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].created_at, "2026-01-04T00:00:00Z");
+        assert_eq!(history[1].created_at, "2026-01-03T00:00:00Z");
+        assert!(history
+            .iter()
+            .all(|item| item.server_id.as_deref() == Some(allowed_text.as_str())));
+        assert!(history.iter().all(|item| item.service_id == service_id));
+    }
+
+    #[tokio::test]
+    async fn batch_service_history_returns_empty_list_for_services_without_results() {
+        let db = test_db().await;
+        let admin = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let server = Uuid::parse_str("00000000-0000-0000-0000-000000000101").unwrap();
+
+        seed_user(&db, admin, "admin", "admin").await;
+        seed_agent(&db, server, admin, "server").await;
+        seed_service(
+            &db,
+            "00000000-0000-0000-0000-000000000301",
+            "svc",
+            server,
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+
+        let auth = admin_cookie_session(admin);
+        let mut response = list_services_for_auth(&db, &auth, 10, 0).await.unwrap();
+        attach_service_history(&db, &auth, &mut response.services, 100)
+            .await
+            .unwrap();
+
+        assert_eq!(response.services[0].history.as_ref().map(Vec::len), Some(0));
+    }
+
+    #[test]
+    fn list_services_query_history_flag_and_limit_are_clamped() {
+        let disabled = ListServicesQuery {
+            limit: 50,
+            offset: 0,
+            include_history: None,
+            history_limit: None,
+        };
+        assert!(!disabled.wants_history());
+        assert_eq!(disabled.history_limit(), SERVICE_HISTORY_DEFAULT_LIMIT);
+
+        let numeric = ListServicesQuery {
+            limit: 50,
+            offset: 0,
+            include_history: Some("1".into()),
+            history_limit: Some(0),
+        };
+        assert!(numeric.wants_history());
+        assert_eq!(numeric.history_limit(), 1);
+
+        let boolean = ListServicesQuery {
+            limit: 50,
+            offset: 0,
+            include_history: Some("TRUE".into()),
+            history_limit: Some(10_000),
+        };
+        assert!(boolean.wants_history());
+        assert_eq!(boolean.history_limit(), SERVICE_HISTORY_MAX_LIMIT);
+
+        let falsy = ListServicesQuery {
+            limit: 50,
+            offset: 0,
+            include_history: Some("0".into()),
+            history_limit: None,
+        };
+        assert!(!falsy.wants_history());
     }
 
     #[tokio::test]
