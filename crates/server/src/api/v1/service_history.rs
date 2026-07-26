@@ -296,7 +296,8 @@ async fn service_uptime_for_auth(
                 row.try_get::<Option<i64>, _>("successful_checks")
                     .map_err(db_err)?
                     .unwrap_or(0),
-                row.try_get::<Option<f64>, _>("avg_latency").map_err(db_err)?,
+                row.try_get::<Option<f64>, _>("avg_latency")
+                    .map_err(db_err)?,
             ))
         }
         crate::db::DatabaseBackend::Postgres(pool) => {
@@ -335,7 +336,8 @@ async fn service_uptime_for_auth(
                 row.try_get::<Option<i64>, _>("successful_checks")
                     .map_err(db_err)?
                     .unwrap_or(0),
-                row.try_get::<Option<f64>, _>("avg_latency").map_err(db_err)?,
+                row.try_get::<Option<f64>, _>("avg_latency")
+                    .map_err(db_err)?,
             ))
         }
     }
