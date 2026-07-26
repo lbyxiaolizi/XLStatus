@@ -15,6 +15,20 @@ jobs:
   rust:
     name: Rust check and test
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: xlstatus
+          POSTGRES_PASSWORD: xlstatus
+          POSTGRES_DB: xlstatus_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U xlstatus"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v7
       - name: Install system dependencies
@@ -56,7 +70,7 @@ jobs:
           grep -F "$expected_install" deploy/install.sh
           grep -F "$expected_install" deploy/install-agent.sh
           grep -F "DEFAULT_AGENT_INSTALL_VERSION: &str = \"$GITHUB_REF_NAME\"" crates/server/src/main.rs
-          grep -F "DEFAULT_AGENT_VERSION = \"$GITHUB_REF_NAME\"" 'web/app/(dashboard)/settings/page.tsx'
+          grep -F "DEFAULT_AGENT_VERSION = \"$GITHUB_REF_NAME\"" 'web/app/(dashboard)/settings/sections/AgentInstallCard.tsx'
       - name: Check formatting
         run: cargo fmt --check
       - name: Check workspace
@@ -64,6 +78,10 @@ jobs:
       - name: Lint workspace
         run: cargo clippy --workspace --all-targets --locked -- -D warnings -A clippy::too_many_arguments -A clippy::type_complexity
       - name: Test workspace
+        env:
+          # Enables the postgres-gated tests (migration idempotency + column
+          # width contract); without this variable they self-skip.
+          XLSTATUS_TEST_PG_URL: postgres://xlstatus:xlstatus@localhost:5432/xlstatus_test
         run: cargo test --workspace --locked
 
   web:

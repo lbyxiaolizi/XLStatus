@@ -535,13 +535,17 @@ impl AlertEngine {
         };
         match &self.db {
             crate::db::DatabaseBackend::Sqlite(pool) => {
-                let row: Option<(String,)> =
+                // owner_user_id is nullable (ON DELETE SET NULL, and the 022
+                // backfill left ambiguous rows unset); decode Option or the
+                // first ownerless service errors out of the alert tick.
+                let row: Option<(Option<String>,)> =
                     sqlx::query_as("SELECT owner_user_id FROM services WHERE id = ?")
                         .bind(service_id)
                         .fetch_optional(pool)
                         .await?;
                 Ok(row
-                    .and_then(|(owner,)| uuid::Uuid::parse_str(owner.trim()).ok())
+                    .and_then(|(owner,)| owner)
+                    .and_then(|owner| uuid::Uuid::parse_str(owner.trim()).ok())
                     .map(|owner| owner == owner_uuid)
                     .unwrap_or(false))
             }
@@ -549,12 +553,15 @@ impl AlertEngine {
                 let Ok(service_uuid) = uuid::Uuid::parse_str(service_id) else {
                     return Ok(false);
                 };
-                let row: Option<(uuid::Uuid,)> =
+                let row: Option<(Option<uuid::Uuid>,)> =
                     sqlx::query_as("SELECT owner_user_id FROM services WHERE id = $1")
                         .bind(service_uuid)
                         .fetch_optional(pool)
                         .await?;
-                Ok(row.map(|(owner,)| owner == owner_uuid).unwrap_or(false))
+                Ok(row
+                    .and_then(|(owner,)| owner)
+                    .map(|owner| owner == owner_uuid)
+                    .unwrap_or(false))
             }
         }
     }
@@ -671,7 +678,9 @@ impl AlertEngine {
             crate::db::DatabaseBackend::Postgres(pool) => {
                 let sid = uuid::Uuid::parse_str(service_id)?;
                 let parsed_server_ids = parse_uuid_ids(server_ids)?;
-                sqlx::query_as("SELECT delay_ms FROM service_results WHERE service_id = $1 AND status = 'success' AND server_id = ANY($2::uuid[]) ORDER BY created_at DESC LIMIT 1")
+                // delay_ms is INT4; cast so the shared Option<i64> annotation
+                // decodes on postgres too (sqlite ignores integer width).
+                sqlx::query_as("SELECT delay_ms::bigint FROM service_results WHERE service_id = $1 AND status = 'success' AND server_id = ANY($2::uuid[]) ORDER BY created_at DESC LIMIT 1")
                     .bind(sid)
                     .bind(parsed_server_ids)
                     .fetch_optional(pool)
@@ -691,7 +700,7 @@ impl AlertEngine {
             }
             crate::db::DatabaseBackend::Postgres(pool) => {
                 let sid = uuid::Uuid::parse_str(service_id)?;
-                sqlx::query_as("SELECT delay_ms FROM service_results WHERE service_id = $1 AND status = 'success' AND server_id IS NULL ORDER BY created_at DESC LIMIT 1")
+                sqlx::query_as("SELECT delay_ms::bigint FROM service_results WHERE service_id = $1 AND status = 'success' AND server_id IS NULL ORDER BY created_at DESC LIMIT 1")
                     .bind(sid)
                     .fetch_optional(pool)
                     .await?

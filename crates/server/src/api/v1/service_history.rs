@@ -286,10 +286,17 @@ async fn service_uptime_for_auth(
                 }
             }
             let row = q.fetch_one(pool).await.map_err(db_err)?;
+            // Explicit Option decodes: NULL (empty window) maps to None/0,
+            // while a column-type mismatch surfaces as an error instead of
+            // being silently swallowed into a null latency.
             Ok((
-                row.try_get("total_checks").unwrap_or(0),
-                row.try_get("successful_checks").unwrap_or(0),
-                row.try_get("avg_latency").ok(),
+                row.try_get::<Option<i64>, _>("total_checks")
+                    .map_err(db_err)?
+                    .unwrap_or(0),
+                row.try_get::<Option<i64>, _>("successful_checks")
+                    .map_err(db_err)?
+                    .unwrap_or(0),
+                row.try_get::<Option<f64>, _>("avg_latency").map_err(db_err)?,
             ))
         }
         crate::db::DatabaseBackend::Postgres(pool) => {
@@ -300,7 +307,10 @@ async fn service_uptime_for_auth(
                 SELECT
                     COUNT(*) AS total_checks,
                     SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS successful_checks,
-                    AVG(CASE WHEN status = 'success' THEN delay_ms ELSE NULL END) AS avg_latency
+                    -- ::float8 because AVG(int4) yields NUMERIC, which this
+                    -- build cannot decode into f64 (no decimal feature); the
+                    -- .ok() below would silently turn that into a null latency.
+                    AVG(CASE WHEN status = 'success' THEN delay_ms ELSE NULL END)::float8 AS avg_latency
                 FROM service_results
                 WHERE service_id = $1
                   AND created_at >= $2
@@ -315,10 +325,17 @@ async fn service_uptime_for_auth(
                 q = q.bind(parse_uuid_ids(ids)?);
             }
             let row = q.fetch_one(pool).await.map_err(db_err)?;
+            // Explicit Option decodes: NULL (empty window) maps to None/0,
+            // while a column-type mismatch surfaces as an error instead of
+            // being silently swallowed into a null latency.
             Ok((
-                row.try_get("total_checks").unwrap_or(0),
-                row.try_get("successful_checks").unwrap_or(0),
-                row.try_get("avg_latency").ok(),
+                row.try_get::<Option<i64>, _>("total_checks")
+                    .map_err(db_err)?
+                    .unwrap_or(0),
+                row.try_get::<Option<i64>, _>("successful_checks")
+                    .map_err(db_err)?
+                    .unwrap_or(0),
+                row.try_get::<Option<f64>, _>("avg_latency").map_err(db_err)?,
             ))
         }
     }
@@ -336,7 +353,7 @@ fn parse_uuid_ids(ids: &[String]) -> Result<Vec<Uuid>, AppError> {
         .collect()
 }
 
-fn service_result_from_sqlite_row(row: sqlx::sqlite::SqliteRow) -> ServiceResult {
+pub(crate) fn service_result_from_sqlite_row(row: sqlx::sqlite::SqliteRow) -> ServiceResult {
     ServiceResult {
         id: row.try_get("id").unwrap_or_default(),
         service_id: row.try_get("service_id").unwrap_or_default(),
@@ -351,7 +368,7 @@ fn service_result_from_sqlite_row(row: sqlx::sqlite::SqliteRow) -> ServiceResult
     }
 }
 
-fn service_result_from_postgres_row(row: sqlx::postgres::PgRow) -> ServiceResult {
+pub(crate) fn service_result_from_postgres_row(row: sqlx::postgres::PgRow) -> ServiceResult {
     ServiceResult {
         id: row.try_get("id").unwrap_or_default(),
         service_id: row.try_get("service_id").unwrap_or_default(),

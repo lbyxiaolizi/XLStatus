@@ -383,7 +383,7 @@ impl DatabaseBackend {
                 // raw_sql calls causes "foreign key constraint cannot be implemented"
                 // errors on later files.
                 let batch = format!(
-                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
                     include_str!("../../migrations/postgres/001_initial.sql"),
                     include_str!("../../migrations/postgres/002_agents.sql"),
                     include_str!("../../migrations/postgres/003_services.sql"),
@@ -407,6 +407,7 @@ impl DatabaseBackend {
                     include_str!("../../migrations/postgres/021_pat_expiration_backfill.sql"),
                     include_str!("../../migrations/postgres/022_service_owner.sql"),
                     include_str!("../../migrations/postgres/023_service_notification_group.sql"),
+                    include_str!("../../migrations/postgres/024_int_width_fixes.sql"),
                 );
                 sqlx::raw_sql(batch.as_str()).execute(pool).await?;
                 Ok(())
@@ -1001,5 +1002,50 @@ mod tests {
 
         drop(db);
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    // Runs only when XLSTATUS_TEST_PG_URL points at a disposable postgres
+    // database (CI provides one). Guards the two properties sqlite-based tests
+    // cannot see: the migration batch replays idempotently, and integer column
+    // widths match what the Rust side decodes — an INT4 column read as i64
+    // fails at decode time on postgres only (sqlite integers are always
+    // 8 bytes), which is how the waf_bans.failed_count login 500 shipped.
+    #[tokio::test]
+    async fn postgres_migrations_replay_and_column_widths() {
+        let Ok(url) = std::env::var("XLSTATUS_TEST_PG_URL") else {
+            eprintln!("skipping: XLSTATUS_TEST_PG_URL not set");
+            return;
+        };
+        let db = DatabaseBackend::connect(&url, false).await.unwrap();
+        db.run_migrations().await.unwrap();
+        // Second replay must succeed unchanged (IF NOT EXISTS everywhere, and
+        // the guarded ALTERs in 024 must skip already-widened columns).
+        db.run_migrations().await.unwrap();
+
+        let DatabaseBackend::Postgres(pool) = &db else {
+            panic!("XLSTATUS_TEST_PG_URL must be a postgres URL");
+        };
+        let widths: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT table_name::text, column_name::text, data_type::text \
+             FROM information_schema.columns \
+             WHERE table_schema = current_schema() \
+               AND (table_name, column_name) IN \
+                   (('waf_bans','failed_count'), ('task_runs','delay_ms'), ('service_results','delay_ms'))",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        let width_of = |table: &str, column: &str| {
+            widths
+                .iter()
+                .find(|(t, c, _)| t == table && c == column)
+                .map(|(_, _, d)| d.as_str())
+                .unwrap_or_else(|| panic!("column {table}.{column} missing"))
+        };
+        assert_eq!(width_of("waf_bans", "failed_count"), "bigint");
+        assert_eq!(width_of("task_runs", "delay_ms"), "bigint");
+        // Intentionally INT4: its readers decode i32 (public status, service
+        // history, monitor writes). Widening it would silently null those out.
+        assert_eq!(width_of("service_results", "delay_ms"), "integer");
     }
 }

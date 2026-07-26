@@ -258,7 +258,9 @@ BEGIN
         task_id TEXT,
         server_id UUID,
         status TEXT,
-        delay_ms INTEGER,
+        -- BIGINT to match task_runs.delay_ms after 024 widened it; the Rust
+        -- contract (TaskRun.delay_ms: Option<i64>) binds int8 here.
+        delay_ms BIGINT,
         output TEXT,
         output_truncated BOOLEAN,
         error TEXT,
