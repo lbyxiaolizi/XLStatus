@@ -121,7 +121,10 @@ export function InlineNotice({
   };
 
   return (
-    <div className={`border-2 border-black px-4 py-3 text-sm font-bold shadow-[var(--shadow-brutal-sm)] ${classes[tone]}`}>
+    // role="status" (implicit polite live region) so notices injected after
+    // hydration — e.g. the login page's session-expired banner — are announced
+    // by screen readers instead of silently appearing.
+    <div role="status" className={`border-2 border-black px-4 py-3 text-sm font-bold shadow-[var(--shadow-brutal-sm)] ${classes[tone]}`}>
       {children}
     </div>
   );
