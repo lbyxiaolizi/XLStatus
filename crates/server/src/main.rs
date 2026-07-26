@@ -109,7 +109,8 @@ use xlstatus_shared::UserRole;
 const GRPC_MESSAGE_LIMIT: usize = 256 * 1024 * 1024;
 const HTTP_MAX_PATH_BYTES: usize = 4096;
 const HTTP_MAX_QUERY_BYTES: usize = 16 * 1024;
-const DEFAULT_AGENT_INSTALL_VERSION: &str = "v0.1";
+const TSDB_COMPACTION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+const DEFAULT_AGENT_INSTALL_VERSION: &str = "v0.2";
 const INSTALL_BOOTSTRAP_MAX_QUERY_BYTES: usize = 16 * 1024;
 const INSTALL_BOOTSTRAP_MAX_HOST_BYTES: usize = 512;
 const INSTALL_BOOTSTRAP_MAX_URL_BYTES: usize = 2048;
@@ -203,6 +204,19 @@ async fn main() -> anyhow::Result<()> {
     // Run migrations
     db.run_migrations().await?;
     tracing::info!("Database migrations applied");
+    let settled_task_runs =
+        crate::db::repository::tasks::TaskRunRepository::settle_pending_after_restart(
+            &db,
+            "Server restarted before the task result was received",
+        )
+        .await
+        .context("Failed to settle task runs left pending by a previous Server process")?;
+    if settled_task_runs > 0 {
+        tracing::warn!(
+            settled_task_runs,
+            "settled task runs left pending by a previous Server process"
+        );
+    }
     match secrets::migrate_plaintext_secrets(&db).await {
         Ok(changed) if changed > 0 => {
             tracing::info!("Encrypted {} existing plaintext secret values", changed);
@@ -300,6 +314,10 @@ async fn main() -> anyhow::Result<()> {
             tracing::warn!("failed to load TSDB retention setting: {:?}", err);
         }
     }
+    let metrics_compactor = metrics.clone();
+    tokio::spawn(async move {
+        run_tsdb_compaction(metrics_compactor, TSDB_COMPACTION_INTERVAL).await;
+    });
     let realtime = crate::realtime::BroadcastHub::new();
     let state = AppState {
         db: db.clone(),
@@ -832,6 +850,23 @@ async fn main() -> anyhow::Result<()> {
     }
 
     result
+}
+
+async fn run_tsdb_compaction(metrics: xlstatus_tsdb::MetricStore, period: std::time::Duration) {
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tick.tick().await;
+        let metrics = metrics.clone();
+        match tokio::task::spawn_blocking(move || metrics.compact()).await {
+            Ok(Ok(removed)) if removed > 0 => {
+                tracing::info!(removed, "compacted expired TSDB samples");
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => tracing::warn!("periodic TSDB compaction failed: {}", err),
+            Err(err) => tracing::warn!("periodic TSDB compaction task failed: {}", err),
+        }
+    }
 }
 
 async fn healthz() -> &'static str {
@@ -1432,6 +1467,37 @@ fn read_seed_admin_password_file(path: &str) -> anyhow::Result<String> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn periodic_tsdb_compaction_reclaims_inactive_agent_samples() {
+        let backend = Arc::new(xlstatus_tsdb::InMemoryMetricStore::with_retention(
+            chrono::Duration::milliseconds(20),
+        ));
+        let metrics = xlstatus_tsdb::MetricStore::from_arc_backend(backend.clone());
+        metrics
+            .write(xlstatus_tsdb::MetricSample {
+                agent_id: xlstatus_tsdb::AgentId(uuid::Uuid::from_bytes([42; 16])),
+                sample_at: chrono::Utc::now(),
+                fields_json: serde_json::json!({ "cpu": 10 }),
+            })
+            .unwrap();
+        assert_eq!(backend.len(), 1);
+
+        let compactor = tokio::spawn(run_tsdb_compaction(
+            metrics,
+            std::time::Duration::from_millis(5),
+        ));
+        let reclaimed = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !backend.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        compactor.abort();
+
+        reclaimed.expect("expired inactive Agent samples should be compacted");
+        assert!(backend.is_empty());
+    }
+
     fn headers_with_host(host: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, HeaderValue::from_str(host).unwrap());
@@ -1553,6 +1619,7 @@ mod tests {
 
         assert!(body.contains("export SERVER_URL='http://status.example.com'"));
         assert!(body.contains("export GRPC_SERVER='http://status.example.com:50051'"));
+        assert!(body.contains("export VERSION='v0.2'"));
     }
 
     #[test]
@@ -1701,10 +1768,29 @@ mod tests {
         assert!(script.contains("write_bootstrap_env_file"));
         assert!(script.contains("clear_bootstrap_env_after_seed"));
         assert!(script.contains("wait_for_healthz"));
-        assert!(script.contains("before clearing secrets"));
+        assert!(script.contains("before committing an upgraded binary"));
         assert!(script.contains("systemctl restart xlstatus"));
         assert!(!script.contains("Environment=\"XLSTATUS_SEED_ADMIN_PASSWORD="));
         assert!(!script.contains("ADMIN_PASSWORD_SYSTEMD"));
+    }
+
+    #[test]
+    fn install_scripts_preserve_configuration_and_replace_binaries_atomically() {
+        let server_script = include_str!("../../../deploy/install.sh");
+        assert!(server_script.contains("RECONFIGURE=\"${RECONFIGURE:-false}\""));
+        assert!(server_script.contains("GRPC_BIND=\"${GRPC_BIND:-127.0.0.1:50051}\""));
+        assert!(server_script.contains("Preserving existing configuration"));
+        assert!(server_script.contains("mktemp \"$INSTALL_DIR/.xlstatus-server.XXXXXX\""));
+        assert!(server_script.contains("mv -f \"$BINARY_TMP\" \"$BINARY_TARGET\""));
+        assert!(server_script.contains("rollback_install"));
+        assert!(server_script.contains("systemctl restart xlstatus"));
+
+        let agent_script = include_str!("../../../deploy/install-agent.sh");
+        assert!(agent_script
+            .contains("mktemp \"$(dirname \"$BINARY_TARGET\")/.xlstatus-agent.XXXXXX\""));
+        assert!(agent_script.contains("mv -f \"$BINARY_TMP\" \"$BINARY_TARGET\""));
+        assert!(agent_script.contains("rollback_agent_install"));
+        assert!(agent_script.contains("systemctl restart xlstatus-agent"));
     }
 
     #[test]
@@ -1776,6 +1862,10 @@ mod tests {
             assert!(
                 compose.contains("file: ./.secrets/xlstatus_seed_admin_password"),
                 "{name} must load the seed admin password from the local secrets directory"
+            );
+            assert!(
+                compose.contains("${XLSTATUS_GRPC_PUBLISH_ADDRESS:-127.0.0.1}:50051:50051"),
+                "{name} must publish plaintext-capable Agent gRPC on loopback by default"
             );
         }
 

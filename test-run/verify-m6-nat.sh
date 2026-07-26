@@ -21,6 +21,9 @@ DB="$LOG_DIR/x.db"
 SERVICE_LOG="$LOG_DIR/private-http.log"
 BODY_FILE="$LOG_DIR/private-body.txt"
 
+source "$ROOT/test-run/lib/test-processes.sh"
+test_process_init "$ROOT" "$0"
+
 mkdir -p "$LOG_DIR"
 rm -f "$DB" "$LOG_DIR/agent.yaml" "$SERVICE_LOG" "$BODY_FILE"
 
@@ -40,13 +43,8 @@ session_secret = "test-secret-key-for-development-only-2026"
 session_ttl_hours = 24
 TOML
 
-pkill -9 -f xlstatus-server 2>/dev/null || true
-pkill -9 -f xlstatus-agent 2>/dev/null || true
-pkill -9 -f "PRIVATE_NAT_SERVICE_$SERVICE_PORT" 2>/dev/null || true
-sleep 1
-
 echo ">>> start private service on agent side"
-python3 > "$SERVICE_LOG" 2>&1 <<PY &
+cat > "$LOG_DIR/private-http.py" <<PY
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 BODY = b"m6-nat-ok"
@@ -64,15 +62,15 @@ class H(BaseHTTPRequestHandler):
 print("PRIVATE_NAT_SERVICE_$SERVICE_PORT", flush=True)
 HTTPServer(("127.0.0.1", $SERVICE_PORT), H).serve_forever()
 PY
-disown $! 2>/dev/null || true
+test_process_start "$TEST_PROCESS_REGISTRY" private-http "$SERVICE_LOG" \
+  python3 "$LOG_DIR/private-http.py"
 sleep 2
 
 echo ">>> start server"
-nohup env CONFIG_FILE="$LOG_DIR/cfg.toml" \
+test_process_start "$TEST_PROCESS_REGISTRY" server "$LOG_DIR/server.log" \
+  env CONFIG_FILE="$LOG_DIR/cfg.toml" \
   XLSTATUS_SEED_ADMIN_USERNAME=admin XLSTATUS_SEED_ADMIN_PASSWORD=admin-pw \
-  "$ROOT/target/debug/xlstatus-server" \
-  > "$LOG_DIR/server.log" 2>&1 < /dev/null &
-disown $!
+  "$ROOT/target/debug/xlstatus-server"
 sleep 5
 
 echo ">>> login admin"
@@ -98,9 +96,8 @@ echo ">>> enroll + run agent"
   --config "$LOG_DIR/agent.yaml" > "$LOG_DIR/enroll.log" 2>&1
 AGENT_ID=$(python3 -c "import json;print(json.load(open('$LOG_DIR/agent.yaml'))['agent_id'])")
 
-nohup "$ROOT/target/debug/xlstatus-agent" run --config "$LOG_DIR/agent.yaml" \
-  > "$LOG_DIR/agent.log" 2>&1 < /dev/null &
-disown $!
+test_process_start "$TEST_PROCESS_REGISTRY" agent "$LOG_DIR/agent.log" \
+  "$ROOT/target/debug/xlstatus-agent" run --config "$LOG_DIR/agent.yaml"
 
 for i in $(seq 1 20); do
   SEEN=$(sqlite3 "$DB" "SELECT last_seen_at IS NOT NULL FROM agents WHERE id = '$AGENT_ID';" 2>/dev/null || echo 0)
@@ -152,4 +149,4 @@ echo "  body: $BODY"
 
 echo ""
 echo "M6 NAT PASS (public port reaches agent-local HTTP service via IoStream reverse tunnel)"
-echo "Stop with: pkill -9 -f xlstatus-server; pkill -9 -f xlstatus-agent; pkill -9 -f PRIVATE_NAT_SERVICE_$SERVICE_PORT"
+test_process_print_cleanup "$TEST_PROCESS_REGISTRY"

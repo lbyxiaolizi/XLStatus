@@ -22,6 +22,9 @@ DB="$LOG_DIR/x.db"
 HOOK_BODY="$LOG_DIR/hook.body"
 HOOK_LOG="$LOG_DIR/hook.log"
 
+source "$ROOT/test-run/lib/test-processes.sh"
+test_process_init "$ROOT" "$0"
+
 mkdir -p "$LOG_DIR"
 rm -f "$DB" "$HOOK_LOG" "$HOOK_BODY" "$LOG_DIR/agent.yaml"
 
@@ -41,12 +44,8 @@ session_secret = "test-secret-key-for-development-only-2026"
 session_ttl_hours = 24
 TOML
 
-pkill -9 -f xlstatus-server 2>/dev/null || true
-pkill -9 -f xlstatus-agent 2>/dev/null || true
-sleep 1
-
 echo ">>> start webhook listener"
-python3 > "$HOOK_LOG" 2>&1 <<PYHOOK &
+cat > "$LOG_DIR/webhook.py" <<PYHOOK
 from http.server import BaseHTTPRequestHandler, HTTPServer
 class H(BaseHTTPRequestHandler):
     def do_POST(self):
@@ -61,16 +60,16 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a, **k): pass
 HTTPServer(("127.0.0.1", $LISTEN_PORT), H).serve_forever()
 PYHOOK
-disown $! 2>/dev/null || true
+test_process_start "$TEST_PROCESS_REGISTRY" webhook "$HOOK_LOG" \
+  python3 "$LOG_DIR/webhook.py"
 sleep 2
 
 echo ">>> start server"
-nohup env CONFIG_FILE="$LOG_DIR/cfg.toml" \
+test_process_start "$TEST_PROCESS_REGISTRY" server "$LOG_DIR/server.log" \
+  env CONFIG_FILE="$LOG_DIR/cfg.toml" \
   XLSTATUS_ALLOW_PRIVATE_OUTBOUND=1 \
   XLSTATUS_SEED_ADMIN_USERNAME=admin XLSTATUS_SEED_ADMIN_PASSWORD=admin-pw \
-  "$ROOT/target/debug/xlstatus-server" \
-  > "$LOG_DIR/server.log" 2>&1 < /dev/null &
-disown $!
+  "$ROOT/target/debug/xlstatus-server"
 sleep 5
 
 echo ">>> login admin"
@@ -107,9 +106,8 @@ with open(path, "w", encoding="utf-8") as f:
     json.dump(cfg, f, indent=2)
 PY
 
-nohup "$ROOT/target/debug/xlstatus-agent" run --config "$LOG_DIR/agent.yaml" \
-  > "$LOG_DIR/agent.log" 2>&1 < /dev/null &
-disown $!
+test_process_start "$TEST_PROCESS_REGISTRY" agent "$LOG_DIR/agent.log" \
+  "$ROOT/target/debug/xlstatus-agent" run --config "$LOG_DIR/agent.yaml"
 sleep 5
 
 echo ">>> POST /api/v1/ddns/configs (webhook provider)"
@@ -171,4 +169,4 @@ echo "  $HIST_RESP"
 
 echo ""
 echo "M6 PASS (DDNS: agent IP report triggers webhook provider, history persisted)"
-echo "Stop with: pkill -9 -f xlstatus-server; pkill -9 -f xlstatus-agent; pkill -9 -f 'http.server'"
+test_process_print_cleanup "$TEST_PROCESS_REGISTRY"

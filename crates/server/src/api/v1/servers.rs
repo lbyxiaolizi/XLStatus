@@ -16,7 +16,9 @@ use crate::api::v1::agent_json::{
     AGENT_DASHBOARD_METADATA_JSON_MAX_BYTES,
 };
 use crate::api::v1::auth::{require_sensitive_totp, AppError, AppState};
-use crate::api::v1::geoip::{lookup_agent_geo_location, AgentGeoLocation};
+use crate::api::v1::geoip::{
+    lookup_agent_geo_location, lookup_agent_geo_locations, AgentGeoLocation,
+};
 use crate::auth::middleware::{AuthKind, AuthSession};
 use crate::auth::rbac::has_scope;
 use crate::db::{Agent, AgentRepository, DatabaseBackend, UserRepository};
@@ -146,12 +148,28 @@ pub async fn list_servers(
             .list_with_state_by_owner(auth.user_id, limit, offset)
             .await?
     };
+    let prepared_rows = rows
+        .into_iter()
+        .filter(|row| agent_visible(&auth, &row.agent))
+        .map(|row| {
+            let parsed = parse_agent_telemetry_json(row.last_state_json.as_deref());
+            let parsed_info = parse_agent_telemetry_json(row.last_info_json.as_deref());
+            let dashboard = dashboard_metadata(
+                row.dashboard_metadata_json.as_deref(),
+                &[parsed_info.as_ref(), parsed.as_ref()],
+            );
+            (row, parsed, parsed_info, dashboard)
+        })
+        .collect::<Vec<_>>();
+    let agent_ids = prepared_rows
+        .iter()
+        .filter(|(_, _, _, dashboard)| !dashboard_has_manual_location(dashboard))
+        .map(|(row, _, _, _)| row.agent.id)
+        .collect::<Vec<_>>();
+    let mut geo_locations = lookup_agent_geo_locations(&state.db, &agent_ids).await;
     let now = Utc::now();
-    let mut servers = Vec::with_capacity(rows.len());
-    for row in rows.into_iter() {
-        if !agent_visible(&auth, &row.agent) {
-            continue;
-        }
+    let mut servers = Vec::with_capacity(prepared_rows.len());
+    for (row, parsed, parsed_info, dashboard) in prepared_rows {
         let agent = row.agent;
         let last_seen_age = agent
             .last_seen_at
@@ -164,17 +182,8 @@ pub async fn list_servers(
         } else {
             "offline"
         };
-        let parsed = parse_agent_telemetry_json(row.last_state_json.as_deref());
-        let parsed_info = parse_agent_telemetry_json(row.last_info_json.as_deref());
-        let dashboard = dashboard_metadata(
-            row.dashboard_metadata_json.as_deref(),
-            &[parsed_info.as_ref(), parsed.as_ref()],
-        );
         let network_rates = network_rates_from_store(&state.metrics, agent.id.0);
-        let location = server_location_view(
-            &dashboard,
-            lookup_agent_geo_location(&state.db, agent.id).await,
-        );
+        let location = server_location_view(&dashboard, geo_locations.remove(&agent.id));
         servers.push(ServerView {
             id: agent.id.0.to_string(),
             name: agent.name,
@@ -3019,12 +3028,7 @@ fn server_location_view(
     dashboard: &DashboardMetadata,
     geoip: Option<AgentGeoLocation>,
 ) -> Option<ServerLocationView> {
-    let manual_has_location = dashboard.country.is_some()
-        || dashboard.region.is_some()
-        || dashboard.city.is_some()
-        || dashboard.latitude.is_some()
-        || dashboard.longitude.is_some();
-    if manual_has_location {
+    if dashboard_has_manual_location(dashboard) {
         return Some(ServerLocationView {
             source: "manual".into(),
             provider: None,
@@ -3047,6 +3051,14 @@ fn server_location_view(
         longitude: location.longitude,
         timezone: location.timezone,
     })
+}
+
+fn dashboard_has_manual_location(dashboard: &DashboardMetadata) -> bool {
+    dashboard.country.is_some()
+        || dashboard.region.is_some()
+        || dashboard.city.is_some()
+        || dashboard.latitude.is_some()
+        || dashboard.longitude.is_some()
 }
 
 fn dashboard_metadata(

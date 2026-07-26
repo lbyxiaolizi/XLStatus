@@ -33,12 +33,16 @@ interface AlertEvent {
   created_at?: string;
 }
 
+const DASHBOARD_REFRESH_INTERVAL_MS = 30_000;
+
 export default function DashboardPage() {
   const { t: copy } = useI18n();
   const {
     servers,
     loading: serversLoading,
     error: serversError,
+    refresh: refreshServers,
+    revalidate: revalidateServers,
   } = useServerData();
   const [services, setServices] = useState<Service[]>([]);
   const [alerts, setAlerts] = useState<AlertEvent[]>([]);
@@ -46,35 +50,77 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState({ services: true, alerts: true });
 
   useEffect(() => {
-    let cancelled = false;
-    const controller = new AbortController();
-    const { signal } = controller;
+    let stopped = false;
+    let controller: AbortController | null = null;
+    let timer: number | null = null;
 
-    void apiClient.listServices(100, 0, false, { signal }).then((response) => {
-      if (cancelled || signal.aborted) return;
-      if (response.success && response.data) {
-        setServices((response.data.services as Service[]) ?? []);
-      } else {
-        setErrors((current) => ({ ...current, services: responseError(response) }));
+    function stopPolling() {
+      if (timer !== null) {
+        window.clearInterval(timer);
+        timer = null;
       }
-      setLoading((current) => ({ ...current, services: false }));
-    });
+    }
 
-    void apiClient.listAlertEvents(10, { signal }).then((response) => {
-      if (cancelled || signal.aborted) return;
-      if (response.success && response.data) {
-        setAlerts((response.data.events as AlertEvent[]) ?? []);
+    function startPolling() {
+      stopPolling();
+      if (document.visibilityState !== "visible") return;
+      timer = window.setInterval(() => refreshAll(), DASHBOARD_REFRESH_INTERVAL_MS);
+    }
+
+    async function loadSupplementalData(force = false) {
+      controller?.abort();
+      controller = new AbortController();
+      const { signal } = controller;
+      const [servicesResponse, alertsResponse] = await Promise.all([
+        apiClient.listServices(100, 0, false, { signal, bypassClientCache: force }),
+        apiClient.listAlertEvents(10, { signal, bypassClientCache: force }),
+      ]);
+      if (stopped || signal.aborted) return;
+
+      if (servicesResponse.success && servicesResponse.data) {
+        setServices((servicesResponse.data.services as Service[]) ?? []);
+        setErrors((current) => ({ ...current, services: "" }));
       } else {
-        setErrors((current) => ({ ...current, alerts: responseError(response) }));
+        setErrors((current) => ({ ...current, services: responseError(servicesResponse) }));
       }
-      setLoading((current) => ({ ...current, alerts: false }));
-    });
+      if (alertsResponse.success && alertsResponse.data) {
+        setAlerts((alertsResponse.data.events as AlertEvent[]) ?? []);
+        setErrors((current) => ({ ...current, alerts: "" }));
+      } else {
+        setErrors((current) => ({ ...current, alerts: responseError(alertsResponse) }));
+      }
+      setLoading({ services: false, alerts: false });
+    }
+
+    function refreshAll(force = false) {
+      void (force ? refreshServers(true) : revalidateServers());
+      void loadSupplementalData(force);
+    }
+
+    function handleVisibilityChange() {
+      if (document.visibilityState !== "visible") {
+        stopPolling();
+        controller?.abort();
+        controller = null;
+        return;
+      }
+      refreshAll(true);
+      startPolling();
+    }
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    if (document.visibilityState === "visible") {
+      refreshAll();
+      startPolling();
+    }
 
     return () => {
-      cancelled = true;
-      controller.abort();
+      stopped = true;
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      stopPolling();
+      controller?.abort();
     };
-  }, []);
+  }, [refreshServers, revalidateServers]);
 
   const anyLoading = serversLoading || loading.services || loading.alerts;
 

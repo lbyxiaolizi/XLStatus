@@ -2,11 +2,12 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type KeyboardEvent as ReactKeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import { apiClient, type ThemeDefinition } from "@/lib/api";
 import { type Locale, type Translations } from "@/lib/i18n";
 import { useI18n } from "@/lib/use-i18n";
-import { clearStoredUser, compactId, inputClass, isAdmin, readStoredUser, useBoldTheme, useStoredUser } from "./M7Primitives";
+import { clearStoredUser, compactId, inputClass, isAdmin, readStoredUser, useBoldTheme, useDialogFocusTrap, useStoredUser } from "./M7Primitives";
+import { useOptionalServerData } from "./ServerDataProvider";
 import {
   applyDashboardTheme,
   cacheDashboardTheme,
@@ -59,6 +60,7 @@ export default function Navigation() {
   const dashboardPath = isDashboardPath(pathname);
   const router = useRouter();
   const user = useStoredUser();
+  const serverData = useOptionalServerData();
   const { locale, locales, setLocale, t: copy } = useI18n();
   const [theme, setTheme] = useBoldTheme();
   const [dashboardTheme, setDashboardTheme] = useState<OwnedDashboardTheme>(() => {
@@ -75,9 +77,9 @@ export default function Navigation() {
   const [commandLoadingUserId, setCommandLoadingUserId] = useState("");
   const [commandLoadedUserId, setCommandLoadedUserId] = useState("");
   const [commandError, setCommandError] = useState<{ userId: string; message: string } | null>(null);
-  const commandInputRef = useRef<HTMLInputElement | null>(null);
   const commandRequestUserIdRef = useRef("");
   const dashboardThemeRevisionRef = useRef(0);
+  const revalidateCommandServers = serverData?.revalidate;
 
   const handleLogout = async () => {
     await apiClient.logout();
@@ -89,9 +91,16 @@ export default function Navigation() {
 
   const navigation = useMemo(() => navigationFor(copy), [copy]);
   const publicNavigation = useMemo(() => publicNavigationFor(copy), [copy]);
-  const commandLoading = Boolean(user && commandLoadingUserId === user.id);
-  const visibleCommandServers = user && commandLoadedUserId === user.id ? commandServers : EMPTY_COMMAND_SERVERS;
-  const visibleCommandError = user && commandError?.userId === user.id ? commandError.message : null;
+  const commandLoading = Boolean(user && (
+    serverData ? serverData.loading : commandLoadingUserId === user.id
+  ));
+  const visibleCommandServers = user
+    ? serverData?.servers ?? (commandLoadedUserId === user.id ? commandServers : EMPTY_COMMAND_SERVERS)
+    : EMPTY_COMMAND_SERVERS;
+  const fallbackCommandError = commandError && commandError.userId === user?.id
+    ? commandError.message
+    : null;
+  const visibleCommandError = user ? serverData?.error ?? fallbackCommandError : null;
   const visibleNavigation = user
     ? navigation.filter((item) => !item.adminOnly || isAdmin(user))
     : publicNavigation;
@@ -104,6 +113,7 @@ export default function Navigation() {
       }
       if (event.key === "Escape") {
         setCommandOpen(false);
+        setOpen(false);
       }
     }
 
@@ -112,27 +122,29 @@ export default function Navigation() {
   }, []);
 
   useEffect(() => {
-    if (!commandOpen) return;
-    commandInputRef.current?.focus();
-  }, [commandOpen]);
-
-  useEffect(() => {
-    if (!commandOpen || !user || commandLoadedUserId === user.id) return;
+    if (!commandOpen || !user) return;
+    if (revalidateCommandServers) {
+      void revalidateCommandServers();
+      return;
+    }
     if (commandRequestUserIdRef.current === user.id) return;
     const requestUserId = user.id;
     const controller = new AbortController();
     commandRequestUserIdRef.current = requestUserId;
     setCommandLoadingUserId(requestUserId);
-    setCommandServers([]);
     setCommandError(null);
-    apiClient.listServers(200, 0, false, { signal: controller.signal }).then((response) => {
+    apiClient.listServers(200, 0, false, {
+      signal: controller.signal,
+      bypassClientCache: true,
+    }).then((response) => {
       if (controller.signal.aborted) return;
       if (commandRequestUserIdRef.current === requestUserId) commandRequestUserIdRef.current = "";
       setCommandLoadingUserId((current) => current === requestUserId ? "" : current);
       if (response.success && response.data) {
+        const responseServers = Array.isArray(response.data.servers) ? response.data.servers : [];
         setCommandLoadedUserId(requestUserId);
         setCommandServers(
-          ((response.data.servers as CommandServer[]) ?? []).filter((server) => server.id && server.name),
+          (responseServers as CommandServer[]).filter((server) => server.id && server.name),
         );
       } else {
         setCommandError({ userId: requestUserId, message: response.error || copy.common.requestFailed });
@@ -142,7 +154,7 @@ export default function Navigation() {
       controller.abort();
       if (commandRequestUserIdRef.current === requestUserId) commandRequestUserIdRef.current = "";
     };
-  }, [commandLoadedUserId, commandOpen, copy.common.requestFailed, user]);
+  }, [commandOpen, copy.common.requestFailed, revalidateCommandServers, user]);
 
   useEffect(() => {
     if (!dashboardPath) {
@@ -253,7 +265,7 @@ export default function Navigation() {
 
   return (
     <nav className="sticky top-0 z-40 border-b-4 border-black bg-[var(--bg-card)]">
-      <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
+      <div className="mx-auto max-w-[96rem] px-4 sm:px-6 lg:px-8">
         <div className="flex min-h-16 items-center justify-between gap-4 py-3">
           <Link href="/status" className="group flex items-center gap-3">
             <span className="grid h-10 w-10 place-items-center border-2 border-black bg-[var(--accent-color)] text-lg font-black text-white shadow-[var(--shadow-brutal-sm)] group-hover:-translate-x-0.5 group-hover:-translate-y-0.5 group-hover:shadow-[var(--shadow-brutal)]">
@@ -264,7 +276,7 @@ export default function Navigation() {
             </span>
           </Link>
 
-          <div className="hidden flex-1 items-center justify-center md:flex">
+          <div className="hidden flex-1 items-center justify-center 2xl:flex">
             <div className="flex flex-wrap justify-center gap-2">
               {visibleNavigation.map((item) => (
                 <NavLink key={item.href} href={item.href} active={isActive(pathname, item.href)}>
@@ -274,12 +286,13 @@ export default function Navigation() {
             </div>
           </div>
 
-          <div className="hidden items-center gap-2 md:flex">
+          <div className="hidden items-center gap-2 2xl:flex">
             <button
               type="button"
               onClick={() => setCommandOpen(true)}
               className="border-2 border-black bg-[var(--bg-card)] px-3 py-2 text-xs font-black uppercase shadow-[var(--shadow-brutal-sm)]"
               aria-label={copy.common.search}
+              aria-keyshortcuts="Control+K Meta+K"
             >
               {copy.common.search}
             </button>
@@ -311,8 +324,10 @@ export default function Navigation() {
           <button
             type="button"
             onClick={() => setOpen((value) => !value)}
-            className="border-2 border-black bg-[var(--bg-card)] px-3 py-2 text-sm font-black uppercase shadow-[var(--shadow-brutal-sm)] md:hidden"
+            className="border-2 border-black bg-[var(--bg-card)] px-3 py-2 text-sm font-black uppercase shadow-[var(--shadow-brutal-sm)] 2xl:hidden"
             aria-label={copy.common.menu}
+            aria-expanded={open}
+            aria-controls="primary-navigation-menu"
           >
             {copy.common.menu}
           </button>
@@ -320,7 +335,10 @@ export default function Navigation() {
       </div>
 
       {open ? (
-        <div className="border-t-4 border-black bg-[var(--bg-card)] px-4 pb-4 pt-3 md:hidden">
+        <div
+          id="primary-navigation-menu"
+          className="max-h-[calc(100dvh-4.25rem)] overflow-y-auto overscroll-contain border-t-4 border-black bg-[var(--bg-card)] px-4 pb-4 pt-3 2xl:hidden"
+        >
           <div className="grid gap-2">
             {visibleNavigation.map((item) => (
               <NavLink
@@ -369,19 +387,19 @@ export default function Navigation() {
           </div>
         </div>
       ) : null}
-      <CommandPalette
-        open={commandOpen}
-        query={commandQuery}
-        setQuery={setCommandQuery}
-        inputRef={commandInputRef}
-        items={commandItems}
-        loading={commandLoading}
-        error={visibleCommandError}
-        copy={copy}
-        onClose={closeCommand}
-        onRun={runCommand}
-        canSearchServers={Boolean(user)}
-      />
+      {commandOpen ? (
+        <CommandPalette
+          query={commandQuery}
+          setQuery={setCommandQuery}
+          items={commandItems}
+          loading={commandLoading}
+          error={visibleCommandError}
+          copy={copy}
+          onClose={closeCommand}
+          onRun={runCommand}
+          canSearchServers={Boolean(user)}
+        />
+      ) : null}
     </nav>
   );
 }
@@ -396,10 +414,8 @@ type CommandItem = {
 };
 
 function CommandPalette({
-  open,
   query,
   setQuery,
-  inputRef,
   items,
   loading,
   error,
@@ -408,10 +424,8 @@ function CommandPalette({
   onRun,
   canSearchServers,
 }: {
-  open: boolean;
   query: string;
   setQuery: (value: string) => void;
-  inputRef: React.RefObject<HTMLInputElement | null>;
   items: CommandItem[];
   loading: boolean;
   error: string | null;
@@ -420,21 +434,32 @@ function CommandPalette({
   onRun: (href: string) => void;
   canSearchServers: boolean;
 }) {
-  if (!open) return null;
+  const dialogRef = useDialogFocusTrap(onClose);
   const pageItems = items.filter((item) => item.group === "pages");
   const shortcutItems = items.filter((item) => item.group === "commands");
   const serverItems = items.filter((item) => item.group === "servers");
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/50 px-4 py-16" role="dialog" aria-modal="true">
-      <div className="mx-auto max-w-2xl border-4 border-black bg-[var(--bg-card)] shadow-[10px_10px_0_0_#000]">
+    <div className="fixed inset-0 z-50 overflow-y-auto overscroll-contain bg-black/50 px-4 py-4 sm:py-10">
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label={copy.common.search}
+        tabIndex={-1}
+        onKeyDown={handleCommandNavigation}
+        className="mx-auto w-full max-w-2xl border-4 border-black bg-[var(--bg-card)] shadow-[10px_10px_0_0_#000] outline-none"
+      >
         <div className="flex items-center gap-3 border-b-4 border-black bg-[var(--accent-bg)] p-3">
           <input
-            ref={inputRef}
             value={query}
             onChange={(event) => setQuery(event.target.value)}
             className={`${inputClass} min-w-0 flex-1`}
             placeholder={copy.command.searchPlaceholder}
+            aria-label={copy.command.searchPlaceholder}
+            aria-keyshortcuts="ArrowDown ArrowUp Enter"
+            data-dialog-initial-focus
+            data-command-search
           />
           <button type="button" onClick={onClose} className="border-2 border-black bg-black px-3 py-2 text-xs font-black uppercase text-white shadow-[var(--shadow-brutal-sm)]">
             {copy.common.close}
@@ -486,6 +511,7 @@ function CommandGroup({
             key={item.key}
             type="button"
             onClick={() => onRun(item.href)}
+            data-command-item
             className="grid gap-1 border-2 border-black bg-[var(--bg-card)] px-3 py-2 text-left shadow-[var(--shadow-brutal-sm)] transition hover:-translate-x-0.5 hover:-translate-y-0.5 hover:bg-[var(--accent-bg)]"
           >
             <span className="text-sm font-black text-[var(--text-main)]">{item.title}</span>
@@ -495,6 +521,33 @@ function CommandGroup({
       </div>
     </section>
   );
+}
+
+function handleCommandNavigation(event: ReactKeyboardEvent<HTMLDivElement>) {
+  if (event.nativeEvent.isComposing) return;
+  if (!["ArrowDown", "ArrowUp", "Enter"].includes(event.key)) return;
+  const items = Array.from(
+    event.currentTarget.querySelectorAll<HTMLButtonElement>("[data-command-item]"),
+  );
+  if (!items.length) return;
+
+  const activeElement = document.activeElement;
+  const activeIndex = items.indexOf(activeElement as HTMLButtonElement);
+  const searchHasFocus = activeElement instanceof HTMLElement
+    && activeElement.hasAttribute("data-command-search");
+
+  if (event.key === "Enter" && searchHasFocus) {
+    event.preventDefault();
+    items[0].click();
+    return;
+  }
+  if (event.key === "Enter") return;
+
+  event.preventDefault();
+  const nextIndex = event.key === "ArrowDown"
+    ? activeIndex < 0 ? 0 : (activeIndex + 1) % items.length
+    : activeIndex < 0 ? items.length - 1 : (activeIndex - 1 + items.length) % items.length;
+  items[nextIndex].focus();
 }
 
 function buildCommandItems(

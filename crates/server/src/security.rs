@@ -118,6 +118,9 @@ async fn resolve_outbound_host_with_policy(
 
 pub fn secure_reqwest_client_builder(validated: &ValidatedOutboundUrl) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
+        // A system proxy resolves the URL independently and would bypass the
+        // address validation and DNS pinning performed above.
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .resolve_to_addrs(&validated.host, &validated.addrs)
 }

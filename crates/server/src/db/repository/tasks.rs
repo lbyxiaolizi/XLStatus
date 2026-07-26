@@ -13,6 +13,12 @@ use xlstatus_shared::tasks::*;
 
 pub struct TaskRepository;
 
+#[derive(Debug)]
+pub(crate) struct ScheduledTaskPage {
+    pub tasks: Vec<Task>,
+    pub next_cursor: Option<String>,
+}
+
 impl TaskRepository {
     /// Create a new task
     pub async fn create(db: &Db, task: &Task) -> Result<()> {
@@ -127,54 +133,133 @@ impl TaskRepository {
         Ok(tasks)
     }
 
-    /// List all enabled scheduled tasks
+    /// List all enabled scheduled tasks.
+    ///
+    /// This compatibility helper traverses every keyset page rather than
+    /// silently truncating the result at the scheduler's page size.
     pub async fn list_scheduled(db: &Db) -> Result<Vec<Task>> {
-        let tasks = match db {
-            crate::db::DatabaseBackend::Sqlite(pool) => {
-                let rows = sqlx::query(TASK_SELECT_SQLITE_SCHEDULED)
-                    .bind(TASK_SCHEDULED_RUNTIME_SCAN_LIMIT)
-                    .fetch_all(pool)
+        let mut tasks = Vec::new();
+        let mut cursor = None;
+
+        loop {
+            let page =
+                Self::list_scheduled_page(db, cursor.as_deref(), TASK_SCHEDULED_RUNTIME_SCAN_LIMIT)
                     .await?;
-                rows.into_iter()
-                    .filter_map(|row| match Self::sqlite_row_to_task(row) {
-                        Ok(task) => match validate_task_definition(&task) {
-                            Ok(()) => Some(task),
-                            Err(err) => {
-                                warn!("historical scheduled task {} skipped: {err}", task.id);
-                                None
-                            }
-                        },
-                        Err(err) => {
-                            warn!("historical scheduled task row skipped: {err}");
-                            None
-                        }
-                    })
-                    .collect()
+            tasks.extend(page.tasks);
+
+            match page.next_cursor {
+                Some(next_cursor) => cursor = Some(next_cursor),
+                None => break,
             }
-            crate::db::DatabaseBackend::Postgres(pool) => {
-                let rows = sqlx::query(TASK_SELECT_POSTGRES_SCHEDULED)
-                    .bind(TASK_SCHEDULED_RUNTIME_SCAN_LIMIT)
-                    .fetch_all(pool)
-                    .await?;
-                rows.into_iter()
-                    .filter_map(|row| match Self::postgres_row_to_task(row) {
-                        Ok(task) => match validate_task_definition(&task) {
-                            Ok(()) => Some(task),
-                            Err(err) => {
-                                warn!("historical scheduled task {} skipped: {err}", task.id);
-                                None
-                            }
-                        },
-                        Err(err) => {
-                            warn!("historical scheduled task row skipped: {err}");
-                            None
-                        }
-                    })
-                    .collect()
-            }
-        };
+        }
 
         Ok(tasks)
+    }
+
+    /// List one stable keyset page of enabled scheduled tasks.
+    ///
+    /// Task IDs are immutable UUIDv7 values in normal operation. Scanning
+    /// them in descending order keeps newly-created tasks ahead of an active
+    /// cursor, so they are picked up on the next scheduler tick without
+    /// shifting or starving older pages.
+    pub(crate) async fn list_scheduled_page(
+        db: &Db,
+        cursor: Option<&str>,
+        limit: i64,
+    ) -> Result<ScheduledTaskPage> {
+        if limit <= 0 {
+            anyhow::bail!("scheduled task page limit must be positive");
+        }
+
+        match db {
+            crate::db::DatabaseBackend::Sqlite(pool) => {
+                let rows = match cursor {
+                    Some(cursor) => {
+                        sqlx::query(TASK_SELECT_SQLITE_SCHEDULED_AFTER)
+                            .bind(cursor)
+                            .bind(limit)
+                            .fetch_all(pool)
+                            .await?
+                    }
+                    None => {
+                        sqlx::query(TASK_SELECT_SQLITE_SCHEDULED_FIRST)
+                            .bind(limit)
+                            .fetch_all(pool)
+                            .await?
+                    }
+                };
+                Self::sqlite_rows_to_scheduled_page(rows, limit)
+            }
+            crate::db::DatabaseBackend::Postgres(pool) => {
+                let rows = match cursor {
+                    Some(cursor) => {
+                        sqlx::query(TASK_SELECT_POSTGRES_SCHEDULED_AFTER)
+                            .bind(cursor)
+                            .bind(limit)
+                            .fetch_all(pool)
+                            .await?
+                    }
+                    None => {
+                        sqlx::query(TASK_SELECT_POSTGRES_SCHEDULED_FIRST)
+                            .bind(limit)
+                            .fetch_all(pool)
+                            .await?
+                    }
+                };
+                Self::postgres_rows_to_scheduled_page(rows, limit)
+            }
+        }
+    }
+
+    fn sqlite_rows_to_scheduled_page(
+        rows: Vec<SqliteRow>,
+        limit: i64,
+    ) -> Result<ScheduledTaskPage> {
+        let next_cursor = if rows.len() == limit as usize {
+            rows.last()
+                .map(|row| row.try_get::<String, _>("id"))
+                .transpose()?
+        } else {
+            None
+        };
+        let tasks = rows
+            .into_iter()
+            .filter_map(|row| Self::validate_scheduled_task(Self::sqlite_row_to_task(row)))
+            .collect();
+
+        Ok(ScheduledTaskPage { tasks, next_cursor })
+    }
+
+    fn postgres_rows_to_scheduled_page(rows: Vec<PgRow>, limit: i64) -> Result<ScheduledTaskPage> {
+        let next_cursor = if rows.len() == limit as usize {
+            rows.last()
+                .map(|row| row.try_get::<String, _>("id"))
+                .transpose()?
+        } else {
+            None
+        };
+        let tasks = rows
+            .into_iter()
+            .filter_map(|row| Self::validate_scheduled_task(Self::postgres_row_to_task(row)))
+            .collect();
+
+        Ok(ScheduledTaskPage { tasks, next_cursor })
+    }
+
+    fn validate_scheduled_task(task: Result<Task>) -> Option<Task> {
+        match task {
+            Ok(task) => match validate_task_definition(&task) {
+                Ok(()) => Some(task),
+                Err(err) => {
+                    warn!("historical scheduled task {} skipped: {err}", task.id);
+                    None
+                }
+            },
+            Err(err) => {
+                warn!("historical scheduled task row skipped: {err}");
+                None
+            }
+        }
     }
 
     /// Update a task
@@ -364,6 +449,54 @@ impl TaskRunRepository {
             }
         }
         Ok(())
+    }
+
+    /// Mark an abandoned in-flight run as failed without overwriting a result
+    /// that may have completed concurrently.
+    pub async fn settle_pending_after_cancellation(
+        db: &Db,
+        run_id: &str,
+        error: &str,
+    ) -> Result<bool> {
+        let rows_affected = match db {
+            crate::db::DatabaseBackend::Sqlite(pool) => sqlx::query(TASK_RUN_SETTLE_PENDING_SQLITE)
+                .bind(error)
+                .bind(run_id)
+                .execute(pool)
+                .await?
+                .rows_affected(),
+            crate::db::DatabaseBackend::Postgres(pool) => {
+                sqlx::query(TASK_RUN_SETTLE_PENDING_POSTGRES)
+                    .bind(error)
+                    .bind(run_id)
+                    .execute(pool)
+                    .await?
+                    .rows_affected()
+            }
+        };
+        Ok(rows_affected > 0)
+    }
+
+    /// A restarted Server cannot receive replies for task IDs registered by
+    /// the previous process, so all pre-existing pending rows are terminal.
+    pub async fn settle_pending_after_restart(db: &Db, error: &str) -> Result<u64> {
+        let rows_affected = match db {
+            crate::db::DatabaseBackend::Sqlite(pool) => {
+                sqlx::query(TASK_RUN_SETTLE_ALL_PENDING_SQLITE)
+                    .bind(error)
+                    .execute(pool)
+                    .await?
+                    .rows_affected()
+            }
+            crate::db::DatabaseBackend::Postgres(pool) => {
+                sqlx::query(TASK_RUN_SETTLE_ALL_PENDING_POSTGRES)
+                    .bind(error)
+                    .execute(pool)
+                    .await?
+                    .rows_affected()
+            }
+        };
+        Ok(rows_affected)
     }
 
     /// Create a task run record
@@ -583,10 +716,15 @@ const TASK_SELECT_SQLITE_BY_USER: &str =
     task_select!("WHERE owner_user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?");
 const TASK_SELECT_POSTGRES_BY_USER: &str =
     task_select!("WHERE owner_user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3");
-const TASK_SELECT_SQLITE_SCHEDULED: &str =
-    task_select!("WHERE enabled = 1 AND schedule IS NOT NULL ORDER BY created_at DESC LIMIT ?");
-const TASK_SELECT_POSTGRES_SCHEDULED: &str =
-    task_select!("WHERE enabled = TRUE AND schedule IS NOT NULL ORDER BY created_at DESC LIMIT $1");
+const TASK_SELECT_SQLITE_SCHEDULED_FIRST: &str =
+    task_select!("WHERE enabled = 1 AND schedule IS NOT NULL ORDER BY id DESC LIMIT ?");
+const TASK_SELECT_SQLITE_SCHEDULED_AFTER: &str =
+    task_select!("WHERE enabled = 1 AND schedule IS NOT NULL AND id < ? ORDER BY id DESC LIMIT ?");
+const TASK_SELECT_POSTGRES_SCHEDULED_FIRST: &str =
+    task_select!("WHERE enabled = TRUE AND schedule IS NOT NULL ORDER BY id DESC LIMIT $1");
+const TASK_SELECT_POSTGRES_SCHEDULED_AFTER: &str = task_select!(
+    "WHERE enabled = TRUE AND schedule IS NOT NULL AND id < $1 ORDER BY id DESC LIMIT $2"
+);
 const TASK_UPDATE_SQLITE: &str = r#"
     UPDATE tasks
     SET name = ?, schedule = ?, command = ?, payload_json = ?,
@@ -612,6 +750,14 @@ const TASK_RUN_UPDATE_RESULT_SQLITE: &str =
     "UPDATE task_runs SET status = ?, delay_ms = ?, output = ?, output_truncated = ?, error = ? WHERE id = ?";
 const TASK_RUN_UPDATE_RESULT_POSTGRES: &str =
     "UPDATE task_runs SET status = $1, delay_ms = $2, output = $3, output_truncated = $4, error = $5 WHERE id = $6";
+const TASK_RUN_SETTLE_PENDING_SQLITE: &str =
+    "UPDATE task_runs SET status = 'failed', error = ? WHERE id = ? AND status = 'pending'";
+const TASK_RUN_SETTLE_PENDING_POSTGRES: &str =
+    "UPDATE task_runs SET status = 'failed', error = $1 WHERE id = $2 AND status = 'pending'";
+const TASK_RUN_SETTLE_ALL_PENDING_SQLITE: &str =
+    "UPDATE task_runs SET status = 'failed', error = ? WHERE status = 'pending'";
+const TASK_RUN_SETTLE_ALL_PENDING_POSTGRES: &str =
+    "UPDATE task_runs SET status = 'failed', error = $1 WHERE status = 'pending'";
 const TASK_RUN_INSERT_SQLITE: &str = r#"
     INSERT INTO task_runs (
         id, task_id, server_id, status, delay_ms, output,
@@ -738,11 +884,14 @@ mod tests {
             TASK_INSERT_POSTGRES,
             TASK_SELECT_POSTGRES_BY_ID,
             TASK_SELECT_POSTGRES_BY_USER,
-            TASK_SELECT_POSTGRES_SCHEDULED,
+            TASK_SELECT_POSTGRES_SCHEDULED_FIRST,
+            TASK_SELECT_POSTGRES_SCHEDULED_AFTER,
             TASK_UPDATE_POSTGRES,
             TASK_DELETE_POSTGRES,
             TASK_UPDATE_LAST_EXECUTION_POSTGRES,
             TASK_RUN_UPDATE_RESULT_POSTGRES,
+            TASK_RUN_SETTLE_PENDING_POSTGRES,
+            TASK_RUN_SETTLE_ALL_PENDING_POSTGRES,
             TASK_RUN_INSERT_POSTGRES,
             TASK_RUN_SELECT_POSTGRES_BY_TASK,
             TASK_RUN_SELECT_POSTGRES_BY_TASK_AND_SERVERS,
@@ -849,15 +998,75 @@ mod tests {
             output: Some("ok".into()),
             output_truncated: false,
             error: None,
-            created_at: now,
+            created_at: now.clone(),
         };
         TaskRunRepository::create(&db, &run).await.unwrap();
+        assert!(!TaskRunRepository::settle_pending_after_cancellation(
+            &db,
+            &run.id,
+            "must not replace success",
+        )
+        .await
+        .unwrap());
+
+        let cancelled_run = TaskRun {
+            id: uuid::Uuid::now_v7().to_string(),
+            task_id: task.id.clone(),
+            server_id: agent.id.0.to_string(),
+            status: TaskStatus::Offline,
+            delay_ms: Some(0),
+            output: None,
+            output_truncated: false,
+            error: None,
+            created_at: now.clone(),
+        };
+        TaskRunRepository::create(&db, &cancelled_run)
+            .await
+            .unwrap();
+        assert!(TaskRunRepository::settle_pending_after_cancellation(
+            &db,
+            &cancelled_run.id,
+            "dispatch cancelled",
+        )
+        .await
+        .unwrap());
+
+        let restart_run = TaskRun {
+            id: uuid::Uuid::now_v7().to_string(),
+            task_id: task.id.clone(),
+            server_id: agent.id.0.to_string(),
+            status: TaskStatus::Offline,
+            delay_ms: Some(0),
+            output: None,
+            output_truncated: false,
+            error: None,
+            created_at: now,
+        };
+        TaskRunRepository::create(&db, &restart_run).await.unwrap();
+        assert_eq!(
+            TaskRunRepository::settle_pending_after_restart(&db, "Server restarted")
+                .await
+                .unwrap(),
+            1
+        );
+
         let runs = TaskRunRepository::list_by_task(&db, &task.id, 10, 0)
             .await
             .unwrap();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].server_id, agent.id.0.to_string());
-        assert_eq!(runs[0].status, TaskStatus::Success);
+        assert_eq!(runs.len(), 3);
+        let completed = runs.iter().find(|item| item.id == run.id).unwrap();
+        assert_eq!(completed.server_id, agent.id.0.to_string());
+        assert_eq!(completed.status, TaskStatus::Success);
+        assert_eq!(completed.output.as_deref(), Some("ok"));
+        let cancelled = runs
+            .iter()
+            .find(|item| item.id == cancelled_run.id)
+            .unwrap();
+        assert_eq!(cancelled.status, TaskStatus::Failure);
+        assert_eq!(cancelled.error.as_deref(), Some("dispatch cancelled"));
+        let restarted = runs.iter().find(|item| item.id == restart_run.id).unwrap();
+        assert_eq!(restarted.status, TaskStatus::Failure);
+        assert_eq!(restarted.error.as_deref(), Some("Server restarted"));
     }
 
     #[tokio::test]
@@ -924,6 +1133,67 @@ mod tests {
         assert_eq!(scheduled.len(), 1);
         assert_eq!(scheduled[0].id, valid.id);
         assert_eq!(scheduled[0].command.as_deref(), Some("true"));
+    }
+
+    #[tokio::test]
+    async fn scheduled_task_scan_traverses_more_than_runtime_page_limit() {
+        let db = test_db().await;
+        let user_id = "00000000-0000-0000-0000-000000000001";
+        seed_user(&db, user_id).await;
+        let task_count = TASK_SCHEDULED_RUNTIME_SCAN_LIMIT as usize + 1;
+        let task_ids = (0..task_count)
+            .map(|index| format!("00000000-0000-0000-0000-{index:012}"))
+            .collect::<Vec<_>>();
+
+        let DatabaseBackend::Sqlite(pool) = &db else {
+            unreachable!();
+        };
+        let mut transaction = pool.begin().await.unwrap();
+        for task_id in &task_ids {
+            sqlx::query(
+                "INSERT INTO tasks (id, owner_user_id, name, task_type, schedule, command, cover_mode, server_selector_json, enabled, push_successful, created_at, updated_at) VALUES (?, ?, 'scheduled', '\"shell\"', '0 * * * *', 'true', '\"specific\"', '{}', 1, 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            )
+            .bind(task_id)
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        }
+        transaction.commit().await.unwrap();
+
+        let first_page =
+            TaskRepository::list_scheduled_page(&db, None, TASK_SCHEDULED_RUNTIME_SCAN_LIMIT)
+                .await
+                .unwrap();
+        assert_eq!(
+            first_page.tasks.len(),
+            TASK_SCHEDULED_RUNTIME_SCAN_LIMIT as usize
+        );
+        assert_eq!(first_page.tasks[0].id, task_ids[task_count - 1]);
+        assert_eq!(first_page.tasks.last().unwrap().id, task_ids[1]);
+        assert_eq!(
+            first_page.next_cursor.as_deref(),
+            Some(task_ids[1].as_str())
+        );
+
+        let second_page = TaskRepository::list_scheduled_page(
+            &db,
+            first_page.next_cursor.as_deref(),
+            TASK_SCHEDULED_RUNTIME_SCAN_LIMIT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second_page.tasks.len(), 1);
+        assert_eq!(second_page.tasks[0].id, task_ids[0]);
+        assert_eq!(second_page.next_cursor, None);
+
+        let scheduled = TaskRepository::list_scheduled(&db).await.unwrap();
+        assert_eq!(scheduled.len(), task_count);
+        assert_eq!(scheduled.first().unwrap().id, task_ids[task_count - 1]);
+        assert_eq!(scheduled.last().unwrap().id, task_ids[0]);
+        assert!(TaskRepository::list_scheduled_page(&db, None, 0)
+            .await
+            .is_err());
     }
 
     async fn test_db() -> DatabaseBackend {

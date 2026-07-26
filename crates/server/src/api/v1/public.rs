@@ -313,12 +313,7 @@ async fn build_public_status_mjpeg_frame(state: &AppState) -> Result<Vec<u8>, Ap
         .count();
     let failing_services = services
         .iter()
-        .filter(|service| {
-            matches!(
-                service.last_status.as_deref(),
-                Some("failure" | "down" | "failed")
-            )
-        })
+        .filter(|service| !public_service_status_healthy(service.last_status.as_deref()))
         .count();
     let status = if servers.is_empty() && services.is_empty() {
         "NO DATA"
@@ -336,6 +331,10 @@ async fn build_public_status_mjpeg_frame(state: &AppState) -> Result<Vec<u8>, Ap
         services.len(),
     );
     build_mjpeg_frame(&jpeg)
+}
+
+fn public_service_status_healthy(status: Option<&str>) -> bool {
+    matches!(status, Some("success" | "up" | "ok"))
 }
 
 async fn public_servers(state: &AppState) -> Result<Vec<PublicServerView>, AppError> {
@@ -1945,6 +1944,19 @@ mod tests {
         let (last_status, last_check_at) = public_service_last_from_history(&history);
         assert_eq!(last_status.as_deref(), Some("success"));
         assert_eq!(last_check_at.as_deref(), Some("2026-06-22T10:00:00Z"));
+    }
+
+    #[test]
+    fn public_status_frame_uses_healthy_service_allowlist() {
+        for status in ["success", "up", "ok"] {
+            assert!(public_service_status_healthy(Some(status)), "{status}");
+        }
+        for status in [
+            "failure", "down", "failed", "timeout", "degraded", "unknown",
+        ] {
+            assert!(!public_service_status_healthy(Some(status)), "{status}");
+        }
+        assert!(!public_service_status_healthy(None));
     }
 
     #[tokio::test]

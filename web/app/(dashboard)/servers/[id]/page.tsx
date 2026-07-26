@@ -30,6 +30,7 @@ import { apiClient, type FileEntry, type JsonObject } from "@/lib/api";
 import { durationLabel, formatRate, maxOf, minOf, optionalNumber } from "@/app/lib/format";
 import { useI18n } from "@/lib/use-i18n";
 import { useStoredPreference } from "@/app/lib/client-store";
+import { mapWithConcurrency } from "@/app/lib/concurrency";
 
 const BINARY_PREFERENCE_VALUES = ["0", "1"] as const;
 
@@ -322,8 +323,11 @@ export default function ServerDetailPage({ params }: PageProps) {
     const services = ((servicesResponse.data.services as ServiceSummary[]) ?? []).filter(
       (service) => service.id && serviceBelongsToServer(service, serverId),
     );
-    const histories = await Promise.all(
-      services.map(async (service) => {
+    const histories = await mapWithConcurrency(
+      services,
+      6,
+      async (service) => {
+        if (signal?.aborted) return null;
         const response = await apiClient.getServiceHistory(service.id, historyLimitForRange(metricsRange), { signal });
         if (!response.success || !response.data) return null;
         const results = Array.isArray(response.data.results) ? response.data.results : [];
@@ -334,7 +338,7 @@ export default function ServerDetailPage({ params }: PageProps) {
             .filter((result): result is ServiceResult => Boolean(result))
             .filter((result) => result.server_id === serverId),
         };
-      }),
+      },
     );
     if (signal?.aborted) return;
 
@@ -909,10 +913,10 @@ function AgentOpsPanel({
         <h2 className="mb-4 text-xl font-black uppercase">{copy.serverDetailPage.sendUpdateTitle}</h2>
         <form onSubmit={onForceUpdate} className="space-y-4">
           <Field label={copy.serverDetailPage.versionLabel}>
-            <input className={inputClass} value={updateForm.version} onChange={(e) => onUpdateChange({ ...updateForm, version: e.target.value })} placeholder="v0.1" />
+            <input className={inputClass} value={updateForm.version} onChange={(e) => onUpdateChange({ ...updateForm, version: e.target.value })} placeholder="v0.2" />
           </Field>
           <Field label={copy.serverDetailPage.downloadUrlLabel}>
-            <input className={inputClass} value={updateForm.download_url} onChange={(e) => onUpdateChange({ ...updateForm, download_url: e.target.value })} placeholder="https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1/xlstatus-agent-linux-amd64.tar.gz" />
+            <input className={inputClass} value={updateForm.download_url} onChange={(e) => onUpdateChange({ ...updateForm, download_url: e.target.value })} placeholder="https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.2/xlstatus-agent-linux-x86_64" />
           </Field>
           <Field label="SHA-256">
             <input className={inputClass} value={updateForm.checksum} onChange={(e) => onUpdateChange({ ...updateForm, checksum: e.target.value })} placeholder={copy.serverDetailPage.checksumPlaceholder} />

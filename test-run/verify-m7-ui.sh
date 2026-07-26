@@ -55,11 +55,11 @@ for token in [
 
 server_detail = (root / "web/app/(dashboard)/servers/[id]/page.tsx").read_text(encoding="utf-8")
 for token in [
-    "Write File",
-    "Download URL",
-    "Upload URL",
-    "Apply Config",
-    "Send Update",
+    "apiClient.writeServerFile",
+    "apiClient.getServerDownloadUrl",
+    "apiClient.getServerUploadUrl",
+    "apiClient.applyServerConfig",
+    "apiClient.forceUpdateServer",
     "disable_command_execute",
 ]:
     assert token in server_detail, f"server detail UI missing {token}"
@@ -76,7 +76,7 @@ for token in [
 status = (root / "web/app/status/page.tsx").read_text(encoding="utf-8")
 for token in [
     "getPublicStatus",
-    "No public data",
+    "copy.statusPage.overallNoData",
 ]:
     assert token in status, f"public status view missing {token}"
 
@@ -84,10 +84,40 @@ nav = (root / "web/app/components/Navigation.tsx").read_text(encoding="utf-8")
 for token in [
     "adminOnly",
     "publicNavigation",
-    "md:hidden",
+    "2xl:hidden",
     "isAdmin(user)",
+    "useDialogFocusTrap(onClose)",
+    "aria-label={copy.common.search}",
+    "data-dialog-initial-focus",
+    "apiClient.listServers(200, 0, false, {",
+    "bypassClientCache: true",
 ]:
     assert token in nav, f"navigation/permission view missing {token}"
+
+dialog_primitives = (root / "web/app/components/Dialogs.tsx").read_text(encoding="utf-8")
+for token in [
+    "activeKindRef.current",
+    "dialogCancellationValue(previousKind)",
+    "key={active.id}",
+    "data-dialog-initial-focus",
+]:
+    assert token in dialog_primitives, f"dialog lifecycle handling missing {token}"
+
+modal_primitives = (root / "web/app/components/M7Primitives.tsx").read_text(encoding="utf-8")
+for token in [
+    "acquireBodyScrollLock()",
+    "getClientRects().length > 0",
+    "releaseScrollLock()",
+]:
+    assert token in modal_primitives, f"modal focus/scroll handling missing {token}"
+
+body_scroll_lock = (root / "web/app/lib/body-scroll-lock.ts").read_text(encoding="utf-8")
+for token in [
+    "createBodyScrollLockManager",
+    "activeLocks += 1",
+    "lockedTarget.style.overflow = originalOverflow",
+]:
+    assert token in body_scroll_lock, f"nested body scroll lock missing {token}"
 
 print("M7 UI PASS (dashboard pages, public view, permissions, terminal, file transfer/config/update UI)")
 PY

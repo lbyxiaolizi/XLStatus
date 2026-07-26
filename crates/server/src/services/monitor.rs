@@ -14,12 +14,15 @@ use crate::services::probe::{probe_http, probe_icmp, probe_tcp, ProbeType, Servi
 use crate::tasks::spawn_triggered_tasks;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use futures::{stream, StreamExt};
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
-use tokio::time::interval;
+use tokio::sync::{RwLock, Semaphore};
+use tokio::time::{interval, MissedTickBehavior};
 use tracing::{error, info, warn};
 use xlstatus_proto_gen::xlstatus::v1::{
     server_task::Spec, HttpGetTask, IcmpPingTask, ServerTask, TaskOutcome, TaskType, TcpPingTask,
@@ -28,9 +31,24 @@ use xlstatus_shared::AgentId;
 
 const SERVICE_AGENT_PROBE_STDOUT_MAX_BYTES: usize = 16 * 1024;
 const SERVICE_AGENT_PROBE_ERROR_MAX_BYTES: usize = 4096;
+const SERVICE_AGENT_PROBE_MAX_CONCURRENCY: usize = 8;
 const SERVICE_UUID_TEXT_LEN: usize = 36;
 const LOAD_SERVICES_SQLITE: &str = "SELECT id, owner_user_id, name, type, target, interval_seconds, timeout_seconds, enabled, server_id, notification_group_id, COALESCE(cover_mode, 'local'), exclude_server_ids_json, failure_task_ids_json, recovery_task_ids_json FROM services WHERE enabled = 1";
 const LOAD_SERVICES_POSTGRES: &str = "SELECT id::text, owner_user_id::text, name, type, target, interval_seconds, timeout_seconds, enabled, server_id::text, notification_group_id::text, COALESCE(cover_mode, 'local'), exclude_server_ids_json, failure_task_ids_json, recovery_task_ids_json FROM services WHERE enabled = TRUE";
+
+static SERVICE_AGENT_PROBE_PERMITS: Lazy<Arc<Semaphore>> =
+    Lazy::new(|| Arc::new(Semaphore::new(SERVICE_AGENT_PROBE_MAX_CONCURRENCY)));
+
+async fn run_with_agent_probe_permit<T>(
+    permits: Arc<Semaphore>,
+    operation: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    let _permit = permits
+        .acquire_owned()
+        .await
+        .context("service agent probe limiter closed")?;
+    operation.await
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceConfig {
@@ -93,6 +111,7 @@ impl ServiceMonitor {
     pub async fn start(self: Arc<Self>) {
         info!("service monitor started");
         let mut tick = interval(Duration::from_secs(10));
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
             if let Err(e) = self.tick_once().await {
@@ -104,6 +123,12 @@ impl ServiceMonitor {
     async fn tick_once(&self) -> Result<()> {
         let now = Utc::now();
         let services = self.load_services().await?;
+        let active_service_ids = services
+            .iter()
+            .map(|service| service.id.clone())
+            .collect::<HashSet<_>>();
+        self.prune_inactive_runtime_state(&active_service_ids).await;
+        let mut due_services = Vec::new();
         for s in services {
             let should = {
                 let sch = self.scheduled.read().await;
@@ -113,12 +138,44 @@ impl ServiceMonitor {
                 let interval_seconds = bounded_interval_seconds(s.interval_seconds);
                 let next = now + chrono::Duration::seconds(interval_seconds as i64);
                 self.scheduled.write().await.insert(s.id.clone(), next);
-                if let Err(e) = self.probe(&s).await {
-                    warn!("probe {} failed: {}", s.id, e);
-                }
+                due_services.push(s);
             }
         }
+
+        stream::iter(due_services)
+            .for_each_concurrent(SERVICE_AGENT_PROBE_MAX_CONCURRENCY, |service| async move {
+                if let Err(e) = self.probe(&service).await {
+                    warn!("probe {} failed: {}", service.id, e);
+                }
+            })
+            .await;
         Ok(())
+    }
+
+    async fn prune_inactive_runtime_state(&self, active_service_ids: &HashSet<String>) {
+        self.scheduled
+            .write()
+            .await
+            .retain(|service_id, _| active_service_ids.contains(service_id));
+        self.service_states.write().await.retain(|key, _| {
+            key.split_once(':')
+                .is_some_and(|(service_id, _)| active_service_ids.contains(service_id))
+        });
+    }
+
+    async fn prune_service_target_states(&self, service_id: &str, server_ids: Option<&[String]>) {
+        let active_keys = match server_ids {
+            Some(server_ids) => server_ids
+                .iter()
+                .map(|server_id| service_state_key(service_id, Some(server_id)))
+                .collect::<HashSet<_>>(),
+            None => HashSet::from([service_state_key(service_id, None)]),
+        };
+        let service_key_prefix = format!("{service_id}:");
+        self.service_states
+            .write()
+            .await
+            .retain(|key, _| !key.starts_with(&service_key_prefix) || active_keys.contains(key));
     }
 
     async fn probe(&self, s: &ServiceConfig) -> Result<()> {
@@ -126,40 +183,71 @@ impl ServiceMonitor {
             "all" | "exclude" => {
                 let server_ids = self.covered_agent_ids(s).await?;
                 ensure_probe_target_count(server_ids.len())?;
-                for server_id in server_ids {
-                    if !self
-                        .session_registry
-                        .is_online(&AgentId(uuid::Uuid::parse_str(&server_id)?))
-                        .await
-                    {
-                        continue;
-                    }
-                    let result = match self.probe_via_agent(s, &server_id).await {
-                        Ok(result) => result,
-                        Err(e) => failure_probe(format!("agent probe failed: {e}")),
-                    };
-                    self.save(s, Some(&server_id), &result).await?;
-                }
-                Ok(())
+                self.prune_service_target_states(&s.id, Some(&server_ids))
+                    .await;
+                self.probe_agents(s, server_ids, true).await
             }
             "specific" => {
                 let server_ids = self.specific_agent_ids(s).await?;
                 ensure_probe_target_count(server_ids.len())?;
-                for server_id in server_ids {
-                    let result = match self.probe_via_agent(s, &server_id).await {
-                        Ok(result) => result,
-                        Err(e) => failure_probe(format!("agent probe failed: {e}")),
-                    };
-                    self.save(s, Some(&server_id), &result).await?;
-                }
-                Ok(())
+                self.prune_service_target_states(&s.id, Some(&server_ids))
+                    .await;
+                self.probe_agents(s, server_ids, false).await
             }
             _ => {
+                self.prune_service_target_states(&s.id, None).await;
                 let result = self.probe_locally(s).await?;
                 self.save(s, None, &result).await?;
                 Ok(())
             }
         }
+    }
+
+    async fn probe_agents(
+        &self,
+        service: &ServiceConfig,
+        server_ids: Vec<String>,
+        skip_offline: bool,
+    ) -> Result<()> {
+        let probes = stream::iter(server_ids.into_iter().enumerate())
+            .map(|(index, server_id)| async move {
+                let result = async {
+                    let probe =
+                        run_with_agent_probe_permit(SERVICE_AGENT_PROBE_PERMITS.clone(), async {
+                            if skip_offline {
+                                let agent_id = AgentId(
+                                    uuid::Uuid::parse_str(&server_id)
+                                        .context("invalid server_id")?,
+                                );
+                                if !self.session_registry.is_online(&agent_id).await {
+                                    return Ok(None);
+                                }
+                            }
+                            self.probe_via_agent(service, &server_id).await.map(Some)
+                        })
+                        .await;
+                    let result = match probe {
+                        Ok(Some(result)) => result,
+                        Ok(None) => return Ok(()),
+                        Err(e) => failure_probe(format!("agent probe failed: {e}")),
+                    };
+                    self.save(service, Some(&server_id), &result).await
+                }
+                .await;
+                (index, result)
+            })
+            .buffer_unordered(SERVICE_AGENT_PROBE_MAX_CONCURRENCY)
+            .collect::<Vec<(usize, Result<()>)>>()
+            .await;
+
+        // All targets are allowed to finish independently. Preserve the input
+        // order when reporting an infrastructure error to keep failures stable.
+        let mut probes = probes;
+        probes.sort_unstable_by_key(|(index, _)| *index);
+        for (_, result) in probes {
+            result?;
+        }
+        Ok(())
     }
 
     async fn covered_agent_ids(&self, s: &ServiceConfig) -> Result<Vec<String>> {
@@ -1175,6 +1263,9 @@ mod tests {
     use super::*;
     use crate::db::DatabaseBackend;
     use crate::grpc::{SessionRegistry, TaskResponseRegistry};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::{mpsc, watch};
+    use xlstatus_proto_gen::xlstatus::v1::{server_message::Payload, TaskResult};
 
     #[test]
     fn config_round_trip() {
@@ -1312,6 +1403,203 @@ mod tests {
         assert!(ensure_probe_target_count(SERVICE_MAX_TARGETS_PER_PROBE + 1).is_err());
         assert_eq!(SERVICE_AGENT_PROBE_STDOUT_MAX_BYTES, 16 * 1024);
         assert_eq!(SERVICE_AGENT_PROBE_ERROR_MAX_BYTES, 4096);
+    }
+
+    #[tokio::test]
+    async fn agent_probe_permit_helper_enforces_concurrency_limit() {
+        let permits = Arc::new(Semaphore::new(2));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let (release_tx, release_rx) = watch::channel(false);
+
+        let work = tokio::spawn({
+            let permits = permits.clone();
+            let active = active.clone();
+            let peak = peak.clone();
+            async move {
+                stream::iter(0..3)
+                    .map(|_| {
+                        let permits = permits.clone();
+                        let active = active.clone();
+                        let peak = peak.clone();
+                        let entered_tx = entered_tx.clone();
+                        let mut release_rx = release_rx.clone();
+                        async move {
+                            run_with_agent_probe_permit(permits, async move {
+                                let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                                peak.fetch_max(now_active, Ordering::SeqCst);
+                                entered_tx.send(()).unwrap();
+                                release_rx.wait_for(|released| *released).await.unwrap();
+                                active.fetch_sub(1, Ordering::SeqCst);
+                                Ok(())
+                            })
+                            .await
+                            .unwrap();
+                        }
+                    })
+                    .buffer_unordered(3)
+                    .collect::<Vec<_>>()
+                    .await;
+            }
+        });
+
+        entered_rx.recv().await.unwrap();
+        entered_rx.recv().await.unwrap();
+        assert!(matches!(
+            entered_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+
+        release_tx.send(true).unwrap();
+        work.await.unwrap();
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn service_monitor_dispatches_multiple_agent_probes_before_waiting_for_replies() {
+        let db = test_db().await;
+        let owner = "00000000-0000-0000-0000-000000000001";
+        let service_id = "00000000-0000-0000-0000-000000000301";
+        let server_a = "00000000-0000-0000-0000-000000000101";
+        let server_b = "00000000-0000-0000-0000-000000000102";
+        seed_user(&db, owner, "owner").await;
+        seed_agent(&db, server_a, owner, "server-a").await;
+        seed_agent(&db, server_b, owner, "server-b").await;
+        seed_service(
+            &db,
+            service_id,
+            Some(owner),
+            "http",
+            "https://example.com",
+            60,
+            10,
+            "specific",
+            None,
+        )
+        .await;
+
+        let sessions = SessionRegistry::new();
+        let responses = Arc::new(TaskResponseRegistry::new());
+        let monitor = Arc::new(ServiceMonitor::new(db, sessions.clone(), responses.clone()));
+        let stale_server = "00000000-0000-0000-0000-000000000103";
+        monitor.service_states.write().await.extend([
+            (service_state_key(service_id, None), false),
+            (service_state_key(service_id, Some(stale_server)), false),
+        ]);
+        let agent_a = AgentId(uuid::Uuid::parse_str(server_a).unwrap());
+        let agent_b = AgentId(uuid::Uuid::parse_str(server_b).unwrap());
+        let (sender_a, mut receiver_a) = mpsc::channel(1);
+        let (sender_b, mut receiver_b) = mpsc::channel(1);
+        assert!(sessions.register(agent_a, sender_a).await);
+        assert!(sessions.register(agent_b, sender_b).await);
+
+        let mut service = test_service_config();
+        service.owner_user_id = Some(owner.into());
+        service.cover_mode = "specific".into();
+        service.server_ids = vec![server_a.into(), server_b.into()];
+        service.target = "https://example.com".into();
+        service.timeout_seconds = 10;
+
+        let probe = tokio::spawn({
+            let monitor = monitor.clone();
+            async move { monitor.probe(&service).await }
+        });
+
+        let task_a = receive_agent_probe_task(&mut receiver_a).await;
+        let task_b = receive_agent_probe_task(&mut receiver_b).await;
+        assert!(!probe.is_finished());
+
+        assert!(
+            responses
+                .deliver(&agent_a, &task_a.task_id, successful_agent_probe_result())
+                .await
+        );
+        assert!(
+            responses
+                .deliver(&agent_b, &task_b.task_id, successful_agent_probe_result())
+                .await
+        );
+        tokio::time::timeout(Duration::from_secs(2), probe)
+            .await
+            .expect("concurrent service probe should finish")
+            .unwrap()
+            .unwrap();
+
+        let states = monitor.service_states.read().await;
+        assert_eq!(states.len(), 2);
+        assert!(states.contains_key(&service_state_key(service_id, Some(server_a))));
+        assert!(states.contains_key(&service_state_key(service_id, Some(server_b))));
+        assert!(!states.contains_key(&service_state_key(service_id, None)));
+        assert!(!states.contains_key(&service_state_key(service_id, Some(stale_server))));
+    }
+
+    #[tokio::test]
+    async fn monitor_prunes_runtime_state_for_removed_services() {
+        let monitor = ServiceMonitor::new(
+            test_db().await,
+            SessionRegistry::new(),
+            Arc::new(TaskResponseRegistry::new()),
+        );
+        let active = "00000000-0000-0000-0000-000000000301";
+        let removed = "00000000-0000-0000-0000-000000000302";
+        let now = Utc::now();
+        monitor
+            .scheduled
+            .write()
+            .await
+            .extend([(active.to_string(), now), (removed.to_string(), now)]);
+        monitor.service_states.write().await.extend([
+            (service_state_key(active, None), true),
+            (service_state_key(active, Some("agent-a")), false),
+            (service_state_key(removed, None), true),
+            (service_state_key(removed, Some("agent-b")), false),
+        ]);
+
+        monitor
+            .prune_inactive_runtime_state(&HashSet::from([active.to_string()]))
+            .await;
+
+        assert_eq!(
+            monitor
+                .scheduled
+                .read()
+                .await
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![active.to_string()]
+        );
+        let states = monitor.service_states.read().await;
+        assert_eq!(states.len(), 2);
+        assert!(states.contains_key(&service_state_key(active, None)));
+        assert!(states.contains_key(&service_state_key(active, Some("agent-a"))));
+    }
+
+    #[tokio::test]
+    async fn local_service_state_cleanup_removes_previous_agent_targets() {
+        let monitor = ServiceMonitor::new(
+            test_db().await,
+            SessionRegistry::new(),
+            Arc::new(TaskResponseRegistry::new()),
+        );
+        let service_id = "00000000-0000-0000-0000-000000000301";
+        let other_service_id = "00000000-0000-0000-0000-000000000302";
+        monitor.service_states.write().await.extend([
+            (service_state_key(service_id, None), true),
+            (service_state_key(service_id, Some("agent-a")), false),
+            (service_state_key(service_id, Some("agent-b")), true),
+            (service_state_key(other_service_id, None), false),
+        ]);
+
+        monitor.prune_service_target_states(service_id, None).await;
+
+        let states = monitor.service_states.read().await;
+        assert_eq!(states.len(), 2);
+        assert!(states.contains_key(&service_state_key(service_id, None)));
+        assert!(states.contains_key(&service_state_key(other_service_id, None)));
     }
 
     #[test]
@@ -1677,6 +1965,30 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    async fn receive_agent_probe_task(
+        receiver: &mut mpsc::Receiver<
+            Result<xlstatus_proto_gen::xlstatus::v1::ServerMessage, tonic::Status>,
+        >,
+    ) -> ServerTask {
+        let message = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("Agent should receive a probe before any reply is sent")
+            .expect("Agent session should remain open")
+            .expect("probe message should be successful");
+        let Some(Payload::Task(task)) = message.payload else {
+            panic!("expected service probe task");
+        };
+        task
+    }
+
+    fn successful_agent_probe_result() -> TaskResult {
+        TaskResult {
+            status: TaskOutcome::Success as i32,
+            stdout: r#"{"success":true}"#.into(),
+            ..TaskResult::default()
+        }
     }
 
     fn test_service_config() -> ServiceConfig {

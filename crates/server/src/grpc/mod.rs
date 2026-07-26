@@ -81,9 +81,12 @@ impl AgentService for AgentServiceImpl {
 
         let mut in_stream = request.into_inner();
         let (tx, rx) = mpsc::channel(128);
+        let registration = tx.downgrade();
 
         // Register session
-        self.session_registry.register(agent_id, tx.clone()).await;
+        if !self.session_registry.register(agent_id, tx).await {
+            return Err(Status::permission_denied("agent revoked"));
+        }
 
         let db = self.db.clone();
         let session_registry = self.session_registry.clone();
@@ -210,7 +213,7 @@ impl AgentService for AgentServiceImpl {
             }
 
             // Unregister when stream ends
-            session_registry.unregister(&agent_id).await;
+            session_registry.unregister(&agent_id, &registration).await;
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -234,7 +237,10 @@ impl AgentService for AgentServiceImpl {
 
         let mut in_stream = request.into_inner();
         let (tx, rx) = mpsc::channel(128);
-        self.io_registry.register_agent(agent_id, tx.clone()).await;
+        let registration = tx.downgrade();
+        if !self.io_registry.register_agent(agent_id, tx).await {
+            return Err(Status::permission_denied("agent revoked"));
+        }
         let io_registry = self.io_registry.clone();
 
         // Spawn task to handle IO frames
@@ -247,7 +253,7 @@ impl AgentService for AgentServiceImpl {
                 );
                 let _ = io_registry.deliver_from_agent(&agent_id, frame).await;
             }
-            io_registry.unregister_agent(&agent_id).await;
+            io_registry.unregister_agent(&agent_id, &registration).await;
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))

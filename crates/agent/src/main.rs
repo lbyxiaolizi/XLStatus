@@ -527,7 +527,7 @@ async fn run_agent_session(runtime: RuntimeContext) -> anyhow::Result<SessionExi
     // Heartbeat loop (server uses this to refresh `last_seen_at` and
     // detect disconnects quickly; metrics flow on a separate stream).
     let heartbeat_tx = tx.clone();
-    tokio::spawn(async move {
+    let heartbeat_task = tokio::spawn(async move {
         let mut tick = interval(heartbeat_interval);
         loop {
             tick.tick().await;
@@ -546,7 +546,7 @@ async fn run_agent_session(runtime: RuntimeContext) -> anyhow::Result<SessionExi
     // report_interval. Per-collector failures do not abort the loop.
     let metrics_tx = tx.clone();
     let metrics_runtime = runtime.clone();
-    tokio::spawn(async move {
+    let metrics_task = tokio::spawn(async move {
         let cfg = metrics_runtime.config.lock().await.clone();
         if let Err(e) = send_host_info(&metrics_tx, &cfg).await {
             tracing::warn!("host_info send failed: {}", e);
@@ -567,7 +567,7 @@ async fn run_agent_session(runtime: RuntimeContext) -> anyhow::Result<SessionExi
     let ip_report_tx = tx.clone();
     let ip_report_runtime = runtime.clone();
     let ip_report_interval = Duration::from_secs(initial.ip_report_interval_seconds.max(1));
-    tokio::spawn(async move {
+    let ip_report_task = tokio::spawn(async move {
         let mut tick = interval(ip_report_interval);
         let mut last_ipv4: Option<String> = None;
         loop {
@@ -605,70 +605,116 @@ async fn run_agent_session(runtime: RuntimeContext) -> anyhow::Result<SessionExi
         initial.report_interval_seconds.max(1)
     );
 
-    loop {
-        tokio::select! {
-            message = response_stream.message() => {
-                let Some(message) = message.map_err(|e| anyhow::anyhow!("gRPC recv: {e}"))? else {
-                    return Ok(SessionExit::StreamClosed);
-                };
-                match message.payload {
-                    Some(xlstatus_proto_gen::xlstatus::v1::server_message::Payload::ForceDisconnect(_)) => {
-                        tracing::info!("server requested force_disconnect, exiting");
-                        return Ok(SessionExit::Revoked);
-                    }
-                    Some(xlstatus_proto_gen::xlstatus::v1::server_message::Payload::ConfigUpdate(update)) => {
-                        if let Err(e) = apply_remote_config(&runtime, &update).await {
-                            tracing::warn!("config update failed: {}", e);
-                        } else {
-                            tracing::info!("remote config update applied");
+    let mut background_tasks = vec![heartbeat_task, metrics_task, ip_report_task];
+    let mut dispatched_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let outcome = async {
+        loop {
+            tokio::select! {
+                message = response_stream.message() => {
+                    let Some(message) = message.map_err(|e| anyhow::anyhow!("gRPC recv: {e}"))? else {
+                        return Ok(SessionExit::StreamClosed);
+                    };
+                    match message.payload {
+                        Some(xlstatus_proto_gen::xlstatus::v1::server_message::Payload::ForceDisconnect(_)) => {
+                            tracing::info!("server requested force_disconnect, exiting");
+                            return Ok(SessionExit::Revoked);
                         }
-                    }
-                    Some(xlstatus_proto_gen::xlstatus::v1::server_message::Payload::ForceUpdate(update)) => {
-                        let cfg = runtime.config.lock().await.clone();
-                        if cfg.disable_force_update {
-                            tracing::warn!("force update ignored because disable_force_update=true");
-                        } else if let Err(e) = record_force_update_request(&runtime, &update).await {
-                            tracing::warn!("force update record failed: {}", e);
-                        } else {
-                            tracing::info!("force update request recorded for version {}", update.version);
-                        }
-                    }
-                    Some(xlstatus_proto_gen::xlstatus::v1::server_message::Payload::Task(task)) => {
-                        // M5: server just dispatched a task. Execute
-                        // it inline and stream the result back over
-                        // the same session.
-                        let metrics_tx = tx.clone();
-                        let task_id = task.task_id.clone();
-                        let runtime = runtime.clone();
-                        tokio::spawn(async move {
-                            let result = run_server_task(runtime, task).await;
-                            let msg = xlstatus_proto_gen::xlstatus::v1::AgentMessage {
-                                payload: Some(xlstatus_proto_gen::xlstatus::v1::agent_message::Payload::TaskResult(result)),
-                            };
-                            if let Err(e) = metrics_tx.send(msg).await {
-                                tracing::warn!("task_result send failed: {}", e);
+                        Some(xlstatus_proto_gen::xlstatus::v1::server_message::Payload::ConfigUpdate(update)) => {
+                            if let Err(e) = apply_remote_config(&runtime, &update).await {
+                                tracing::warn!("config update failed: {}", e);
                             } else {
-                                tracing::info!("task {} completed", task_id);
+                                tracing::info!("remote config update applied");
                             }
-                        });
+                        }
+                        Some(xlstatus_proto_gen::xlstatus::v1::server_message::Payload::ForceUpdate(update)) => {
+                            let cfg = runtime.config.lock().await.clone();
+                            if cfg.disable_force_update {
+                                tracing::warn!("force update ignored because disable_force_update=true");
+                            } else if let Err(e) = record_force_update_request(&runtime, &update).await {
+                                tracing::warn!("force update record failed: {}", e);
+                            } else {
+                                tracing::info!("force update request recorded for version {}", update.version);
+                            }
+                        }
+                        Some(xlstatus_proto_gen::xlstatus::v1::server_message::Payload::Task(task)) => {
+                            // M5: server just dispatched a task. Execute
+                            // it inline and stream the result back over
+                            // the same session.
+                            let metrics_tx = tx.clone();
+                            let task_id = task.task_id.clone();
+                            let runtime = runtime.clone();
+                            dispatched_tasks.retain(|task| !task.is_finished());
+                            dispatched_tasks.push(tokio::spawn(async move {
+                                let result = run_server_task(runtime, task).await;
+                                let msg = xlstatus_proto_gen::xlstatus::v1::AgentMessage {
+                                    payload: Some(xlstatus_proto_gen::xlstatus::v1::agent_message::Payload::TaskResult(result)),
+                                };
+                                if let Err(e) = metrics_tx.send(msg).await {
+                                    tracing::warn!("task_result send failed: {}", e);
+                                } else {
+                                    tracing::info!("task {} completed", task_id);
+                                }
+                            }));
+                        }
+                        _ => tracing::debug!("received server message: {:?}", message.payload),
                     }
-                    _ => tracing::debug!("received server message: {:?}", message.payload),
+                }
+                frame = io_response_stream.message() => {
+                    let Some(frame) = frame.map_err(|e| anyhow::anyhow!("gRPC io recv: {e}"))? else {
+                        return Ok(SessionExit::StreamClosed);
+                    };
+                    handle_io_frame(
+                        &initial.agent_id,
+                        frame,
+                        terminal_sessions.clone(),
+                        nat_sessions.clone(),
+                        runtime.clone(),
+                        io_tx.clone(),
+                    ).await;
                 }
             }
-            frame = io_response_stream.message() => {
-                let Some(frame) = frame.map_err(|e| anyhow::anyhow!("gRPC io recv: {e}"))? else {
-                    return Ok(SessionExit::StreamClosed);
-                };
-                handle_io_frame(
-                    &initial.agent_id,
-                    frame,
-                    terminal_sessions.clone(),
-                    nat_sessions.clone(),
-                    runtime.clone(),
-                    io_tx.clone(),
-                ).await;
-            }
         }
+    }
+    .await;
+
+    abort_join_handles(&mut background_tasks).await;
+    abort_join_handles(&mut dispatched_tasks).await;
+    drop(response_stream);
+    drop(io_response_stream);
+    drop(tx);
+    drop(io_tx);
+    cleanup_agent_io_sessions(&terminal_sessions, &nat_sessions).await;
+    outcome
+}
+
+async fn abort_join_handles(tasks: &mut Vec<tokio::task::JoinHandle<()>>) {
+    let tasks = std::mem::take(tasks);
+    for task in &tasks {
+        task.abort();
+    }
+    for task in tasks {
+        let _ = task.await;
+    }
+}
+
+async fn cleanup_agent_io_sessions(
+    terminal_sessions: &TerminalSessionMap,
+    nat_sessions: &NatSessionMap,
+) {
+    let terminal_sessions = {
+        let mut sessions = terminal_sessions.lock().await;
+        std::mem::take(&mut *sessions)
+    };
+    for session in terminal_sessions.into_values() {
+        session.close();
+    }
+
+    let nat_sessions = {
+        let mut sessions = nat_sessions.lock().await;
+        std::mem::take(&mut *sessions)
+    };
+    for session in nat_sessions.into_values() {
+        session.reader_task.abort();
     }
 }
 
@@ -1802,6 +1848,9 @@ async fn run_http_probe_task(
         );
     }
     let client = reqwest::Client::builder()
+        // Keep the connection on the addresses validated above. Environment
+        // proxies would resolve and connect to the target independently.
+        .no_proxy()
         .timeout(std::time::Duration::from_secs(timeout))
         .redirect(reqwest::redirect::Policy::none())
         .danger_accept_invalid_certs(!spec.verify_tls)
@@ -2630,6 +2679,72 @@ fn read_private_key(config_path: &PathBuf) -> anyhow::Result<String> {
 mod tests {
     use super::*;
 
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn session_task_cleanup_aborts_tracked_work() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _drop_signal = DropSignal(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+        let mut tasks = vec![task];
+
+        abort_join_handles(&mut tasks).await;
+
+        assert!(tasks.is_empty());
+        tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("aborted session task should be dropped")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_cleanup_breaks_nat_task_map_cycle() {
+        let terminal_sessions: TerminalSessionMap =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let nat_sessions: NatSessionMap = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let (writer_tx, mut writer_rx) = mpsc::channel(1);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let task_sessions = nat_sessions.clone();
+        let reader_task = tokio::spawn(async move {
+            let _drop_signal = DropSignal(Some(dropped_tx));
+            let _held_sessions = task_sessions;
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+        nat_sessions.lock().await.insert(
+            "stream-1".to_string(),
+            NatSocketSession {
+                writer_tx,
+                reader_task,
+            },
+        );
+
+        cleanup_agent_io_sessions(&terminal_sessions, &nat_sessions).await;
+
+        assert!(terminal_sessions.lock().await.is_empty());
+        assert!(nat_sessions.lock().await.is_empty());
+        tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("aborted NAT reader task should be dropped")
+            .unwrap();
+        assert!(writer_rx.recv().await.is_none());
+    }
+
     fn test_agent_config() -> AgentConfig {
         AgentConfig {
             server: "http://dashboard.example".to_string(),
@@ -2696,9 +2811,7 @@ mod tests {
         let script = include_str!("../../../deploy/install-agent.sh");
 
         assert!(script.contains("--token-stdin"));
-        assert!(
-            script.contains("printf '%s' \"$ENROLLMENT_TOKEN\" | /usr/local/bin/xlstatus-agent")
-        );
+        assert!(script.contains("printf '%s' \"$ENROLLMENT_TOKEN\" | \"$BINARY_TARGET\""));
         assert!(!script.contains("--token \"$ENROLLMENT_TOKEN\""));
     }
 

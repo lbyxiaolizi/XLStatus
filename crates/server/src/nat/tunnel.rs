@@ -308,64 +308,59 @@ impl NatTunnelManager {
             bytes_sent: Arc::new(RwLock::new(0)),
             bytes_received: Arc::new(RwLock::new(0)),
         };
-        self.active_tunnels
-            .write()
-            .await
-            .insert(tunnel_id.clone(), tunnel);
+        let bytes_sent = tunnel.bytes_sent.clone();
+        let bytes_received = tunnel.bytes_received.clone();
+        {
+            let mut active_tunnels = self.active_tunnels.write().await;
+            reserve_active_tunnel(
+                &mut active_tunnels,
+                tunnel,
+                nat_max_active_tunnels(),
+                mapping.max_active_tunnels.map(|limit| limit as usize),
+            )?;
+        }
 
-        let mut inbound = self
-            .io_registry
-            .subscribe_stream(tunnel_id.clone(), agent_id)
-            .await;
-        self.io_registry
-            .send_to_agent(
-                &agent_id,
-                IoFrame {
-                    stream_id: tunnel_id.clone(),
-                    sequence: 1,
-                    agent_id: mapping.agent_id.clone(),
-                    payload: Some(io_frame::Payload::Data(IoData {
-                        data: serde_json::to_vec(&NatTunnelControlMessage::Open {
-                            local_host: mapping.local_host.clone(),
-                            local_port: mapping.local_port,
-                        })
-                        .unwrap_or_default(),
-                    })),
-                },
+        // Everything after the reservation lives inside this result block so
+        // the cleanup below runs for open-send failures as well as bridge exits.
+        let result = async {
+            let mut inbound = self
+                .io_registry
+                .subscribe_stream(tunnel_id.clone(), agent_id)
+                .await;
+            self.io_registry
+                .send_to_agent(
+                    &agent_id,
+                    IoFrame {
+                        stream_id: tunnel_id.clone(),
+                        sequence: 1,
+                        agent_id: mapping.agent_id.clone(),
+                        payload: Some(io_frame::Payload::Data(IoData {
+                            data: serde_json::to_vec(&NatTunnelControlMessage::Open {
+                                local_host: mapping.local_host.clone(),
+                                local_port: mapping.local_port,
+                            })
+                            .unwrap_or_default(),
+                        })),
+                    },
+                )
+                .await
+                .map_err(|e| anyhow!("failed to send NAT open request: {}", e))?;
+
+            Self::bridge_over_iostream(
+                public_stream,
+                agent_id,
+                mapping.agent_id.clone(),
+                tunnel_id.clone(),
+                self.io_registry.clone(),
+                &mut inbound,
+                bytes_sent,
+                bytes_received,
+                mapping.idle_timeout_seconds,
+                mapping.max_bytes_per_tunnel,
+                mapping.max_bandwidth_bytes_per_second,
             )
             .await
-            .map_err(|e| anyhow!("failed to send NAT open request: {}", e))?;
-
-        let bytes_sent = self
-            .active_tunnels
-            .read()
-            .await
-            .get(&tunnel_id)
-            .expect("active tunnel missing")
-            .bytes_sent
-            .clone();
-        let bytes_received = self
-            .active_tunnels
-            .read()
-            .await
-            .get(&tunnel_id)
-            .expect("active tunnel missing")
-            .bytes_received
-            .clone();
-
-        let result = Self::bridge_over_iostream(
-            public_stream,
-            agent_id,
-            mapping.agent_id.clone(),
-            tunnel_id.clone(),
-            self.io_registry.clone(),
-            &mut inbound,
-            bytes_sent,
-            bytes_received,
-            mapping.idle_timeout_seconds,
-            mapping.max_bytes_per_tunnel,
-            mapping.max_bandwidth_bytes_per_second,
-        )
+        }
         .await;
 
         self.io_registry.unsubscribe_stream(&tunnel_id).await;
@@ -677,6 +672,31 @@ enum NatBridgeEvent {
     IdleTimeout,
 }
 
+fn reserve_active_tunnel(
+    active_tunnels: &mut HashMap<String, ActiveTunnel>,
+    tunnel: ActiveTunnel,
+    global_limit: usize,
+    mapping_limit: Option<usize>,
+) -> Result<()> {
+    if active_tunnels.len() >= global_limit {
+        return Err(anyhow!("active tunnel limit reached"));
+    }
+    if let Some(limit) = mapping_limit {
+        let mapping_count = active_tunnels
+            .values()
+            .filter(|active| active.mapping_id == tunnel.mapping_id)
+            .count();
+        if mapping_count >= limit {
+            return Err(anyhow!("mapping active tunnel limit reached"));
+        }
+    }
+    if active_tunnels.contains_key(&tunnel.tunnel_id) {
+        return Err(anyhow!("duplicate tunnel id"));
+    }
+    active_tunnels.insert(tunnel.tunnel_id.clone(), tunnel);
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct NatUsageWindow {
     window_start: DateTime<Utc>,
@@ -805,14 +825,18 @@ mod tests {
     use super::*;
     use crate::nat::policy::{nat_public_port_allowed, nat_source_entry_valid};
 
+    static NAT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn nat_listener_binds_loopback_by_default() {
+        let _lock = NAT_ENV_LOCK.lock().unwrap();
         std::env::remove_var("XLSTATUS_NAT_BIND_HOST");
         assert_eq!(nat_bind_addr(18080), "127.0.0.1:18080");
     }
 
     #[test]
     fn nat_listener_bind_host_can_be_overridden() {
+        let _lock = NAT_ENV_LOCK.lock().unwrap();
         std::env::set_var("XLSTATUS_NAT_BIND_HOST", "0.0.0.0");
         assert_eq!(nat_bind_addr(18080), "0.0.0.0:18080");
         std::env::remove_var("XLSTATUS_NAT_BIND_HOST");
@@ -820,6 +844,7 @@ mod tests {
 
     #[test]
     fn nat_source_allowlist_defaults_to_loopback() {
+        let _lock = NAT_ENV_LOCK.lock().unwrap();
         std::env::remove_var("XLSTATUS_NAT_ALLOWED_SOURCES");
         assert!(nat_source_allowed("127.0.0.1:12345".parse().unwrap()));
         assert!(nat_source_allowed("[::1]:12345".parse().unwrap()));
@@ -828,6 +853,7 @@ mod tests {
 
     #[test]
     fn nat_source_allowlist_supports_cidrs() {
+        let _lock = NAT_ENV_LOCK.lock().unwrap();
         std::env::set_var("XLSTATUS_NAT_ALLOWED_SOURCES", "203.0.113.0/24");
         assert!(nat_source_allowed("203.0.113.10:12345".parse().unwrap()));
         assert!(!nat_source_allowed("198.51.100.10:12345".parse().unwrap()));
@@ -860,6 +886,7 @@ mod tests {
 
     #[test]
     fn nat_public_ports_reject_privileged_ports_by_default() {
+        let _lock = NAT_ENV_LOCK.lock().unwrap();
         std::env::remove_var("XLSTATUS_NAT_PUBLIC_PORT_MIN");
         assert!(!nat_public_port_allowed(80));
         assert!(nat_public_port_allowed(1024));
@@ -880,6 +907,80 @@ mod tests {
     #[test]
     fn test_tunnel_manager_creation() {
         // Placeholder: integration covered by verify scripts.
+    }
+
+    #[test]
+    fn active_tunnel_reservation_enforces_mapping_and_global_limits_atomically() {
+        let mut active = HashMap::new();
+        reserve_active_tunnel(
+            &mut active,
+            test_active_tunnel("one", "mapping-1"),
+            2,
+            Some(1),
+        )
+        .unwrap();
+
+        let mapping_error = reserve_active_tunnel(
+            &mut active,
+            test_active_tunnel("two", "mapping-1"),
+            2,
+            Some(1),
+        )
+        .unwrap_err();
+        assert!(mapping_error.to_string().contains("mapping active"));
+
+        reserve_active_tunnel(&mut active, test_active_tunnel("two", "mapping-2"), 2, None)
+            .unwrap();
+        let global_error = reserve_active_tunnel(
+            &mut active,
+            test_active_tunnel("three", "mapping-3"),
+            2,
+            None,
+        )
+        .unwrap_err();
+        assert!(global_error.to_string().contains("active tunnel limit"));
+        assert_eq!(active.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn nat_open_send_failure_releases_tunnel_and_subscriber() {
+        let db = Db::connect("sqlite::memory:", true).await.unwrap();
+        let registry = IoRegistry::new();
+        let agent_id = xlstatus_shared::AgentId(uuid::Uuid::now_v7());
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        assert!(registry.register_agent(agent_id, tx).await);
+        let manager = NatTunnelManager::new(db, registry.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, peer_addr) = listener.accept().await.unwrap();
+
+        let mut mapping = test_mapping();
+        mapping.agent_id = agent_id.0.to_string();
+        let error = manager
+            .handle_connection(server, mapping, peer_addr, None)
+            .await
+            .unwrap_err();
+        drop(client);
+
+        assert!(error
+            .to_string()
+            .contains("failed to send NAT open request"));
+        assert_eq!(manager.active_tunnel_count().await, 0);
+        assert_eq!(registry.subscriber_count().await, 0);
+    }
+
+    fn test_active_tunnel(tunnel_id: &str, mapping_id: &str) -> ActiveTunnel {
+        ActiveTunnel {
+            tunnel_id: tunnel_id.into(),
+            mapping_id: mapping_id.into(),
+            agent_id: "agent-1".into(),
+            created_at: Utc::now(),
+            bytes_sent: Arc::new(RwLock::new(0)),
+            bytes_received: Arc::new(RwLock::new(0)),
+        }
     }
 
     fn test_mapping() -> NatMapping {

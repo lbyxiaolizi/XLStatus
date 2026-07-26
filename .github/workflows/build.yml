@@ -9,7 +9,7 @@ on:
   pull_request:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   rust:
@@ -19,16 +19,52 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler sqlite3 binutils
+      - name: Check shell scripts
+        run: find deploy scripts test-run -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
+      - name: Test scoped process cleanup
+        run: bash test-run/verify-process-cleanup-safety.sh
+      - name: Test installer upgrade safety
+        run: bash test-run/verify-install-upgrade-safety.sh
+      - name: Validate Docker Compose configurations
+        env:
+          SESSION_SECRET: ci-only-session-secret-at-least-32-bytes
+          SECRET_ENCRYPTION_KEY: ci-only-encryption-key-at-least-32-bytes
+          POSTGRES_PASSWORD: ci-only-postgres-password
+        run: |
+          docker compose -f docker-compose.yml config --quiet
+          docker compose -f docker-compose.pg.yml config --quiet
+          docker compose -f docker-compose.simple.yml config --quiet
+      - name: Test database import tooling
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+      - name: Verify release version metadata
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_version="${GITHUB_REF_NAME#v}"
+          if [[ "$release_version" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            manifest_version="${release_version}.0"
+          else
+            manifest_version="$release_version"
+          fi
+          cargo metadata --locked --no-deps --format-version 1 \
+            | jq -e --arg version "$manifest_version" 'all(.packages[]; .version == $version)'
+          jq -e --arg version "$manifest_version" '.version == $version' web/package.json
+          expected_install='VERSION="${VERSION:-'"$GITHUB_REF_NAME"'}"'
+          grep -F "$expected_install" deploy/install.sh
+          grep -F "$expected_install" deploy/install-agent.sh
+          grep -F "DEFAULT_AGENT_INSTALL_VERSION: &str = \"$GITHUB_REF_NAME\"" crates/server/src/main.rs
+          grep -F "DEFAULT_AGENT_VERSION = \"$GITHUB_REF_NAME\"" 'web/app/(dashboard)/settings/page.tsx'
       - name: Check formatting
         run: cargo fmt --check
       - name: Check workspace
-        run: cargo check --workspace
+        run: cargo check --workspace --locked
       - name: Lint workspace
-        run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::too_many_arguments -A clippy::type_complexity
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings -A clippy::too_many_arguments -A clippy::type_complexity
       - name: Test workspace
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
   web:
     name: Web build
@@ -53,6 +89,10 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Lint
         run: pnpm lint
+      - name: Test frontend units
+        run: pnpm test:unit
+      - name: Typecheck
+        run: pnpm typecheck
       - name: Build
         run: NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm build
 
@@ -187,9 +227,9 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ matrix.use_zigbuild }}" = "true" ]; then
-            cargo zigbuild --release --target "${{ matrix.target }}" --bin xlstatus-server --bin xlstatus-agent
+            cargo zigbuild --locked --release --target "${{ matrix.target }}" --bin xlstatus-server --bin xlstatus-agent
           else
-            cargo build --release --target "${{ matrix.target }}" --bin xlstatus-server --bin xlstatus-agent
+            cargo build --locked --release --target "${{ matrix.target }}" --bin xlstatus-server --bin xlstatus-agent
           fi
       - name: Build release binaries
         if: runner.os == 'Windows'
@@ -201,7 +241,7 @@ jobs:
             throw "Visual Studio C++ build tools not found"
           }
           $devCmd = Join-Path $vsInstall "Common7\Tools\VsDevCmd.bat"
-          cmd /c "`"$devCmd`" -arch=${{ matrix.msvc_arch }} && cargo build --release --target `"${{ matrix.target }}`" --bin xlstatus-server --bin xlstatus-agent"
+          cmd /c "`"$devCmd`" -arch=${{ matrix.msvc_arch }} && cargo build --locked --release --target `"${{ matrix.target }}`" --bin xlstatus-server --bin xlstatus-agent"
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }
@@ -249,6 +289,8 @@ jobs:
     name: Publish GitHub release
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
     needs:
       - release-binaries
       - web

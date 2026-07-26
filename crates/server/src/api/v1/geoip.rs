@@ -17,12 +17,16 @@ use axum::{
     Json,
 };
 use chrono::Utc;
+use futures::{stream, StreamExt};
 use maxminddb::{geoip2, Reader};
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 use reqwest::header::{HeaderValue, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use xlstatus_shared::AgentId;
 
 const GEOIP_MMDB_MAX_BYTES: usize = 128 * 1024 * 1024;
@@ -35,6 +39,18 @@ const GEOIP_RAW_MAX_STRING_BYTES: usize = 1024;
 const GEOIP_RAW_MAX_ARRAY_ITEMS: usize = 16;
 const GEOIP_RAW_MAX_OBJECT_FIELDS: usize = 32;
 const GEOIP_RAW_MAX_DEPTH: usize = 4;
+const GEOIP_LIST_LOOKUP_MAX_CONCURRENCY: usize = 8;
+const GEOIP_LOCATION_CACHE_MAX_ENTRIES: usize = 2048;
+const GEOIP_LOCATION_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
+const GEOIP_LOCATION_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(60);
+
+struct CachedGeoLocation {
+    location: Option<AgentGeoLocation>,
+    expires_at: Instant,
+}
+
+static GEOIP_LOCATION_CACHE: Lazy<Mutex<HashMap<String, CachedGeoLocation>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Deserialize)]
 pub struct GeoIpTestRequest {
@@ -135,21 +151,119 @@ pub async fn lookup_agent_geo_location(
     db: &DatabaseBackend,
     agent_id: AgentId,
 ) -> Option<AgentGeoLocation> {
-    let snapshot = match latest_agent_ip(db, agent_id).await {
-        Ok(snapshot) => snapshot,
+    lookup_agent_geo_locations(db, &[agent_id])
+        .await
+        .remove(&agent_id)
+}
+
+pub async fn lookup_agent_geo_locations(
+    db: &DatabaseBackend,
+    agent_ids: &[AgentId],
+) -> HashMap<AgentId, AgentGeoLocation> {
+    if agent_ids.is_empty() {
+        return HashMap::new();
+    }
+    let snapshots = match latest_agent_ips(db, agent_ids).await {
+        Ok(snapshots) => snapshots,
         Err(err) => {
-            tracing::debug!("agent GeoIP snapshot lookup failed: {}", err);
-            return None;
+            tracing::debug!("agent GeoIP batch snapshot lookup failed: {err}");
+            return HashMap::new();
         }
     };
-    let ip = snapshot.ipv4.or(snapshot.ipv6)?;
-    let lookup = match lookup_ip_with_provider(db, &ip, None, None).await {
-        Ok(lookup) => lookup,
+    if snapshots.is_empty() {
+        return HashMap::new();
+    }
+
+    let provider = match settings::geoip_provider(db).await {
+        Ok(provider) => provider,
         Err(err) => {
-            tracing::debug!("agent GeoIP lookup failed for {}: {:?}", agent_id.0, err);
-            return None;
+            tracing::debug!("agent GeoIP provider lookup failed: {err:?}");
+            return HashMap::new();
         }
     };
+    let token = if provider == "ipinfo" {
+        match settings::geoip_ipinfo_token(db).await {
+            Ok(token) => token,
+            Err(err) => {
+                tracing::debug!("agent GeoIP token lookup failed: {err:?}");
+                return HashMap::new();
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut agents_by_ip: HashMap<String, Vec<AgentId>> = HashMap::new();
+    for (agent_id, snapshot) in snapshots {
+        if let Some(ip) = snapshot.ipv4.or(snapshot.ipv6) {
+            agents_by_ip.entry(ip).or_default().push(agent_id);
+        }
+    }
+
+    let mut locations_by_ip = HashMap::new();
+    let mut uncached_ips = Vec::new();
+    for ip in agents_by_ip.keys() {
+        match read_cached_geo_location(&provider, ip) {
+            Some(location) => {
+                locations_by_ip.insert(ip.clone(), location);
+            }
+            None => uncached_ips.push(ip.clone()),
+        }
+    }
+
+    if provider == "mmdb" {
+        match Reader::open_readfile(mmdb_path()) {
+            Ok(reader) => {
+                for ip in uncached_ips {
+                    let location = lookup_mmdb_with_reader(&ip, &reader)
+                        .ok()
+                        .and_then(agent_geo_location_from_lookup);
+                    cache_geo_location(&provider, &ip, location.clone());
+                    locations_by_ip.insert(ip, location);
+                }
+            }
+            Err(err) => {
+                tracing::debug!("agent GeoIP MMDB is unavailable: {err}");
+                for ip in uncached_ips {
+                    cache_geo_location(&provider, &ip, None);
+                    locations_by_ip.insert(ip, None);
+                }
+            }
+        }
+    } else {
+        let lookups = stream::iter(uncached_ips.into_iter().map(|ip| {
+            let provider = provider.clone();
+            let token = token.clone();
+            async move {
+                let location = lookup_ip_for_provider(&ip, &provider, token.as_deref())
+                    .await
+                    .ok()
+                    .and_then(agent_geo_location_from_lookup);
+                (ip, location)
+            }
+        }))
+        .buffer_unordered(GEOIP_LIST_LOOKUP_MAX_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+        for (ip, location) in lookups {
+            cache_geo_location(&provider, &ip, location.clone());
+            locations_by_ip.insert(ip, location);
+        }
+    }
+
+    let mut locations = HashMap::new();
+    for (ip, agent_ids) in agents_by_ip {
+        let Some(Some(location)) = locations_by_ip.get(&ip) else {
+            continue;
+        };
+        for agent_id in agent_ids {
+            locations.insert(agent_id, location.clone());
+        }
+    }
+    locations
+}
+
+fn agent_geo_location_from_lookup(lookup: GeoIpLookupResponse) -> Option<AgentGeoLocation> {
     if lookup.country.is_none()
         && lookup.region.is_none()
         && lookup.city.is_none()
@@ -169,6 +283,45 @@ pub async fn lookup_agent_geo_location(
         longitude: lookup.longitude,
         timezone: lookup.timezone,
     })
+}
+
+fn geo_location_cache_key(provider: &str, ip: &str) -> String {
+    format!("{provider}\0{ip}")
+}
+
+fn read_cached_geo_location(provider: &str, ip: &str) -> Option<Option<AgentGeoLocation>> {
+    let key = geo_location_cache_key(provider, ip);
+    let now = Instant::now();
+    let mut cache = GEOIP_LOCATION_CACHE.lock();
+    let entry = cache.get(&key)?;
+    if entry.expires_at <= now {
+        cache.remove(&key);
+        return None;
+    }
+    Some(entry.location.clone())
+}
+
+fn cache_geo_location(provider: &str, ip: &str, location: Option<AgentGeoLocation>) {
+    let now = Instant::now();
+    let mut cache = GEOIP_LOCATION_CACHE.lock();
+    if cache.len() >= GEOIP_LOCATION_CACHE_MAX_ENTRIES {
+        cache.retain(|_, entry| entry.expires_at > now);
+        if cache.len() >= GEOIP_LOCATION_CACHE_MAX_ENTRIES {
+            cache.clear();
+        }
+    }
+    let ttl = if location.is_some() {
+        GEOIP_LOCATION_CACHE_TTL
+    } else {
+        GEOIP_LOCATION_NEGATIVE_CACHE_TTL
+    };
+    cache.insert(
+        geo_location_cache_key(provider, ip),
+        CachedGeoLocation {
+            location,
+            expires_at: now + ttl,
+        },
+    );
 }
 
 pub async fn geoip_status(
@@ -342,9 +495,17 @@ async fn lookup_ip_with_provider(
         None
     };
     let ipinfo_token = token.or(configured_ipinfo_token.as_deref());
-    match provider.as_str() {
+    lookup_ip_for_provider(ip, &provider, ipinfo_token).await
+}
+
+async fn lookup_ip_for_provider(
+    ip: &str,
+    provider: &str,
+    ipinfo_token: Option<&str>,
+) -> Result<GeoIpLookupResponse, AppError> {
+    match provider {
         "empty" => Ok(GeoIpLookupResponse {
-            provider,
+            provider: provider.to_string(),
             ip: ip.to_string(),
             country: None,
             region: None,
@@ -463,6 +624,13 @@ fn lookup_mmdb(ip: &str) -> Result<GeoIpLookupResponse, AppError> {
             path.to_string_lossy()
         ))
     })?;
+    lookup_mmdb_with_reader(ip, &reader)
+}
+
+fn lookup_mmdb_with_reader(
+    ip: &str,
+    reader: &Reader<Vec<u8>>,
+) -> Result<GeoIpLookupResponse, AppError> {
     let ip_addr = ip
         .parse::<std::net::IpAddr>()
         .map_err(|e| AppError::BadRequest(format!("ip is invalid: {e}")))?;
@@ -633,6 +801,7 @@ fn install_mmdb_bytes(bytes: &[u8]) -> Result<GeoIpMmdbStatus, AppError> {
         .map_err(|e| AppError::BadRequest(format!("failed to write MMDB temp file: {e}")))?;
     std::fs::rename(&temp_path, &path)
         .map_err(|e| AppError::BadRequest(format!("failed to install MMDB file: {e}")))?;
+    GEOIP_LOCATION_CACHE.lock().clear();
     Ok(read_mmdb_status())
 }
 
@@ -746,6 +915,64 @@ async fn latest_agent_ip(
                 }))
         }
     }
+}
+
+async fn latest_agent_ips(
+    db: &DatabaseBackend,
+    agent_ids: &[AgentId],
+) -> anyhow::Result<HashMap<AgentId, AgentIpSnapshot>> {
+    if agent_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = match db {
+        DatabaseBackend::Sqlite(pool) => {
+            let placeholders = std::iter::repeat_n("?", agent_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                r#"
+                SELECT agent_id, new_ipv4, new_ipv6
+                FROM (
+                    SELECT agent_id, new_ipv4, new_ipv6,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY agent_id
+                               ORDER BY created_at DESC, id DESC
+                           ) AS row_number
+                    FROM agent_ip_events
+                    WHERE agent_id IN ({placeholders})
+                ) ranked
+                WHERE row_number = 1
+                "#
+            );
+            let mut query = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(&sql);
+            for agent_id in agent_ids {
+                query = query.bind(agent_id.0.to_string());
+            }
+            query.fetch_all(pool).await?
+        }
+        DatabaseBackend::Postgres(pool) => {
+            let ids = agent_ids.iter().map(|id| id.0).collect::<Vec<_>>();
+            sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+                r#"
+                SELECT DISTINCT ON (agent_id)
+                       agent_id::text AS agent_id, new_ipv4, new_ipv6
+                FROM agent_ip_events
+                WHERE agent_id = ANY($1::uuid[])
+                ORDER BY agent_id, created_at DESC, id DESC
+                "#,
+            )
+            .bind(&ids)
+            .fetch_all(pool)
+            .await?
+        }
+    };
+
+    let mut snapshots = HashMap::with_capacity(rows.len());
+    for (agent_id, ipv4, ipv6) in rows {
+        let agent_id = AgentId(uuid::Uuid::parse_str(&agent_id)?);
+        snapshots.insert(agent_id, AgentIpSnapshot { ipv4, ipv6 });
+    }
+    Ok(snapshots)
 }
 
 async fn insert_agent_ip_event(
@@ -1453,6 +1680,58 @@ mod tests {
         assert_eq!(channels[0].id, owner_notification);
     }
 
+    #[tokio::test]
+    async fn latest_agent_ips_returns_one_latest_row_per_agent() {
+        let db = test_db().await;
+        let owner = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let first = AgentId(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000101").unwrap());
+        let second =
+            AgentId(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000102").unwrap());
+        seed_user(&db, owner, "owner").await;
+        seed_agent(&db, first, owner, "first").await;
+        seed_agent(&db, second, owner, "second").await;
+
+        let DatabaseBackend::Sqlite(pool) = &db else {
+            unreachable!();
+        };
+        for (id, agent_id, ipv4, created_at) in [
+            (
+                "00000000-0000-0000-0000-000000001001",
+                first,
+                "192.0.2.1",
+                "2026-01-01T00:00:00Z",
+            ),
+            (
+                "00000000-0000-0000-0000-000000001002",
+                first,
+                "192.0.2.2",
+                "2026-01-02T00:00:00Z",
+            ),
+            (
+                "00000000-0000-0000-0000-000000001003",
+                second,
+                "198.51.100.1",
+                "2026-01-01T00:00:00Z",
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO agent_ip_events (id, agent_id, new_ipv4, created_at) VALUES (?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(agent_id.0.to_string())
+            .bind(ipv4)
+            .bind(created_at)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        let snapshots = latest_agent_ips(&db, &[first, second]).await.unwrap();
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[&first].ipv4.as_deref(), Some("192.0.2.2"));
+        assert_eq!(snapshots[&second].ipv4.as_deref(), Some("198.51.100.1"));
+    }
+
     fn auth_session(auth_kind: AuthKind) -> AuthSession {
         auth_session_for(UserId(uuid::Uuid::from_bytes([1; 16])), auth_kind)
     }
@@ -1503,6 +1782,21 @@ mod tests {
         )
         .bind(id.to_string())
         .bind(username)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_agent(db: &DatabaseBackend, id: AgentId, owner: uuid::Uuid, name: &str) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO agents (id, name, public_key, owner_user_id, created_at, updated_at) VALUES (?, ?, 'pk', ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id.0.to_string())
+        .bind(name)
+        .bind(owner.to_string())
         .execute(pool)
         .await
         .unwrap();

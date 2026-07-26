@@ -34,10 +34,11 @@ docker compose -f docker-compose.pg.yml up -d
 curl -fsS http://localhost:8080/healthz
 ```
 
-Docker Compose 默认把 Agent gRPC `50051` 发布到宿主所有地址，便于远端
-Agent 直接接入。HTTP API `8080` 和 Web UI `3000` 仍只发布到宿主
-`127.0.0.1`，生产环境建议继续通过 Nginx、Caddy 或其他反向代理对外提供
-HTTPS 页面/API。
+Docker Compose 默认只把 Agent gRPC `50051` 发布到宿主 `127.0.0.1`。
+远端 Agent 需要直接接入时，仅应在配置 gRPC TLS/mTLS 或可信 VPN 后，在
+`.env` 设置 `XLSTATUS_GRPC_PUBLISH_ADDRESS=0.0.0.0`。HTTP API `8080` 和 Web
+UI `3000` 也只发布到宿主 `127.0.0.1`，生产环境建议继续通过 Nginx、Caddy
+或其他反向代理对外提供 HTTPS 页面/API。
 
 PostgreSQL Compose 默认只把数据库端口发布到宿主 `127.0.0.1:5432`，供本机调试和备份使用；不要把 `5432` 直接发布到公网。需要远端维护数据库时，优先通过 SSH tunnel、VPN 或受控防火墙访问。
 Compose 会把 `.secrets/xlstatus_seed_admin_password` 挂载为 Docker secret，并通过 `XLSTATUS_SEED_ADMIN_PASSWORD_FILE` 让 Server 读取；不要把首次管理员密码写进 `.env` 或 Compose 环境变量。
@@ -124,10 +125,10 @@ https://github.com/lbyxiaolizi/XLStatus/releases/download/<VERSION>/xlstatus-age
 
 ## systemd 安装 Server
 
-Release 安装脚本默认下载 `v0.1` 的 Linux 二进制，并按当前机器选择 `x86_64`、`arm64` 或 `i386`：
+Release 安装脚本默认下载 `v0.2` 的 Linux 二进制，并按当前机器选择 `x86_64`、`arm64` 或 `i386`：
 
 ```bash
-curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1/install-server.sh | sudo bash
+curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.2/install-server.sh | sudo VERSION=v0.2 bash
 ```
 
 如果需要安装本地构建产物：
@@ -151,9 +152,9 @@ sudo bash deploy/install.sh
 
 ```bash
 sudo INTERACTIVE=false \
-  VERSION=v0.1 \
+  VERSION=v0.2 \
   HTTP_BIND=127.0.0.1:8080 \
-  GRPC_BIND=0.0.0.0:50051 \
+  GRPC_BIND=127.0.0.1:50051 \
   DATABASE_URL=sqlite:///var/lib/xlstatus/xlstatus.db?mode=rwc \
   DATABASE_CREATE_IF_MISSING=true \
   CORS_ALLOWED_ORIGINS=https://status.example.com \
@@ -177,28 +178,31 @@ curl -fsS http://localhost:8080/healthz
 ```
 
 脚本会把 `CORS_ALLOWED_ORIGINS` 写入 TOML 的 `server.cors_allowed_origins`，启动失败时会打印最近的 systemd 日志。
+新安装的 gRPC 默认只监听 `127.0.0.1:50051`。远端 Agent 需要直连时，必须显式设置 `GRPC_BIND=0.0.0.0:50051`，并同时配置 gRPC TLS/mTLS 或通过可信 VPN 暴露端口。
 如果提供 `ADMIN_PASSWORD`，安装脚本只会把首次管理员初始化密码写入
 root-only 的 `/run/xlstatus/bootstrap.env` 临时文件；服务通过 `/healthz` 后脚本会删除该文件并重启一次，避免密码长期保存在 systemd unit 或运行中进程环境里。
 如果设置 `START_SERVICE=false`，脚本不会持久保存 `ADMIN_PASSWORD`；需要首次手动启动时再通过受控环境传入初始化密码。
+重复运行脚本升级二进制时，已有 `CONFIG_FILE` 和 systemd unit 默认会完整保留，避免轮换 `SESSION_SECRET` 或 `SECRET_ENCRYPTION_KEY` 后造成会话失效和历史密文不可读。只有明确需要重建配置时才设置 `RECONFIGURE=true`，并先备份数据库与原配置。二进制会先下载到同目录临时文件，验证格式后再原子替换；运行中的服务会通过 `restart` 加载新版本。如果重启或健康检查失败，脚本会恢复旧二进制、配置和 unit，并重新启动旧服务。
 
 ## 自定义安装参数
 
 常用变量：
 
 ```bash
-VERSION=v0.1
+VERSION=v0.2
 INSTALL_DIR=/opt/xlstatus
 DATA_DIR=/var/lib/xlstatus
 BINARY_PATH=target/release/xlstatus-server
 CONFIG_FILE=/etc/xlstatus/server.toml
 HTTP_BIND=127.0.0.1:8080
-GRPC_BIND=0.0.0.0:50051
+GRPC_BIND=127.0.0.1:50051
 DATABASE_URL=sqlite:///var/lib/xlstatus/xlstatus.db?mode=rwc
 DATABASE_CREATE_IF_MISSING=true
 CORS_ALLOWED_ORIGINS=https://status.example.com
 SESSION_SECRET="$(openssl rand -hex 32)"
 ADMIN_USERNAME=admin
 ADMIN_PASSWORD=replace-with-a-strong-initial-password
+RECONFIGURE=false
 ```
 
 安装脚本会生成完整 `server.toml`。如果要走 `CONFIG_FILE` 模式，不要在 systemd unit 里额外设置 `DATABASE_URL`。
@@ -226,7 +230,7 @@ psql 'postgresql://xlstatus:change-this-password@localhost:5432/xlstatus' -c 'se
 ```bash
 DATABASE_URL='postgresql://xlstatus:change-this-password@localhost:5432/xlstatus' \
 HTTP_BIND="127.0.0.1:8080" \
-GRPC_BIND="0.0.0.0:50051" \
+GRPC_BIND="127.0.0.1:50051" \
 CORS_ALLOWED_ORIGINS="http://localhost:3000,http://127.0.0.1:3000" \
 SESSION_SECRET="$(openssl rand -hex 32)" \
 XLSTATUS_SEED_ADMIN_USERNAME="admin" \
@@ -249,7 +253,7 @@ sudo BINARY_PATH=target/release/xlstatus-server \
 从既有 SQLite 实例迁移到 PostgreSQL 时，先让同版本 Server 在目标
 PostgreSQL 上初始化 schema，再使用
 `scripts/import_sqlite_to_postgres.py` 导入 SQLite 备份。完整步骤、备份要求和
-`--truncate` 注意事项见 [运维手册](./operations.md#sqlite-到-postgresql-迁移)。
+原子回滚、`--truncate` 注意事项见 [运维手册](./operations.md#sqlite-到-postgresql-迁移)。
 
 ## Web UI 部署
 
@@ -287,9 +291,10 @@ cors_allowed_origins = ["https://status.example.com"]
 ```bash
 sudo SERVER_URL=http://dashboard.example.com:8080 \
   GRPC_SERVER=http://dashboard.example.com:50051 \
+  VERSION=v0.2 \
   ENROLLMENT_TOKEN=xle_... \
   AGENT_NAME="$(hostname)" \
-  bash -c 'curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1/install-agent.sh | bash'
+  bash -c 'curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.2/install-agent.sh | bash'
 ```
 
 如果需要安装本地构建的 Agent：
@@ -325,16 +330,18 @@ GET /api/v1/agents/install.sh
 手动使用带参数链接：
 
 ```bash
-curl -fsSL 'http://dashboard.example.com:8080/api/v1/agents/install.sh?server_url=http%3A%2F%2Fdashboard.example.com%3A8080&grpc_server=http%3A%2F%2Fdashboard.example.com%3A50051&enrollment_token=xle_...&agent_name=%24(hostname)&version=v0.1' | sudo bash
+curl -fsSL 'http://dashboard.example.com:8080/api/v1/agents/install.sh?server_url=http%3A%2F%2Fdashboard.example.com%3A8080&grpc_server=http%3A%2F%2Fdashboard.example.com%3A50051&enrollment_token=xle_...&agent_name=%24(hostname)&version=v0.2' | sudo bash
 ```
 
 这个 bootstrap 会下载并执行：
 
 ```text
-https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1/install-agent.sh
+https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.2/install-agent.sh
 ```
 
 `enrollment_token` 会出现在安装链接和 bootstrap 脚本内容里，应只给受信任的主机使用；令牌过期或使用后需要重新生成。Release 安装脚本会通过 stdin 把 token 交给 `xlstatus-agent enroll`，避免 token 出现在 Agent 子进程命令行参数中。
+
+Agent 安装器会先在目标目录暂存 binary、enrollment 配置和 systemd unit，再原子替换正式文件。如果 enrollment、unit 安装或服务启动失败，脚本会恢复原文件和原来的 active/enabled 状态；全新安装失败时会移除尚未提交的文件。已经由控制面消费的 enrollment token 或已经创建的 Agent 记录属于远端副作用，无法由本机回滚脚本撤销，失败后应在 Dashboard 中检查并撤销无效记录。
 
 ## 远端 Linux 验证
 

@@ -616,7 +616,7 @@ class ApiClient {
       } catch (error) {
         return {
           success: false,
-          error: error instanceof Error ? error.message : getTranslations().common.networkError,
+          error: requestFailureMessage(error),
         };
       }
     };
@@ -798,7 +798,7 @@ class ApiClient {
     } catch (error) {
       return {
         success: false,
-        error: error instanceof Error ? error.message : getTranslations().common.networkError,
+        error: requestFailureMessage(error),
       };
     }
   }
@@ -1978,6 +1978,11 @@ class ApiClient {
 }
 
 export const apiClient = new ApiClient();
+
+function requestFailureMessage(error: unknown): string {
+  if (error instanceof TypeError) return getTranslations().common.networkError;
+  return error instanceof Error ? error.message : getTranslations().common.networkError;
+}
 
 function parseJson(text: string): unknown {
   if (!text.trim()) {

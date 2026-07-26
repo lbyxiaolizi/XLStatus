@@ -157,7 +157,8 @@ Enrollment token 创建请求体上限为 4KiB，`expires_in_hours` 必须在 1 
 | `POST` | `/api/v1/tasks/:id/run` | 手动运行任务 |
 | `GET` | `/api/v1/tasks/:id/runs` | 任务运行记录 |
 
-任务创建/更新请求体上限为 256KiB。任务名称最长 128 字节，Shell 命令最长 8192 字节，`payload_json` 最长 64KiB，`server_selector_json` 最长 16KiB。任务创建、更新、删除和手动运行只允许 Cookie session；若账号已启用 TOTP，请求必须携带有效 `x-totp-code`，PAT 不能保存、删除或触发远程任务。任务详情、更新、删除、手动运行和运行历史 path `:id` 必须是 36 字节 canonical UUID 文本；非法、simple、大写或带空格 UUID 会在 repository/调度前返回 400。选择器中每类显式 ID 最多 64 项、标签最多 32 项；显式 `server_ids` 和 `exclude_server_ids` 必须是任务 owner 名下未撤销服务器。一次任务执行最多解析并下发到 64 台服务器。后台定时任务每轮最多扫描 1024 条 enabled 且带 schedule 的任务；读取历史定时任务时会重新执行任务定义预算校验，畸形或超预算历史行会被跳过并记录 warning，不会让单条脏任务阻断整轮调度读取。任务执行时，group selector 只展开任务 owner 名下未撤销 Agent 成员，历史跨 owner、已删除或已撤销分组成员不会进入目标集合。Agent Shell 执行端会把 timeout 夹取到 1 到 60 秒，0 使用默认 30 秒；stdout/stderr 采集预算最高 64KiB，0 使用默认 64KiB，子进程设置 `kill_on_drop` 且超时后主动 kill。任务列表和任务运行记录的 `limit` 会限制在 1 到 500；带 server allowlist 的 PAT 会先按任务选择器或运行记录 `server_id` 过滤，再应用 `offset` / `limit`。任务运行历史持久化前会把 Agent 返回的 stdout/stderr 分别截断到 64KiB、error 截断到 16KiB，并标记 `output_truncated`。
+任务创建/更新请求体上限为 256KiB。任务名称最长 128 字节，Shell 命令最长 8192 字节，`payload_json` 最长 64KiB，`server_selector_json` 最长 16KiB。任务创建、更新、删除和手动运行只允许 Cookie session；若账号已启用 TOTP，请求必须携带有效 `x-totp-code`，PAT 不能保存、删除或触发远程任务。任务详情、更新、删除、手动运行和运行历史 path `:id` 必须是 36 字节 canonical UUID 文本；非法、simple、大写或带空格 UUID 会在 repository/调度前返回 400。选择器中每类显式 ID 最多 64 项、标签最多 32 项；显式 `server_ids` 和 `exclude_server_ids` 必须是任务 owner 名下未撤销服务器。一次任务执行最多解析并下发到 64 台服务器，进程内所有任务共享最多 8 个并发派发槽位，结果仍按目标选择器顺序返回。
+后台定时任务以 1024 条为一页使用稳定 keyset 游标扫描全部 enabled 且带 schedule 的任务；调度器会在等待任何远程响应前，先完整读取、推进本轮全部页并收集所有到期任务，因此第 1025 条及更旧任务的扫描和到期判定不会被前页慢任务阻塞；实际执行阶段最多同时处理 8 个到期任务，超出部分会等待执行槽位。读取历史定时任务时会重新执行任务定义预算校验，畸形或超预算历史行会被跳过并记录 warning，游标仍按原始页末行继续推进。任务执行时，group selector 只展开任务 owner 名下未撤销 Agent 成员，历史跨 owner、已删除或已撤销分组成员不会进入目标集合。Agent Shell 执行端会把 timeout 夹取到 1 到 60 秒，0 使用默认 30 秒；stdout/stderr 采集预算最高 64KiB，0 使用默认 64KiB，达到预算后会继续 drain 但不再增长缓冲区。Unix Agent 会把任务放入独立进程组并在超时或执行 future 被取消时终止仍在该组内的进程；主动 `setsid()`/daemonize 的后代需要容器或 cgroup/systemd scope 才能完整约束，Windows 当前只保证终止直接任务进程。任务列表和任务运行记录的 `limit` 会限制在 1 到 500；带 server allowlist 的 PAT 会先按任务选择器或运行记录 `server_id` 过滤，再应用 `offset` / `limit`。任务运行历史持久化前会把 Agent 返回的 stdout/stderr 分别截断到 64KiB、error 截断到 16KiB，并标记 `output_truncated`。
 
 ### 文件、配置和终端
 
@@ -181,7 +182,7 @@ Enrollment token 创建请求体上限为 4KiB，`expires_in_hours` 必须在 1 
 
 强制更新需要 Cookie session、`server:exec` 权限、明确版本、HTTPS 下载 URL 和 SHA-256 校验和；若账号已启用 TOTP，请求必须携带有效 `x-totp-code`。PAT 不能下发 Agent 强制更新请求。默认只允许 `https://github.com/lbyxiaolizi/XLStatus/releases/download/<VERSION>/xlstatus-agent-*` 这类官方 Agent release 资产；自托管更新源必须显式设置 `XLSTATUS_ALLOW_CUSTOM_FORCE_UPDATE_URL=1`，但仍要求 HTTPS 和 SHA-256。Agent 记录强制更新请求前也会拒绝 `latest`、非法版本、非 HTTPS、URL credentials/query/fragment、超长 URL 和非 SHA-256 checksum。
 
-维护导出、SQLite VACUUM、TSDB compact 和 TSDB retention 均只允许管理员 Cookie session，敏感写操作仍要求 TOTP。维护导出附件响应会发送 `Cache-Control: no-store`、`Pragma: no-cache` 和 `Expires: 0`，避免数据库备份或完整归档被浏览器、代理或 CDN 缓存。SQLite 备份导出、完整归档和恢复验证的临时数据库文件只会写入本进程创建的私有临时目录，Unix 下目录权限为 `0700`，操作结束后会清理。恢复请求体上限为 512MiB。TSDB retention 请求体上限为 4KiB，`retention_days` 必须在 1 到 3650 天之间；超出范围会拒绝而不是静默修正。
+维护导出、SQLite VACUUM、TSDB compact 和 TSDB retention 均只允许管理员 Cookie session，敏感写操作仍要求 TOTP。维护导出附件响应会发送 `Cache-Control: no-store`、`Pragma: no-cache` 和 `Expires: 0`，避免数据库备份或完整归档被浏览器、代理或 CDN 缓存。SQLite 备份导出、完整归档和恢复验证的临时数据库文件只会写入本进程创建的私有临时目录，Unix 下目录权限为 `0700`，操作结束后会清理。恢复请求体上限为 512MiB。TSDB retention 请求体上限为 4KiB，`retention_days` 必须在 1 到 3650 天之间；超出范围会拒绝而不是静默修正。内存 TSDB 写入只裁剪本次涉及的 Agent series，Server 每小时自动扫描并回收全部过期样本和空 series，管理员也可显式 compact；`latest`、查询、导出和 Agent 列表都会按 retention 隐藏尚未物理 compact 的陈旧样本。
 
 ### DDNS、NAT、MCP
 
@@ -241,12 +242,12 @@ Agent gRPC 服务定义在 `proto/xlstatus/v1/agent.proto`，生成代码在 `cr
 | `grpc_tls_client_key_path` | 可选，Agent 侧 mTLS 客户端 PEM 私钥路径，最长 1024 字节 |
 | `enrollment_token` | enrollment token，最长 128 字节 |
 | `agent_name` | Agent 名称，最长 255 字节；默认 `$(hostname)` |
-| `version` | GitHub Release 版本，默认 `v0.1`；后台设置页默认会从 GitHub Releases 获取最新非草稿版本后传入 |
+| `version` | GitHub Release 版本，默认 `v0.2`；后台设置页默认会从 GitHub Releases 获取最新非草稿版本后传入 |
 
 示例：
 
 ```bash
-curl -fsSL 'http://dashboard.example.com:8080/api/v1/agents/install.sh?server_url=http%3A%2F%2Fdashboard.example.com%3A8080&grpc_server=http%3A%2F%2Fdashboard.example.com%3A50051&enrollment_token=xle_...&agent_name=%24(hostname)&version=v0.1' | sudo bash
+curl -fsSL 'http://dashboard.example.com:8080/api/v1/agents/install.sh?server_url=http%3A%2F%2Fdashboard.example.com%3A8080&grpc_server=http%3A%2F%2Fdashboard.example.com%3A50051&enrollment_token=xle_...&agent_name=%24(hostname)&version=v0.2' | sudo bash
 ```
 
 `enrollment_token` 会进入 URL 和 bootstrap 脚本内容，建议使用短有效期 token。Release 安装脚本会通过 stdin 把 token 交给 `xlstatus-agent enroll`，避免 token 出现在 Agent 子进程命令行参数中。若需要让 Agent 连接到不同主机名的控制面，不要使用这个公开 bootstrap 端点；请直接从 GitHub Release 下载 `install-agent.sh` 并通过环境变量传入 `SERVER_URL` / `GRPC_SERVER`。

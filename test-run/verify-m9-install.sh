@@ -33,13 +33,21 @@ cleanup() {
 }
 trap cleanup EXIT
 
+echo ">>> verify installer upgrade safety"
+"$ROOT/test-run/verify-install-upgrade-safety.sh"
+
 echo ">>> build debug binaries"
 cargo build --bin xlstatus-server --bin xlstatus-agent >/dev/null
 
 echo ">>> validate docker compose files"
 if command -v docker >/dev/null 2>&1; then
-  docker compose -f "$ROOT/docker-compose.yml" config >/dev/null
-  docker compose -f "$ROOT/docker-compose.pg.yml" config >/dev/null
+  SESSION_SECRET=test-session-secret-for-compose-validation-only \
+    docker compose -f "$ROOT/docker-compose.yml" config >/dev/null
+  SESSION_SECRET=test-session-secret-for-compose-validation-only \
+    docker compose -f "$ROOT/docker-compose.simple.yml" config >/dev/null
+  SESSION_SECRET=test-session-secret-for-compose-validation-only \
+    POSTGRES_PASSWORD=test-postgres-password-for-compose-validation-only \
+    docker compose -f "$ROOT/docker-compose.pg.yml" config >/dev/null
   echo "OK: docker compose config"
 else
   echo "SKIP: docker not available; compose config not validated"

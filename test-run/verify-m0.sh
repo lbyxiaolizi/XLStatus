@@ -11,6 +11,9 @@ GRPC_PORT="${GRPC_PORT:-15061}"
 WEB_PORT="${WEB_PORT:-3017}"
 LOG_DIR="${LOG_DIR:-/tmp/xls-m0}"
 
+source "$ROOT/test-run/lib/test-processes.sh"
+test_process_init "$ROOT" "$0"
+
 mkdir -p "$LOG_DIR"
 rm -f "$LOG_DIR/x.db" "$LOG_DIR/server.log" "$LOG_DIR/web.log" "$LOG_DIR/web.html"
 
@@ -30,19 +33,13 @@ session_secret = "test-secret-key-for-development-only-2026"
 session_ttl_hours = 24
 TOML
 
-# Kill any leftover processes
-pkill -9 -f xlstatus-server 2>/dev/null || true
-pkill -9 -f "next dev" 2>/dev/null || true
-sleep 1
-
 # Use a dedicated shell so we can exec the long-lived process inside a tty session
 echo ">>> start server (port $HTTP_PORT / gRPC $GRPC_PORT)"
-nohup env CONFIG_FILE="$LOG_DIR/cfg.toml" \
+test_process_start "$TEST_PROCESS_REGISTRY" server "$LOG_DIR/server.log" \
+  env CONFIG_FILE="$LOG_DIR/cfg.toml" \
   XLSTATUS_SEED_ADMIN_USERNAME=admin XLSTATUS_SEED_ADMIN_PASSWORD=admin-pw \
-  "$ROOT/target/debug/xlstatus-server" \
-  > "$LOG_DIR/server.log" 2>&1 < /dev/null &
-SRV_PID=$!
-disown $SRV_PID
+  "$ROOT/target/debug/xlstatus-server"
+SRV_PID="$TEST_PROCESS_PID"
 sleep 5
 
 HEALTH=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HTTP_PORT/healthz")
@@ -67,8 +64,9 @@ fi
 echo "OK: grpcurl reflection lists AgentService + NatTunnel"
 
 echo ">>> start web (port $WEB_PORT)"
-(cd "$ROOT/web" && nohup pnpm dev -p "$WEB_PORT" > "$LOG_DIR/web.log" 2>&1 < /dev/null &)
-disown 2>/dev/null || true
+test_process_start "$TEST_PROCESS_REGISTRY" web "$LOG_DIR/web.log" \
+  bash -c 'cd "$1" && exec pnpm dev -p "$2"' _ "$ROOT/web" "$WEB_PORT"
+WEB_PID="$TEST_PROCESS_PID"
 
 # Wait for web to be ready
 WEB=000
@@ -91,7 +89,7 @@ echo "OK: web page = 200 (contains XLStatus)"
 
 echo ""
 echo "M0 PASS"
-echo "Server PID:    $(pgrep -f xlstatus-server | head -1)"
-echo "Web PID:       $(pgrep -f 'next dev' | head -1)"
+echo "Server supervisor PID: $SRV_PID"
+echo "Web supervisor PID:    $WEB_PID"
 echo "Logs in:       $LOG_DIR"
-echo "Stop with:     pkill -9 -f xlstatus-server; pkill -9 -f 'next dev'"
+test_process_print_cleanup "$TEST_PROCESS_REGISTRY"

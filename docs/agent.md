@@ -90,12 +90,13 @@ printf '%s' 'xle_...' | xlstatus-agent enroll \
 ```bash
 sudo SERVER_URL=http://dashboard.example.com:8080 \
   GRPC_SERVER=https://grpc.dashboard.example.com:50051 \
+  VERSION=v0.2 \
   GRPC_TLS_CA_PATH=/etc/xlstatus-agent/tls/grpc-ca.crt \
   GRPC_TLS_CLIENT_CERT_PATH=/etc/xlstatus-agent/tls/agent.crt \
   GRPC_TLS_CLIENT_KEY_PATH=/etc/xlstatus-agent/tls/agent.key \
   ENROLLMENT_TOKEN=xle_... \
   AGENT_NAME="$(hostname)" \
-  bash -c 'curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1/install-agent.sh | bash'
+  bash -c 'curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.2/install-agent.sh | bash'
 ```
 
 使用本地构建产物安装：
@@ -138,6 +139,8 @@ https://github.com/lbyxiaolizi/XLStatus/releases/download/<VERSION>/install-agen
 Release 安装脚本会通过 stdin 把该 token 交给 `xlstatus-agent enroll`，
 避免 token 出现在 Agent 子进程命令行参数中；安装链接和 bootstrap 脚本内容本身仍应按敏感信息处理。
 
+安装器会暂存并原子激活 binary、Agent 配置和 systemd unit。enrollment 或启动失败时，本机会恢复原文件以及服务原来的 active/enabled 状态；控制面已经消费的 token 或创建的 Agent 记录不会随本机回滚自动撤销，应在 Dashboard 中清理无效记录。
+
 ## 地址说明
 
 - `--server` 是 Dashboard HTTP API 地址，例如 `http://dashboard.example.com:8080`。
@@ -146,9 +149,15 @@ Release 安装脚本会通过 stdin 把该 token 交给 `xlstatus-agent enroll`�
 
 两者不能混用。HTTP API 可通过 `/healthz` 检查，gRPC 端口需要确认网络可达。
 
+## 远程任务执行边界
+
+Shell 任务会受到执行时间和输出大小限制。Unix Agent 会为每个任务建立独立进程组；任务超时或执行 future 被取消时会终止 shell 及仍在该进程组内的后代进程，并继续排空已截断的 stdout/stderr，避免常规后台进程残留或因 pipe 提前关闭改变命令行为。主动调用 `setsid()`/daemonize 的后代可以脱离普通进程组；需要执行不受信任命令时，应把 Agent 放在容器、cgroup/systemd scope 等 OS 级 containment 中。Windows 当前只保证终止直接任务进程。
+
+Windows Agent 当前只能保证终止直接任务进程，不能等价保证清理所有后代进程。对会启动后台进程的高风险任务，建议优先使用 Unix Agent，或在 Windows 主机上另行使用 Job Object/服务级隔离。
+
 ## 网络探测安全策略
 
-Agent 收到 Dashboard 下发的 HTTP/TCP/ICMP 探测任务时，会在执行端重新解析目标并拒绝私网、loopback、链路本地、组播、未指定、文档网段、CGNAT 和云元数据常见链路本地地址。HTTP 探测会把校验后的解析结果固定到请求客户端；TCP 只连接校验后的地址；ICMP 会把校验后的 IP 字符串传给 `ping`，避免系统 `ping` 再次解析原始主机名。
+Agent 收到 Dashboard 下发的 HTTP/TCP/ICMP 探测任务时，会在执行端重新解析目标并拒绝私网、loopback、链路本地、组播、未指定、文档网段、CGNAT 和云元数据常见链路本地地址。HTTP 探测会把校验后的解析结果固定到请求客户端，并忽略 `HTTP_PROXY` / `HTTPS_PROXY` 等系统代理，避免代理侧重新解析目标；TCP 只连接校验后的地址；ICMP 会把校验后的 IP 字符串传给 `ping`，避免系统 `ping` 再次解析原始主机名。
 
 如果某台 Agent 必须用于内网服务探测，需要在运行环境中显式设置：
 

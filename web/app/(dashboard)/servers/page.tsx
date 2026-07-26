@@ -39,6 +39,7 @@ import { clampPercent, durationLabel, formatRate, optionalNumber } from "@/app/l
 import { useI18n } from "@/lib/use-i18n";
 import type { Translations } from "@/lib/i18n";
 import { useStoredPreference } from "@/app/lib/client-store";
+import { mapWithConcurrency } from "@/app/lib/concurrency";
 import { useServerRealtime } from "@/app/lib/use-server-realtime";
 
 const WorldServerMap = dynamic(
@@ -157,6 +158,7 @@ export default function ServersPage() {
   const [selectedServerGroupId, setSelectedServerGroupId] = useState("");
   const [serverGroupEdit, setServerGroupEdit] = useState({ name: "", color: "#2563eb", displayOrder: "" });
   const servicesLoadedRef = useRef(false);
+  const ownerTransfersLoadedRef = useRef(false);
   const serverGroupsLoadRequestIdRef = useRef(0);
   const servicesPending = showServices && !servicesLoadedRef.current && !serviceError;
 
@@ -175,16 +177,18 @@ export default function ServersPage() {
   }, []);
 
   useEffect(() => {
+    if (loading) return;
     // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount is the standard client data-load pattern
     void loadServerGroups();
     return () => {
       serverGroupsLoadRequestIdRef.current += 1;
     };
-  }, [loadServerGroups]);
+  }, [loadServerGroups, loading]);
 
   const loadOwnerTransfers = useCallback(async () => {
     if (!canManageTransfers) {
       setOwnerTransfers([]);
+      ownerTransfersLoadedRef.current = false;
       return;
     }
     setTransfersLoading(true);
@@ -193,16 +197,11 @@ export default function ServersPage() {
     setTransfersLoading(false);
     if (response.success && response.data) {
       setOwnerTransfers(response.data.transfers ?? []);
+      ownerTransfersLoadedRef.current = true;
     } else {
       setTransferError(responseError(response));
     }
   }, [canManageTransfers]);
-
-  useEffect(() => {
-    if (!canManageTransfers) return;
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount is the standard client data-load pattern
-    void loadOwnerTransfers();
-  }, [canManageTransfers, loadOwnerTransfers]);
 
   const loadServices = useCallback(async (signal?: AbortSignal) => {
     setServicesLoading(true);
@@ -758,7 +757,18 @@ export default function ServersPage() {
             </div>
           ) : null}
           {canManageTransfers ? (
-            <details className="border-2 border-black bg-[var(--bg-card)] shadow-[var(--shadow-brutal)]">
+            <details
+              className="border-2 border-black bg-[var(--bg-card)] shadow-[var(--shadow-brutal)]"
+              onToggle={(event) => {
+                if (
+                  event.currentTarget.open
+                  && !ownerTransfersLoadedRef.current
+                  && !transfersLoading
+                ) {
+                  void loadOwnerTransfers();
+                }
+              }}
+            >
               <summary className="flex cursor-pointer flex-wrap items-center justify-between gap-3 p-3 text-sm font-black uppercase">
                 <span className="flex flex-wrap items-center gap-2">
                   <span>{copy.serversPage.ownerTransfersTitle}</span>
@@ -1332,29 +1342,6 @@ function buildServiceTracker(service: ServiceSummary, results: ServiceResult[]):
     avgDelay: delays.length ? delays.reduce((sum, value) => sum + value, 0) / delays.length : undefined,
     days,
   };
-}
-
-async function mapWithConcurrency<T, R>(
-  items: T[],
-  limit: number,
-  mapper: (item: T, index: number) => Promise<R>,
-): Promise<R[]> {
-  if (items.length === 0) return [];
-  const results = new Array<R>(items.length);
-  let nextIndex = 0;
-
-  async function worker() {
-    while (nextIndex < items.length) {
-      const index = nextIndex;
-      nextIndex += 1;
-      results[index] = await mapper(items[index], index);
-    }
-  }
-
-  await Promise.all(
-    Array.from({ length: Math.min(Math.max(1, limit), items.length) }, () => worker()),
-  );
-  return results;
 }
 
 function buildServiceDays(results: ServiceResult[]): ServiceDay[] {

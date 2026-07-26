@@ -112,6 +112,8 @@ interface InFlightRevalidation {
 
 const ServerDataContext = createContext<ServerDataContextValue | null>(null);
 const EMPTY_SERVERS: Server[] = [];
+const SERVER_INITIAL_PAGE_SIZE = 50;
+const SERVER_MAX_ROWS = 500;
 
 export function ServerDataProvider({ children }: { children: ReactNode }) {
   const user = useStoredUser();
@@ -133,6 +135,11 @@ export function ServerDataProvider({ children }: { children: ReactNode }) {
   const requestIdRef = useRef(0);
   const inFlightRevalidationRef = useRef<InFlightRevalidation | null>(null);
   const requestAbortRef = useRef<AbortController | null>(null);
+  const hasVisibleSnapshotRef = useRef(freshServers !== null || cachedSnapshot !== null);
+
+  useEffect(() => {
+    hasVisibleSnapshotRef.current = freshServers !== null || cachedSnapshot !== null;
+  }, [cachedSnapshot, freshServers]);
 
   const loadServers = useCallback(async (force = false, rotateRealtime = false) => {
     if (!dataScope) return;
@@ -142,10 +149,11 @@ export function ServerDataProvider({ children }: { children: ReactNode }) {
     const controller = new AbortController();
     requestAbortRef.current = controller;
     const cacheGeneration = getServerCacheGeneration();
+    const publishFirstPage = !hasVisibleSnapshotRef.current;
     setSettledScope(null);
     setScopedError(null);
 
-    const response = await apiClient.listServers(200, 0, false, {
+    const response = await apiClient.listServers(SERVER_INITIAL_PAGE_SIZE, 0, false, {
       signal: controller.signal,
       bypassClientCache: force,
     });
@@ -156,23 +164,60 @@ export function ServerDataProvider({ children }: { children: ReactNode }) {
     ) {
       return;
     }
-    if (requestAbortRef.current === controller) requestAbortRef.current = null;
-
-    setSettledScope(dataScope);
-    if (response.success && response.data) {
-      const responseServers = Array.isArray(response.data.servers) ? response.data.servers : [];
-      const nextServers = responseServers.filter(isServer);
-      setFreshSnapshot({ scope: dataScope, servers: nextServers, observedAt: Date.now() });
-      if (rotateRealtime) setRealtimeRevision((current) => current + 1);
-      if (cacheScope) writeCachedServerList(cacheScope, nextServers, cacheGeneration);
+    if (!response.success || !response.data) {
+      if (requestAbortRef.current === controller) requestAbortRef.current = null;
+      setSettledScope(dataScope);
+      if (response.status === 401 || response.status === 403) {
+        if (cacheScope) clearCachedServerList(cacheScope);
+        setFreshSnapshot(null);
+      }
+      setScopedError({ scope: dataScope, message: responseError(response) });
       return;
     }
 
-    if (response.status === 401 || response.status === 403) {
-      if (cacheScope) clearCachedServerList(cacheScope);
-      setFreshSnapshot(null);
+    const firstRows = Array.isArray(response.data.servers) ? response.data.servers : [];
+    const firstServers = firstRows.filter(isServer);
+    if (publishFirstPage) {
+      setFreshSnapshot({ scope: dataScope, servers: firstServers, observedAt: Date.now() });
     }
-    setScopedError({ scope: dataScope, message: responseError(response) });
+
+    const reportedTotal = typeof response.data.total === "number" && Number.isFinite(response.data.total)
+      ? Math.max(0, Math.floor(response.data.total))
+      : firstServers.length;
+    const cappedTotal = Math.min(reportedTotal, SERVER_MAX_ROWS);
+    let nextServers = firstServers;
+    if (cappedTotal > SERVER_INITIAL_PAGE_SIZE) {
+      const remainder = await apiClient.listServers(
+        cappedTotal - SERVER_INITIAL_PAGE_SIZE,
+        SERVER_INITIAL_PAGE_SIZE,
+        false,
+        {
+          signal: controller.signal,
+          bypassClientCache: force,
+        },
+      );
+      if (
+        controller.signal.aborted
+        || requestId !== requestIdRef.current
+        || currentDataScope() !== dataScope
+      ) {
+        return;
+      }
+      if (!remainder.success || !remainder.data) {
+        if (requestAbortRef.current === controller) requestAbortRef.current = null;
+        setSettledScope(dataScope);
+        setScopedError({ scope: dataScope, message: responseError(remainder) });
+        return;
+      }
+      const remainderRows = Array.isArray(remainder.data.servers) ? remainder.data.servers : [];
+      nextServers = [...firstServers, ...remainderRows.filter(isServer)];
+    }
+
+    if (requestAbortRef.current === controller) requestAbortRef.current = null;
+    setSettledScope(dataScope);
+    setFreshSnapshot({ scope: dataScope, servers: nextServers, observedAt: Date.now() });
+    if (rotateRealtime) setRealtimeRevision((current) => current + 1);
+    if (cacheScope) writeCachedServerList(cacheScope, nextServers, cacheGeneration);
   }, [cacheScope, dataScope]);
 
   const refresh = useCallback(
@@ -229,6 +274,10 @@ export function useServerData(): ServerDataContextValue {
   const value = useContext(ServerDataContext);
   if (!value) throw new Error("useServerData must be used inside ServerDataProvider");
   return value;
+}
+
+export function useOptionalServerData(): ServerDataContextValue | null {
+  return useContext(ServerDataContext);
 }
 
 function isServer(value: unknown): value is Server {

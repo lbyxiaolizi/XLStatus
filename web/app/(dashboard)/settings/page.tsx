@@ -42,7 +42,7 @@ import {
 } from "@/app/lib/dashboard-theme";
 import { readStoredUser } from "@/app/lib/client-store";
 
-const DEFAULT_AGENT_VERSION = "v0.1";
+const DEFAULT_AGENT_VERSION = "v0.2";
 const GITHUB_RELEASES_API = "https://api.github.com/repos/lbyxiaolizi/XLStatus/releases?per_page=20";
 const GITHUB_RELEASE_CACHE_KEY = "xlstatus:agent-latest-release:v1";
 const GITHUB_RELEASE_CACHE_TTL_MS = 45 * 60 * 1000;

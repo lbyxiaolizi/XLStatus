@@ -16,7 +16,7 @@
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
@@ -180,9 +180,9 @@ pub trait MetricBackend: Send + Sync + 'static {
     }
 }
 
-/// Thread-safe, bounded in-memory store. Retention defaults to 30 days
-/// and is enforced on every `write` to keep memory bounded during long
-/// runs.
+/// Thread-safe, bounded in-memory store. Retention defaults to 30 days.
+/// Writes compact only the affected agents; call `compact` to reclaim
+/// expired data belonging to inactive agents.
 #[derive(Debug)]
 pub struct InMemoryMetricStore {
     inner: RwLock<InMemoryState>,
@@ -214,22 +214,48 @@ impl InMemoryMetricStore {
         }
     }
 
-    /// Drop samples older than `cutoff` for every agent. Called
-    /// opportunistically inside `write`; can also be called manually.
-    pub fn compact(&self) -> usize {
-        let retention = self.inner.read().retention;
-        let cutoff = Utc::now() - retention;
-        let mut state = self.inner.write();
-        let mut dropped = 0;
-        for entries in state.series.values_mut() {
-            // BTreeMap is ordered by key, so split_off is O(log n) plus
-            // the size of the dropped prefix.
-            let before = entries.len();
-            let prefix = entries.split_off(&cutoff);
-            *entries = prefix;
-            dropped += before.saturating_sub(entries.len());
+    fn compact_series(
+        entries: &mut BTreeMap<DateTime<Utc>, serde_json::Value>,
+        cutoff: DateTime<Utc>,
+    ) -> usize {
+        // BTreeMap is ordered by key, so split_off is O(log n) plus
+        // the size of the dropped prefix.
+        let before = entries.len();
+        *entries = entries.split_off(&cutoff);
+        before.saturating_sub(entries.len())
+    }
+
+    fn compact_agent(
+        series: &mut HashMap<AgentId, BTreeMap<DateTime<Utc>, serde_json::Value>>,
+        agent_id: &AgentId,
+        cutoff: DateTime<Utc>,
+    ) -> usize {
+        let Some(entries) = series.get_mut(agent_id) else {
+            return 0;
+        };
+
+        let dropped = Self::compact_series(entries, cutoff);
+        if entries.is_empty() {
+            series.remove(agent_id);
         }
         dropped
+    }
+
+    fn compact_all(state: &mut InMemoryState, cutoff: DateTime<Utc>) -> usize {
+        let mut dropped = 0;
+        state.series.retain(|_, entries| {
+            dropped += Self::compact_series(entries, cutoff);
+            !entries.is_empty()
+        });
+        dropped
+    }
+
+    /// Drop samples outside retention for every agent and remove empty
+    /// series. Writes use the narrower per-agent helper instead.
+    pub fn compact(&self) -> usize {
+        let mut state = self.inner.write();
+        let cutoff = Utc::now() - state.retention;
+        Self::compact_all(&mut state, cutoff)
     }
 
     pub fn retention(&self) -> Duration {
@@ -237,8 +263,10 @@ impl InMemoryMetricStore {
     }
 
     pub fn set_retention(&self, retention: Duration) -> usize {
-        self.inner.write().retention = retention;
-        self.compact()
+        let mut state = self.inner.write();
+        state.retention = retention;
+        let cutoff = Utc::now() - retention;
+        Self::compact_all(&mut state, cutoff)
     }
 
     /// Total number of samples currently held. Useful in tests and
@@ -253,13 +281,18 @@ impl InMemoryMetricStore {
 
     pub fn export_samples(&self) -> Vec<MetricSample> {
         let state = self.inner.read();
+        let cutoff = Utc::now() - state.retention;
         let mut samples = Vec::new();
         for (agent_id, entries) in &state.series {
-            samples.extend(entries.iter().map(|(sample_at, fields_json)| MetricSample {
-                agent_id: agent_id.clone(),
-                sample_at: *sample_at,
-                fields_json: fields_json.clone(),
-            }));
+            samples.extend(
+                entries
+                    .range(cutoff..)
+                    .map(|(sample_at, fields_json)| MetricSample {
+                        agent_id: agent_id.clone(),
+                        sample_at: *sample_at,
+                        fields_json: fields_json.clone(),
+                    }),
+            );
         }
         samples.sort_by_key(|sample| (sample.agent_id.0, sample.sample_at));
         samples
@@ -278,17 +311,14 @@ impl MetricBackend for InMemoryMetricStore {
         let agent_id = sample.agent_id.clone();
         let ts = sample.sample_at;
         let payload = sample.fields_json.clone();
-        {
-            let mut state = self.inner.write();
-            state
-                .series
-                .entry(agent_id)
-                .or_default()
-                .insert(ts, payload);
-        }
-        // Compact occasionally; cheap because most calls hit the early
-        // return when nothing is outside the retention window.
-        self.compact();
+        let mut state = self.inner.write();
+        let cutoff = Utc::now() - state.retention;
+        state
+            .series
+            .entry(agent_id.clone())
+            .or_default()
+            .insert(ts, payload);
+        Self::compact_agent(&mut state.series, &agent_id, cutoff);
         Ok(())
     }
 
@@ -300,23 +330,27 @@ impl MetricBackend for InMemoryMetricStore {
         }
 
         let count = samples.len();
-        {
-            let mut state = self.inner.write();
-            for sample in samples {
-                state
-                    .series
-                    .entry(sample.agent_id)
-                    .or_default()
-                    .insert(sample.sample_at, sample.fields_json);
-            }
+        let mut state = self.inner.write();
+        let cutoff = Utc::now() - state.retention;
+        let mut affected_agents = HashSet::with_capacity(count);
+        for sample in samples {
+            affected_agents.insert(sample.agent_id.clone());
+            state
+                .series
+                .entry(sample.agent_id)
+                .or_default()
+                .insert(sample.sample_at, sample.fields_json);
         }
-        self.compact();
+        for agent_id in affected_agents {
+            Self::compact_agent(&mut state.series, &agent_id, cutoff);
+        }
         Ok(count)
     }
 
     fn query(&self, agent_id: AgentId, range: QueryRange) -> Result<MetricSeries, MetricError> {
-        let cutoff = Utc::now() - range.to_chrono_duration();
         let state = self.inner.read();
+        let now = Utc::now();
+        let cutoff = std::cmp::max(now - range.to_chrono_duration(), now - state.retention);
         let samples = state
             .series
             .get(&agent_id)
@@ -336,10 +370,12 @@ impl MetricBackend for InMemoryMetricStore {
 
     fn latest(&self, agent_id: AgentId) -> Result<Option<MetricSample>, MetricError> {
         let state = self.inner.read();
+        let cutoff = Utc::now() - state.retention;
         Ok(state
             .series
             .get(&agent_id)
             .and_then(|entries| entries.iter().next_back())
+            .filter(|(ts, _)| **ts >= cutoff)
             .map(|(ts, payload)| MetricSample {
                 agent_id: agent_id.clone(),
                 sample_at: *ts,
@@ -348,7 +384,18 @@ impl MetricBackend for InMemoryMetricStore {
     }
 
     fn list_agents(&self) -> Result<Vec<AgentId>, MetricError> {
-        Ok(self.inner.read().series.keys().cloned().collect())
+        let state = self.inner.read();
+        let cutoff = Utc::now() - state.retention;
+        Ok(state
+            .series
+            .iter()
+            .filter(|(_, entries)| {
+                entries
+                    .last_key_value()
+                    .is_some_and(|(sample_at, _)| *sample_at >= cutoff)
+            })
+            .map(|(agent_id, _)| agent_id.clone())
+            .collect())
     }
 
     fn export_samples(&self) -> Result<Vec<MetricSample>, MetricError> {
@@ -489,6 +536,16 @@ mod tests {
         AgentId(Uuid::from_bytes([byte; 16]))
     }
 
+    fn seed_uncompacted(store: &InMemoryMetricStore, agent_id: AgentId, sample_at: DateTime<Utc>) {
+        store
+            .inner
+            .write()
+            .series
+            .entry(agent_id)
+            .or_default()
+            .insert(sample_at, json!({ "seeded": true }));
+    }
+
     #[test]
     fn write_then_latest_round_trip() {
         let store = InMemoryMetricStore::new();
@@ -569,6 +626,90 @@ mod tests {
 
         assert_eq!(store.len(), 1);
         assert_eq!(store.compact(), 0);
+    }
+
+    #[test]
+    fn write_only_compacts_the_touched_agent() {
+        let store = InMemoryMetricStore::with_retention(Duration::hours(1));
+        let touched = id(11);
+        let untouched = id(12);
+        let now = Utc::now();
+        let expired = now - Duration::hours(2);
+        seed_uncompacted(&store, touched.clone(), expired);
+        seed_uncompacted(&store, untouched.clone(), expired);
+
+        store
+            .write(MetricSample {
+                agent_id: touched.clone(),
+                sample_at: now,
+                fields_json: json!({ "cpu": 3.0 }),
+            })
+            .unwrap();
+
+        let state = store.inner.read();
+        assert_eq!(state.series[&touched].len(), 1);
+        assert_eq!(state.series[&untouched].len(), 1);
+        drop(state);
+
+        assert!(store.latest(untouched.clone()).unwrap().is_none());
+        assert_eq!(store.list_agents().unwrap(), vec![touched.clone()]);
+        assert!(store
+            .query(untouched.clone(), QueryRange::Day30)
+            .unwrap()
+            .samples
+            .is_empty());
+        assert!(store
+            .export_samples()
+            .into_iter()
+            .all(|sample| sample.agent_id == touched));
+
+        assert_eq!(store.compact(), 1);
+        assert!(!store.inner.read().series.contains_key(&untouched));
+    }
+
+    #[test]
+    fn batch_write_compacts_each_affected_agent_once() {
+        let store = InMemoryMetricStore::with_retention(Duration::hours(1));
+        let first = id(13);
+        let second = id(14);
+        let untouched = id(15);
+        let now = Utc::now();
+        let expired = now - Duration::hours(2);
+        for agent_id in [&first, &second, &untouched] {
+            seed_uncompacted(&store, agent_id.clone(), expired);
+        }
+
+        store
+            .write_batch(vec![
+                MetricSample {
+                    agent_id: first.clone(),
+                    sample_at: now,
+                    fields_json: json!({ "cpu": 1.0 }),
+                },
+                MetricSample {
+                    agent_id: first.clone(),
+                    sample_at: now + Duration::seconds(1),
+                    fields_json: json!({ "cpu": 2.0 }),
+                },
+                MetricSample {
+                    agent_id: second.clone(),
+                    sample_at: now,
+                    fields_json: json!({ "cpu": 3.0 }),
+                },
+            ])
+            .unwrap();
+
+        let state = store.inner.read();
+        assert_eq!(state.series[&first].len(), 2);
+        assert_eq!(state.series[&second].len(), 1);
+        assert_eq!(state.series[&untouched].len(), 1);
+        drop(state);
+
+        let mut agents = store.list_agents().unwrap();
+        agents.sort_by_key(|agent| agent.0);
+        assert_eq!(agents, vec![first, second]);
+        assert_eq!(store.compact(), 1);
+        assert!(!store.inner.read().series.contains_key(&untouched));
     }
 
     #[test]

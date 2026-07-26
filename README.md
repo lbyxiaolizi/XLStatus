@@ -6,7 +6,7 @@ English | [简体中文](./README.zh-CN.md)
 
 XLStatus is a self-hosted server monitoring and operations panel written in Rust and Next.js. It combines real-time host metrics, public status pages, service probes, alerting, task execution, file operations, terminal sessions, DDNS, NAT tunnels, and MCP tools in one deployable stack.
 
-The current release is `v0.1`. Start from the documentation index for installation, operations, and development details: [docs/README.md](./docs/README.md).
+The current release is `v0.2`. Start from the documentation index for installation, operations, and development details: [docs/README.md](./docs/README.md).
 
 ## Features
 
@@ -26,6 +26,8 @@ mkdir -p .secrets
 printf '%s\n' 'replace-with-a-strong-initial-password' > .secrets/xlstatus_seed_admin_password
 chmod 700 .secrets
 chmod 600 .secrets/xlstatus_seed_admin_password
+test -f .env || (umask 077; printf 'SESSION_SECRET=%s\nPOSTGRES_PASSWORD=%s\n' \
+  "$(openssl rand -hex 32)" "$(openssl rand -hex 24)" > .env)
 docker compose up -d
 curl -fsS http://localhost:8080/healthz
 ```
@@ -36,11 +38,13 @@ Open:
 - API: `http://localhost:8080`
 - Public status: `http://localhost:3000/status`
 
-Docker Compose publishes Agent gRPC on `0.0.0.0:50051` by default so remote
-agents can connect without per-IP firewall allowlisting. Keep `8080` and
-`3000` behind localhost or your reverse proxy in production.
+Docker Compose publishes Agent gRPC on `127.0.0.1:50051` by default. For remote
+Agents, set `XLSTATUS_GRPC_PUBLISH_ADDRESS=0.0.0.0` only when gRPC uses TLS/mTLS
+or the hosts communicate through a trusted VPN. Keep `8080` and `3000` behind
+localhost or your reverse proxy in production.
 
 Set a strong initial password in `.secrets/xlstatus_seed_admin_password` before first start.
+The generated `.env` contains the session signing secret and the PostgreSQL password used by the optional PostgreSQL stack. Keep it private and do not regenerate it during upgrades.
 
 For PostgreSQL:
 
@@ -53,7 +57,7 @@ docker compose -f docker-compose.pg.yml up -d
 Server:
 
 ```bash
-curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1/install-server.sh | sudo bash
+curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.2/install-server.sh | sudo VERSION=v0.2 bash
 ```
 
 Agent:
@@ -61,12 +65,13 @@ Agent:
 ```bash
 sudo SERVER_URL=http://dashboard.example.com:8080 \
   GRPC_SERVER=https://grpc.dashboard.example.com:50051 \
+  VERSION=v0.2 \
   ENROLLMENT_TOKEN=xle_... \
   AGENT_NAME="$(hostname)" \
-  bash -c 'curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1/install-agent.sh | bash'
+  bash -c 'curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.2/install-agent.sh | bash'
 ```
 
-The dashboard Settings page can generate a parameterized Agent bootstrap link. By default it fetches the newest non-draft GitHub Release version and falls back to `v0.1` if GitHub is unavailable.
+The dashboard Settings page can generate a parameterized Agent bootstrap link. By default it fetches the newest non-draft GitHub Release version and falls back to `v0.2` if GitHub is unavailable.
 
 ## Documentation
 

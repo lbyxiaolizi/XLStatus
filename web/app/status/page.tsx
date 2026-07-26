@@ -243,8 +243,8 @@ export default function StatusPage() {
       return { label: copy.statusPage.overallNoData, tone: "gray" as const };
     }
     if (
-      servers.some((server) => server.status === "down" || server.status === "offline") ||
-      services.some((service) => service.last_status === "failure" || service.last_status === "down")
+      servers.some((server) => server.status !== "online") ||
+      services.some((service) => !serviceOk(service.last_status ?? ""))
     ) {
       return { label: copy.statusPage.overallPartial, tone: "yellow" as const };
     }
@@ -260,7 +260,7 @@ export default function StatusPage() {
   }
 
   return (
-    <div className="min-h-screen" style={publicPageStyle(site, theme)} data-public-theme-root="true">
+    <div className="min-h-screen" style={publicPageStyle(site)} data-public-theme-root="true">
       <Navigation />
       <PageShell>
         <PageHeader
@@ -719,7 +719,7 @@ function serverTone(status: string): "green" | "red" | "yellow" | "gray" {
 }
 
 function serviceTone(status?: string): "green" | "red" | "yellow" | "gray" {
-  if (status === "success" || status === "up") return "green";
+  if (status === "success" || status === "up" || status === "ok") return "green";
   if (status === "failure" || status === "down") return "red";
   if (status === "timeout" || status === "degraded") return "yellow";
   return "gray";
@@ -790,15 +790,12 @@ function averageDelay(results: PublicServiceResult[]): number | undefined {
   return values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : undefined;
 }
 
-function publicPageStyle(site: PublicSiteBranding, theme?: ThemeDefinition | null): CSSProperties {
+function publicPageStyle(site: PublicSiteBranding): CSSProperties {
   const style: CSSProperties & Record<string, string> = {};
-  if (theme) {
-    for (const [key, value] of Object.entries(themeVariablesForMode(theme, false))) {
-      if (key.startsWith("--") && value) {
-        style[key] = value;
-      }
-    }
-  }
+  style.backgroundColor = "var(--bg-page)";
+  style.backgroundImage = "radial-gradient(var(--dot-color) 1px, transparent 1px)";
+  style.backgroundSize = "20px 20px";
+  style.color = "var(--text-main)";
   if (site.theme_color) {
     style["--accent-color"] = site.theme_color;
   }
@@ -835,6 +832,7 @@ function applyPublicHead(site: PublicSiteBranding, theme?: ThemeDefinition | nul
     const style = document.createElement("style");
     style.dataset.xlstatusCustomHead = "true";
     style.textContent = [
+      themeModeCss("[data-public-theme-root=\"true\"]", themeVariablesForMode(theme, false)),
       themeModeCss("[data-public-theme-root=\"true\"]", themeVariablesForMode(theme, true), ".dark-mode"),
     ]
       .filter(Boolean)

@@ -25,9 +25,10 @@ sudo journalctl -u xlstatus-agent -n 100 --no-pager
 - Agent gRPC: `50051`
 - Web UI: `3000`
 
-生产部署默认让 `50051` 面向公网可达，方便新增 Agent 不再按来源 IP
-维护白名单。`8080` 和 `3000` 建议保持本机监听或只对反向代理开放，由
-HTTPS 入口处理浏览器访问。
+Release/systemd 安装和 Docker Compose 默认都只让宿主机的 `50051` 在
+`127.0.0.1` 上监听。远端 Agent 需要直连时，必须显式修改监听或发布地址，
+并同时配置 gRPC TLS/mTLS 或通过可信 VPN 接入。`8080` 和 `3000` 也建议
+保持本机监听或只对反向代理开放，由 HTTPS 入口处理浏览器访问。
 
 检查占用：
 
@@ -120,6 +121,7 @@ Compose 部署，默认通过 `docker exec xlstatus-postgres psql ...` 写入数
 - 已备份 SQLite 数据库、部署配置和 `.env` / secret 文件。
 - 迁移后继续使用原来的 `SESSION_SECRET` 和 `SECRET_ENCRYPTION_KEY`。缺少匹配的 `SECRET_ENCRYPTION_KEY` 时，历史加密密文无法恢复。
 - PostgreSQL schema 必须先由 XLStatus Server 初始化。仅启动空的 PostgreSQL 容器还不够。
+- 导入期间源 SQLite 和目标 PostgreSQL 都必须停止应用写入。脚本会对目标应用表获取独占锁，等待并发事务释放锁后才开始替换数据。
 - 不要把 PostgreSQL `5432` 发布到公网。容器内部访问即可；远端维护优先使用 SSH tunnel、VPN 或受控防火墙。
 
 推荐流程：
@@ -138,7 +140,7 @@ docker compose -f docker-compose.pg.yml up -d server
 curl -fsS http://127.0.0.1:8080/healthz
 docker compose -f docker-compose.pg.yml stop server
 
-# 4. 导入 SQLite 备份。--truncate 会清空目标 PG public schema 中的应用表。
+# 4. 导入 SQLite 备份。--truncate 只以 XLStatus allowlist 中的表为清理目标。
 python3 scripts/import_sqlite_to_postgres.py \
   /root/xlstatus-backups/YYYYMMDDTHHMMSSZ-pre-pg/xlstatus.sqlite3 \
   --container xlstatus-postgres \
@@ -152,10 +154,12 @@ curl -fsS http://127.0.0.1:8080/healthz
 脚本行为和注意事项：
 
 - 默认不会清空目标 PostgreSQL。如果目标表已有数据且没有传 `--truncate`，脚本会拒绝导入。
-- `--truncate` 会执行 `TRUNCATE ... RESTART IDENTITY CASCADE`，只能在确认备份可用、目标库可替换时使用。
+- 脚本只选择内置 XLStatus table allowlist 中的表；同一 `public` schema 中的未知表不会被锁定、检查、复制或列为 TRUNCATE 目标。如果未知表通过外键引用 XLStatus 表，PostgreSQL 会拒绝 TRUNCATE，导入事务随即完整回滚，不会级联清空未知表。
+- `--truncate` 会对 allowlist 中实际存在的 XLStatus 表执行 `TRUNCATE ... RESTART IDENTITY`，只能在确认备份可用、目标库可替换时使用。TRUNCATE、全部 COPY 和逐表行数核验位于同一个 PostgreSQL session/transaction；全部核验成功后才 COMMIT，任一步失败或连接中断都会完整回滚，包括恢复 TRUNCATE 前的数据。
 - 脚本按 PostgreSQL 外键关系计算导入顺序，只导入 SQLite 和 PostgreSQL 都存在的列。
 - SQLite 的 `0/1` 会转换为 PostgreSQL boolean，空字符串会按 nullable UUID/timestamp 转为 `NULL`。
-- 导入后脚本会逐表核对已导入行数；任何 COPY 或行数不一致都会以非零状态退出。
+- SQLite 数据通过固定大小批次读取并直接写入 `docker exec ... psql` 的 stdin，不会把整张表或完整 COPY 内容保存在内存中，也不会把行数据放进进程命令行。
+- 导入后脚本会在提交前逐表核对已导入行数；任何 COPY 或行数不一致都会以非零状态退出，成功摘要只会在事务已经提交后输出。
 - 如果脚本提示 PostgreSQL 没有表，先启动同版本 XLStatus Server 跑完迁移，再重新执行导入。
 
 ## 升级
@@ -172,6 +176,7 @@ curl -fsS http://localhost:8080/healthz
 ```
 
 升级前先备份数据库和 `/etc/xlstatus/server.toml`。
+使用 Release 安装脚本重复安装时，默认只更新二进制并保留现有配置与 systemd unit；不要在升级时设置 `RECONFIGURE=true`，除非已经备份并明确要替换持久密钥和连接配置。新版本重启或健康检查失败时，脚本会自动恢复旧文件并重启原服务。
 
 ## 远端 smoke
 

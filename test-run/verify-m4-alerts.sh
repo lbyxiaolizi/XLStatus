@@ -25,6 +25,9 @@ NG_ID=""
 CH_ID=""
 RULE_ID=""
 
+source "$ROOT/test-run/lib/test-processes.sh"
+test_process_init "$ROOT" "$0"
+
 mkdir -p "$LOG_DIR"
 rm -f "$DB" "$HOOK_LOG" "$HOOK_BODY" "$LOG_DIR/agent.yaml"
 
@@ -44,22 +47,8 @@ session_secret = "test-secret-key-for-development-only-2026"
 session_ttl_hours = 24
 TOML
 
-pkill -9 -f xlstatus-server 2>/dev/null || true
-pkill -9 -f xlstatus-agent 2>/dev/null || true
-kill_port() {
-  if command -v lsof >/dev/null 2>&1; then
-    for pid in $(lsof -ti tcp:"$1" 2>/dev/null || true); do
-      kill -9 "$pid" 2>/dev/null || true
-    done
-  fi
-}
-kill_port "$LISTEN_PORT"
-kill_port "$HTTPS_PORT"
-kill_port "$RECOVERY_PORT"
-sleep 1
-
 echo ">>> start webhook listener (python http.server on :$LISTEN_PORT)"
-python3 > "$HOOK_LOG" 2>&1 <<PYHOOK &
+cat > "$LOG_DIR/webhook.py" <<PYHOOK
 from http.server import BaseHTTPRequestHandler, HTTPServer
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -81,14 +70,14 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a, **k): pass
 HTTPServer(("127.0.0.1", $LISTEN_PORT), H).serve_forever()
 PYHOOK
-NC_PID=$!
-disown $NC_PID 2>/dev/null || true
+test_process_start "$TEST_PROCESS_REGISTRY" webhook "$HOOK_LOG" \
+  python3 "$LOG_DIR/webhook.py"
 sleep 2
 
 echo ">>> start local HTTPS target with self-signed certificate (:$HTTPS_PORT)"
 openssl req -x509 -newkey rsa:2048 -keyout "$LOG_DIR/tls.key" -out "$LOG_DIR/tls.crt" \
   -sha256 -days 7 -nodes -subj "/CN=localhost" >/dev/null 2>&1
-python3 > "$LOG_DIR/https.log" 2>&1 <<PYHTTPS &
+cat > "$LOG_DIR/https.py" <<PYHTTPS
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import ssl
 class H(BaseHTTPRequestHandler):
@@ -105,16 +94,16 @@ ctx.load_cert_chain("$LOG_DIR/tls.crt", "$LOG_DIR/tls.key")
 httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
 httpd.serve_forever()
 PYHTTPS
-disown $! 2>/dev/null || true
+test_process_start "$TEST_PROCESS_REGISTRY" https-target "$LOG_DIR/https.log" \
+  python3 "$LOG_DIR/https.py"
 sleep 2
 
 echo ">>> start server"
-nohup env CONFIG_FILE="$LOG_DIR/cfg.toml" \
+test_process_start "$TEST_PROCESS_REGISTRY" server "$LOG_DIR/server.log" \
+  env CONFIG_FILE="$LOG_DIR/cfg.toml" \
   XLSTATUS_ALLOW_PRIVATE_OUTBOUND=1 \
   XLSTATUS_SEED_ADMIN_USERNAME=admin XLSTATUS_SEED_ADMIN_PASSWORD=admin-pw \
-  "$ROOT/target/debug/xlstatus-server" \
-  > "$LOG_DIR/server.log" 2>&1 < /dev/null &
-disown $!
+  "$ROOT/target/debug/xlstatus-server"
 sleep 5
 
 echo ">>> login admin"
@@ -255,7 +244,7 @@ done
 [[ "$REC_FIRED" -ge 1 ]] || { echo "FAIL: service_down rule did not fire"; tail -30 "$LOG_DIR/server.log"; exit 1; }
 
 echo ">>> start recovery HTTP target"
-python3 > "$LOG_DIR/recovery-http.log" 2>&1 <<PYRECOVERY &
+cat > "$LOG_DIR/recovery-http.py" <<PYRECOVERY
 from http.server import BaseHTTPRequestHandler, HTTPServer
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -267,7 +256,8 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a, **k): pass
 HTTPServer(("127.0.0.1", $RECOVERY_PORT), H).serve_forever()
 PYRECOVERY
-disown $! 2>/dev/null || true
+test_process_start "$TEST_PROCESS_REGISTRY" recovery-http "$LOG_DIR/recovery-http.log" \
+  python3 "$LOG_DIR/recovery-http.py"
 
 for i in $(seq 1 50); do
   RECOVERED=$(curl -s -b "$JAR" "http://127.0.0.1:$HTTP_PORT/api/v1/alert-events?limit=50" | python3 -c "import sys,json;d=json.load(sys.stdin);print(sum(1 for e in d.get('data',{}).get('events',[]) if e.get('rule_id') == '$REC_RULE_ID' and e.get('kind') == 'recovered'))")
@@ -286,9 +276,8 @@ echo ">>> enroll + run agent"
   --config "$LOG_DIR/agent.yaml" > "$LOG_DIR/enroll.log" 2>&1
 AGENT_ID=$(python3 -c "import json;print(json.load(open('$LOG_DIR/agent.yaml'))['agent_id'])")
 
-nohup "$ROOT/target/debug/xlstatus-agent" run --config "$LOG_DIR/agent.yaml" \
-  > "$LOG_DIR/agent.log" 2>&1 < /dev/null &
-disown $!
+test_process_start "$TEST_PROCESS_REGISTRY" agent "$LOG_DIR/agent.log" \
+  "$ROOT/target/debug/xlstatus-agent" run --config "$LOG_DIR/agent.yaml"
 
 # Wait for the agent to start producing HostState
 for i in $(seq 1 20); do
@@ -354,4 +343,4 @@ fi
 
 echo ""
 echo "M4 PASS (services, SSL status, recovery notification, resource alert, webhook delivery)"
-echo "Stop with: pkill -9 -f xlstatus-server; pkill -9 -f xlstatus-agent; pkill -9 -f verify-m4-alerts.sh 2>/dev/null; pkill -9 -f 'http.server' 2>/dev/null"
+test_process_print_cleanup "$TEST_PROCESS_REGISTRY"

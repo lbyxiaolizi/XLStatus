@@ -22,6 +22,9 @@ GRPC_PORT="${GRPC_PORT:-15065}"
 LOG_DIR="${LOG_DIR:-/tmp/xls-m2-recon}"
 DB="$LOG_DIR/x.db"
 
+source "$ROOT/test-run/lib/test-processes.sh"
+test_process_init "$ROOT" "$0"
+
 mkdir -p "$LOG_DIR"
 rm -f "$DB" "$LOG_DIR/agent.yaml"
 
@@ -41,16 +44,11 @@ session_secret = "test-secret-key-for-development-only-2026"
 session_ttl_hours = 24
 TOML
 
-pkill -9 -f xlstatus-server 2>/dev/null || true
-pkill -9 -f xlstatus-agent 2>/dev/null || true
-sleep 1
-
 start_server() {
-  nohup env CONFIG_FILE="$LOG_DIR/cfg.toml" \
+  test_process_start "$TEST_PROCESS_REGISTRY" server "$LOG_DIR/server.log" \
+    env CONFIG_FILE="$LOG_DIR/cfg.toml" \
     XLSTATUS_SEED_ADMIN_USERNAME=admin XLSTATUS_SEED_ADMIN_PASSWORD=admin-pw \
-    "$ROOT/target/debug/xlstatus-server" \
-    > "$LOG_DIR/server.log" 2>&1 < /dev/null &
-  disown $!
+    "$ROOT/target/debug/xlstatus-server"
   sleep 5
 }
 
@@ -77,13 +75,12 @@ ETOK=$(echo "$TOKR" | python3 -c "import sys,json;print(json.load(sys.stdin).get
   --name "verify-m2-recon-agent" \
   --config "$LOG_DIR/agent.yaml" > "$LOG_DIR/enroll.log" 2>&1
 
-nohup "$ROOT/target/debug/xlstatus-agent" run --config "$LOG_DIR/agent.yaml" \
-  > "$LOG_DIR/agent.log" 2>&1 < /dev/null &
-disown $!
+test_process_start "$TEST_PROCESS_REGISTRY" agent "$LOG_DIR/agent.log" \
+  "$ROOT/target/debug/xlstatus-agent" run --config "$LOG_DIR/agent.yaml"
 sleep 8
 
 echo ">>> kill server (force disconnect from the agent side)"
-pkill -9 -f xlstatus-server
+test_process_stop_label "$TEST_PROCESS_REGISTRY" server
 sleep 1
 # The agent should log "stream closed, reconnecting in Ns (attempt 1)"
 for i in $(seq 1 5); do
@@ -126,4 +123,4 @@ fi
 
 echo ""
 echo "M2 RECONNECT PASS (server restart -> agent reconnects with backoff)"
-echo "Stop with: pkill -9 -f xlstatus-server; pkill -9 -f xlstatus-agent"
+test_process_print_cleanup "$TEST_PROCESS_REGISTRY"

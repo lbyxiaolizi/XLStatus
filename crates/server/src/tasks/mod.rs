@@ -3,9 +3,12 @@ pub mod scheduler;
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use cron::Schedule;
+use futures::{stream, StreamExt};
+use once_cell::sync::Lazy;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tracing::{info, warn};
 use xlstatus_shared::tasks::*;
 
@@ -32,10 +35,85 @@ pub(crate) const TASK_MAX_SELECTOR_IDS: usize = 64;
 pub(crate) const TASK_MAX_SELECTOR_TAGS: usize = 32;
 pub(crate) const TASK_MAX_SELECTOR_TOKEN_BYTES: usize = 128;
 pub(crate) const TASK_MAX_DISPATCH_TARGETS: usize = 64;
+pub(crate) const TASK_MAX_CONCURRENT_DISPATCHES: usize = 8;
 pub(crate) const TASK_SCHEDULED_RUNTIME_SCAN_LIMIT: i64 = 1024;
 pub(crate) const TASK_RESULT_STDOUT_MAX_BYTES: usize = 64 * 1024;
 pub(crate) const TASK_RESULT_STDERR_MAX_BYTES: usize = 64 * 1024;
 pub(crate) const TASK_RESULT_ERROR_MAX_BYTES: usize = 16 * 1024;
+
+static TASK_DISPATCH_PERMITS: Lazy<Arc<Semaphore>> =
+    Lazy::new(|| Arc::new(Semaphore::new(TASK_MAX_CONCURRENT_DISPATCHES)));
+
+const TASK_RUN_CANCELLATION_ERROR: &str = "task dispatch was cancelled before completion";
+const TASK_RUN_CANCELLATION_CLEANUP_ATTEMPTS: usize = 10;
+
+struct PendingTaskRunGuard {
+    db: Db,
+    run_id: String,
+    armed: bool,
+}
+
+impl PendingTaskRunGuard {
+    fn new(db: Db, run_id: String) -> Self {
+        Self {
+            db,
+            run_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingTaskRunGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            warn!(
+                "task run {} cancellation cleanup deferred until Server restart",
+                self.run_id
+            );
+            return;
+        };
+        let db = self.db.clone();
+        let run_id = self.run_id.clone();
+        runtime.spawn(async move {
+            settle_cancelled_task_run(db, run_id).await;
+        });
+    }
+}
+
+async fn settle_cancelled_task_run(db: Db, run_id: String) {
+    let mut last_error = None;
+    for attempt in 0..TASK_RUN_CANCELLATION_CLEANUP_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        match TaskRunRepository::settle_pending_after_cancellation(
+            &db,
+            &run_id,
+            TASK_RUN_CANCELLATION_ERROR,
+        )
+        .await
+        {
+            Ok(true) => return,
+            Ok(false) => last_error = None,
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    if let Some(error) = last_error {
+        warn!(
+            "failed to settle cancelled task run {} after retries: {}",
+            run_id, error
+        );
+    }
+}
 
 pub(crate) fn parse_task_schedule(schedule: &str) -> Result<Schedule> {
     let trimmed = schedule.trim();
@@ -184,196 +262,54 @@ pub async fn dispatch_task_to_agents_with_source(
     }
     ensure_task_target_count_allowed(target_agent_ids.len())?;
 
-    let mut runs = Vec::with_capacity(target_agent_ids.len());
+    let dispatches = stream::iter(target_agent_ids.iter().cloned().enumerate())
+        .map(|(index, agent_id)| {
+            let response_registry = response_registry.clone();
+            let task_id = task.id.as_str();
+            let shell_command = shell_command.as_str();
+            async move {
+                let _permit = TASK_DISPATCH_PERMITS
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .context("task dispatch limiter closed")?;
+                dispatch_task_to_agent(
+                    db,
+                    session_registry,
+                    response_registry.as_ref(),
+                    task_id,
+                    shell_command,
+                    &agent_id,
+                )
+                .await
+                .map(|run| (index, run))
+            }
+        })
+        .buffer_unordered(TASK_MAX_CONCURRENT_DISPATCHES)
+        .collect::<Vec<Result<(usize, TaskRun)>>>()
+        .await;
+
+    let mut indexed_runs = Vec::with_capacity(dispatches.len());
+    for dispatch in dispatches {
+        indexed_runs.push(dispatch?);
+    }
+    indexed_runs.sort_unstable_by_key(|(index, _)| *index);
+    let runs = indexed_runs
+        .into_iter()
+        .map(|(_, run)| run)
+        .collect::<Vec<_>>();
+
     let mut success = 0usize;
     let mut failure = 0usize;
     let mut offline = 0usize;
     let mut timeout = 0usize;
-
-    for agent_id_str in &target_agent_ids {
-        let agent_uuid = match uuid::Uuid::parse_str(agent_id_str) {
-            Ok(u) => u,
-            Err(_) => {
-                failure += 1;
-                let run = create_run(
-                    db,
-                    &task.id,
-                    agent_id_str,
-                    TaskStatus::Failure,
-                    0,
-                    None,
-                    false,
-                    Some("invalid agent id".to_string()),
-                )
-                .await?;
-                runs.push(run);
-                continue;
-            }
-        };
-        let agent_id = xlstatus_shared::AgentId(agent_uuid);
-
-        let run_id = uuid::Uuid::now_v7().to_string();
-        let now = Utc::now().to_rfc3339();
-
-        if !session_registry.is_online(&agent_id).await {
-            offline += 1;
-            let run = TaskRun {
-                id: run_id,
-                task_id: task.id.clone(),
-                server_id: agent_id_str.clone(),
-                status: TaskStatus::Offline,
-                delay_ms: Some(0),
-                output: None,
-                output_truncated: false,
-                error: Some("agent offline".to_string()),
-                created_at: now,
-            };
-            TaskRunRepository::create(db, &run).await?;
-            runs.push(run);
-            continue;
+    for run in &runs {
+        match run.status {
+            TaskStatus::Success => success += 1,
+            TaskStatus::Failure => failure += 1,
+            TaskStatus::Offline => offline += 1,
+            TaskStatus::Timeout => timeout += 1,
         }
-
-        let rx = response_registry.register(run_id.clone(), agent_id).await;
-        if let Err(e) = session_registry
-            .send_task(&agent_id, &run_id, &shell_command, 30)
-            .await
-        {
-            response_registry.cancel(&run_id).await;
-            failure += 1;
-            let run = TaskRun {
-                id: run_id,
-                task_id: task.id.clone(),
-                server_id: agent_id_str.clone(),
-                status: TaskStatus::Failure,
-                delay_ms: Some(0),
-                output: None,
-                output_truncated: false,
-                error: Some(e),
-                created_at: now,
-            };
-            TaskRunRepository::create(db, &run).await?;
-            runs.push(run);
-            continue;
-        }
-
-        let pending_run = TaskRun {
-            id: run_id.clone(),
-            task_id: task.id.clone(),
-            server_id: agent_id_str.clone(),
-            status: TaskStatus::Offline,
-            delay_ms: Some(0),
-            output: None,
-            output_truncated: false,
-            error: None,
-            created_at: now.clone(),
-        };
-        TaskRunRepository::create(db, &pending_run).await?;
-
-        let started = std::time::Instant::now();
-        let final_run = match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
-            Ok(Ok(mut result)) => {
-                let elapsed = started.elapsed().as_millis() as i64;
-                let text_truncation = truncate_task_result_text(
-                    &mut result,
-                    TASK_RESULT_STDOUT_MAX_BYTES,
-                    TASK_RESULT_STDERR_MAX_BYTES,
-                    TASK_RESULT_ERROR_MAX_BYTES,
-                );
-                use xlstatus_proto_gen::xlstatus::v1::TaskOutcome as Outcome;
-                let mapped = match Outcome::try_from(result.status).unwrap_or(Outcome::Unspecified)
-                {
-                    Outcome::Success => {
-                        success += 1;
-                        TaskStatus::Success
-                    }
-                    Outcome::Failure => {
-                        failure += 1;
-                        TaskStatus::Failure
-                    }
-                    Outcome::Timeout => {
-                        timeout += 1;
-                        TaskStatus::Timeout
-                    }
-                    Outcome::Unspecified => {
-                        failure += 1;
-                        TaskStatus::Failure
-                    }
-                };
-                let stderr = if result.stderr.is_empty() {
-                    None
-                } else {
-                    Some(result.stderr)
-                };
-                let error = if !result.error.is_empty() {
-                    Some(result.error)
-                } else {
-                    stderr
-                };
-                let output = if result.stdout.is_empty() {
-                    None
-                } else {
-                    Some(result.stdout)
-                };
-                let output_truncated = text_truncation.any();
-
-                TaskRunRepository::update_result(
-                    db,
-                    &run_id,
-                    mapped,
-                    elapsed,
-                    output.clone(),
-                    output_truncated,
-                    error.clone(),
-                )
-                .await?;
-
-                TaskRun {
-                    id: run_id,
-                    task_id: task.id.clone(),
-                    server_id: agent_id_str.clone(),
-                    status: mapped,
-                    delay_ms: Some(elapsed),
-                    output,
-                    output_truncated,
-                    error,
-                    created_at: now,
-                }
-            }
-            Ok(Err(_canceled)) => {
-                failure += 1;
-                update_and_build_run(
-                    db,
-                    &run_id,
-                    &task.id,
-                    agent_id_str,
-                    TaskStatus::Failure,
-                    0,
-                    None,
-                    false,
-                    Some("agent disconnected before reply".to_string()),
-                    now,
-                )
-                .await?
-            }
-            Err(_elapsed) => {
-                response_registry.cancel(&run_id).await;
-                timeout += 1;
-                update_and_build_run(
-                    db,
-                    &run_id,
-                    &task.id,
-                    agent_id_str,
-                    TaskStatus::Timeout,
-                    started.elapsed().as_millis() as i64,
-                    None,
-                    false,
-                    Some("server-side timeout".to_string()),
-                    now,
-                )
-                .await?
-            }
-        };
-        runs.push(final_run);
     }
 
     let total = target_agent_ids.len();
@@ -401,6 +337,177 @@ pub async fn dispatch_task_to_agents_with_source(
     }
 
     Ok(report)
+}
+
+async fn dispatch_task_to_agent(
+    db: &Db,
+    session_registry: &SessionRegistry,
+    response_registry: &TaskResponseRegistry,
+    task_id: &str,
+    shell_command: &str,
+    agent_id_str: &str,
+) -> Result<TaskRun> {
+    let agent_uuid = match uuid::Uuid::parse_str(agent_id_str) {
+        Ok(agent_uuid) => agent_uuid,
+        Err(_) => {
+            return create_run(
+                db,
+                task_id,
+                agent_id_str,
+                TaskStatus::Failure,
+                0,
+                None,
+                false,
+                Some("invalid agent id".to_string()),
+            )
+            .await;
+        }
+    };
+    let agent_id = xlstatus_shared::AgentId(agent_uuid);
+    let run_id = uuid::Uuid::now_v7().to_string();
+    let now = Utc::now().to_rfc3339();
+
+    if !session_registry.is_online(&agent_id).await {
+        let run = TaskRun {
+            id: run_id,
+            task_id: task_id.to_string(),
+            server_id: agent_id_str.to_string(),
+            status: TaskStatus::Offline,
+            delay_ms: Some(0),
+            output: None,
+            output_truncated: false,
+            error: Some("agent offline".to_string()),
+            created_at: now,
+        };
+        TaskRunRepository::create(db, &run).await?;
+        return Ok(run);
+    }
+
+    let rx = response_registry.register(run_id.clone(), agent_id).await;
+    if let Err(error) = session_registry
+        .send_task(&agent_id, &run_id, shell_command, 30)
+        .await
+    {
+        response_registry.cancel(&run_id).await;
+        let run = TaskRun {
+            id: run_id,
+            task_id: task_id.to_string(),
+            server_id: agent_id_str.to_string(),
+            status: TaskStatus::Failure,
+            delay_ms: Some(0),
+            output: None,
+            output_truncated: false,
+            error: Some(error),
+            created_at: now,
+        };
+        TaskRunRepository::create(db, &run).await?;
+        return Ok(run);
+    }
+
+    let pending_run = TaskRun {
+        id: run_id.clone(),
+        task_id: task_id.to_string(),
+        server_id: agent_id_str.to_string(),
+        status: TaskStatus::Offline,
+        delay_ms: Some(0),
+        output: None,
+        output_truncated: false,
+        error: None,
+        created_at: now.clone(),
+    };
+    // Arm before awaiting the insert. If cancellation races with the database
+    // commit, the cleanup retries until the pending row becomes visible.
+    let mut pending_guard = PendingTaskRunGuard::new(db.clone(), run_id.clone());
+    if let Err(error) = TaskRunRepository::create(db, &pending_run).await {
+        response_registry.cancel(&run_id).await;
+        return Err(error);
+    }
+
+    let started = std::time::Instant::now();
+    let outcome = match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+        Ok(Ok(mut result)) => {
+            let elapsed = started.elapsed().as_millis() as i64;
+            let text_truncation = truncate_task_result_text(
+                &mut result,
+                TASK_RESULT_STDOUT_MAX_BYTES,
+                TASK_RESULT_STDERR_MAX_BYTES,
+                TASK_RESULT_ERROR_MAX_BYTES,
+            );
+            use xlstatus_proto_gen::xlstatus::v1::TaskOutcome as Outcome;
+            let status = match Outcome::try_from(result.status).unwrap_or(Outcome::Unspecified) {
+                Outcome::Success => TaskStatus::Success,
+                Outcome::Timeout => TaskStatus::Timeout,
+                Outcome::Failure | Outcome::Unspecified => TaskStatus::Failure,
+            };
+            let stderr = (!result.stderr.is_empty()).then_some(result.stderr);
+            let error = if result.error.is_empty() {
+                stderr
+            } else {
+                Some(result.error)
+            };
+            let output = (!result.stdout.is_empty()).then_some(result.stdout);
+            let output_truncated = text_truncation.any();
+
+            TaskRunRepository::update_result(
+                db,
+                &run_id,
+                status,
+                elapsed,
+                output.clone(),
+                output_truncated,
+                error.clone(),
+            )
+            .await?;
+
+            Ok(TaskRun {
+                id: run_id,
+                task_id: task_id.to_string(),
+                server_id: agent_id_str.to_string(),
+                status,
+                delay_ms: Some(elapsed),
+                output,
+                output_truncated,
+                error,
+                created_at: now,
+            })
+        }
+        Ok(Err(_)) => {
+            response_registry.cancel(&run_id).await;
+            update_and_build_run(
+                db,
+                &run_id,
+                task_id,
+                agent_id_str,
+                TaskStatus::Failure,
+                0,
+                None,
+                false,
+                Some("agent disconnected before reply".to_string()),
+                now,
+            )
+            .await
+        }
+        Err(_) => {
+            response_registry.cancel(&run_id).await;
+            update_and_build_run(
+                db,
+                &run_id,
+                task_id,
+                agent_id_str,
+                TaskStatus::Timeout,
+                started.elapsed().as_millis() as i64,
+                None,
+                false,
+                Some("server-side timeout".to_string()),
+                now,
+            )
+            .await
+        }
+    };
+    if outcome.is_ok() {
+        pending_guard.disarm();
+    }
+    outcome
 }
 
 pub fn spawn_triggered_tasks(
@@ -998,6 +1105,7 @@ async fn update_and_build_run(
 mod tests {
     use super::*;
     use xlstatus_shared::tasks::{CoverMode, ServerSelector, Task, TaskType};
+    use xlstatus_shared::AgentId;
 
     #[tokio::test]
     async fn triggered_task_requires_matching_owner_when_provided() {
@@ -1057,6 +1165,172 @@ mod tests {
         assert!(ensure_task_target_count_allowed(TASK_MAX_DISPATCH_TARGETS).is_ok());
         let err = ensure_task_target_count_allowed(TASK_MAX_DISPATCH_TARGETS + 1).unwrap_err();
         assert!(err.to_string().contains("maximum"));
+    }
+
+    #[tokio::test]
+    async fn task_dispatches_agents_concurrently_and_preserves_target_order() {
+        let db = test_db().await;
+        let owner = "00000000-0000-0000-0000-000000000001";
+        let first_agent = "00000000-0000-0000-0000-000000000201";
+        let second_agent = "00000000-0000-0000-0000-000000000202";
+        seed_user(&db, owner, "owner").await;
+        seed_agent(&db, first_agent, owner, None).await;
+        seed_agent(&db, second_agent, owner, None).await;
+
+        let mut task = sample_task();
+        task.server_selector_json = serde_json::to_string(&ServerSelector {
+            server_ids: vec![first_agent.to_string(), second_agent.to_string()],
+            ..ServerSelector::default()
+        })
+        .unwrap();
+        TaskRepository::create(&db, &task).await.unwrap();
+
+        let sessions = SessionRegistry::new();
+        let first_id = AgentId(uuid::Uuid::parse_str(first_agent).unwrap());
+        let second_id = AgentId(uuid::Uuid::parse_str(second_agent).unwrap());
+        let (first_tx, mut first_rx) = tokio::sync::mpsc::channel(1);
+        let (second_tx, mut second_rx) = tokio::sync::mpsc::channel(1);
+        assert!(sessions.register(first_id, first_tx).await);
+        assert!(sessions.register(second_id, second_tx).await);
+        let responses = Arc::new(TaskResponseRegistry::new());
+
+        let dispatch_db = db.clone();
+        let dispatch_sessions = sessions.clone();
+        let dispatch_responses = responses.clone();
+        let dispatch_task = task.clone();
+        let dispatch = tokio::spawn(async move {
+            dispatch_task_to_agents(
+                &dispatch_db,
+                &dispatch_sessions,
+                dispatch_responses,
+                &dispatch_task,
+            )
+            .await
+        });
+
+        let (first_message, second_message) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                tokio::join!(first_rx.recv(), second_rx.recv())
+            })
+            .await
+            .expect("both Agents should receive work before either replies");
+        assert!(!dispatch.is_finished());
+        let first_task_id = dispatched_task_id(first_message.unwrap().unwrap());
+        let second_task_id = dispatched_task_id(second_message.unwrap().unwrap());
+
+        for (agent_id, task_id) in [(first_id, first_task_id), (second_id, second_task_id)] {
+            let result_task_id = task_id.clone();
+            assert!(
+                responses
+                    .deliver(
+                        &agent_id,
+                        &task_id,
+                        xlstatus_proto_gen::xlstatus::v1::TaskResult {
+                            task_id: result_task_id,
+                            status: xlstatus_proto_gen::xlstatus::v1::TaskOutcome::Success as i32,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            );
+        }
+
+        let report = tokio::time::timeout(std::time::Duration::from_secs(1), dispatch)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.summary.success, 2);
+        assert_eq!(
+            report
+                .runs
+                .iter()
+                .map(|run| run.server_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![first_agent, second_agent]
+        );
+    }
+
+    #[tokio::test]
+    async fn aborting_task_dispatch_cleans_pending_response_waiters() {
+        let db = test_db().await;
+        let owner = "00000000-0000-0000-0000-000000000001";
+        let first_agent = "00000000-0000-0000-0000-000000000211";
+        let second_agent = "00000000-0000-0000-0000-000000000212";
+        seed_user(&db, owner, "owner").await;
+        seed_agent(&db, first_agent, owner, None).await;
+        seed_agent(&db, second_agent, owner, None).await;
+
+        let mut task = sample_task();
+        task.server_selector_json = serde_json::to_string(&ServerSelector {
+            server_ids: vec![first_agent.to_string(), second_agent.to_string()],
+            ..ServerSelector::default()
+        })
+        .unwrap();
+        TaskRepository::create(&db, &task).await.unwrap();
+
+        let sessions = SessionRegistry::new();
+        let first_id = AgentId(uuid::Uuid::parse_str(first_agent).unwrap());
+        let second_id = AgentId(uuid::Uuid::parse_str(second_agent).unwrap());
+        let (first_tx, mut first_rx) = tokio::sync::mpsc::channel(1);
+        let (second_tx, mut second_rx) = tokio::sync::mpsc::channel(1);
+        assert!(sessions.register(first_id, first_tx).await);
+        assert!(sessions.register(second_id, second_tx).await);
+        let responses = Arc::new(TaskResponseRegistry::new());
+
+        let dispatch = tokio::spawn({
+            let db = db.clone();
+            let sessions = sessions.clone();
+            let responses = responses.clone();
+            let task = task.clone();
+            async move { dispatch_task_to_agents(&db, &sessions, responses, &task).await }
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::join!(first_rx.recv(), second_rx.recv())
+        })
+        .await
+        .expect("both Agents should receive work before dispatch cancellation");
+        assert_eq!(responses.pending_count(), 2);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let rows = task_run_status_rows(&db, &task.id).await;
+                if rows.len() == 2 && rows.iter().all(|(status, _)| status == "pending") {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("both task runs should be persisted as pending before cancellation");
+
+        dispatch.abort();
+        assert!(dispatch.await.unwrap_err().is_cancelled());
+        assert_eq!(responses.pending_count(), 0);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let rows = task_run_status_rows(&db, &task.id).await;
+                if rows.len() == 2 && rows.iter().all(|(status, _)| status != "pending") {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled task runs should leave pending state");
+        let rows = task_run_status_rows(&db, &task.id).await;
+        assert!(rows.iter().all(|(status, error)| {
+            status == "failed" && error.as_deref() == Some(TASK_RUN_CANCELLATION_ERROR)
+        }));
+    }
+
+    fn dispatched_task_id(message: xlstatus_proto_gen::xlstatus::v1::ServerMessage) -> String {
+        match message.payload {
+            Some(xlstatus_proto_gen::xlstatus::v1::server_message::Payload::Task(task)) => {
+                task.task_id
+            }
+            _ => panic!("expected dispatched task message"),
+        }
     }
 
     #[test]
@@ -1198,6 +1472,17 @@ mod tests {
         db
     }
 
+    async fn task_run_status_rows(db: &Db, task_id: &str) -> Vec<(String, Option<String>)> {
+        let Db::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query_as("SELECT status, error FROM task_runs WHERE task_id = ? ORDER BY id")
+            .bind(task_id)
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
     async fn seed_user(db: &Db, id: &str, username: &str) {
         let Db::Sqlite(pool) = db else {
             unreachable!();
@@ -1223,6 +1508,16 @@ mod tests {
         .bind(format!("agent-{id}"))
         .bind(owner)
         .bind(revoked_at)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO servers (id, owner_user_id, name, created_at, updated_at, agent_id) VALUES (?, ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', ?)",
+        )
+        .bind(id)
+        .bind(owner)
+        .bind(format!("server-{id}"))
+        .bind(id)
         .execute(pool)
         .await
         .unwrap();

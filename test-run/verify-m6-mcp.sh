@@ -14,6 +14,9 @@ GRPC_PORT="${GRPC_PORT:-15070}"
 LOG_DIR="${LOG_DIR:-/tmp/xls-m6-mcp}"
 DB="$LOG_DIR/x.db"
 
+source "$ROOT/test-run/lib/test-processes.sh"
+test_process_init "$ROOT" "$0"
+
 mkdir -p "$LOG_DIR"
 rm -f "$DB" "$LOG_DIR/agent.yaml"
 
@@ -33,16 +36,11 @@ session_secret = "test-secret-key-for-development-only-2026"
 session_ttl_hours = 24
 TOML
 
-pkill -9 -f xlstatus-server 2>/dev/null || true
-pkill -9 -f xlstatus-agent 2>/dev/null || true
-sleep 1
-
 echo ">>> start server"
-nohup env CONFIG_FILE="$LOG_DIR/cfg.toml" \
+test_process_start "$TEST_PROCESS_REGISTRY" server "$LOG_DIR/server.log" \
+  env CONFIG_FILE="$LOG_DIR/cfg.toml" \
   XLSTATUS_SEED_ADMIN_USERNAME=admin XLSTATUS_SEED_ADMIN_PASSWORD=admin-pw \
-  "$ROOT/target/debug/xlstatus-server" \
-  > "$LOG_DIR/server.log" 2>&1 < /dev/null &
-disown $!
+  "$ROOT/target/debug/xlstatus-server"
 sleep 5
 
 echo ">>> login admin"
@@ -67,9 +65,8 @@ echo ">>> enroll + run agent"
   --name "verify-m6-mcp-agent" \
   --config "$LOG_DIR/agent.yaml" > "$LOG_DIR/enroll.log" 2>&1
 AGENT_ID=$(python3 -c "import json;print(json.load(open('$LOG_DIR/agent.yaml'))['agent_id'])")
-nohup "$ROOT/target/debug/xlstatus-agent" run --config "$LOG_DIR/agent.yaml" \
-  > "$LOG_DIR/agent.log" 2>&1 < /dev/null &
-disown $!
+test_process_start "$TEST_PROCESS_REGISTRY" agent "$LOG_DIR/agent.log" \
+  "$ROOT/target/debug/xlstatus-agent" run --config "$LOG_DIR/agent.yaml"
 
 for i in $(seq 1 20); do
   SEEN=$(sqlite3 "$DB" "SELECT last_seen_at IS NOT NULL FROM agents WHERE id = '$AGENT_ID';" 2>/dev/null || echo 0)
@@ -172,4 +169,4 @@ echo "$DEL" | python3 -c "import sys,json;d=json.load(sys.stdin);assert d['data'
 
 echo ""
 echo "M6 MCP PASS (PAT-only MCP, server exec, fs read/write/list/delete, temporary URL transfer + rate limit)"
-echo "Stop with: pkill -9 -f xlstatus-server; pkill -9 -f xlstatus-agent"
+test_process_print_cleanup "$TEST_PROCESS_REGISTRY"

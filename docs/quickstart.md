@@ -11,6 +11,8 @@ mkdir -p .secrets
 printf '%s\n' 'replace-with-a-strong-initial-password' > .secrets/xlstatus_seed_admin_password
 chmod 700 .secrets
 chmod 600 .secrets/xlstatus_seed_admin_password
+test -f .env || (umask 077; printf 'SESSION_SECRET=%s\nPOSTGRES_PASSWORD=%s\n' \
+  "$(openssl rand -hex 32)" "$(openssl rand -hex 24)" > .env)
 docker compose up -d
 curl -fsS http://localhost:8080/healthz
 docker compose ps
@@ -31,6 +33,7 @@ docker compose -f docker-compose.pg.yml ps
 - 公开状态页: `http://localhost:3000/status`
 
 本地管理员账号使用你写入 `.secrets/xlstatus_seed_admin_password` 的初始密码。
+`.env` 中的 `SESSION_SECRET` 用于会话签名，`POSTGRES_PASSWORD` 供可选的 PostgreSQL Compose 使用；升级时不要重新生成或覆盖该文件。
 
 Compose 已设置：
 
@@ -51,9 +54,13 @@ cp .env.example .env
 编辑 `.env`：
 
 ```env
+SESSION_SECRET=<至少 32 字节的随机值>
+POSTGRES_PASSWORD=<强随机数据库密码>
 XLSTATUS_PUBLIC_API_URL=http://example.com:8080
 XLSTATUS_CORS_ALLOWED_ORIGINS=http://example.com:3000,http://localhost:3000,http://127.0.0.1:3000
 ```
+
+Agent gRPC 默认仍只发布到宿主 `127.0.0.1:50051`。只有远端 Agent 通过 TLS/mTLS 或可信 VPN 接入时，才在 `.env` 额外设置 `XLSTATUS_GRPC_PUBLISH_ADDRESS=0.0.0.0`。
 
 然后重新构建并启动：
 

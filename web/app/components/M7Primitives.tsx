@@ -1,6 +1,7 @@
 "use client";
 
-import { type HTMLAttributes, ReactNode } from "react";
+import { type HTMLAttributes, ReactNode, useEffect, useId, useRef } from "react";
+import { acquireBodyScrollLock } from "@/app/lib/body-scroll-lock";
 import type { ApiResponse } from "@/lib/api";
 import { formatLocaleDate, getTranslations } from "@/lib/i18n";
 
@@ -96,7 +97,10 @@ export function StatusBadge({
 export function InlineError({ message }: { message: string | null }) {
   if (!message) return null;
   return (
-    <div className="border-2 border-black bg-[var(--btn-bg)] px-4 py-3 text-sm font-bold text-[var(--btn-text)] shadow-[var(--shadow-brutal-sm)]">
+    <div
+      role="alert"
+      className="break-words border-2 border-black bg-[var(--btn-bg)] px-4 py-3 text-sm font-bold text-[var(--btn-text)] shadow-[var(--shadow-brutal-sm)]"
+    >
       {message}
     </div>
   );
@@ -215,6 +219,83 @@ export function Field({
   );
 }
 
+const DIALOG_FOCUSABLE_SELECTOR = [
+  "a[href]",
+  "button:not([disabled])",
+  "input:not([disabled]):not([type='hidden'])",
+  "select:not([disabled])",
+  "textarea:not([disabled])",
+  "[tabindex]:not([tabindex='-1'])",
+].join(",");
+
+export function useDialogFocusTrap(onClose: () => void) {
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  const onCloseRef = useRef(onClose);
+
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const previousFocus = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+    const releaseScrollLock = acquireBodyScrollLock();
+
+    const focusableElements = () => Array.from(
+      dialog.querySelectorAll<HTMLElement>(DIALOG_FOCUSABLE_SELECTOR),
+    ).filter((element) => {
+      const style = window.getComputedStyle(element);
+      return element.getClientRects().length > 0
+        && !element.hidden
+        && style.display !== "none"
+        && style.visibility !== "hidden";
+    });
+
+    if (!dialog.contains(document.activeElement)) {
+      const preferred = dialog.querySelector<HTMLElement>("[data-dialog-initial-focus]")
+        ?? dialog.querySelector<HTMLElement>("input:not([disabled]):not([type='hidden']), select:not([disabled]), textarea:not([disabled])")
+        ?? focusableElements()[0]
+        ?? dialog;
+      preferred.focus();
+    }
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        onCloseRef.current();
+        return;
+      }
+      if (event.key !== "Tab") return;
+
+      const focusable = focusableElements();
+      if (focusable.length === 0) {
+        event.preventDefault();
+        dialogRef.current?.focus();
+        return;
+      }
+      const activeIndex = focusable.indexOf(document.activeElement as HTMLElement);
+      const nextIndex = event.shiftKey ? activeIndex - 1 : activeIndex + 1;
+      if (activeIndex === -1 || nextIndex < 0 || nextIndex >= focusable.length) {
+        event.preventDefault();
+        focusable[event.shiftKey ? focusable.length - 1 : 0].focus();
+      }
+    }
+
+    dialog.addEventListener("keydown", handleKeyDown);
+    return () => {
+      dialog.removeEventListener("keydown", handleKeyDown);
+      releaseScrollLock();
+      if (previousFocus?.isConnected) previousFocus.focus();
+    };
+  }, []);
+
+  return dialogRef;
+}
+
 export function Modal({
   title,
   children,
@@ -224,12 +305,22 @@ export function Modal({
   children: ReactNode;
   onClose: () => void;
 }) {
+  const titleId = useId();
+  const dialogRef = useDialogFocusTrap(onClose);
+
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/50 px-4 py-8">
-      <div className="w-full max-w-3xl border-4 border-black bg-[var(--bg-card)] shadow-[10px_10px_0_0_#000]">
-        <div className="flex items-center justify-between border-b-4 border-black bg-[var(--accent-bg)] px-5 py-4">
-          <h2 className="text-xl font-black uppercase text-[var(--text-main)]">{title}</h2>
-          <button type="button" onClick={onClose} className={buttonClass("secondary")}>
+    <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/50 px-4 py-4 sm:py-8">
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        tabIndex={-1}
+        className="w-full max-w-3xl border-4 border-black bg-[var(--bg-card)] shadow-[10px_10px_0_0_#000] outline-none"
+      >
+        <div className="flex items-center justify-between gap-3 border-b-4 border-black bg-[var(--accent-bg)] px-5 py-4">
+          <h2 id={titleId} className="min-w-0 flex-1 break-words text-lg font-black uppercase text-[var(--text-main)] sm:text-xl">{title}</h2>
+          <button type="button" onClick={onClose} className={`${buttonClass("secondary")} shrink-0`}>
             {getTranslations().common.close}
           </button>
         </div>

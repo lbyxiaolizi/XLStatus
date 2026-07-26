@@ -90,6 +90,13 @@ impl DatabaseBackend {
                 sqlx::query(include_str!("../../migrations/sqlite/003_services.sql"))
                     .execute(pool)
                     .await?;
+                sqlite_add_column_if_missing(
+                    pool,
+                    "services",
+                    "notification_group_id",
+                    "notification_group_id TEXT",
+                )
+                .await?;
                 sqlx::query(include_str!("../../migrations/sqlite/004_nat.sql"))
                     .execute(pool)
                     .await?;
@@ -152,6 +159,7 @@ impl DatabaseBackend {
                 sqlx::query(include_str!("../../migrations/sqlite/005_tasks.sql"))
                     .execute(pool)
                     .await?;
+                sqlite_repair_legacy_audit_log_token_fk(pool).await?;
                 sqlite_add_column_if_missing(
                     pool,
                     "agents",
@@ -369,13 +377,13 @@ impl DatabaseBackend {
             DatabaseBackend::Postgres(pool) => {
                 // PostgreSQL prepared-statement protocol does not accept multi-statement
                 // SQL; route each migration through the simple protocol which does.
-                // Running all five files in a single simple-query batch keeps the
+                // Running all files in a single simple-query batch keeps the
                 // foreign-key checks valid (each FK reference can see its target
                 // table within the same transaction). Splitting them into separate
                 // raw_sql calls causes "foreign key constraint cannot be implemented"
                 // errors on later files.
                 let batch = format!(
-                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
                     include_str!("../../migrations/postgres/001_initial.sql"),
                     include_str!("../../migrations/postgres/002_agents.sql"),
                     include_str!("../../migrations/postgres/003_services.sql"),
@@ -398,6 +406,7 @@ impl DatabaseBackend {
                     include_str!("../../migrations/postgres/020_temporary_transfer_tokens.sql"),
                     include_str!("../../migrations/postgres/021_pat_expiration_backfill.sql"),
                     include_str!("../../migrations/postgres/022_service_owner.sql"),
+                    include_str!("../../migrations/postgres/023_service_notification_group.sql"),
                 );
                 sqlx::raw_sql(batch.as_str()).execute(pool).await?;
                 Ok(())
@@ -423,6 +432,84 @@ async fn sqlite_add_column_if_missing(
         let sql = format!("ALTER TABLE {table} ADD COLUMN {definition}");
         sqlx::query(&sql).execute(pool).await?;
     }
+
+    Ok(())
+}
+
+async fn sqlite_repair_legacy_audit_log_token_fk(pool: &Pool<Sqlite>) -> anyhow::Result<()> {
+    let foreign_keys = sqlx::query("PRAGMA foreign_key_list(audit_logs)")
+        .fetch_all(pool)
+        .await?;
+    let has_legacy_target = foreign_keys.iter().any(|row| {
+        row.try_get::<String, _>("from").ok().as_deref() == Some("api_token_id")
+            && row.try_get::<String, _>("table").ok().as_deref() == Some("api_tokens")
+    });
+    if !has_legacy_target {
+        return Ok(());
+    }
+
+    let mut transaction = pool.begin().await?;
+    sqlx::query(
+        r#"
+        CREATE TABLE _xlstatus_audit_logs_fk_rebuild (
+            id TEXT PRIMARY KEY,
+            user_id TEXT,
+            api_token_id TEXT,
+            action TEXT NOT NULL,
+            resource_type TEXT NOT NULL,
+            resource_id TEXT,
+            server_id TEXT,
+            ip TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            metadata_json TEXT,
+            sensitive_hash TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL,
+            FOREIGN KEY (api_token_id) REFERENCES personal_access_tokens(id) ON DELETE SET NULL
+        )
+        "#,
+    )
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO _xlstatus_audit_logs_fk_rebuild (
+            id, user_id, api_token_id, action, resource_type, resource_id,
+            server_id, ip, outcome, metadata_json, sensitive_hash, created_at
+        )
+        SELECT
+            id, user_id,
+            CASE
+                WHEN api_token_id IS NULL THEN NULL
+                WHEN EXISTS (
+                    SELECT 1 FROM personal_access_tokens AS tokens
+                    WHERE tokens.id = audit_logs.api_token_id
+                ) THEN api_token_id
+                ELSE NULL
+            END,
+            action, resource_type, resource_id,
+            server_id, ip, outcome, metadata_json, sensitive_hash, created_at
+        FROM audit_logs
+        "#,
+    )
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query("DROP TABLE audit_logs")
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query("ALTER TABLE _xlstatus_audit_logs_fk_rebuild RENAME TO audit_logs")
+        .execute(&mut *transaction)
+        .await?;
+    for index_sql in [
+        "CREATE INDEX idx_audit_logs_user ON audit_logs(user_id, created_at DESC)",
+        "CREATE INDEX idx_audit_logs_token ON audit_logs(api_token_id, created_at DESC)",
+        "CREATE INDEX idx_audit_logs_resource ON audit_logs(resource_type, resource_id, created_at DESC)",
+        "CREATE INDEX idx_audit_logs_server ON audit_logs(server_id, created_at DESC)",
+        "CREATE INDEX idx_audit_logs_action ON audit_logs(action, created_at DESC)",
+    ] {
+        sqlx::query(index_sql).execute(&mut *transaction).await?;
+    }
+    transaction.commit().await?;
 
     Ok(())
 }
@@ -691,7 +778,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_migrations_add_service_owner_to_legacy_table_before_index() {
+    async fn sqlite_migrations_add_missing_service_columns_to_legacy_table() {
         let db_path =
             std::env::temp_dir().join(format!("xlstatus-legacy-services-{}.db", Uuid::now_v7()));
         let url = format!("sqlite://{}?mode=rwc", db_path.to_string_lossy());
@@ -710,7 +797,6 @@ mod tests {
                 interval_seconds INTEGER NOT NULL DEFAULT 60,
                 timeout_seconds INTEGER NOT NULL DEFAULT 10,
                 enabled INTEGER NOT NULL DEFAULT 1,
-                notification_group_id TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
@@ -732,6 +818,11 @@ mod tests {
                 .map(|name| name == "owner_user_id")
                 .unwrap_or(false)
         }));
+        assert!(columns.iter().any(|row| {
+            row.try_get::<String, _>("name")
+                .map(|name| name == "notification_group_id")
+                .unwrap_or(false)
+        }));
 
         let indexes = sqlx::query("PRAGMA index_list(services)")
             .fetch_all(pool)
@@ -742,6 +833,110 @@ mod tests {
                 .map(|name| name == "idx_services_owner")
                 .unwrap_or(false)
         }));
+
+        drop(db);
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn sqlite_migrations_repair_legacy_audit_token_foreign_key() {
+        let db_path =
+            std::env::temp_dir().join(format!("xlstatus-legacy-audit-token-{}.db", Uuid::now_v7()));
+        let url = format!("sqlite://{}?mode=rwc", db_path.to_string_lossy());
+        let db = DatabaseBackend::connect(&url, true).await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = &db else {
+            unreachable!();
+        };
+
+        sqlx::query(include_str!("../../migrations/sqlite/001_initial.sql"))
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE api_tokens (id TEXT PRIMARY KEY)")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO api_tokens (id) VALUES ('orphaned-legacy-token')")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TABLE audit_logs (
+                id TEXT PRIMARY KEY,
+                user_id TEXT,
+                api_token_id TEXT,
+                action TEXT NOT NULL,
+                resource_type TEXT NOT NULL,
+                resource_id TEXT,
+                server_id TEXT,
+                ip TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                metadata_json TEXT,
+                sensitive_hash TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL,
+                FOREIGN KEY (api_token_id) REFERENCES api_tokens(id) ON DELETE SET NULL
+            )
+            "#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO audit_logs (id, api_token_id, action, resource_type, ip, outcome) VALUES ('legacy-audit', 'orphaned-legacy-token', 'read', 'server', '127.0.0.1', 'success')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        db.run_migrations().await.unwrap();
+        db.run_migrations().await.unwrap();
+
+        let foreign_keys = sqlx::query("PRAGMA foreign_key_list(audit_logs)")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+        assert!(foreign_keys.iter().any(|row| {
+            row.try_get::<String, _>("from").ok().as_deref() == Some("api_token_id")
+                && row.try_get::<String, _>("table").ok().as_deref()
+                    == Some("personal_access_tokens")
+        }));
+        let legacy_token: Option<String> =
+            sqlx::query_scalar("SELECT api_token_id FROM audit_logs WHERE id = 'legacy-audit'")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(legacy_token, None);
+
+        let user_id = Uuid::now_v7().to_string();
+        let pat_id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, role, created_at, updated_at) VALUES (?, ?, 'hash', 'admin', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(&user_id)
+        .bind(format!("legacy-audit-user-{user_id}"))
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO personal_access_tokens (id, user_id, name, token_hash, scopes, expires_at, created_at) VALUES (?, ?, 'audit-token', ?, '[]', '2027-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(&pat_id)
+        .bind(&user_id)
+        .bind(format!("hash-{pat_id}"))
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO audit_logs (id, user_id, api_token_id, action, resource_type, ip, outcome) VALUES (?, ?, ?, 'read', 'server', '127.0.0.1', 'success')",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(&user_id)
+        .bind(&pat_id)
+        .execute(pool)
+        .await
+        .unwrap();
 
         drop(db);
         let _ = std::fs::remove_file(&db_path);

@@ -31,6 +31,10 @@ dist/
 *.tsbuildinfo
 next-env.d.ts
 
+# Python
+__pycache__/
+*.py[cod]
+
 # Environment
 .env
 .env.local
@@ -42,7 +46,6 @@ next-env.d.ts
 /logs/
 
 # Progress and status reports (development artifacts)
-security.md
 M*-PROGRESS.md
 M*-STATUS-REPORT.md
 M*-IMPLEMENTATION-PROGRESS.md

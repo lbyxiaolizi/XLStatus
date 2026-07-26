@@ -18,8 +18,8 @@
 // Each call resolves and closes immediately; in-flight "busy" state belongs on
 // the page's own action button, not the dialog.
 
-import { ReactNode, useCallback, useRef, useState } from "react";
-import { buttonClass, inputClass, textareaClass } from "./M7Primitives";
+import { ReactNode, useCallback, useId, useRef, useState } from "react";
+import { buttonClass, inputClass, textareaClass, useDialogFocusTrap } from "./M7Primitives";
 import { getTranslations } from "@/lib/i18n";
 
 export interface ConfirmOptions {
@@ -48,10 +48,11 @@ export interface TotpOptions {
   message?: ReactNode;
 }
 
-type ActiveDialog =
+type DialogRequest =
   | { kind: "confirm"; opts: ConfirmOptions }
   | { kind: "prompt"; opts: PromptOptions }
   | { kind: "totp"; opts: TotpOptions };
+type ActiveDialog = DialogRequest & { id: number };
 
 export interface Dialogs {
   confirm: (opts: ConfirmOptions) => Promise<boolean>;
@@ -60,20 +61,44 @@ export interface Dialogs {
   element: ReactNode;
 }
 
-function Backdrop({ children }: { children: ReactNode }) {
+function dialogCancellationValue(kind: DialogRequest["kind"] | null): false | null {
+  return kind === "confirm" ? false : null;
+}
+
+function Backdrop({
+  children,
+  titleId,
+  descriptionId,
+  onClose,
+}: {
+  children: ReactNode;
+  titleId: string;
+  descriptionId?: string;
+  onClose: () => void;
+}) {
+  const dialogRef = useDialogFocusTrap(onClose);
+
   return (
-    <div className="fixed inset-0 z-[60] flex items-start justify-center overflow-y-auto bg-black/50 px-4 py-16">
-      <div className="w-full max-w-md border-4 border-black bg-[var(--bg-card)] shadow-[10px_10px_0_0_#000]">
+    <div className="fixed inset-0 z-[60] flex items-start justify-center overflow-y-auto bg-black/50 px-4 py-4 sm:py-16">
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        aria-describedby={descriptionId}
+        tabIndex={-1}
+        className="w-full max-w-md border-4 border-black bg-[var(--bg-card)] shadow-[10px_10px_0_0_#000] outline-none"
+      >
         {children}
       </div>
     </div>
   );
 }
 
-function DialogHeader({ title }: { title: string }) {
+function DialogHeader({ id, title }: { id: string; title: string }) {
   return (
     <div className="border-b-4 border-black bg-[var(--accent-bg)] px-5 py-4">
-      <h2 className="text-lg font-black uppercase text-[var(--text-main)]">{title}</h2>
+      <h2 id={id} className="break-words text-lg font-black uppercase text-[var(--text-main)]">{title}</h2>
     </div>
   );
 }
@@ -81,26 +106,40 @@ function DialogHeader({ title }: { title: string }) {
 export function useDialogs(): Dialogs {
   const [active, setActive] = useState<ActiveDialog | null>(null);
   const resolveRef = useRef<((value: unknown) => void) | null>(null);
+  const activeKindRef = useRef<DialogRequest["kind"] | null>(null);
+  const nextDialogIdRef = useRef(0);
   const [value, setValue] = useState("");
   const [fieldError, setFieldError] = useState<string | null>(null);
+  const titleId = useId();
+  const descriptionId = useId();
+  const fieldId = useId();
+  const errorId = useId();
 
   const settle = useCallback((result: unknown) => {
     const resolve = resolveRef.current;
     resolveRef.current = null;
+    activeKindRef.current = null;
     setActive(null);
     setValue("");
     setFieldError(null);
     resolve?.(result);
   }, []);
 
-  const open = useCallback((dialog: ActiveDialog, initial = "") => {
+  const open = useCallback((dialog: DialogRequest, initial = "") => {
     // If a dialog is somehow already open, cancel it first.
-    resolveRef.current?.(dialog.kind === "confirm" ? false : null);
+    const previousResolve = resolveRef.current;
+    const previousKind = activeKindRef.current;
+    resolveRef.current = null;
+    activeKindRef.current = null;
+    previousResolve?.(dialogCancellationValue(previousKind));
+    nextDialogIdRef.current += 1;
+    const id = nextDialogIdRef.current;
     return new Promise<unknown>((resolve) => {
       resolveRef.current = resolve;
+      activeKindRef.current = dialog.kind;
       setValue(initial);
       setFieldError(null);
-      setActive(dialog);
+      setActive({ ...dialog, id });
     });
   }, []);
 
@@ -122,23 +161,28 @@ export function useDialogs(): Dialogs {
   if (active) {
     const copy = getTranslations();
     const cancelText = copy.common.cancel;
+    const dismiss = () => settle(dialogCancellationValue(active.kind));
 
     if (active.kind === "confirm") {
       const { opts } = active;
       element = (
-        <Backdrop>
-          <DialogHeader title={opts.title ?? copy.dialogs.pleaseConfirm} />
+        <Backdrop key={active.id} titleId={titleId} descriptionId={descriptionId} onClose={dismiss}>
+          <DialogHeader id={titleId} title={opts.title ?? copy.dialogs.pleaseConfirm} />
           <div className="space-y-5 px-5 py-5">
-            <div className="text-sm font-bold text-[var(--text-main)]">{opts.message}</div>
-            <div className="flex justify-end gap-2">
-              <button type="button" className={buttonClass("secondary")} onClick={() => settle(false)}>
+            <div id={descriptionId} className="text-sm font-bold text-[var(--text-main)]">{opts.message}</div>
+            <div className="flex flex-wrap justify-end gap-2">
+              <button
+                type="button"
+                className={buttonClass("secondary")}
+                onClick={() => settle(false)}
+                data-dialog-initial-focus
+              >
                 {opts.cancelLabel ?? cancelText}
               </button>
               <button
                 type="button"
                 className={buttonClass(opts.danger ? "danger" : "primary")}
                 onClick={() => settle(true)}
-                autoFocus
               >
                 {opts.confirmLabel ?? copy.dialogs.confirm}
               </button>
@@ -157,8 +201,13 @@ export function useDialogs(): Dialogs {
         settle(value);
       };
       element = (
-        <Backdrop>
-          <DialogHeader title={opts.title ?? opts.label ?? copy.dialogs.pleaseInput} />
+        <Backdrop
+          key={active.id}
+          titleId={titleId}
+          descriptionId={opts.message ? descriptionId : undefined}
+          onClose={dismiss}
+        >
+          <DialogHeader id={titleId} title={opts.title ?? opts.label ?? copy.dialogs.pleaseInput} />
           <form
             className="space-y-5 px-5 py-5"
             onSubmit={(event) => {
@@ -167,41 +216,49 @@ export function useDialogs(): Dialogs {
             }}
           >
             {opts.message ? (
-              <div className="text-sm font-bold text-[var(--text-main)]">{opts.message}</div>
+              <div id={descriptionId} className="text-sm font-bold text-[var(--text-main)]">{opts.message}</div>
             ) : null}
             {opts.label ? (
-              <span className="block text-xs font-black uppercase tracking-wide text-[var(--text-main)]">
+              <label htmlFor={fieldId} className="block text-xs font-black uppercase tracking-wide text-[var(--text-main)]">
                 {opts.label}
-              </span>
+              </label>
             ) : null}
             {opts.multiline ? (
               <textarea
+                id={fieldId}
                 className={textareaClass}
                 rows={4}
                 value={value}
                 placeholder={opts.placeholder}
+                aria-label={opts.label ? undefined : opts.title ?? copy.dialogs.pleaseInput}
+                aria-invalid={Boolean(fieldError)}
+                aria-describedby={fieldError ? errorId : undefined}
                 onChange={(event) => {
                   setValue(event.target.value);
                   if (fieldError) setFieldError(null);
                 }}
-                autoFocus
+                data-dialog-initial-focus
               />
             ) : (
               <input
+                id={fieldId}
                 className={inputClass}
                 value={value}
                 placeholder={opts.placeholder}
+                aria-label={opts.label ? undefined : opts.title ?? copy.dialogs.pleaseInput}
+                aria-invalid={Boolean(fieldError)}
+                aria-describedby={fieldError ? errorId : undefined}
                 onChange={(event) => {
                   setValue(event.target.value);
                   if (fieldError) setFieldError(null);
                 }}
-                autoFocus
+                data-dialog-initial-focus
               />
             )}
             {fieldError ? (
-              <span className="block text-xs font-bold text-[var(--accent-color)]">{fieldError}</span>
+              <span id={errorId} role="alert" className="block text-xs font-bold text-[var(--accent-color)]">{fieldError}</span>
             ) : null}
-            <div className="flex justify-end gap-2">
+            <div className="flex flex-wrap justify-end gap-2">
               <button type="button" className={buttonClass("secondary")} onClick={() => settle(null)}>
                 {opts.cancelLabel ?? cancelText}
               </button>
@@ -223,8 +280,8 @@ export function useDialogs(): Dialogs {
         settle(code);
       };
       element = (
-        <Backdrop>
-          <DialogHeader title={opts.title ?? copy.dialogs.twoFactor} />
+        <Backdrop key={active.id} titleId={titleId} descriptionId={descriptionId} onClose={dismiss}>
+          <DialogHeader id={titleId} title={opts.title ?? copy.dialogs.twoFactor} />
           <form
             className="space-y-5 px-5 py-5"
             onSubmit={(event) => {
@@ -232,26 +289,29 @@ export function useDialogs(): Dialogs {
               submit();
             }}
           >
-            <div className="text-sm font-bold text-[var(--text-main)]">
+            <label id={descriptionId} htmlFor={fieldId} className="text-sm font-bold text-[var(--text-main)]">
               {opts.message ?? copy.dialogs.totpPrompt}
-            </div>
+            </label>
             <input
+              id={fieldId}
               className={`${inputClass} text-center text-2xl tracking-[0.5em]`}
               value={code}
               inputMode="numeric"
               autoComplete="one-time-code"
               maxLength={6}
               placeholder="000000"
+              aria-invalid={Boolean(fieldError)}
+              aria-describedby={fieldError ? errorId : undefined}
               onChange={(event) => {
                 setValue(event.target.value.replace(/\D/g, "").slice(0, 6));
                 if (fieldError) setFieldError(null);
               }}
-              autoFocus
+              data-dialog-initial-focus
             />
             {fieldError ? (
-              <span className="block text-xs font-bold text-[var(--accent-color)]">{fieldError}</span>
+              <span id={errorId} role="alert" className="block text-xs font-bold text-[var(--accent-color)]">{fieldError}</span>
             ) : null}
-            <div className="flex justify-end gap-2">
+            <div className="flex flex-wrap justify-end gap-2">
               <button type="button" className={buttonClass("secondary")} onClick={() => settle(null)}>
                 {cancelText}
               </button>

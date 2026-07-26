@@ -6,7 +6,7 @@
 
 XLStatus 是一个用 Rust 和 Next.js 编写的自托管服务器监控与运维面板。它把主机实时指标、公开状态页、服务探测、告警、任务执行、文件操作、Web 终端、DDNS、NAT 隧道和 MCP 工具整合到一个可部署的系统里。
 
-当前正式版本是 `v0.1`。安装、运维和继续开发请从文档索引开始：[docs/README.md](./docs/README.md)。
+当前正式版本是 `v0.2`。安装、运维和继续开发请从文档索引开始：[docs/README.md](./docs/README.md)。
 
 ## 功能特性
 
@@ -26,6 +26,8 @@ mkdir -p .secrets
 printf '%s\n' 'replace-with-a-strong-initial-password' > .secrets/xlstatus_seed_admin_password
 chmod 700 .secrets
 chmod 600 .secrets/xlstatus_seed_admin_password
+test -f .env || (umask 077; printf 'SESSION_SECRET=%s\nPOSTGRES_PASSWORD=%s\n' \
+  "$(openssl rand -hex 32)" "$(openssl rand -hex 24)" > .env)
 docker compose up -d
 curl -fsS http://localhost:8080/healthz
 ```
@@ -36,11 +38,13 @@ curl -fsS http://localhost:8080/healthz
 - API：`http://localhost:8080`
 - 公开状态页：`http://localhost:3000/status`
 
-Docker Compose 默认把 Agent gRPC 发布到 `0.0.0.0:50051`，远端 Agent
-无需逐个添加来源 IP 白名单即可接入。生产环境仍建议让 `8080` 和 `3000`
+Docker Compose 默认只把 Agent gRPC 发布到 `127.0.0.1:50051`。远端 Agent
+需要接入时，仅应在已配置 gRPC TLS/mTLS 或可信 VPN 的前提下设置
+`XLSTATUS_GRPC_PUBLISH_ADDRESS=0.0.0.0`。生产环境仍建议让 `8080` 和 `3000`
 只经本机或反向代理访问。
 
 首次启动前请在 `.secrets/xlstatus_seed_admin_password` 写入强初始密码。
+生成的 `.env` 保存会话签名密钥，以及可选 PostgreSQL Compose 使用的数据库密码。请保持文件私有，升级时不要重新生成。
 
 PostgreSQL 版本：
 
@@ -53,7 +57,7 @@ docker compose -f docker-compose.pg.yml up -d
 Server：
 
 ```bash
-curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1/install-server.sh | sudo bash
+curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.2/install-server.sh | sudo VERSION=v0.2 bash
 ```
 
 Agent：
@@ -61,12 +65,13 @@ Agent：
 ```bash
 sudo SERVER_URL=http://dashboard.example.com:8080 \
   GRPC_SERVER=https://grpc.dashboard.example.com:50051 \
+  VERSION=v0.2 \
   ENROLLMENT_TOKEN=xle_... \
   AGENT_NAME="$(hostname)" \
-  bash -c 'curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1/install-agent.sh | bash'
+  bash -c 'curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.2/install-agent.sh | bash'
 ```
 
-后台设置页可以生成带参数的 Agent bootstrap 链接。默认情况下会从 GitHub Releases 获取最新非草稿版本；如果 GitHub 不可用，则回退到 `v0.1`。
+后台设置页可以生成带参数的 Agent bootstrap 链接。默认情况下会从 GitHub Releases 获取最新非草稿版本；如果 GitHub 不可用，则回退到 `v0.2`。
 
 ## 文档
 

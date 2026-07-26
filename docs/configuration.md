@@ -39,7 +39,8 @@ XLSTATUS_SEED_ADMIN_PASSWORD_FILE=/run/secrets/xlstatus_seed_admin_password
 | `DATABASE_URL` | SQLite 或 PostgreSQL URL。设置后启用环境变量模式。 |
 | `DATABASE_CREATE_IF_MISSING` | 仅 SQLite 使用。`1`、`true`、`yes`、`y`、`on` 视为开启。 |
 | `HTTP_BIND` | HTTP API 监听地址，默认 `127.0.0.1:8080`。 |
-| `GRPC_BIND` | Agent gRPC 监听地址。Release/systemd 和 Docker 部署默认使用 `0.0.0.0:50051`，让远端 Agent 可直接接入；源码无配置裸跑的内置默认仍是 `127.0.0.1:50051`。 |
+| `GRPC_BIND` | Agent gRPC 进程监听地址。Release/systemd 和源码无配置裸跑默认使用 `127.0.0.1:50051`；Docker 容器内监听所有地址，但 Compose 默认也只发布到宿主 loopback。远端直连必须显式修改并配置 TLS/mTLS 或可信 VPN。 |
+| `XLSTATUS_GRPC_PUBLISH_ADDRESS` | Docker Compose 的宿主 gRPC 发布地址，默认 `127.0.0.1`。仅在 gRPC 已启用 TLS/mTLS 或通过可信 VPN 接入时设置为 `0.0.0.0`。 |
 | `GRPC_TLS_CERT_PATH` | 可选的 gRPC 服务端 PEM 证书路径。必须与 `GRPC_TLS_KEY_PATH` 同时设置，设置后 gRPC 使用 TLS。 |
 | `GRPC_TLS_KEY_PATH` | 可选的 gRPC 服务端 PEM 私钥路径。必须与 `GRPC_TLS_CERT_PATH` 同时设置。 |
 | `GRPC_TLS_CLIENT_CA_PATH` | 可选的 gRPC 客户端证书 CA 路径。设置后启用 mTLS，Agent 必须提交该 CA 签发的客户端证书。 |
@@ -55,7 +56,7 @@ XLSTATUS_SEED_ADMIN_PASSWORD_FILE=/run/secrets/xlstatus_seed_admin_password
 | `XLSTATUS_ALLOW_PRIVATE_WEBHOOKS` | 可选的 Webhook 专用私网出站逃生阀。设置为 `1` / `true` / `yes` 时，只允许通知 Webhook 和 DDNS Webhook 访问私网、loopback 或链路本地目标。 |
 | `XLSTATUS_ALLOW_PRIVATE_OUTBOUND` | 可选的全局主控私网出站逃生阀。设置后会放开服务探测、OAuth/OIDC、GeoIP、DDNS provider/resolver 和 Webhook 等所有主控出站路径的私网地址阻断；生产应优先使用更窄的专用开关。 |
 
-主控默认会阻断 HTTP/TCP/ICMP 探测、OAuth/OIDC、GeoIP、DDNS、通知 Webhook 等出站请求访问私网、loopback、链路本地、保留地址和云元数据常见地址，并固定 DNS 解析结果以减少重绑定风险。只有确需把 Webhook 发到内网接收器时才建议启用 `XLSTATUS_ALLOW_PRIVATE_WEBHOOKS=1`；它不会放开服务探测、OAuth/OIDC、GeoIP 或 DDNS resolver/provider。`XLSTATUS_ALLOW_PRIVATE_OUTBOUND=1` 是实例级高危全局开关，应只用于受控内网部署并配合主机 egress firewall 和审计。
+主控默认会阻断 HTTP/TCP/ICMP 探测、OAuth/OIDC、GeoIP、DDNS、通知 Webhook 等出站请求访问私网、loopback、链路本地、保留地址和云元数据常见地址，并固定 DNS 解析结果以减少重绑定风险。经过该校验的 HTTP 客户端不会继承 `HTTP_PROXY` / `HTTPS_PROXY` 等系统代理，因为代理侧重新解析目标会绕过本机的地址校验和 DNS 固定；需要代理出站的部署应在受控网关上另行限制目标，而不要依赖这些环境变量。只有确需把 Webhook 发到内网接收器时才建议启用 `XLSTATUS_ALLOW_PRIVATE_WEBHOOKS=1`；它不会放开服务探测、OAuth/OIDC、GeoIP 或 DDNS resolver/provider。`XLSTATUS_ALLOW_PRIVATE_OUTBOUND=1` 是实例级高危全局开关，应只用于受控内网部署并配合主机 egress firewall 和审计。
 
 ## config.toml
 

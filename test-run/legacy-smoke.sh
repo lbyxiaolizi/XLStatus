@@ -5,6 +5,8 @@
 set -e
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+source "$PROJECT_ROOT/test-run/lib/test-processes.sh"
+test_process_init "$PROJECT_ROOT" "$0"
 cd "$PROJECT_ROOT"
 
 echo "=========================================="
@@ -27,10 +29,7 @@ cd "$TEST_DIR"
 cleanup() {
     echo ""
     echo "Cleaning up..."
-    if [ -f server.pid ]; then
-        kill $(cat server.pid) 2>/dev/null || true
-        rm -f server.pid
-    fi
+    test_process_cleanup "$TEST_PROCESS_REGISTRY"
     cd "$PROJECT_ROOT"
 }
 trap cleanup EXIT
@@ -58,22 +57,23 @@ touch xlstatus.db
 chmod 666 xlstatus.db
 
 # Start server with environment variables
-DATABASE_URL="sqlite:///$TEST_DIR/xlstatus.db" \
-HTTP_BIND="127.0.0.1:8080" \
-GRPC_BIND="127.0.0.1:50051" \
-SESSION_SECRET="test-secret-key" \
-"$PROJECT_ROOT/target/release/xlstatus-server" > server.log 2>&1 &
-echo $! > server.pid
+test_process_start "$TEST_PROCESS_REGISTRY" server "$TEST_DIR/server.log" \
+    env DATABASE_URL="sqlite:///$TEST_DIR/xlstatus.db" \
+    HTTP_BIND="127.0.0.1:8080" \
+    GRPC_BIND="127.0.0.1:50051" \
+    SESSION_SECRET="test-secret-key" \
+    "$PROJECT_ROOT/target/release/xlstatus-server"
+SERVER_PID="$TEST_PROCESS_PID"
 
 sleep 3
 
-if ! ps -p $(cat server.pid) > /dev/null 2>&1; then
+if ! test_process_label_is_running "$TEST_PROCESS_REGISTRY" server; then
     echo -e "${RED}✗${NC} Server failed to start"
     echo ""
     cat server.log
     exit 1
 fi
-echo -e "${GREEN}✓${NC} Server started (PID: $(cat server.pid))"
+echo -e "${GREEN}✓${NC} Server started (supervisor PID: $SERVER_PID)"
 echo ""
 
 echo "4. Testing HTTP endpoint..."
@@ -127,5 +127,7 @@ echo ""
 echo "Press Ctrl+C to stop the server"
 echo ""
 
-# Keep server running
-wait $(cat server.pid) 2>/dev/null || true
+# Keep the test attached until interrupted; the EXIT trap owns cleanup.
+while test_process_label_is_running "$TEST_PROCESS_REGISTRY" server; do
+    sleep 1
+done
