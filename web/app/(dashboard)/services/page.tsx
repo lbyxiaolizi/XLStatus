@@ -21,6 +21,7 @@ import {
 } from "@/app/components/M7Primitives";
 import { apiClient, type JsonObject, type TotpStatusResponse } from "@/lib/api";
 import { useDialogs } from "@/app/components/Dialogs";
+import { useServerData } from "@/app/components/ServerDataProvider";
 import { useI18n } from "@/lib/use-i18n";
 import type { Translations } from "@/lib/i18n";
 import type { servicesPage } from "@/lib/i18n/pages/services";
@@ -87,13 +88,16 @@ const blankForm: ServiceForm = {
 export default function ServicesPage() {
   const dialogs = useDialogs();
   const { t: copy } = useI18n();
+  const {
+    servers,
+    error: serverError,
+    revalidate: revalidateServers,
+  } = useServerData();
   const [services, setServices] = useState<Service[]>([]);
-  const [servers, setServers] = useState<ServerOption[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [serverError, setServerError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [modal, setModal] = useState<"create" | "edit" | null>(null);
   const [editing, setEditing] = useState<Service | null>(null);
@@ -103,7 +107,6 @@ export default function ServicesPage() {
   const [query, setQuery] = useState("");
   const initialLoadRef = useRef(true);
   const servicesLoadRequestIdRef = useRef(0);
-  const serversLoadRequestIdRef = useRef(0);
 
   const loadServices = useCallback(async (signal?: AbortSignal) => {
     const requestId = servicesLoadRequestIdRef.current + 1;
@@ -121,30 +124,19 @@ export default function ServicesPage() {
     }
   }, []);
 
-  const loadServers = useCallback(async (signal?: AbortSignal) => {
-    const requestId = serversLoadRequestIdRef.current + 1;
-    serversLoadRequestIdRef.current = requestId;
-    setServerError(null);
-    const response = await apiClient.listServers(200, 0, false, { signal });
-    if (signal?.aborted || requestId !== serversLoadRequestIdRef.current) return;
-    if (response.success && response.data) {
-      setServers((response.data.servers as ServerOption[]) ?? []);
-    } else {
-      setServerError(responseError(response));
-    }
-  }, []);
-
   useEffect(() => {
     const controller = new AbortController();
     // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount is the standard client data-load pattern
     void loadServices(controller.signal);
-    void loadServers(controller.signal);
     return () => {
       controller.abort();
       servicesLoadRequestIdRef.current += 1;
-      serversLoadRequestIdRef.current += 1;
     };
-  }, [loadServices, loadServers]);
+  }, [loadServices]);
+
+  useEffect(() => {
+    void revalidateServers();
+  }, [revalidateServers]);
 
   const deferredQuery = useDeferredValue(query);
   const filtered = useMemo(() => {

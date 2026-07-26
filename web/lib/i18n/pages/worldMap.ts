@@ -1,7 +1,8 @@
 // Per-page i18n namespace for the WorldServerMap component.
-// `zh` is the source of truth; `en` must mirror its shape (enforced by the
-// `typeof` annotation). Interpolated strings use {placeholder} tokens that the
-// component fills in with String.prototype.replace.
+// `zh` is the source of truth; the en half lives in `worldMap.en.ts` and is
+// shape-checked by the `Translations` annotation on `enUS` in `lib/i18n/en.ts`.
+// Interpolated strings use {placeholder} tokens that the component fills in with
+// String.prototype.replace.
 
 export const worldMap = {
   serverUnit: "服务器",
@@ -17,20 +18,4 @@ export const worldMap = {
   tooltipSummary: "{servers} 台服务器 · {source}",
   sourceManual: "手动坐标",
   sourceCountry: "国家/地区",
-};
-
-export const worldMapEn: typeof worldMap = {
-  serverUnit: "servers",
-  regionsSummary: "{regions} regions identified / {servers} {detail}",
-  unmatchedCount: "{count} unidentified",
-  allIdentified: "All identified",
-  serversCount: "{count}",
-  moreServers: "+{count}",
-  moreRegions: "{count} more regions",
-  emptyTitle: "No identifiable regions yet",
-  emptyDetail: "The map lights up once GeoIP or manual location fields are available.",
-  unmatchedTitle: "Unidentified",
-  tooltipSummary: "{servers} servers · {source}",
-  sourceManual: "Manual coordinates",
-  sourceCountry: "Country/region",
 };

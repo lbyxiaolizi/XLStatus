@@ -1,7 +1,8 @@
 // Per-page i18n namespace for the remote terminal screen.
-// `zh` is the source of truth; `en` must mirror its shape (enforced by the
-// `typeof` annotation). Interpolated strings use {placeholder} tokens that the
-// page fills in with String.prototype.replace.
+// `zh` is the source of truth; the en half lives in `terminal.en.ts` and is
+// shape-checked by the `Translations` annotation on `enUS` in `lib/i18n/en.ts`.
+// Interpolated strings use {placeholder} tokens that the page fills in with
+// String.prototype.replace.
 
 export const terminalPage = {
   // Initial line / errors
@@ -41,38 +42,4 @@ export const terminalPage = {
   statusOpen: "已连接",
   statusClosed: "已关闭",
   statusError: "错误",
-};
-
-export const terminalPageEn: typeof terminalPage = {
-  selectAgentPrompt: "Select an agent and open a terminal session.",
-  selectAgentBeforeOpen: "Select an agent before opening the terminal.",
-  totpInvalid: "Enter a 6-digit TOTP code.",
-  missingSessionId: "Terminal session response is missing a session id.",
-  opening: "Opening {name} ({cols}x{rows})...",
-  connected: "Connected to session {id}.",
-  wsError: "WebSocket error.",
-  terminalClosed: "Terminal closed.",
-  serverClosed: "Server closed the terminal.",
-  terminalError: "Terminal error.",
-  resized: "Resized to {cols}x{rows}.",
-  eyebrow: "Remote shell",
-  title: "Terminal",
-  detail: "Open an agent terminal session over the backend WebSocket.",
-  fieldAgent: "Agent",
-  agentUnknownStatus: "Unknown",
-  fieldCols: "Columns",
-  fieldRows: "Rows",
-  openSession: "Open session",
-  resize: "Resize",
-  close: "Close",
-  sessionLabel: "Session {id}",
-  noOutput: "No terminal output yet",
-  inputPlaceholderOpen: "Type a command and press Enter",
-  inputPlaceholderClosed: "Open the terminal first",
-  send: "Send",
-  statusIdle: "Idle",
-  statusConnecting: "Connecting",
-  statusOpen: "Connected",
-  statusClosed: "Closed",
-  statusError: "Error",
 };

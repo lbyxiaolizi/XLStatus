@@ -1,7 +1,8 @@
 // Per-page i18n namespace for the public single-server detail page.
-// `zh` is the source of truth; `en` must mirror its shape (enforced by the
-// `typeof` annotation). Interpolated strings use {placeholder} tokens that the
-// page fills in with String.prototype.replace.
+// `zh` is the source of truth; the en half lives in `statusDetail.en.ts` and is
+// shape-checked by the `Translations` annotation on `enUS` in `lib/i18n/en.ts`.
+// Interpolated strings use {placeholder} tokens that the page fills in with
+// String.prototype.replace.
 
 export const statusDetailPage = {
   // Page header
@@ -57,53 +58,4 @@ export const statusDetailPage = {
   statusUp: "正常",
   statusTimeout: "超时",
   serviceKindFallback: "服务",
-};
-
-export const statusDetailPageEn: typeof statusDetailPage = {
-  eyebrow: "Public server",
-  lastSeen: "Last seen {time}",
-  headerDetailFallback: "Public status details",
-  backToStatus: "Back to status",
-  loadingServer: "Loading public server",
-  relatedServicesHeading: "Related public services",
-  loading: "Loading",
-  relatedServicesEmptyTitle: "No related public services",
-  relatedServicesEmptyDetail: "Only public service monitoring history linked to this server is shown.",
-  publicServerNote: "Public server",
-  labelStatus: "Status",
-  labelLastSeen: "Last seen",
-  labelCpu: "CPU",
-  labelMemory: "Memory",
-  labelDisk: "Disk",
-  labelLoad: "Load",
-  labelDownload: "Download",
-  labelUpload: "Upload",
-  labelTotalTraffic: "Total traffic",
-  labelUptime: "Uptime",
-  labelTcpUdp: "TCP / UDP",
-  labelProcessCount: "Processes",
-  chartsHeading: "Charts",
-  chartResourceUsage: "Resource usage",
-  chartNetworkRate: "Network rate",
-  noHistory: "No history yet",
-  seriesCpu: "CPU",
-  seriesMemory: "Memory",
-  seriesDisk: "Disk",
-  seriesDownload: "Download",
-  seriesUpload: "Upload",
-  labelUptimeRate: "Uptime",
-  labelAvgDelay: "Avg latency",
-  labelLastCheck: "Last check",
-  uptimeSuffix: "{percent} uptime",
-  daysAgo30: "30 days ago",
-  today: "Today",
-  chartAriaLabel: "Public server metrics trend chart",
-  statusOnline: "Online",
-  statusOffline: "Offline",
-  statusDown: "Down",
-  statusDegraded: "Degraded",
-  statusRevoked: "Revoked",
-  statusUp: "Up",
-  statusTimeout: "Timeout",
-  serviceKindFallback: "Service",
 };

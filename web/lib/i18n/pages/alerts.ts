@@ -1,7 +1,8 @@
 // Per-page i18n namespace for the alerts screen.
-// `zh` is the source of truth; `en` must mirror its shape (enforced by the
-// `typeof` annotation). Interpolated strings use {placeholder} tokens that the
-// page fills in with String.prototype.replace.
+// `zh` is the source of truth; the en half lives in `alerts.en.ts` and is
+// shape-checked by the `Translations` annotation on `enUS` in `lib/i18n/en.ts`.
+// Interpolated strings use {placeholder} tokens that the page fills in with
+// String.prototype.replace.
 
 export const alertsPage = {
   // notices / errors
@@ -56,53 +57,4 @@ export const alertsPage = {
   conditionLatency: "延迟",
   conditionCert: "证书",
   payloadEvent: "事件",
-};
-
-export const alertsPageEn: typeof alertsPage = {
-  ruleCreated: "Alert rule created.",
-  ruleDeleted: "Alert rule deleted.",
-  deleteRuleConfirm: "Delete alert rule \"{name}\"?",
-  invalidTotp: "Enter a 6-digit TOTP code.",
-  eyebrow: "Event rules",
-  title: "Alerts",
-  detail: "Manage rules for resources, services, and recovery notifications.",
-  addRule: "New rule",
-  rulesHeading: "Rules",
-  noRules: "No alert rules yet",
-  colName: "Name",
-  colCondition: "Condition",
-  colStatus: "Status",
-  colActions: "Actions",
-  disabled: "Disabled",
-  enabled: "Enabled",
-  delete: "Delete",
-  eventsHeading: "Events",
-  noEvents: "No alert events yet",
-  modalTitle: "New alert rule",
-  fieldName: "Name",
-  fieldTrigger: "Trigger",
-  fieldConditionType: "Condition type",
-  fieldAgentId: "Agent ID",
-  fieldServiceId: "Service ID",
-  fieldResource: "Resource",
-  fieldOperator: "Operator",
-  fieldThreshold: "Threshold",
-  fieldDurationSeconds: "Duration (seconds)",
-  fieldOfflineSeconds: "Offline (seconds)",
-  fieldDaysBefore: "Days before",
-  fieldUsagePercent: "Usage percent",
-  fieldDirection: "Direction",
-  fieldConsecutiveFailures: "Consecutive failures",
-  fieldMaxLatencyMs: "Max latency (ms)",
-  fieldNotificationGroupId: "Notification group ID",
-  fieldFailureTaskIds: "Failure task IDs",
-  fieldRecoveryTaskIds: "Recovery task IDs",
-  saveRule: "Save rule",
-  conditionOffline: "offline",
-  conditionExpiryDays: "days to expiry",
-  conditionTraffic: "traffic",
-  conditionServiceDown: "down",
-  conditionLatency: "latency",
-  conditionCert: "cert",
-  payloadEvent: "Event",
 };

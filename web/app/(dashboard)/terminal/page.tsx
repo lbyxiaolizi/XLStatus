@@ -18,13 +18,8 @@ import {
 } from "@/app/components/M7Primitives";
 import { apiClient, buildWebSocketUrl, type TotpStatusResponse } from "@/lib/api";
 import { useDialogs } from "@/app/components/Dialogs";
+import { useServerData } from "@/app/components/ServerDataProvider";
 import { useI18n } from "@/lib/use-i18n";
-
-interface Server {
-  id: string;
-  name: string;
-  status?: string;
-}
 
 type TerminalStatus = "idle" | "connecting" | "open" | "closed" | "error";
 
@@ -37,14 +32,18 @@ interface TerminalLine {
 export default function TerminalPage() {
   const dialogs = useDialogs();
   const { t: copy } = useI18n();
-  const [servers, setServers] = useState<Server[]>([]);
+  const {
+    servers,
+    loading,
+    error: serverLoadError,
+    revalidate: revalidateServers,
+  } = useServerData();
   const [agentId, setAgentId] = useState("");
   const [cols, setCols] = useState(100);
   const [rows, setRows] = useState(30);
   const [input, setInput] = useState("");
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [status, setStatus] = useState<TerminalStatus>("idle");
-  const [loading, setLoading] = useState(true);
   const [opening, setOpening] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [totpStatus, setTotpStatus] = useState<TotpStatusResponse | null>(null);
@@ -54,42 +53,63 @@ export default function TerminalPage() {
   const wsRef = useRef<WebSocket | null>(null);
   const lineIdRef = useRef(2);
   const outputRef = useRef<HTMLDivElement | null>(null);
+  const pendingLinesRef = useRef<TerminalLine[]>([]);
+  const flushRafRef = useRef<number | null>(null);
 
   const selectedAgent = useMemo(() => servers.find((server) => server.id === agentId), [agentId, servers]);
 
-  const appendLine = useCallback((direction: TerminalLine["direction"], text: string) => {
-    setLines((prev) => [...prev, { id: lineIdRef.current++, direction, text }].slice(-400));
+  const flushLines = useCallback(() => {
+    if (flushRafRef.current !== null) {
+      window.cancelAnimationFrame(flushRafRef.current);
+      flushRafRef.current = null;
+    }
+    const pending = pendingLinesRef.current;
+    if (pending.length === 0) return;
+    pendingLinesRef.current = [];
+    setLines((prev) => [...prev, ...pending].slice(-400));
   }, []);
+
+  // A chatty shell emits many frames per animation frame; buffering them means
+  // one commit per frame instead of one re-render of the 400-line log per frame.
+  const appendLine = useCallback((direction: TerminalLine["direction"], text: string) => {
+    pendingLinesRef.current.push({ id: lineIdRef.current++, direction, text });
+    if (flushRafRef.current === null) {
+      flushRafRef.current = window.requestAnimationFrame(flushLines);
+    }
+  }, [flushLines]);
 
   const closeSocket = useCallback(() => {
     wsRef.current?.close();
     wsRef.current = null;
-  }, []);
-
-  const loadServers = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    const response = await apiClient.listServers(200, 0);
-    setLoading(false);
-    if (response.success && response.data) {
-      const loaded = ((response.data.servers as Server[]) ?? []).filter((server) => server.id);
-      setServers(loaded);
-      setAgentId((current) => current || loaded[0]?.id || "");
-    } else {
-      setError(responseError(response));
-    }
-  }, []);
+    // Drain synchronously: frames buffered right before a close (the server's
+    // close reason, for one) must still reach the log.
+    flushLines();
+  }, [flushLines]);
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount is the standard client data-load pattern
-    void loadServers();
-  }, [loadServers]);
+    void revalidateServers();
+  }, [revalidateServers]);
 
   useEffect(() => {
-    outputRef.current?.scrollTo({ top: outputRef.current.scrollHeight, behavior: "smooth" });
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- picker default derived from the shared server list, kept out of render
+    setAgentId((current) => current || servers[0]?.id || "");
+  }, [servers]);
+
+  useEffect(() => {
+    outputRef.current?.scrollTo({ top: outputRef.current.scrollHeight, behavior: "auto" });
   }, [lines]);
 
-  useEffect(() => closeSocket, [closeSocket]);
+  useEffect(() => () => {
+    // Unmount cleanup is inlined rather than reusing closeSocket so no flush
+    // (and no setState) is scheduled against a component that is going away.
+    wsRef.current?.close();
+    wsRef.current = null;
+    if (flushRafRef.current !== null) {
+      window.cancelAnimationFrame(flushRafRef.current);
+      flushRafRef.current = null;
+    }
+    pendingLinesRef.current = [];
+  }, []);
 
   async function openTerminal(event?: FormEvent) {
     event?.preventDefault();
@@ -238,7 +258,7 @@ export default function TerminalPage() {
           detail={copy.terminalPage.detail}
           actions={<StatusBadge tone={status === "open" ? "green" : status === "error" ? "red" : "gray"}>{terminalStatusLabel(status, copy)}</StatusBadge>}
         />
-        <InlineError message={error} />
+        <InlineError message={error ?? serverLoadError} />
 
         <div className="mt-5 grid gap-6 lg:grid-cols-[360px_minmax(0,1fr)]">
           <BrutalCard>

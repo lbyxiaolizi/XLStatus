@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { FormEvent, MouseEvent, memo, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, use, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useDialogs } from "@/app/components/Dialogs";
 import {
   asRecord,
@@ -26,6 +26,14 @@ import {
   textareaClass,
   thClass,
 } from "@/app/components/M7Primitives";
+import {
+  MiniDualAxisChart,
+  MiniLineChart,
+  chartHasData,
+  thinPoints,
+  type ChartPoint,
+  type ChartSeries,
+} from "@/app/components/charts";
 import { apiClient, type FileEntry, type JsonObject } from "@/lib/api";
 import { durationLabel, formatRate, maxOf, minOf, optionalNumber } from "@/app/lib/format";
 import { useI18n } from "@/lib/use-i18n";
@@ -97,21 +105,9 @@ interface ServiceResult {
   created_at: string;
 }
 
-interface ChartPoint {
-  time: number;
-  value: number;
-}
-
-interface ChartSeries {
-  id?: string;
-  label: string;
-  color: string;
-  points: ChartPoint[];
-  axis?: ChartAxis;
-  kind?: ChartKind;
-  opacity?: number;
-  strokeDasharray?: string;
-  strokeWidth?: number;
+interface ProbeHistoryEntry {
+  service: ServiceSummary;
+  results: ServiceResult[];
 }
 
 interface ProbeHistory {
@@ -159,8 +155,6 @@ interface PageProps {
 type MetricsRange = "1d" | "7d" | "30d";
 type SecondaryPanel = "custom" | "files" | "ops" | null;
 type ChartTab = "resources" | "network";
-type ChartAxis = "left" | "right";
-type ChartKind = "line" | "area";
 
 const blankConfig = {
   report_interval_seconds: "3",
@@ -198,10 +192,48 @@ const blankMetadataForm: ServerMetadataForm = {
   display_order: "",
 };
 
+// Detail -> editable form projection. Shared by the initial load and the save
+// response so both paths seed the editor from exactly the same rules.
+function metadataFormFromDetail(detail: ServerDetail): ServerMetadataForm {
+  const info = detail.last_info ?? {};
+  return {
+    name: detail.name || "",
+    remark: detail.remark || metadataFromRecord(info, ["remark", "note", "description"]) || "",
+    public_note: detail.public_note || metadataFromRecord(info, ["public_note", "public_description"]) || "",
+    expires_at: detail.expires_at || metadataFromRecord(info, ["expires_at", "expired_at", "expire_at", "due_at", "end_at"]) || "",
+    renewal_price: detail.renewal_price === null || detail.renewal_price === undefined ? "" : String(detail.renewal_price),
+    price: detail.price === null || detail.price === undefined ? metadataFromRecord(info, ["price", "billing_price", "monthly_price", "amount"]) || "" : String(detail.price),
+    currency: detail.currency || metadataFromRecord(info, ["currency", "currency_code"]) || "",
+    billing_cycle: detail.billing_cycle || metadataFromRecord(info, ["billing_cycle", "cycle", "billing_period", "period"]) || "",
+    auto_renew: detail.auto_renew ?? false,
+    traffic_quota_bytes: detail.traffic_quota_bytes === null || detail.traffic_quota_bytes === undefined ? "" : String(detail.traffic_quota_bytes),
+    traffic_quota_type: detail.traffic_quota_type || metadataFromRecord(info, ["traffic_quota_type", "quota_type", "traffic_type", "bandwidth_type"]) || "",
+    provider: detail.provider || metadataFromRecord(info, ["provider", "vendor", "datacenter", "isp"]) || "",
+    region: detail.region || metadataFromRecord(info, ["region", "geo_region", "state", "province", "location"]) || "",
+    country: detail.country || metadataFromRecord(info, ["country", "geo_country", "country_name"]) || "",
+    city: detail.city || metadataFromRecord(info, ["city", "geo_city"]) || "",
+    latitude: detail.latitude === null || detail.latitude === undefined ? metadataFromRecord(info, ["latitude", "lat", "geo_latitude"]) || "" : String(detail.latitude),
+    longitude: detail.longitude === null || detail.longitude === undefined ? metadataFromRecord(info, ["longitude", "lon", "lng", "geo_longitude"]) || "" : String(detail.longitude),
+    plan: detail.plan || metadataFromRecord(info, ["plan", "package", "sku", "product", "instance_type"]) || "",
+    tags: Array.isArray(detail.tags) ? detail.tags.join(", ") : "",
+    accent_color: detail.accent_color || "#db2777",
+    dashboard_visible: detail.dashboard_visible ?? false,
+    hide_for_guest: detail.hide_for_guest ?? false,
+    display_order: detail.display_order === null || detail.display_order === undefined ? "" : String(detail.display_order),
+  };
+}
+
+function probeHistoryKey(serverId: string, range: MetricsRange): string {
+  return `${serverId}:${range}`;
+}
+
 export default function ServerDetailPage({ params }: PageProps) {
   const dialogs = useDialogs();
   const { t: copy } = useI18n();
-  const [serverId, setServerId] = useState("");
+  // Next may hand params as a promise; use() unwraps it without an extra render
+  // pass, and it is allowed in a conditional.
+  const resolved = params instanceof Promise ? use(params) : params;
+  const serverId = resolved.id;
   const [server, setServer] = useState<ServerDetail | null>(null);
   const [files, setFiles] = useState<FileEntry[]>([]);
   const [path, setPath] = useState("/");
@@ -228,13 +260,11 @@ export default function ServerDetailPage({ params }: PageProps) {
   const showMissingInfo = showMissingInfoPreference === "1";
   const [probeLoading, setProbeLoading] = useState(false);
   const [monitorError, setMonitorError] = useState<string | null>(null);
-
-  useEffect(() => {
-    void Promise.resolve(params).then((value) => setServerId(value.id));
-  }, [params]);
+  // Range that finished loading probe history. Aborted loads leave it untouched
+  // so re-entering the network tab retries instead of showing an empty chart.
+  const loadedProbeKeyRef = useRef<string | null>(null);
 
   const loadServer = useCallback(async (signal?: AbortSignal) => {
-    if (!serverId) return;
     setLoading(true);
     setError(null);
     const response = await apiClient.getServer(serverId, { signal });
@@ -243,31 +273,7 @@ export default function ServerDetailPage({ params }: PageProps) {
     if (response.success && response.data) {
       const detail = response.data as unknown as ServerDetail;
       setServer(detail);
-      setMetadataForm({
-        name: detail.name || "",
-        remark: detail.remark || metadataFromRecord(detail.last_info ?? {}, ["remark", "note", "description"]) || "",
-        public_note: detail.public_note || metadataFromRecord(detail.last_info ?? {}, ["public_note", "public_description"]) || "",
-        expires_at: detail.expires_at || metadataFromRecord(detail.last_info ?? {}, ["expires_at", "expired_at", "expire_at", "due_at", "end_at"]) || "",
-        renewal_price: detail.renewal_price === null || detail.renewal_price === undefined ? "" : String(detail.renewal_price),
-        price: detail.price === null || detail.price === undefined ? metadataFromRecord(detail.last_info ?? {}, ["price", "billing_price", "monthly_price", "amount"]) || "" : String(detail.price),
-        currency: detail.currency || metadataFromRecord(detail.last_info ?? {}, ["currency", "currency_code"]) || "",
-        billing_cycle: detail.billing_cycle || metadataFromRecord(detail.last_info ?? {}, ["billing_cycle", "cycle", "billing_period", "period"]) || "",
-        auto_renew: detail.auto_renew ?? false,
-        traffic_quota_bytes: detail.traffic_quota_bytes === null || detail.traffic_quota_bytes === undefined ? "" : String(detail.traffic_quota_bytes),
-        traffic_quota_type: detail.traffic_quota_type || metadataFromRecord(detail.last_info ?? {}, ["traffic_quota_type", "quota_type", "traffic_type", "bandwidth_type"]) || "",
-        provider: detail.provider || metadataFromRecord(detail.last_info ?? {}, ["provider", "vendor", "datacenter", "isp"]) || "",
-        region: detail.region || metadataFromRecord(detail.last_info ?? {}, ["region", "geo_region", "state", "province", "location"]) || "",
-        country: detail.country || metadataFromRecord(detail.last_info ?? {}, ["country", "geo_country", "country_name"]) || "",
-        city: detail.city || metadataFromRecord(detail.last_info ?? {}, ["city", "geo_city"]) || "",
-        latitude: detail.latitude === null || detail.latitude === undefined ? metadataFromRecord(detail.last_info ?? {}, ["latitude", "lat", "geo_latitude"]) || "" : String(detail.latitude),
-        longitude: detail.longitude === null || detail.longitude === undefined ? metadataFromRecord(detail.last_info ?? {}, ["longitude", "lon", "lng", "geo_longitude"]) || "" : String(detail.longitude),
-        plan: detail.plan || metadataFromRecord(detail.last_info ?? {}, ["plan", "package", "sku", "product", "instance_type"]) || "",
-        tags: Array.isArray(detail.tags) ? detail.tags.join(", ") : "",
-        accent_color: detail.accent_color || "#db2777",
-        dashboard_visible: detail.dashboard_visible ?? false,
-        hide_for_guest: detail.hide_for_guest ?? false,
-        display_order: detail.display_order === null || detail.display_order === undefined ? "" : String(detail.display_order),
-      });
+      setMetadataForm(metadataFormFromDetail(detail));
     } else {
       setError(responseError(response));
     }
@@ -275,7 +281,6 @@ export default function ServerDetailPage({ params }: PageProps) {
 
   const loadFiles = useCallback(
     async (nextPath: string) => {
-      if (!serverId) return;
       setFilesLoading(true);
       setError(null);
       const response = await apiClient.listServerFiles(serverId, nextPath);
@@ -291,7 +296,6 @@ export default function ServerDetailPage({ params }: PageProps) {
   );
 
   const loadMetrics = useCallback(async (signal?: AbortSignal) => {
-    if (!serverId) return;
     setMetricsLoading(true);
     setMonitorError(null);
     const response = await apiClient.getServerMetrics(serverId, metricsRange, { signal });
@@ -308,10 +312,14 @@ export default function ServerDetailPage({ params }: PageProps) {
   }, [metricsRange, serverId]);
 
   const loadProbeHistory = useCallback(async (signal?: AbortSignal) => {
-    if (!serverId) return;
     setProbeLoading(true);
     setMonitorError(null);
-    const servicesResponse = await apiClient.listServices(200, 0, false, { signal });
+    const historyLimit = historyLimitForRange(metricsRange);
+    const servicesResponse = await apiClient.listServices(200, 0, false, {
+      signal,
+      includeHistory: true,
+      historyLimit,
+    });
     if (signal?.aborted) return;
     if (!servicesResponse.success || !servicesResponse.data) {
       setProbeHistories([]);
@@ -323,23 +331,28 @@ export default function ServerDetailPage({ params }: PageProps) {
     const services = ((servicesResponse.data.services as ServiceSummary[]) ?? []).filter(
       (service) => service.id && serviceBelongsToServer(service, serverId),
     );
-    const histories = await mapWithConcurrency(
-      services,
-      6,
-      async (service) => {
-        if (signal?.aborted) return null;
-        const response = await apiClient.getServiceHistory(service.id, historyLimitForRange(metricsRange), { signal });
-        if (!response.success || !response.data) return null;
-        const results = Array.isArray(response.data.results) ? response.data.results : [];
-        return {
-          service,
-          results: results
-            .map((result) => normalizeServiceResult(result))
-            .filter((result): result is ServiceResult => Boolean(result))
-            .filter((result) => result.server_id === serverId),
-        };
-      },
-    );
+    // Servers that support batched history answer in a single request; the
+    // per-service fan-out below only runs against older deployments.
+    const embedded = readEmbeddedHistories(services, serverId);
+    const histories: (ProbeHistoryEntry | null)[] =
+      embedded ??
+      (await mapWithConcurrency(
+        services,
+        6,
+        async (service) => {
+          if (signal?.aborted) return null;
+          const response = await apiClient.getServiceHistory(service.id, historyLimit, { signal });
+          if (!response.success || !response.data) return null;
+          const results = Array.isArray(response.data.results) ? response.data.results : [];
+          return {
+            service,
+            results: results
+              .map((result) => normalizeServiceResult(result))
+              .filter((result): result is ServiceResult => Boolean(result))
+              .filter((result) => result.server_id === serverId),
+          };
+        },
+      ));
     if (signal?.aborted) return;
 
     const nextHistories = histories
@@ -368,6 +381,7 @@ export default function ServerDetailPage({ params }: PageProps) {
         };
       });
 
+    loadedProbeKeyRef.current = probeHistoryKey(serverId, metricsRange);
     setProbeHistories(nextHistories);
     setSelectedProbeIds((current) =>
       current.filter((id) => nextHistories.some((history) => history.id === id)),
@@ -389,12 +403,15 @@ export default function ServerDetailPage({ params }: PageProps) {
     return () => controller.abort();
   }, [loadMetrics]);
 
+  // Probe history pulls a full history window (and one call per related service
+  // on older servers), so it stays unloaded until the network tab is opened.
   useEffect(() => {
+    if (chartTab !== "network") return;
+    if (loadedProbeKeyRef.current === probeHistoryKey(serverId, metricsRange)) return;
     const controller = new AbortController();
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount is the standard client data-load pattern
     void loadProbeHistory(controller.signal);
     return () => controller.abort();
-  }, [loadProbeHistory]);
+  }, [chartTab, loadProbeHistory, metricsRange, serverId]);
 
   const statusTone = server?.status === "online" ? "green" : server?.status === "revoked" ? "yellow" : "red";
   const currentDir = useMemo(() => parentPath(path), [path]);
@@ -588,7 +605,6 @@ export default function ServerDetailPage({ params }: PageProps) {
 
   async function saveServerMetadata(event: FormEvent) {
     event.preventDefault();
-    if (!serverId) return;
     const totpCode = await sensitiveTotpCode();
     if (totpCode === null) return;
     setSaving(true);
@@ -619,10 +635,12 @@ export default function ServerDetailPage({ params }: PageProps) {
     }, totpCode);
     setSaving(false);
     if (response.success && response.data) {
+      // The update response already carries the persisted detail, so re-reading
+      // the server would only cost a second round trip.
       const detail = response.data as unknown as ServerDetail;
       setServer(detail);
+      setMetadataForm(metadataFormFromDetail(detail));
       setNotice(copy.serverDetailPage.metadataSaved);
-      await loadServer();
     } else {
       setError(responseError(response));
     }
@@ -964,7 +982,9 @@ function MonitoringCharts({
   onPeakCutChange: (enabled: boolean) => void;
 }) {
   const { t: copy } = useI18n();
-  const resourceCharts = [
+  // Rebuilding this array on every render would hand each memoized chart a fresh
+  // series reference and defeat the path memo inside MiniLineChart.
+  const resourceCharts = useMemo(() => [
     {
       key: "cpu",
       title: "CPU",
@@ -1036,7 +1056,7 @@ function MonitoringCharts({
       maxValue: 100,
       formatValue: formatChartPercent,
     },
-  ];
+  ], [copy, metricCharts]);
   const visibleResourceCharts = metricsLoading ? resourceCharts : resourceCharts.filter((chart) => chartHasData(chart.series));
 
   return (
@@ -1145,13 +1165,22 @@ function NetworkProbePanel({
   const visibleHistories = selectedIds.length
     ? histories.filter((history) => selectedIds.includes(history.id))
     : histories;
-  const displayedLatencySeries = peakCutEnabled
-    ? latencySeries.map((item) => ({ ...item, points: smoothPeakPoints(item.points) }))
-    : latencySeries;
-  const networkSeries = [
-    { id: "tx", label: copy.serverDetailPage.seriesUpload, color: "var(--accent-color)", points: metricCharts.tx },
-    { id: "rx", label: copy.serverDetailPage.seriesDownload, color: "var(--border-color)", points: metricCharts.rx },
-  ];
+  // Peak smoothing is a sliding median over every sample, so it must not rerun
+  // on unrelated renders such as probe selection or hover state.
+  const displayedLatencySeries = useMemo(
+    () =>
+      peakCutEnabled
+        ? latencySeries.map((item) => ({ ...item, points: smoothPeakPoints(item.points) }))
+        : latencySeries,
+    [latencySeries, peakCutEnabled],
+  );
+  const networkSeries = useMemo(
+    () => [
+      { id: "tx", label: copy.serverDetailPage.seriesUpload, color: "var(--accent-color)", points: metricCharts.tx },
+      { id: "rx", label: copy.serverDetailPage.seriesDownload, color: "var(--border-color)", points: metricCharts.rx },
+    ],
+    [copy, metricCharts],
+  );
   const hasNetworkData = chartHasData(networkSeries);
   const hasProbeData = chartHasData(displayedLatencySeries) || chartHasData(lossSeries);
   const showNetworkChart = metricsLoading || hasNetworkData;
@@ -1600,7 +1629,13 @@ function MetricChartCard({
           {copy.serverDetailPage.loadingChart}
         </div>
       ) : hasData ? (
-        <MiniLineChart series={series} maxValue={maxValue} formatValue={formatValue} />
+        <MiniLineChart
+          series={series}
+          maxValue={maxValue}
+          formatValue={formatValue}
+          emptyLabel={copy.serverDetailPage.noHistory}
+          ariaLabel={copy.serverDetailPage.metricChartAria}
+        />
       ) : (
         <div className="flex h-44 items-center justify-center border-2 border-black bg-[var(--accent-bg)] text-sm font-black">
           {copy.serverDetailPage.noHistory}
@@ -1618,10 +1653,6 @@ function MetricChartCard({
       ) : null}
     </section>
   );
-}
-
-function chartHasData(series: ChartSeries[]): boolean {
-  return series.some((item) => item.points.some((point) => Number.isFinite(point.time) && Number.isFinite(point.value)));
 }
 
 function ProbeOverlayChartCard({
@@ -1658,7 +1689,14 @@ function ProbeOverlayChartCard({
           {copy.serverDetailPage.loadingChart}
         </div>
       ) : hasData ? (
-        <MiniDualAxisChart latencySeries={latencySeries} lossSeries={lossSeries} />
+        <MiniDualAxisChart
+          latencySeries={latencySeries}
+          lossSeries={lossSeries}
+          emptyLabel={copy.serverDetailPage.noProbeHistory}
+          ariaLabel={copy.serverDetailPage.probeChartAria}
+          latencyLabelTemplate={copy.serverDetailPage.seriesLatencySuffix}
+          lossLabelTemplate={copy.serverDetailPage.seriesLossSuffix}
+        />
       ) : (
         <div className="flex h-56 items-center justify-center border-2 border-black bg-[var(--accent-bg)] text-sm font-black">
           {copy.serverDetailPage.noProbeHistory}
@@ -1682,351 +1720,6 @@ function ProbeOverlayChartCard({
       ) : null}
     </section>
   );
-}
-
-const MiniLineChart = memo(function MiniLineChart({ series, maxValue, formatValue }: { series: ChartSeries[]; maxValue?: number; formatValue: (value: number) => string }) {
-  const { t: copy } = useI18n();
-  const [hover, setHover] = useState<{
-    x: number;
-    time: number;
-    values: Array<{ label: string; color: string; value: number }>;
-  } | null>(null);
-  const width = 640;
-  const height = 190;
-  const padding = { top: 14, right: 16, bottom: 30, left: 46 };
-  const plotWidth = width - padding.left - padding.right;
-  const plotHeight = height - padding.top - padding.bottom;
-  const allPoints = series.flatMap((item) => item.points).filter((point) => Number.isFinite(point.time) && Number.isFinite(point.value));
-  if (allPoints.length === 0) {
-    return (
-      <div className="flex h-44 items-center justify-center border-2 border-black bg-[var(--accent-bg)] text-sm font-black">
-        {copy.serverDetailPage.noHistory}
-      </div>
-    );
-  }
-  const timeValues = Array.from(new Set(allPoints.map((point) => point.time))).sort((a, b) => a - b);
-  const minTime = timeValues[0];
-  const maxTime = timeValues[timeValues.length - 1];
-  const maxSeriesValue = maxOf(allPoints.map((point) => point.value), 1);
-  const yMax = maxValue ?? Math.ceil(maxSeriesValue * 1.2);
-  const timeSpan = Math.max(maxTime - minTime, 1);
-
-  function x(time: number): number {
-    if (allPoints.length === 1) return padding.left + plotWidth / 2;
-    return padding.left + ((time - minTime) / timeSpan) * plotWidth;
-  }
-
-  function y(value: number): number {
-    const clamped = Math.max(0, Math.min(yMax, value));
-    return padding.top + plotHeight - (clamped / yMax) * plotHeight;
-  }
-
-  function handleMove(event: MouseEvent<SVGSVGElement>) {
-    const localX = svgPointerX(event, width);
-    if (localX < padding.left || localX > width - padding.right) {
-      setHover(null);
-      return;
-    }
-    const targetTime = minTime + ((localX - padding.left) / plotWidth) * timeSpan;
-    const hoverTime = nearestValue(timeValues, targetTime);
-    const values = series
-      .map((item) => {
-        const point = nearestPoint(item.points, hoverTime);
-        return point ? { label: item.label, color: item.color, value: point.value, time: point.time } : null;
-      })
-      .filter((item): item is { label: string; color: string; value: number; time: number } => Boolean(item));
-    if (!values.length) {
-      setHover(null);
-      return;
-    }
-    setHover({
-      x: x(hoverTime),
-      time: hoverTime,
-      values: values.map(({ label, color, value }) => ({ label, color, value })),
-    });
-  }
-
-  const tooltipWidth = 210;
-  const tooltipHeight = hover ? 28 + hover.values.length * 20 : 0;
-  const tooltipX = hover ? Math.min(Math.max(hover.x + 12, padding.left), width - padding.right - tooltipWidth) : 0;
-  const tooltipY = hover ? Math.max(padding.top + 4, padding.top + plotHeight - tooltipHeight - 8) : 0;
-
-  return (
-    <svg
-      className="h-48 w-full border-2 border-black bg-[var(--bg-page)]"
-      viewBox={`0 0 ${width} ${height}`}
-      role="img"
-      aria-label={copy.serverDetailPage.metricChartAria}
-      onMouseMove={handleMove}
-      onMouseLeave={() => setHover(null)}
-    >
-      {[0, 0.25, 0.5, 0.75, 1].map((ratio) => {
-        const lineY = padding.top + plotHeight * ratio;
-        return (
-          <line
-            key={ratio}
-            x1={padding.left}
-            x2={width - padding.right}
-            y1={lineY}
-            y2={lineY}
-            stroke="var(--border-color)"
-            strokeOpacity="0.18"
-            strokeWidth="2"
-          />
-        );
-      })}
-      <text x={8} y={padding.top + 10} fill="var(--text-muted)" fontSize="12" fontWeight="900">
-        {formatValue(yMax)}
-      </text>
-      <text x={8} y={padding.top + plotHeight} fill="var(--text-muted)" fontSize="12" fontWeight="900">
-        {formatValue(0)}
-      </text>
-      <text x={padding.left} y={height - 9} fill="var(--text-muted)" fontSize="12" fontWeight="900">
-        {formatChartTime(minTime)}
-      </text>
-      <text x={width - padding.right} y={height - 9} fill="var(--text-muted)" fontSize="12" fontWeight="900" textAnchor="end">
-        {formatChartTime(maxTime)}
-      </text>
-      {series.map((item) => {
-        const points = item.points.filter((point) => Number.isFinite(point.time) && Number.isFinite(point.value));
-        const path = points.map((point, index) => `${index === 0 ? "M" : "L"} ${x(point.time).toFixed(2)} ${y(point.value).toFixed(2)}`).join(" ");
-        return (
-          <g key={item.id ?? item.label}>
-            <path
-              d={path}
-              fill="none"
-              stroke={item.color}
-              strokeLinecap="square"
-              strokeLinejoin="round"
-              strokeWidth="4"
-            />
-            {points.length === 1 ? (
-              <circle cx={x(points[0].time)} cy={y(points[0].value)} r="5" fill={item.color} stroke="var(--border-color)" strokeWidth="2" />
-            ) : null}
-          </g>
-        );
-      })}
-      {hover ? (
-        <g>
-          <line x1={hover.x} x2={hover.x} y1={padding.top} y2={padding.top + plotHeight} stroke="var(--border-color)" strokeDasharray="6 5" strokeWidth="2" />
-          <rect x={tooltipX} y={tooltipY} width={tooltipWidth} height={tooltipHeight} fill="var(--bg-card)" stroke="var(--border-color)" strokeWidth="2" />
-          <text x={tooltipX + 10} y={tooltipY + 18} fill="var(--text-main)" fontSize="12" fontWeight="900">
-            {formatChartTime(hover.time)}
-          </text>
-          {hover.values.map((item, index) => (
-            <g key={item.label} transform={`translate(${tooltipX + 10}, ${tooltipY + 36 + index * 20})`}>
-              <rect width="9" height="9" y="-8" fill={item.color} stroke="var(--border-color)" strokeWidth="1.5" />
-              <text x="16" y="0" fill="var(--text-main)" fontSize="12" fontWeight="900">
-                {item.label}: {formatValue(item.value)}
-              </text>
-            </g>
-          ))}
-        </g>
-      ) : null}
-    </svg>
-  );
-});
-
-const MiniDualAxisChart = memo(function MiniDualAxisChart({ latencySeries, lossSeries }: { latencySeries: ChartSeries[]; lossSeries: ChartSeries[] }) {
-  const { t: copy } = useI18n();
-  const [hover, setHover] = useState<{
-    x: number;
-    time: number;
-    values: Array<{ label: string; color: string; value: number; kind: "latency" | "loss" }>;
-  } | null>(null);
-  const width = 760;
-  const height = 240;
-  const padding = { top: 16, right: 52, bottom: 34, left: 52 };
-  const plotWidth = width - padding.left - padding.right;
-  const plotHeight = height - padding.top - padding.bottom;
-  const allPoints = [...latencySeries, ...lossSeries]
-    .flatMap((item) => item.points)
-    .filter((point) => Number.isFinite(point.time) && Number.isFinite(point.value));
-  const latencyPoints = latencySeries.flatMap((item) => item.points).filter((point) => Number.isFinite(point.value));
-  if (allPoints.length === 0) {
-    return (
-      <div className="flex h-56 items-center justify-center border-2 border-black bg-[var(--accent-bg)] text-sm font-black">
-        {copy.serverDetailPage.noProbeHistory}
-      </div>
-    );
-  }
-
-  const timeValues = Array.from(new Set(allPoints.map((point) => point.time))).sort((a, b) => a - b);
-  const minTime = timeValues[0];
-  const maxTime = timeValues[timeValues.length - 1];
-  const maxLatency = maxOf(latencyPoints.map((point) => point.value), 1);
-  const latencyMax = Math.max(1, Math.ceil(maxLatency * 1.2));
-  const lossMax = 100;
-  const timeSpan = Math.max(maxTime - minTime, 1);
-
-  function x(time: number): number {
-    if (allPoints.length === 1) return padding.left + plotWidth / 2;
-    return padding.left + ((time - minTime) / timeSpan) * plotWidth;
-  }
-
-  function yLatency(value: number): number {
-    const clamped = Math.max(0, Math.min(latencyMax, value));
-    return padding.top + plotHeight - (clamped / latencyMax) * plotHeight;
-  }
-
-  function yLoss(value: number): number {
-    const clamped = Math.max(0, Math.min(lossMax, value));
-    return padding.top + plotHeight - (clamped / lossMax) * plotHeight;
-  }
-
-  function handleMove(event: MouseEvent<SVGSVGElement>) {
-    const localX = svgPointerX(event, width);
-    if (localX < padding.left || localX > width - padding.right) {
-      setHover(null);
-      return;
-    }
-    const targetTime = minTime + ((localX - padding.left) / plotWidth) * timeSpan;
-    const hoverTime = nearestValue(timeValues, targetTime);
-    const values = [
-      ...latencySeries.map((item) => {
-        const point = nearestPoint(item.points, hoverTime);
-        return point ? { label: copy.serverDetailPage.seriesLatencySuffix.replace("{label}", item.label), color: item.color, value: point.value, time: point.time, kind: "latency" as const } : null;
-      }),
-      ...lossSeries.map((item) => {
-        const point = nearestPoint(item.points, hoverTime);
-        return point ? { label: copy.serverDetailPage.seriesLossSuffix.replace("{label}", item.label), color: "#facc15", value: point.value, time: point.time, kind: "loss" as const } : null;
-      }),
-    ].filter((item): item is { label: string; color: string; value: number; time: number; kind: "latency" | "loss" } => Boolean(item));
-    if (!values.length) {
-      setHover(null);
-      return;
-    }
-    setHover({
-      x: x(hoverTime),
-      time: hoverTime,
-      values: values.map(({ label, color, value, kind }) => ({ label, color, value, kind })),
-    });
-  }
-
-  const tooltipWidth = 240;
-  const tooltipHeight = hover ? 28 + hover.values.length * 20 : 0;
-  const tooltipX = hover ? Math.min(Math.max(hover.x + 12, padding.left), width - padding.right - tooltipWidth) : 0;
-  const tooltipY = hover ? Math.max(padding.top + 4, padding.top + plotHeight - tooltipHeight - 8) : 0;
-  const lossBaseline = padding.top + plotHeight;
-
-  return (
-    <svg
-      className="h-60 w-full border-2 border-black bg-[var(--bg-page)]"
-      viewBox={`0 0 ${width} ${height}`}
-      role="img"
-      aria-label={copy.serverDetailPage.probeChartAria}
-      onMouseMove={handleMove}
-      onMouseLeave={() => setHover(null)}
-    >
-      {[0, 0.25, 0.5, 0.75, 1].map((ratio) => {
-        const lineY = padding.top + plotHeight * ratio;
-        return (
-          <line
-            key={ratio}
-            x1={padding.left}
-            x2={width - padding.right}
-            y1={lineY}
-            y2={lineY}
-            stroke="var(--border-color)"
-            strokeOpacity="0.18"
-            strokeWidth="2"
-          />
-        );
-      })}
-      <text x={8} y={padding.top + 10} fill="var(--text-muted)" fontSize="12" fontWeight="900">
-        {formatMs(latencyMax)}
-      </text>
-      <text x={8} y={padding.top + plotHeight} fill="var(--text-muted)" fontSize="12" fontWeight="900">
-        0 ms
-      </text>
-      <text x={width - 8} y={padding.top + 10} fill="var(--text-muted)" fontSize="12" fontWeight="900" textAnchor="end">
-        100%
-      </text>
-      <text x={width - 8} y={padding.top + plotHeight} fill="var(--text-muted)" fontSize="12" fontWeight="900" textAnchor="end">
-        0%
-      </text>
-      <text x={padding.left} y={height - 10} fill="var(--text-muted)" fontSize="12" fontWeight="900">
-        {formatChartTime(minTime)}
-      </text>
-      <text x={width - padding.right} y={height - 10} fill="var(--text-muted)" fontSize="12" fontWeight="900" textAnchor="end">
-        {formatChartTime(maxTime)}
-      </text>
-      {lossSeries.map((item) => {
-        const points = item.points.filter((point) => Number.isFinite(point.time) && Number.isFinite(point.value));
-        const linePath = points.map((point, index) => `${index === 0 ? "M" : "L"} ${x(point.time).toFixed(2)} ${yLoss(point.value).toFixed(2)}`).join(" ");
-        const areaPath = points.length
-          ? `${linePath} L ${x(points[points.length - 1].time).toFixed(2)} ${lossBaseline.toFixed(2)} L ${x(points[0].time).toFixed(2)} ${lossBaseline.toFixed(2)} Z`
-          : "";
-        return (
-          <g key={`${item.id ?? item.label}-loss`}>
-            {areaPath ? <path d={areaPath} fill="#facc15" fillOpacity="0.14" stroke="none" /> : null}
-            <path d={linePath} fill="none" stroke="#ca8a04" strokeDasharray="6 5" strokeLinecap="square" strokeLinejoin="round" strokeWidth="2.5" />
-          </g>
-        );
-      })}
-      {latencySeries.map((item) => {
-        const points = item.points.filter((point) => Number.isFinite(point.time) && Number.isFinite(point.value));
-        const path = points.map((point, index) => `${index === 0 ? "M" : "L"} ${x(point.time).toFixed(2)} ${yLatency(point.value).toFixed(2)}`).join(" ");
-        return (
-          <g key={item.id ?? item.label}>
-            <path d={path} fill="none" stroke={item.color} strokeLinecap="square" strokeLinejoin="round" strokeWidth="4" />
-            {points.length === 1 ? (
-              <circle cx={x(points[0].time)} cy={yLatency(points[0].value)} r="5" fill={item.color} stroke="var(--border-color)" strokeWidth="2" />
-            ) : null}
-          </g>
-        );
-      })}
-      {hover ? (
-        <g>
-          <line x1={hover.x} x2={hover.x} y1={padding.top} y2={padding.top + plotHeight} stroke="var(--border-color)" strokeDasharray="6 5" strokeWidth="2" />
-          <rect x={tooltipX} y={tooltipY} width={tooltipWidth} height={tooltipHeight} fill="var(--bg-card)" stroke="var(--border-color)" strokeWidth="2" />
-          <text x={tooltipX + 10} y={tooltipY + 18} fill="var(--text-main)" fontSize="12" fontWeight="900">
-            {formatChartTime(hover.time)}
-          </text>
-          {hover.values.map((item, index) => (
-            <g key={`${item.label}-${index}`} transform={`translate(${tooltipX + 10}, ${tooltipY + 36 + index * 20})`}>
-              <rect width="9" height="9" y="-8" fill={item.color} stroke="var(--border-color)" strokeWidth="1.5" />
-              <text x="16" y="0" fill="var(--text-main)" fontSize="12" fontWeight="900">
-                {item.label}: {item.kind === "latency" ? formatMs(Math.round(item.value)) : `${item.value.toFixed(1)}%`}
-              </text>
-            </g>
-          ))}
-        </g>
-      ) : null}
-    </svg>
-  );
-});
-
-function nearestPoint(points: ChartPoint[], targetTime: number): ChartPoint | null {
-  let best: ChartPoint | null = null;
-  for (const point of points) {
-    if (!best || Math.abs(point.time - targetTime) < Math.abs(best.time - targetTime)) {
-      best = point;
-    }
-  }
-  return best;
-}
-
-function nearestValue(values: number[], target: number): number {
-  let best = values[0] ?? target;
-  for (const value of values) {
-    if (Math.abs(value - target) < Math.abs(best - target)) best = value;
-  }
-  return best;
-}
-
-function svgPointerX(event: MouseEvent<SVGSVGElement>, fallbackWidth: number): number {
-  const svg = event.currentTarget;
-  const matrix = svg.getScreenCTM();
-  if (matrix) {
-    const point = svg.createSVGPoint();
-    point.x = event.clientX;
-    point.y = event.clientY;
-    return point.matrixTransform(matrix.inverse()).x;
-  }
-
-  const rect = svg.getBoundingClientRect();
-  return ((event.clientX - rect.left) / rect.width) * fallbackWidth;
 }
 
 function buildMetricCharts(samples: MetricSample[], lastState?: Record<string, unknown> | null) {
@@ -2127,24 +1820,6 @@ function historyLimitForRange(range: MetricsRange): number {
   return 240;
 }
 
-function thinPoints(points: ChartPoint[], limit = 240): ChartPoint[] {
-  if (points.length <= limit) return points;
-  const lastIndex = points.length - 1;
-  const step = lastIndex / (limit - 1);
-  const seen = new Set<number>();
-  const out: ChartPoint[] = [];
-  for (let index = 0; index < limit; index += 1) {
-    const point = points[Math.round(index * step)];
-    if (point && !seen.has(point.time)) {
-      seen.add(point.time);
-      out.push(point);
-    }
-  }
-  const last = points[lastIndex];
-  if (last && !seen.has(last.time)) out.push(last);
-  return out;
-}
-
 function smoothPeakPoints(points: ChartPoint[]): ChartPoint[] {
   if (points.length < 7) return points;
   const windowSize = 7;
@@ -2192,6 +1867,24 @@ function normalizeServiceResult(result: unknown): ServiceResult | null {
     delay_ms: optionalNumber(row.delay_ms),
     created_at: createdAt,
   };
+}
+
+// Returns null as soon as one service lacks the inlined `history` array, which
+// means the server predates batched history and the caller must fan out.
+function readEmbeddedHistories(services: ServiceSummary[], serverId: string): ProbeHistoryEntry[] | null {
+  const entries: ProbeHistoryEntry[] = [];
+  for (const service of services) {
+    const history = asRecord(service).history;
+    if (!Array.isArray(history)) return null;
+    entries.push({
+      service,
+      results: history
+        .map((result) => normalizeServiceResult(result))
+        .filter((result): result is ServiceResult => Boolean(result))
+        .filter((result) => result.server_id === serverId),
+    });
+  }
+  return entries;
 }
 
 function serviceBelongsToServer(service: ServiceSummary, serverId: string): boolean {
@@ -2367,17 +2060,6 @@ function latestProbeLatency(series: ChartSeries[]): string {
     .sort((a, b) => a.time - b.time)
     .at(-1);
   return latest ? formatMs(Math.round(latest.value)) : "N/A";
-}
-
-function formatChartTime(value: number): string {
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "";
-  return date.toLocaleString("zh-CN", {
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
 }
 
 function metadataFromRecord(record: Record<string, unknown>, keys: string[]): string | null {

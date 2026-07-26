@@ -1,7 +1,8 @@
 // Per-page i18n namespace for the services (monitoring) admin screen.
-// `zh` is the source of truth; `en` must mirror its shape (enforced by the
-// `typeof` annotation). Interpolated strings use {placeholder} tokens that the
-// page fills in with String.prototype.replace.
+// `zh` is the source of truth; the en half lives in `services.en.ts` and is
+// shape-checked by the `Translations` annotation on `enUS` in `lib/i18n/en.ts`.
+// Interpolated strings use {placeholder} tokens that the page fills in with
+// String.prototype.replace.
 
 export const servicesPage = {
   eyebrow: "监控",
@@ -65,68 +66,4 @@ export const servicesPage = {
   statusDown: "异常",
   statusTimeout: "超时",
   statusDegraded: "降级",
-};
-
-export const servicesPageEn: typeof servicesPage = {
-  eyebrow: "Monitoring",
-  title: "Services",
-  detail: "HTTP, TCP, and ICMP service monitoring and probe testing.",
-  newService: "New service",
-  searchPlaceholder: "Search services",
-  loading: "Loading services...",
-  emptyTitle: "No services configured",
-  emptyDetail: "Add a monitor or run a probe test first.",
-  colName: "Name",
-  colTarget: "Target",
-  colProbeServers: "Probe servers",
-  colType: "Type",
-  colStatus: "Status",
-  colTls: "TLS",
-  colActions: "Actions",
-  edit: "Edit",
-  delete: "Delete",
-  modalTitleEdit: "Edit service",
-  modalTitleCreate: "New service",
-  fieldName: "Name",
-  fieldType: "Type",
-  fieldTarget: "Target",
-  fieldCoverMode: "Coverage mode",
-  coverLocal: "Master probe",
-  coverAll: "All online servers",
-  coverSpecific: "Specific servers",
-  coverExclude: "Exclude specific servers",
-  fieldSpecificServers: "Specific servers",
-  fieldExcludeServers: "Excluded servers",
-  fieldInterval: "Check interval (s)",
-  fieldTimeout: "Timeout (s)",
-  fieldEnabled: "Enabled",
-  fieldFailureTaskIds: "Failure task IDs",
-  fieldRecoveryTaskIds: "Recovery task IDs",
-  saving: "Saving...",
-  save: "Save",
-  testing: "Testing...",
-  testProbe: "Test probe",
-  pickerMasterUnassigned: "Master / unassigned",
-  pickerNoServers: "No selectable servers",
-  noticeUpdated: "Service updated.",
-  noticeCreated: "Service created.",
-  noticeDeleted: "Service deleted.",
-  totpInvalid: "Enter a 6-digit TOTP code.",
-  probeSuccess: "succeeded",
-  probeFailure: "failed",
-  probeResult: "Probe {status}{latency}{code}{cert}{reason}",
-  certExpiry: ", TLS expires {date}",
-  deleteConfirm: "Delete service \"{name}\"?",
-  serverLabelAllOnline: "All online servers",
-  serverLabelExcludePrefix: "Excluding: ",
-  serverLabelLocal: "Master probe",
-  warningPrefix: "Past config issues: ",
-  defaultKind: "service",
-  statusUnknown: "Unknown",
-  statusSuccess: "Success",
-  statusUp: "Up",
-  statusFailure: "Failure",
-  statusDown: "Down",
-  statusTimeout: "Timeout",
-  statusDegraded: "Degraded",
 };

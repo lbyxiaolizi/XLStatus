@@ -67,6 +67,11 @@ interface ServiceResult {
   created_at: string;
 }
 
+interface ServiceHistoryEntry {
+  service: ServiceSummary;
+  results: ServiceResult[];
+}
+
 interface ServiceTrackerItem {
   id: string;
   name: string;
@@ -99,6 +104,8 @@ type ServerSortKey = "default" | "name" | "status" | "cpu" | "memory" | "load" |
 type SortOrder = "asc" | "desc";
 const SERVER_VIEW_MODES = ["cards", "compact"] as const;
 const BINARY_PREFERENCE_VALUES = ["0", "1"] as const;
+// Roughly a month of checks per service, which is what the 30-day tracker grid needs.
+const SERVICE_TRACKER_HISTORY_LIMIT = 1200;
 
 export default function ServersPage() {
   const dialogs = useDialogs();
@@ -206,7 +213,11 @@ export default function ServersPage() {
   const loadServices = useCallback(async (signal?: AbortSignal) => {
     setServicesLoading(true);
     setServiceError(null);
-    const response = await apiClient.listServices(200, 0, false, { signal });
+    const response = await apiClient.listServices(200, 0, false, {
+      signal,
+      includeHistory: true,
+      historyLimit: SERVICE_TRACKER_HISTORY_LIMIT,
+    });
     if (signal?.aborted) return;
     if (!response.success || !response.data) {
       setServices([]);
@@ -218,22 +229,27 @@ export default function ServersPage() {
 
     const nextServices = ((response.data.services as ServiceSummary[]) ?? []).filter((service) => service.id);
     setServices(nextServices);
-    const histories = await mapWithConcurrency(
-      nextServices,
-      6,
-      async (service) => {
-        if (signal?.aborted) return null;
-        const history = await apiClient.getServiceHistory(service.id, 1200, { signal });
-        if (!history.success || !history.data) return null;
-        const results = Array.isArray(history.data.results) ? history.data.results : [];
-        return {
-          service,
-          results: results
-            .map((result) => normalizeServiceResult(result))
-            .filter((result): result is ServiceResult => Boolean(result)),
-        };
-      },
-    );
+    // Servers that support batched history answer in a single request; the
+    // per-service fan-out below only runs against older deployments.
+    const embedded = readEmbeddedHistories(nextServices);
+    const histories: (ServiceHistoryEntry | null)[] =
+      embedded ??
+      (await mapWithConcurrency(
+        nextServices,
+        6,
+        async (service) => {
+          if (signal?.aborted) return null;
+          const history = await apiClient.getServiceHistory(service.id, SERVICE_TRACKER_HISTORY_LIMIT, { signal });
+          if (!history.success || !history.data) return null;
+          const results = Array.isArray(history.data.results) ? history.data.results : [];
+          return {
+            service,
+            results: results
+              .map((result) => normalizeServiceResult(result))
+              .filter((result): result is ServiceResult => Boolean(result)),
+          };
+        },
+      ));
     if (signal?.aborted) return;
 
     setServiceTrackers(
@@ -1328,6 +1344,23 @@ function normalizeServiceResult(result: unknown): ServiceResult | null {
     delay_ms: optionalNumber(row.delay_ms),
     created_at: createdAt,
   };
+}
+
+// Returns null as soon as one service lacks the inlined `history` array, which
+// means the server predates batched history and the caller must fan out.
+function readEmbeddedHistories(services: ServiceSummary[]): ServiceHistoryEntry[] | null {
+  const entries: ServiceHistoryEntry[] = [];
+  for (const service of services) {
+    const history = asRecord(service).history;
+    if (!Array.isArray(history)) return null;
+    entries.push({
+      service,
+      results: history
+        .map((result) => normalizeServiceResult(result))
+        .filter((result): result is ServiceResult => Boolean(result)),
+    });
+  }
+  return entries;
 }
 
 function buildServiceTracker(service: ServiceSummary, results: ServiceResult[]): ServiceTrackerItem {

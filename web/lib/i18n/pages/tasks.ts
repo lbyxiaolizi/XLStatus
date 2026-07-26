@@ -1,7 +1,8 @@
 // Per-page i18n namespace for the tasks (automation) admin screen.
-// `zh` is the source of truth; `en` must mirror its shape (enforced by the
-// `typeof` annotation). Interpolated strings use {placeholder} tokens that the
-// page fills in with String.prototype.replace.
+// `zh` is the source of truth; the en half lives in `tasks.en.ts` and is
+// shape-checked by the `Translations` annotation on `enUS` in `lib/i18n/en.ts`.
+// Interpolated strings use {placeholder} tokens that the page fills in with
+// String.prototype.replace.
 
 export const tasksPage = {
   eyebrow: "自动化",
@@ -57,60 +58,4 @@ export const tasksPage = {
   resultFailure: "失败",
   resultError: "错误",
   resultTimeout: "超时",
-};
-
-export const tasksPageEn: typeof tasksPage = {
-  eyebrow: "Automation",
-  title: "Tasks",
-  detail: "Dispatch commands, schedule tasks, and review execution logs.",
-  newTask: "New task",
-  searchPlaceholder: "Search tasks",
-  loading: "Loading tasks...",
-  emptyTitle: "No tasks configured",
-  emptyDetail: "Create a task to dispatch commands to selected agents.",
-  colName: "Name",
-  colType: "Type",
-  colSchedule: "Schedule",
-  colResult: "Result",
-  colActions: "Actions",
-  scheduleManual: "Manual",
-  run: "Run",
-  edit: "Edit",
-  runsLink: "Logs",
-  delete: "Delete",
-  modalTitleEdit: "Edit task",
-  modalTitleCreate: "New task",
-  runsTitle: "Run logs: {name}",
-  runsEmpty: "No run logs",
-  runServerPrefix: "Server {id}",
-  fieldName: "Name",
-  fieldType: "Type",
-  fieldSchedule: "Schedule",
-  schedulePlaceholder: "Enter a cron expression, leave blank to run manually",
-  fieldCommand: "Command",
-  fieldPayloadJson: "Payload JSON",
-  fieldCoverMode: "Coverage mode",
-  fieldServers: "Servers",
-  fieldServerGroups: "Server groups",
-  fieldExcludeServers: "Excluded servers",
-  fieldTags: "Tag filters",
-  fieldNotificationGroup: "Notification group",
-  notificationNone: "No notification",
-  checkboxSourceServer: "Trigger source server",
-  checkboxPushSuccessful: "Push successful results",
-  checkboxEnabled: "Enabled",
-  saving: "Saving...",
-  saveTask: "Save task",
-  noticeUpdated: "Task updated.",
-  noticeCreated: "Task created.",
-  noticeRunRequested: "Task run request sent.",
-  noticeDeleted: "Task deleted.",
-  totpInvalid: "Enter a 6-digit TOTP code.",
-  runConfirm: "Run task \"{name}\" now?",
-  deleteConfirm: "Delete task \"{name}\"?",
-  resultNever: "Never",
-  resultSuccess: "Success",
-  resultFailure: "Failure",
-  resultError: "Error",
-  resultTimeout: "Timeout",
 };

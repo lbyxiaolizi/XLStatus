@@ -25,18 +25,12 @@ import {
 } from "@/app/components/M7Primitives";
 import { apiClient, type JsonObject, type ServerGroup, type TotpStatusResponse } from "@/lib/api";
 import { useDialogs } from "@/app/components/Dialogs";
+import { useServerData, type Server } from "@/app/components/ServerDataProvider";
 import { useI18n } from "@/lib/use-i18n";
 import type { tasksPage } from "@/lib/i18n/pages/tasks";
 
 type TaskType = "shell" | "http_get" | "icmp_ping" | "tcp_ping";
 type CoverMode = "all" | "any" | "specific";
-
-interface Server {
-  id: string;
-  name: string;
-  status: string;
-  tags?: string[];
-}
 
 interface NotificationGroup {
   id: string;
@@ -106,8 +100,12 @@ const blankForm: TaskForm = {
 export default function TasksPage() {
   const dialogs = useDialogs();
   const { t: copy } = useI18n();
+  const {
+    servers,
+    error: serverLoadError,
+    revalidate: revalidateServers,
+  } = useServerData();
   const [tasks, setTasks] = useState<Task[]>([]);
-  const [servers, setServers] = useState<Server[]>([]);
   const [serverGroups, setServerGroups] = useState<ServerGroup[]>([]);
   const [notificationGroups, setNotificationGroups] = useState<NotificationGroup[]>([]);
   const [runs, setRuns] = useState<TaskRun[]>([]);
@@ -151,17 +149,11 @@ export default function TasksPage() {
     if (optionsLoadedRef.current) return;
     setOptionsLoading(true);
     setOptionsError(null);
-    const [serversResponse, groupsResponse, notificationGroupsResponse] = await Promise.all([
-      apiClient.listServers(200, 0),
+    const [groupsResponse, notificationGroupsResponse] = await Promise.all([
       apiClient.listServerGroups(),
       apiClient.listNotificationGroups(200, 0),
     ]);
     const optionErrors: string[] = [];
-    if (serversResponse.success && serversResponse.data) {
-      setServers((serversResponse.data.servers as Server[]) ?? []);
-    } else {
-      optionErrors.push(responseError(serversResponse));
-    }
     if (groupsResponse.success && groupsResponse.data) {
       setServerGroups(groupsResponse.data.groups ?? []);
     } else {
@@ -187,6 +179,10 @@ export default function TasksPage() {
       runsAbortRef.current?.abort();
     };
   }, [loadTasks]);
+
+  useEffect(() => {
+    void revalidateServers();
+  }, [revalidateServers]);
 
   const deferredQuery = useDeferredValue(query);
   const filtered = useMemo(() => {
@@ -331,7 +327,7 @@ export default function TasksPage() {
         />
         <div className="mb-5 space-y-3">
           <input className={inputClass} value={query} onChange={(e) => setQuery(e.target.value)} placeholder={copy.tasksPage.searchPlaceholder} />
-          <InlineError message={error} />
+          <InlineError message={error ?? serverLoadError} />
           {notice ? <InlineNotice tone="green">{notice}</InlineNotice> : null}
         </div>
 

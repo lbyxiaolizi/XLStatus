@@ -1,7 +1,8 @@
 // Per-page i18n namespace for the admin dashboard overview page.
-// `zh` is the source of truth; `en` must mirror its shape (enforced by the
-// `typeof` annotation). Interpolated strings use {placeholder} tokens that the
-// page fills in with String.prototype.replace.
+// `zh` is the source of truth; the en half lives in `dashboard.en.ts` and is
+// shape-checked by the `Translations` annotation on `enUS` in `lib/i18n/en.ts`.
+// Interpolated strings use {placeholder} tokens that the page fills in with
+// String.prototype.replace.
 
 export const dashboardPage = {
   // Page header
@@ -37,35 +38,4 @@ export const dashboardPage = {
   statusRevoked: "已撤销",
   statusDown: "异常",
   statusDegraded: "降级",
-};
-
-export const dashboardPageEn: typeof dashboardPage = {
-  eyebrow: "Operations overview",
-  title: "Dashboard",
-  detail: "Real-time workspace for servers, services, and alerts.",
-  kpiServers: "Servers",
-  kpiServersOnline: "{count} online",
-  kpiServices: "Services",
-  kpiServicesOnline: "{count} healthy",
-  kpiAlerts: "Alerts",
-  kpiAlertsDetail: "Active events",
-  kpiMode: "Mode",
-  kpiModeLive: "Live",
-  kpiModeDetail: "API connected",
-  serversHeading: "Servers",
-  serversEmptyTitle: "No servers",
-  serversEmptyDetail: "Servers will appear here once an agent registers and comes online.",
-  colName: "Name",
-  colStatus: "Status",
-  colLastSeen: "Last seen",
-  recentAlertsHeading: "Recent alerts",
-  alertsEmptyTitle: "No alert events",
-  alertsEmptyDetail: "Alert history shows up here after rules fire or recover.",
-  alertFallbackName: "Alert",
-  alertFallbackEvent: "Event",
-  statusOnline: "Online",
-  statusOffline: "Offline",
-  statusRevoked: "Revoked",
-  statusDown: "Down",
-  statusDegraded: "Degraded",
 };

@@ -1,7 +1,8 @@
 // Per-page i18n namespace for the notifications management screen.
-// `zh` is the source of truth; `en` must mirror its shape (enforced by the
-// `typeof` annotation). Interpolated strings use {placeholder} tokens that the
-// page fills in with String.prototype.replace.
+// `zh` is the source of truth; the en half lives in `notifications.en.ts` and is
+// shape-checked by the `Translations` annotation on `enUS` in `lib/i18n/en.ts`.
+// Interpolated strings use {placeholder} tokens that the page fills in with
+// String.prototype.replace.
 
 export const notificationsPage = {
   // TOTP / errors
@@ -68,62 +69,4 @@ export const notificationsPage = {
   providerGenericJson: "通用 JSON Webhook",
   providerGenericForm: "通用表单 Webhook",
   providerCustomBody: "自定义 Body",
-};
-
-export const notificationsPageEn: typeof notificationsPage = {
-  totpInvalid: "Enter a 6-digit TOTP code.",
-  channelUpdated: "Notification channel updated.",
-  channelCreated: "Notification channel created.",
-  groupUpdated: "Notification group updated.",
-  groupCreated: "Notification group created.",
-  testSent: "Test notification sent: {name}",
-  channelDeleted: "Notification channel deleted.",
-  groupDeleted: "Notification group deleted.",
-  memberAdded: "Added to notification group: {name}",
-  memberRemoved: "Removed from notification group: {name}",
-  deleteChannelConfirm: "Delete notification channel \"{name}\"?",
-  deleteGroupConfirm: "Delete notification group \"{name}\"?",
-  title: "Notifications",
-  detail: "Notification channels, templates, and groups.",
-  refresh: "Refresh",
-  addGroup: "Add group",
-  addChannel: "Add channel",
-  channels: "Channels",
-  noChannels: "No notification channels yet",
-  colName: "Name",
-  colType: "Type",
-  colTls: "TLS",
-  colUpdated: "Updated",
-  colActions: "Actions",
-  tlsSkip: "Skip",
-  tlsVerify: "Verify",
-  test: "Test",
-  edit: "Edit",
-  delete: "Delete",
-  groups: "Groups",
-  noGroups: "No notification groups yet",
-  channelCountSuffix: "channels",
-  noMembers: "No members yet",
-  removeMember: "Remove",
-  selectChannel: "Select channel",
-  join: "Add",
-  editChannel: "Edit notification channel",
-  createChannel: "New notification channel",
-  fieldName: "Name",
-  fieldProvider: "Provider",
-  keepCurrentTemplate: "Keep current template",
-  fieldUrl: "URL",
-  fieldMethod: "Method",
-  fieldType: "Type",
-  fieldHeadersJson: "Headers JSON",
-  fieldBodyTemplate: "Body Template",
-  verifyTlsCert: "Verify TLS certificate",
-  formatMetricUnits: "Format metric units",
-  saveChannel: "Save channel",
-  editGroup: "Edit notification group",
-  createGroup: "New notification group",
-  saveGroup: "Save group",
-  providerGenericJson: "Generic JSON Webhook",
-  providerGenericForm: "Generic Form Webhook",
-  providerCustomBody: "Custom Body",
 };

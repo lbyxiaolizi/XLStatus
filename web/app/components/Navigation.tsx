@@ -3,19 +3,13 @@
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { type KeyboardEvent as ReactKeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
-import { apiClient, type ThemeDefinition } from "@/lib/api";
+import { apiClient } from "@/lib/api";
 import { type Locale, type Translations } from "@/lib/i18n";
 import { useI18n } from "@/lib/use-i18n";
-import { clearStoredUser, compactId, inputClass, isAdmin, readStoredUser, useBoldTheme, useDialogFocusTrap, useStoredUser } from "./M7Primitives";
+import { clearStoredUser, compactId, inputClass, isAdmin, useBoldTheme, useDialogFocusTrap, useStoredUser } from "./M7Primitives";
 import { useOptionalServerData } from "./ServerDataProvider";
-import {
-  applyDashboardTheme,
-  cacheDashboardTheme,
-  clearDashboardThemeCache,
-  DASHBOARD_THEME_CACHE_KEY,
-  DASHBOARD_THEME_EVENT,
-  readCachedDashboardTheme,
-} from "@/app/lib/dashboard-theme";
+import { applyDashboardTheme, clearDashboardThemeCache } from "@/app/lib/dashboard-theme";
+import { useDashboardTheme } from "@/app/lib/use-dashboard-theme";
 
 type NavItem = { name: string; href: string; adminOnly?: boolean };
 
@@ -50,11 +44,6 @@ interface CommandServer {
 
 const EMPTY_COMMAND_SERVERS: CommandServer[] = [];
 
-interface OwnedDashboardTheme {
-  userId: string;
-  theme: ThemeDefinition | null;
-}
-
 export default function Navigation() {
   const pathname = usePathname();
   const dashboardPath = isDashboardPath(pathname);
@@ -63,13 +52,6 @@ export default function Navigation() {
   const serverData = useOptionalServerData();
   const { locale, locales, setLocale, t: copy } = useI18n();
   const [theme, setTheme] = useBoldTheme();
-  const [dashboardTheme, setDashboardTheme] = useState<OwnedDashboardTheme>(() => {
-    const storedUser = readStoredUser();
-    return {
-      userId: storedUser?.id ?? "",
-      theme: storedUser ? readCachedDashboardTheme(storedUser.id) : null,
-    };
-  });
   const [open, setOpen] = useState(false);
   const [commandOpen, setCommandOpen] = useState(false);
   const [commandQuery, setCommandQuery] = useState("");
@@ -78,8 +60,9 @@ export default function Navigation() {
   const [commandLoadedUserId, setCommandLoadedUserId] = useState("");
   const [commandError, setCommandError] = useState<{ userId: string; message: string } | null>(null);
   const commandRequestUserIdRef = useRef("");
-  const dashboardThemeRevisionRef = useRef(0);
   const revalidateCommandServers = serverData?.revalidate;
+
+  useDashboardTheme({ user, dashboardPath, theme });
 
   const handleLogout = async () => {
     await apiClient.logout();
@@ -155,92 +138,6 @@ export default function Navigation() {
       if (commandRequestUserIdRef.current === requestUserId) commandRequestUserIdRef.current = "";
     };
   }, [commandOpen, copy.common.requestFailed, revalidateCommandServers, user]);
-
-  useEffect(() => {
-    if (!dashboardPath) {
-      applyDashboardTheme(null);
-      return;
-    }
-    if (!user) {
-      // useStoredUser hydrates from a null server snapshot. Keep the inline
-      // cached theme intact until the client identity snapshot arrives.
-      if (readStoredUser()) return;
-      applyDashboardTheme(null);
-      clearDashboardThemeCache();
-      return;
-    }
-    const cachedTheme = readCachedDashboardTheme(user.id);
-    applyDashboardTheme(cachedTheme);
-    let cancelled = false;
-    const requestRevision = dashboardThemeRevisionRef.current;
-    apiClient.listThemes({ bypassClientCache: true }).then((response) => {
-      if (cancelled || requestRevision !== dashboardThemeRevisionRef.current) return;
-      if (response.success && response.data) {
-        const selected = response.data.themes.find(
-          (item) => item.id === response.data?.selected_dashboard_theme_id,
-        );
-        const nextTheme = selected ?? null;
-        cacheDashboardTheme(user.id, nextTheme);
-        setDashboardTheme({ userId: user.id, theme: nextTheme });
-        applyDashboardTheme(nextTheme);
-      }
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [dashboardPath, user]);
-
-  useEffect(() => {
-    if (!dashboardPath) return;
-    return () => applyDashboardTheme(null);
-  }, [dashboardPath]);
-
-  useEffect(() => {
-    if (!user) return;
-    const handleThemeChange = (event: Event) => {
-      if (event.type === "storage") {
-        const storageKey = (event as StorageEvent).key;
-        if (storageKey === "user") {
-          apiClient.invalidateCachedReads();
-          return;
-        }
-        if (storageKey !== DASHBOARD_THEME_CACHE_KEY) return;
-        apiClient.invalidateCachedReads();
-      }
-      const detail = (event as CustomEvent<{
-        userId?: string;
-        theme?: ThemeDefinition | null;
-      }>).detail;
-      if (event.type !== "storage" && detail?.userId && detail.userId !== user.id) return;
-      dashboardThemeRevisionRef.current += 1;
-      const nextTheme = detail && "theme" in detail
-        ? detail.theme ?? null
-        : readCachedDashboardTheme(user.id);
-      setDashboardTheme({ userId: user.id, theme: nextTheme });
-      if (dashboardPath) applyDashboardTheme(nextTheme);
-    };
-    window.addEventListener(DASHBOARD_THEME_EVENT, handleThemeChange);
-    window.addEventListener("storage", handleThemeChange);
-    return () => {
-      window.removeEventListener(DASHBOARD_THEME_EVENT, handleThemeChange);
-      window.removeEventListener("storage", handleThemeChange);
-    };
-  }, [dashboardPath, user]);
-
-  useEffect(() => {
-    if (!dashboardPath) {
-      applyDashboardTheme(null);
-      return;
-    }
-    if (!user) {
-      if (!readStoredUser()) applyDashboardTheme(null);
-      return;
-    }
-    const nextTheme = dashboardTheme.userId === user.id
-      ? dashboardTheme.theme
-      : readCachedDashboardTheme(user.id);
-    applyDashboardTheme(nextTheme);
-  }, [dashboardPath, dashboardTheme, theme, user]);
 
   const commandItems = useMemo(
     () => buildCommandItems(visibleNavigation, visibleCommandServers, commandQuery, copy),

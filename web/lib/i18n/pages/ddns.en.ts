@@ -1,0 +1,47 @@
+// English half of the `ddns` i18n namespace, split out so the default zh-CN
+// bundle never ships it. `lib/i18n/en.ts` pulls these in through a dynamic
+// import that only runs when the user selects en-US, so no `typeof` annotation
+// is used here (it would drag the zh object back into the default chunk);
+// shape is enforced by the `Translations` annotation on `enUS`.
+
+export const ddnsPageEn = {
+  configCreated: "DDNS config created.",
+  configDeleted: "DDNS config deleted.",
+  providersReloaded: "DDNS providers reloaded.",
+  checkTriggered: "DDNS check triggered.",
+  historyLoaded: "Loaded history for {name}.",
+  deleteConfigConfirm: "Delete DDNS config \"{name}\"?",
+  invalidTotp: "Enter a 6-digit TOTP code.",
+  eyebrow: "DNS",
+  title: "DDNS",
+  detail: "Dynamic DNS configuration, reload, and update history.",
+  reload: "Reload",
+  checkNow: "Check now",
+  addConfig: "New config",
+  emptyTitle: "No DDNS configs yet",
+  colName: "Name",
+  colProvider: "Provider",
+  colDomain: "Domain",
+  colIp: "IP",
+  colStatus: "Status",
+  colActions: "Actions",
+  disabled: "Disabled",
+  enabled: "Enabled",
+  history: "History",
+  delete: "Delete",
+  historyHeading: "History",
+  success: "Success",
+  failed: "Failed",
+  modalTitle: "New DDNS config",
+  fieldName: "Name",
+  fieldProvider: "Provider",
+  fieldAgentId: "Agent ID",
+  fieldDomain: "Domain",
+  fieldWebhookUrl: "Webhook URL",
+  fieldRecordId: "Record ID",
+  fieldZoneId: "Zone ID",
+  fieldApiToken: "API Token",
+  fieldApiKey: "API Key",
+  fieldApiSecret: "API Secret",
+  saveConfig: "Save config",
+};

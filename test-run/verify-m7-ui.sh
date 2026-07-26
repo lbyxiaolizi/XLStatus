@@ -73,7 +73,7 @@ for token in [
 ]:
     assert token in terminal, f"terminal UI missing {token}"
 
-status = (root / "web/app/status/page.tsx").read_text(encoding="utf-8")
+status = (root / "web/app/status/StatusPageClient.tsx").read_text(encoding="utf-8")
 for token in [
     "getPublicStatus",
     "copy.statusPage.overallNoData",

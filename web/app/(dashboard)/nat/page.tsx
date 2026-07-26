@@ -19,19 +19,18 @@ import {
 } from "@/app/components/M7Primitives";
 import { apiClient, type JsonObject, type NatMapping, type TotpStatusResponse } from "@/lib/api";
 import { useDialogs } from "@/app/components/Dialogs";
+import { useServerData } from "@/app/components/ServerDataProvider";
 import { useI18n } from "@/lib/use-i18n";
-
-interface Server {
-  id: string;
-  name: string;
-  status: string;
-}
 
 export default function NatPage() {
   const dialogs = useDialogs();
   const { t: copy } = useI18n();
+  const {
+    servers,
+    error: serverLoadError,
+    revalidate: revalidateServers,
+  } = useServerData();
   const [mappings, setMappings] = useState<NatMapping[]>([]);
-  const [servers, setServers] = useState<Server[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [totpStatus, setTotpStatus] = useState<TotpStatusResponse | null>(null);
@@ -39,16 +38,11 @@ export default function NatPage() {
   const [form, setForm] = useState({ agent_id: "", description: "", protocol: "tcp", local_host: "127.0.0.1", local_port: "80", public_port: "10080", allowed_sources: "", max_active_tunnels: "", idle_timeout_seconds: "", max_bytes_per_tunnel: "", max_bandwidth_bytes_per_second: "", rate_limit_window_seconds: "", max_connections_per_window: "", max_bytes_per_window: "" });
 
   const load = useCallback(async () => {
-    const [mappingResponse, serverResponse] = await Promise.all([apiClient.listNatMappings(), apiClient.listServers(200, 0)]);
+    const mappingResponse = await apiClient.listNatMappings();
     if (mappingResponse.success && mappingResponse.data) {
       setMappings(mappingResponse.data.mappings ?? []);
     } else {
       setError(responseError(mappingResponse));
-    }
-    if (serverResponse.success && serverResponse.data) {
-      const loaded = (serverResponse.data.servers as Server[]) ?? [];
-      setServers(loaded);
-      setForm((current) => ({ ...current, agent_id: current.agent_id || loaded[0]?.id || "" }));
     }
   }, []);
 
@@ -56,6 +50,19 @@ export default function NatPage() {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount is the standard client data-load pattern
     void load();
   }, [load]);
+
+  useEffect(() => {
+    void revalidateServers();
+  }, [revalidateServers]);
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- picker default derived from the shared server list, kept out of render
+    setForm((current) => {
+      if (current.agent_id) return current;
+      const fallback = servers[0]?.id ?? "";
+      return fallback ? { ...current, agent_id: fallback } : current;
+    });
+  }, [servers]);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -132,7 +139,7 @@ export default function NatPage() {
           actions={<button className={buttonClass("primary")} onClick={() => setModal(true)}>{copy.natPage.addMapping}</button>}
         />
         <div className="mb-5 space-y-3">
-          <InlineError message={error} />
+          <InlineError message={error ?? serverLoadError} />
           {notice ? <InlineNotice tone="green">{notice}</InlineNotice> : null}
         </div>
 

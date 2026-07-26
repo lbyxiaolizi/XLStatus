@@ -1,19 +1,22 @@
-import { loginPage, loginPageEn } from "./i18n/pages/login";
-import { statusPage, statusPageEn } from "./i18n/pages/status";
-import { statusDetailPage, statusDetailPageEn } from "./i18n/pages/statusDetail";
-import { dashboardPage, dashboardPageEn } from "./i18n/pages/dashboard";
-import { serversPage, serversPageEn } from "./i18n/pages/servers";
-import { serverDetailPage, serverDetailPageEn } from "./i18n/pages/serverDetail";
-import { settingsPage, settingsPageEn } from "./i18n/pages/settings";
-import { servicesPage, servicesPageEn } from "./i18n/pages/services";
-import { tasksPage, tasksPageEn } from "./i18n/pages/tasks";
-import { alertsPage, alertsPageEn } from "./i18n/pages/alerts";
-import { natPage, natPageEn } from "./i18n/pages/nat";
-import { ddnsPage, ddnsPageEn } from "./i18n/pages/ddns";
-import { notificationsPage, notificationsPageEn } from "./i18n/pages/notifications";
-import { terminalPage, terminalPageEn } from "./i18n/pages/terminal";
-import { dialogs, dialogsEn, errorsPage, errorsPageEn } from "./i18n/pages/shared";
-import { worldMap, worldMapEn } from "./i18n/pages/worldMap";
+// Only the zh-CN namespaces are imported statically. The en-US half lives in
+// `./i18n/en` (which re-exports every `pages/*.en.ts`) and is loaded through a
+// dynamic import, so the English copy is code-split out of the initial chunk.
+import { loginPage } from "./i18n/pages/login";
+import { statusPage } from "./i18n/pages/status";
+import { statusDetailPage } from "./i18n/pages/statusDetail";
+import { dashboardPage } from "./i18n/pages/dashboard";
+import { serversPage } from "./i18n/pages/servers";
+import { serverDetailPage } from "./i18n/pages/serverDetail";
+import { settingsPage } from "./i18n/pages/settings";
+import { servicesPage } from "./i18n/pages/services";
+import { tasksPage } from "./i18n/pages/tasks";
+import { alertsPage } from "./i18n/pages/alerts";
+import { natPage } from "./i18n/pages/nat";
+import { ddnsPage } from "./i18n/pages/ddns";
+import { notificationsPage } from "./i18n/pages/notifications";
+import { terminalPage } from "./i18n/pages/terminal";
+import { dialogs, errorsPage } from "./i18n/pages/shared";
+import { worldMap } from "./i18n/pages/worldMap";
 
 export const supportedLocales = ["zh-CN", "en-US"] as const;
 
@@ -99,86 +102,37 @@ export const zhCN = {
   worldMap,
 };
 
-export const enUS: typeof zhCN = {
-  appDescription: "Self-hosted server monitoring and operations system",
-  common: {
-    close: "Close",
-    login: "Log in",
-    logout: "Log out",
-    menu: "Menu",
-    light: "Light",
-    dark: "Dark",
-    enabled: "Enabled",
-    disabled: "Disabled",
-    success: "Success",
-    failure: "Failure",
-    cancel: "Cancel",
-    confirm: "Confirm",
-    submit: "Submit",
-    unknown: "Unknown",
-    never: "Never",
-    manual: "Manual",
-    loading: "Loading...",
-    notAvailable: "N/A",
-    requestFailed: "Request failed",
-    networkError: "Network error",
-    noRequestAttempted: "No request attempted",
-    authRequired: "Authentication required",
-    permissionDenied: "Permission denied",
-    backendNotFound: "Backend route or resource not found",
-    search: "Search",
-    noMatches: "No matches",
-    localPreference: "Local preference",
-    language: "Language",
-    zhCN: "中文",
-    enUS: "EN",
-  },
-  nav: {
-    dashboard: "Dashboard",
-    servers: "Servers",
-    services: "Services",
-    tasks: "Tasks",
-    terminal: "Terminal",
-    alerts: "Alerts",
-    notifications: "Notifications",
-    nat: "NAT",
-    ddns: "DDNS",
-    settings: "Settings",
-    status: "Status",
-  },
-  command: {
-    pages: "Pages",
-    servers: "Servers",
-    commands: "Commands",
-    searchPlaceholder: "Search pages or servers",
-  },
-  loginPage: loginPageEn,
-  statusPage: statusPageEn,
-  statusDetailPage: statusDetailPageEn,
-  dashboardPage: dashboardPageEn,
-  serversPage: serversPageEn,
-  serverDetailPage: serverDetailPageEn,
-  settingsPage: settingsPageEn,
-  servicesPage: servicesPageEn,
-  tasksPage: tasksPageEn,
-  alertsPage: alertsPageEn,
-  natPage: natPageEn,
-  ddnsPage: ddnsPageEn,
-  notificationsPage: notificationsPageEn,
-  terminalPage: terminalPageEn,
-  dialogs: dialogsEn,
-  errorsPage: errorsPageEn,
-  worldMap: worldMapEn,
-};
-
+// en-US is deliberately absent: it is not resolvable synchronously.
 export const translations = {
   "zh-CN": zhCN,
-  "en-US": enUS,
-} satisfies Record<Locale, typeof zhCN>;
+} satisfies Partial<Record<Locale, typeof zhCN>>;
 
 export type Translations = typeof zhCN;
 
 export const t = zhCN;
+
+let loadedEn: Translations | null = null;
+let enPromise: Promise<unknown> | null = null;
+
+export function isEnLoaded(): boolean {
+  return loadedEn !== null;
+}
+
+// Fire the en-US chunk fetch at most once. Nothing awaits it: callers keep
+// rendering zh-CN, and the locale-change event is what brings subscribers back
+// for a re-render once the real English copy is in memory. A failed fetch
+// clears the latch so a later locale switch can retry.
+function ensureEnLoaded(): void {
+  if (typeof window === "undefined" || loadedEn !== null || enPromise !== null) return;
+  enPromise = import("./i18n/en")
+    .then((enModule) => {
+      loadedEn = enModule.enUS;
+      window.dispatchEvent(new Event("xlstatus:locale-change"));
+    })
+    .catch(() => {
+      enPromise = null;
+    });
+}
 
 export function normalizeLocale(value?: string | null): Locale {
   return supportedLocales.find((locale) => locale === value) ?? defaultLocale;
@@ -194,11 +148,18 @@ export function setLocale(locale: Locale): void {
   const normalized = normalizeLocale(locale);
   window.localStorage.setItem("xlstatus_locale", normalized);
   document.documentElement.lang = normalized;
+  if (normalized === "en-US") ensureEnLoaded();
   window.dispatchEvent(new CustomEvent("xlstatus:locale-change", { detail: { locale: normalized } }));
 }
 
 export function getTranslations(locale: Locale = getLocale()): Translations {
-  return translations[normalizeLocale(locale)];
+  const normalized = normalizeLocale(locale);
+  if (normalized !== "en-US") return translations["zh-CN"];
+  if (loadedEn !== null) return loadedEn;
+  // First en-US render (and every SSR pass) falls back to zh-CN; ensureEnLoaded
+  // schedules the swap on the client and no-ops on the server.
+  ensureEnLoaded();
+  return translations["zh-CN"];
 }
 
 export function formatLocaleDate(value: string | number | Date, locale: Locale = getLocale()): string {

@@ -1,7 +1,8 @@
 // Per-page i18n namespace for the NAT mapping screen.
-// `zh` is the source of truth; `en` must mirror its shape (enforced by the
-// `typeof` annotation). Interpolated strings use {placeholder} tokens that the
-// page fills in with String.prototype.replace.
+// `zh` is the source of truth; the en half lives in `nat.en.ts` and is
+// shape-checked by the `Translations` annotation on `enUS` in `lib/i18n/en.ts`.
+// Interpolated strings use {placeholder} tokens that the page fills in with
+// String.prototype.replace.
 
 export const natPage = {
   // notices / errors
@@ -58,55 +59,4 @@ export const natPage = {
   fieldMaxConnectionsPerWindow: "窗口最大连接",
   fieldMaxBytesPerWindow: "窗口最大字节",
   saveMapping: "保存映射",
-};
-
-export const natPageEn: typeof natPage = {
-  mappingCreated: "NAT mapping created.",
-  mappingDeleted: "NAT mapping deleted.",
-  deleteMappingConfirm: "Delete NAT mapping \"{name}\"?",
-  invalidTotp: "Enter a 6-digit TOTP code.",
-  eyebrow: "Network",
-  title: "NAT",
-  detail: "Agent loopback port mappings and remote access configuration.",
-  addMapping: "New mapping",
-  emptyTitle: "No NAT mappings yet",
-  emptyDetail: "Create a mapping to expose an agent's local loopback target through a tunnel.",
-  colDescription: "Description",
-  colAgent: "Agent",
-  colPublic: "Public",
-  colLocal: "Local",
-  colPolicy: "Policy",
-  colStatus: "Status",
-  colActions: "Actions",
-  policySource: "Source: ",
-  policyGlobalPolicy: "Global policy",
-  policyConcurrency: "Concurrency: ",
-  policyGlobalLimit: "Global limit",
-  policyIdle: "Idle: ",
-  policyUnlimited: "Unlimited",
-  policyTraffic: "Traffic: ",
-  policyBandwidth: "Bandwidth: ",
-  policyWindow: "Window: ",
-  policyDefaultDisabled: "Default/disabled",
-  policyWindowConnections: "Window connections: ",
-  policyWindowTraffic: "Window traffic: ",
-  disabled: "Disabled",
-  enabled: "Enabled",
-  delete: "Delete",
-  modalTitle: "New NAT mapping",
-  fieldAgent: "Agent",
-  fieldDescription: "Description",
-  fieldProtocol: "Protocol",
-  fieldPublicPort: "Public port",
-  fieldLocalHost: "Local host",
-  fieldLocalPort: "Local port",
-  fieldSourceCidr: "Source CIDR",
-  fieldMaxConcurrent: "Max concurrent",
-  fieldIdleTimeoutSeconds: "Idle timeout (seconds)",
-  fieldMaxBytesPerTunnel: "Max bytes per tunnel",
-  fieldBandwidth: "Bandwidth (B/s)",
-  fieldWindowSeconds: "Window (seconds)",
-  fieldMaxConnectionsPerWindow: "Max connections per window",
-  fieldMaxBytesPerWindow: "Max bytes per window",
-  saveMapping: "Save mapping",
 };

@@ -1,7 +1,8 @@
 // Per-page i18n namespace for the public status overview page.
-// `zh` is the source of truth; `en` must mirror its shape (enforced by the
-// `typeof` annotation). Interpolated strings use {placeholder} tokens that the
-// page fills in with String.prototype.replace.
+// `zh` is the source of truth; the en half lives in `status.en.ts` and is
+// shape-checked by the `Translations` annotation on `enUS` in `lib/i18n/en.ts`.
+// Interpolated strings use {placeholder} tokens that the page fills in with
+// String.prototype.replace.
 
 export const statusPage = {
   // Overall status badge
@@ -70,63 +71,4 @@ export const statusPage = {
   statusUp: "正常",
   statusTimeout: "超时",
   serviceKindFallback: "服务",
-};
-
-export const statusPageEn: typeof statusPage = {
-  overallNoData: "No public data",
-  overallPartial: "Partial issues",
-  overallOk: "Operational",
-  eyebrow: "Public status",
-  detail: "Server and service availability overview, sourced from the backend public API.",
-  updatedAt: "Updated {time}.",
-  waitingFirstRefresh: "Waiting for first refresh.",
-  autoRefresh: "Auto-refreshes every 30 seconds.",
-  kpiServers: "Servers",
-  kpiServersOnline: "{count} online",
-  kpiServices: "Services",
-  kpiServicesDetail: "Public monitors",
-  kpiRefresh: "Refresh",
-  kpiRefreshDetail: "Live polling",
-  viewCards: "Cards",
-  viewCompact: "Compact",
-  hideServices: "Hide services",
-  showServices: "Show services",
-  serversHeading: "Servers",
-  servicesHeading: "Services",
-  serversEmptyTitle: "No public servers",
-  serversEmptyDetail: "Hidden or unauthorized servers do not appear on the public status page.",
-  servicesEmptyTitle: "No public services",
-  servicesEmptyDetail: "Public service monitors will show up here.",
-  checkedAt: "Checked {time}",
-  uptimeSuffix: "{percent} uptime",
-  daysAgo30: "30 days ago",
-  today: "Today",
-  publicServerNote: "Public server",
-  viewPublicServer: "View public server {name}",
-  metricLabelStatus: "Status",
-  metricLabelLastSeen: "Last seen",
-  metricLabelCpu: "CPU",
-  metricLabelMemory: "Memory",
-  metricLabelDisk: "Disk",
-  metricLabelDownload: "Download",
-  metricLabelUpload: "Upload",
-  metricLabelDownloadUpload: "Down/Up",
-  chartsHeading: "Charts",
-  chartResourceUsage: "Resource usage",
-  chartNetworkRate: "Network rate",
-  noHistory: "No history yet",
-  seriesCpu: "CPU",
-  seriesMemory: "Memory",
-  seriesDisk: "Disk",
-  seriesDownload: "Download",
-  seriesUpload: "Upload",
-  chartAriaLabel: "Public server metrics trend chart",
-  statusOnline: "Online",
-  statusOffline: "Offline",
-  statusDown: "Down",
-  statusDegraded: "Degraded",
-  statusRevoked: "Revoked",
-  statusUp: "Up",
-  statusTimeout: "Timeout",
-  serviceKindFallback: "Service",
 };

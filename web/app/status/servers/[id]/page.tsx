@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { use, useCallback, useEffect, useMemo, useState } from "react";
 import Navigation from "@/app/components/Navigation";
 import {
   BrutalCard,
@@ -18,6 +18,15 @@ import {
   formatPercent,
   responseError,
 } from "@/app/components/M7Primitives";
+import {
+  MiniLineChart,
+  averageDelay,
+  buildPublicServiceDays,
+  publicServiceDayClass,
+  type ChartPoint,
+  type ChartSeries,
+  type PublicServiceDay,
+} from "@/app/components/charts";
 import { apiClient } from "@/lib/api";
 import { durationLabel, formatRate } from "@/app/lib/format";
 import type { Translations } from "@/lib/i18n";
@@ -98,28 +107,11 @@ interface PublicService {
   history?: PublicServiceResult[];
 }
 
-interface PublicServiceDay {
-  key: string;
-  label: string;
-  uptime: number;
-  avgDelay?: number;
-  total: number;
-}
-
-interface ChartPoint {
-  time: number;
-  value: number;
-}
-
-interface ChartSeries {
-  id: string;
-  label: string;
-  color: string;
-  points: ChartPoint[];
-}
-
 export default function PublicServerDetailPage({ params }: PageProps) {
-  const [serverId, setServerId] = useState("");
+  // React 19 unwraps the route params promise during render, so the first paint
+  // already knows the id instead of waiting for an effect round-trip.
+  const resolved = params instanceof Promise ? use(params) : params;
+  const serverId = resolved.id;
   const { t: copy } = useI18n();
   const [server, setServer] = useState<PublicServerDetail | null>(null);
   const [services, setServices] = useState<PublicService[]>([]);
@@ -127,10 +119,6 @@ export default function PublicServerDetailPage({ params }: PageProps) {
   const [servicesLoading, setServicesLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [servicesError, setServicesError] = useState<string | null>(null);
-
-  useEffect(() => {
-    void Promise.resolve(params).then((value) => setServerId(value.id));
-  }, [params]);
 
   const loadServer = useCallback(
     async (signal?: AbortSignal) => {
@@ -290,16 +278,26 @@ function PublicResources({ resources }: { resources: PublicServerResources }) {
 
 function PublicMetricsCharts({ metrics }: { metrics: PublicServerMetrics }) {
   const { t: copy } = useI18n();
-  const charts = buildMetricCharts(metrics.samples);
-  const resourceSeries = [
-    { id: "cpu", label: copy.statusDetailPage.seriesCpu, color: "var(--accent-color)", points: charts.cpu },
-    { id: "memory", label: copy.statusDetailPage.seriesMemory, color: "var(--btn-bg)", points: charts.memory },
-    { id: "disk", label: copy.statusDetailPage.seriesDisk, color: "#f97316", points: charts.disk },
-  ].filter((series) => series.points.length > 0);
-  const networkSeries = [
-    { id: "rx", label: copy.statusDetailPage.seriesDownload, color: "var(--accent-color)", points: charts.rx },
-    { id: "tx", label: copy.statusDetailPage.seriesUpload, color: "var(--btn-bg)", points: charts.tx },
-  ].filter((series) => series.points.length > 0);
+  const charts = useMemo(() => buildMetricCharts(metrics.samples), [metrics.samples]);
+  // Keep the series arrays referentially stable so the memoized chart can bail
+  // out when a re-render does not change the samples.
+  const resourceSeries = useMemo(
+    () =>
+      [
+        { id: "cpu", label: copy.statusDetailPage.seriesCpu, color: "var(--accent-color)", points: charts.cpu },
+        { id: "memory", label: copy.statusDetailPage.seriesMemory, color: "var(--btn-bg)", points: charts.memory },
+        { id: "disk", label: copy.statusDetailPage.seriesDisk, color: "#f97316", points: charts.disk },
+      ].filter((series) => series.points.length > 0),
+    [charts, copy],
+  );
+  const networkSeries = useMemo(
+    () =>
+      [
+        { id: "rx", label: copy.statusDetailPage.seriesDownload, color: "var(--accent-color)", points: charts.rx },
+        { id: "tx", label: copy.statusDetailPage.seriesUpload, color: "var(--btn-bg)", points: charts.tx },
+      ].filter((series) => series.points.length > 0),
+    [charts, copy],
+  );
 
   if (!resourceSeries.length && !networkSeries.length) return null;
 
@@ -336,6 +334,7 @@ function MetricChartCard({
   maxValue?: number;
   formatValue: (value?: number | null) => string;
 }) {
+  const { t: copy } = useI18n();
   return (
     <section className="border-2 border-black bg-[var(--bg-card)] p-4 shadow-[var(--shadow-brutal)]">
       <div className="mb-3 flex items-start justify-between gap-3">
@@ -347,80 +346,24 @@ function MetricChartCard({
           LIVE
         </span>
       </div>
-      <MiniLineChart series={series} maxValue={maxValue} formatValue={formatValue} />
+      <MiniLineChart
+        series={series}
+        maxValue={maxValue}
+        formatValue={formatValue}
+        emptyLabel={copy.statusDetailPage.noHistory}
+        ariaLabel={copy.statusDetailPage.chartAriaLabel}
+        interactive={false}
+        variant="detail"
+      />
       <div className="mt-3 flex flex-wrap gap-2">
         {series.map((item) => (
-          <span key={item.id} className="inline-flex items-center gap-2 border-2 border-black bg-[var(--accent-bg)] px-2 py-1 text-xs font-black">
+          <span key={item.id ?? item.label} className="inline-flex items-center gap-2 border-2 border-black bg-[var(--accent-bg)] px-2 py-1 text-xs font-black">
             <span className="h-2.5 w-2.5 border-2 border-black" style={{ background: item.color }} />
             {item.label}
           </span>
         ))}
       </div>
     </section>
-  );
-}
-
-function MiniLineChart({ series, maxValue, formatValue }: { series: ChartSeries[]; maxValue?: number; formatValue: (value?: number | null) => string }) {
-  const { t: copy } = useI18n();
-  const width = 640;
-  const height = 190;
-  const padding = { top: 14, right: 16, bottom: 30, left: 46 };
-  const plotWidth = width - padding.left - padding.right;
-  const plotHeight = height - padding.top - padding.bottom;
-  const allPoints = series.flatMap((item) => item.points).filter((point) => Number.isFinite(point.time) && Number.isFinite(point.value));
-  if (!allPoints.length) {
-    return (
-      <div className="flex h-44 items-center justify-center border-2 border-black bg-[var(--accent-bg)] text-sm font-black">
-        {copy.statusDetailPage.noHistory}
-      </div>
-    );
-  }
-
-  const minTime = Math.min(...allPoints.map((point) => point.time));
-  const maxTime = Math.max(...allPoints.map((point) => point.time));
-  const maxSeriesValue = Math.max(...allPoints.map((point) => point.value), 1);
-  const yMax = maxValue ?? Math.max(1, Math.ceil(maxSeriesValue * 1.2));
-  const timeSpan = Math.max(maxTime - minTime, 1);
-
-  function x(time: number): number {
-    if (allPoints.length === 1) return padding.left + plotWidth / 2;
-    return padding.left + ((time - minTime) / timeSpan) * plotWidth;
-  }
-
-  function y(value: number): number {
-    const clamped = Math.max(0, Math.min(yMax, value));
-    return padding.top + plotHeight - (clamped / yMax) * plotHeight;
-  }
-
-  return (
-    <svg className="h-48 w-full border-2 border-black bg-[var(--bg-page)]" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={copy.statusDetailPage.chartAriaLabel}>
-      {[0, 0.25, 0.5, 0.75, 1].map((ratio) => {
-        const lineY = padding.top + plotHeight * ratio;
-        return <line key={ratio} x1={padding.left} x2={width - padding.right} y1={lineY} y2={lineY} stroke="var(--border-color)" strokeOpacity="0.18" strokeWidth="2" />;
-      })}
-      <text x={8} y={padding.top + 10} fill="var(--text-muted)" fontSize="12" fontWeight="900">
-        {formatValue(yMax)}
-      </text>
-      <text x={8} y={padding.top + plotHeight} fill="var(--text-muted)" fontSize="12" fontWeight="900">
-        {formatValue(0)}
-      </text>
-      <text x={padding.left} y={height - 9} fill="var(--text-muted)" fontSize="12" fontWeight="900">
-        {formatChartTime(minTime)}
-      </text>
-      <text x={width - padding.right} y={height - 9} fill="var(--text-muted)" fontSize="12" fontWeight="900" textAnchor="end">
-        {formatChartTime(maxTime)}
-      </text>
-      {series.map((item) => {
-        const points = item.points.filter((point) => Number.isFinite(point.time) && Number.isFinite(point.value));
-        const path = points.map((point, index) => `${index === 0 ? "M" : "L"} ${x(point.time).toFixed(2)} ${y(point.value).toFixed(2)}`).join(" ");
-        return (
-          <g key={item.id}>
-            <path d={path} fill="none" stroke={item.color} strokeLinecap="square" strokeLinejoin="round" strokeWidth="4" />
-            {points.length === 1 ? <circle cx={x(points[0].time)} cy={y(points[0].value)} r="5" fill={item.color} stroke="var(--border-color)" strokeWidth="2" /> : null}
-          </g>
-        );
-      })}
-    </svg>
   );
 }
 
@@ -537,17 +480,6 @@ function numberLabel(value?: number | null): string {
   return String(value);
 }
 
-function formatChartTime(value: number): string {
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "";
-  return date.toLocaleString("zh-CN", {
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
-
 function serviceBelongsToServer(service: PublicService, serverId: string): boolean {
   const serverIds = Array.isArray(service.server_ids) ? service.server_ids : [];
   return service.server_id === serverId || serverIds.includes(serverId);
@@ -585,59 +517,4 @@ function statusLabel(status: string | null | undefined, copy: Translations): str
     timeout: copy.statusDetailPage.statusTimeout,
   };
   return labels[status] || status;
-}
-
-function buildPublicServiceDays(results: PublicServiceResult[]): PublicServiceDay[] {
-  const today = startOfDay(new Date());
-  const buckets = new Map<string, PublicServiceResult[]>();
-  for (const result of results) {
-    const date = new Date(result.created_at);
-    if (Number.isNaN(date.getTime())) continue;
-    const key = dayKey(date);
-    buckets.set(key, [...(buckets.get(key) ?? []), result]);
-  }
-
-  return Array.from({ length: 30 }, (_, index) => {
-    const date = new Date(today);
-    date.setDate(today.getDate() - (29 - index));
-    const key = dayKey(date);
-    const rows = buckets.get(key) ?? [];
-    const success = rows.filter((result) => serviceOk(result.status)).length;
-    const delays = rows
-      .map((result) => (typeof result.delay_ms === "number" ? result.delay_ms : undefined))
-      .filter((value): value is number => value !== undefined);
-    return {
-      key,
-      label: date.toLocaleDateString("zh-CN"),
-      uptime: rows.length ? (success / rows.length) * 100 : 0,
-      avgDelay: delays.length ? delays.reduce((sum, value) => sum + value, 0) / delays.length : undefined,
-      total: rows.length,
-    };
-  });
-}
-
-function publicServiceDayClass(day: PublicServiceDay): string {
-  if (day.total === 0) return "bg-[var(--accent-bg)]";
-  if (day.uptime >= 99) return "bg-[var(--accent-color)]";
-  if (day.uptime >= 95) return "bg-yellow-300";
-  return "bg-[var(--btn-bg)]";
-}
-
-function averageDelay(results: PublicServiceResult[]): number | undefined {
-  const values = results
-    .map((result) => (typeof result.delay_ms === "number" ? result.delay_ms : undefined))
-    .filter((value): value is number => value !== undefined);
-  return values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : undefined;
-}
-
-function serviceOk(status: string): boolean {
-  return status === "success" || status === "up" || status === "ok";
-}
-
-function startOfDay(date: Date): Date {
-  return new Date(date.getFullYear(), date.getMonth(), date.getDate());
-}
-
-function dayKey(date: Date): string {
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
 }

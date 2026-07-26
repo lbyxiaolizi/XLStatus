@@ -40,8 +40,35 @@ export function useServerRealtime(scope: string | null, revision: number): Serve
   const liveRafRef = useRef<number | null>(null);
 
   useEffect(() => {
-    const timer = window.setInterval(() => setNow(Date.now()), 5_000);
-    return () => window.clearInterval(timer);
+    let timer: number | null = null;
+
+    function startTicking() {
+      if (timer !== null) return;
+      timer = window.setInterval(() => setNow(Date.now()), 5_000);
+    }
+
+    function stopTicking() {
+      if (timer === null) return;
+      window.clearInterval(timer);
+      timer = null;
+    }
+
+    function handleVisibility() {
+      // A hidden tab renders nothing, so the clock only burns wakeups there.
+      if (document.hidden) {
+        stopTicking();
+        return;
+      }
+      setNow(Date.now());
+      startTicking();
+    }
+
+    if (!document.hidden) startTicking();
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => {
+      stopTicking();
+      document.removeEventListener("visibilitychange", handleVisibility);
+    };
   }, []);
 
   useEffect(() => {
@@ -83,8 +110,29 @@ export function useServerRealtime(scope: string | null, revision: number): Serve
       liveRafRef.current = window.requestAnimationFrame(flushLive);
     }
 
+    function teardown() {
+      if (reconnectTimerRef.current !== null) {
+        window.clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+      if (liveRafRef.current !== null) {
+        window.cancelAnimationFrame(liveRafRef.current);
+        liveRafRef.current = null;
+      }
+      pendingLiveRef.current = [];
+      const socket = wsRef.current;
+      wsRef.current = null;
+      if (!socket) return;
+      // Detach handlers before closing so this close cannot schedule a reconnect.
+      socket.onopen = null;
+      socket.onmessage = null;
+      socket.onerror = null;
+      socket.onclose = null;
+      socket.close();
+    }
+
     function connect() {
-      if (cancelled) return;
+      if (cancelled || document.hidden) return;
       setScopedConnection({ scope: activeScope, value: "connecting" });
       const ws = new WebSocket(buildWebSocketUrl("/ws/servers"));
       wsRef.current = ws;
@@ -121,25 +169,35 @@ export function useServerRealtime(scope: string | null, revision: number): Serve
       ws.onclose = () => {
         if (cancelled) return;
         setScopedConnection({ scope: activeScope, value: "closed" });
+        if (document.hidden) return;
         backoff = Math.min(backoff * 2, 15_000);
         reconnectTimerRef.current = window.setTimeout(connect, backoff);
       };
     }
 
-    connect();
+    function handleVisibility() {
+      if (cancelled) return;
+      if (document.hidden) {
+        teardown();
+        setScopedConnection({ scope: activeScope, value: "closed" });
+        return;
+      }
+      // A socket or a pending reconnect already covers the visible tab.
+      if (wsRef.current !== null || reconnectTimerRef.current !== null) return;
+      backoff = 1000;
+      connect();
+    }
+
+    document.addEventListener("visibilitychange", handleVisibility);
+    if (document.hidden) {
+      setScopedConnection({ scope: activeScope, value: "closed" });
+    } else {
+      connect();
+    }
     return () => {
       cancelled = true;
-      if (reconnectTimerRef.current !== null) {
-        window.clearTimeout(reconnectTimerRef.current);
-        reconnectTimerRef.current = null;
-      }
-      if (liveRafRef.current !== null) {
-        window.cancelAnimationFrame(liveRafRef.current);
-        liveRafRef.current = null;
-      }
-      pendingLiveRef.current = [];
-      wsRef.current?.close();
-      wsRef.current = null;
+      document.removeEventListener("visibilitychange", handleVisibility);
+      teardown();
     };
   }, [revision, scope]);
 

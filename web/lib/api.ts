@@ -36,11 +36,15 @@ function redirectToLogin(): void {
   if (isAuthRedirectExemptPath(window.location.pathname)) return;
 
   authRedirectPending = true;
+  // Only a previously stored identity justifies the "session expired" notice;
+  // a never-logged-in visitor hitting a protected API just gets the bare form.
+  const hadSession = window.localStorage.getItem("user") !== null;
   window.localStorage.removeItem("session_token");
   window.localStorage.removeItem("user");
 
   const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}`;
-  window.location.assign(`/login?return_to=${encodeURIComponent(returnTo)}`);
+  const reason = hadSession ? "&reason=expired" : "";
+  window.location.assign(`/login?return_to=${encodeURIComponent(returnTo)}${reason}`);
 }
 
 function isAuthRedirectExemptPath(pathname: string): boolean {
@@ -502,6 +506,14 @@ type ApiReadOptions = {
   bypassClientCache?: boolean;
 };
 
+// Newer servers can inline probe history into the service listing. Older ones
+// simply ignore the extra query params and omit the `history` key, so callers
+// must still be able to fall back to per-service history requests.
+export type ListServicesOptions = ApiReadOptions & {
+  includeHistory?: boolean;
+  historyLimit?: number;
+};
+
 interface ClientCacheEntry {
   expiresAt: number;
   response: ApiResponse<unknown>;
@@ -521,6 +533,9 @@ class ApiClient {
   private latestCacheRequestEpoch = new Map<string, number>();
   private cacheGeneration = 0;
   private cacheRequestSequence = 0;
+  // Remembers which verb a legacy-compatible endpoint family accepted, so later
+  // writes skip the probing round-trips (each of which also drops the read cache).
+  private fallbackMethodPreference = new Map<string, string>();
 
   constructor(baseUrl: string = API_BASE_URL) {
     this.baseUrl = baseUrl;
@@ -722,6 +737,14 @@ class ApiClient {
     });
   }
 
+  // Groups sibling resources (e.g. /api/v1/servers/<id>) under one key so the
+  // learned verb is reused across ids instead of per-instance.
+  private fallbackPreferenceKey(path: string, methods: string[]): string {
+    const pathname = path.split(/[?#]/, 1)[0] ?? path;
+    const family = pathname.split("/").slice(0, 4).join("/");
+    return `${methods.join("|")}:${family}`;
+  }
+
   private async requestWithFallback<T>(
     path: string,
     body: JsonObject,
@@ -730,7 +753,13 @@ class ApiClient {
   ): Promise<ApiResponse<T>> {
     let last: ApiResponse<T> | null = null;
 
-    for (const method of methods) {
+    const preferenceKey = this.fallbackPreferenceKey(path, methods);
+    const preferred = this.fallbackMethodPreference.get(preferenceKey);
+    const orderedMethods = preferred && methods.includes(preferred)
+      ? [preferred, ...methods.filter((method) => method !== preferred)]
+      : methods;
+
+    for (const method of orderedMethods) {
       const response = await this.request<T>(path, {
         ...options,
         method,
@@ -742,6 +771,7 @@ class ApiClient {
         response.success ||
         ![404, 405, 501].includes(response.status ?? 0)
       ) {
+        this.fallbackMethodPreference.set(preferenceKey, method);
         return response;
       }
     }
@@ -1302,16 +1332,23 @@ class ApiClient {
     limit = 50,
     offset = 0,
     anonymous = false,
-    options?: ApiReadOptions,
+    options?: ListServicesOptions,
   ): Promise<ApiResponse<ServiceListResponse>> {
-    return this.request<ServiceListResponse>(
-      `/api/v1/services?limit=${limit}&offset=${offset}`,
-      {
-        anonymous,
-        ...options,
-        clientCacheTtlMs: CACHE_TTL_STANDARD_MS,
-      },
-    );
+    const { includeHistory, historyLimit, ...readOptions }: ListServicesOptions = options ?? {};
+    // The history params live in the URL, so history-bearing responses land in
+    // their own client-cache slot instead of poisoning plain listings.
+    let query = `/api/v1/services?limit=${limit}&offset=${offset}`;
+    if (includeHistory) {
+      query += "&include_history=1";
+      if (typeof historyLimit === "number" && Number.isFinite(historyLimit)) {
+        query += `&history_limit=${Math.max(1, Math.trunc(historyLimit))}`;
+      }
+    }
+    return this.request<ServiceListResponse>(query, {
+      anonymous,
+      ...readOptions,
+      clientCacheTtlMs: CACHE_TTL_STANDARD_MS,
+    });
   }
 
   async getPublicStatus(options?: ApiReadOptions): Promise<ApiResponse<PublicStatusResponse>> {

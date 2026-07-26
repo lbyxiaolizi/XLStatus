@@ -24,6 +24,8 @@ cat > "$LOG_DIR/cfg.toml" <<TOML
 [server]
 http_bind = "127.0.0.1:$HTTP_PORT"
 grpc_bind = "127.0.0.1:$GRPC_PORT"
+# Reflection is off by default; this script asserts service discovery works.
+grpc_reflection_enabled = true
 
 [database]
 url = "sqlite://$LOG_DIR/x.db?mode=rwc"
@@ -71,7 +73,8 @@ WEB_PID="$TEST_PROCESS_PID"
 # Wait for web to be ready
 WEB=000
 for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-  WEB=$(curl -s -o "$LOG_DIR/web.html" -w '%{http_code}' "http://127.0.0.1:$WEB_PORT/" 2>/dev/null || echo 000)
+  # Follow the root redirect: / issues a server-side 307 to /status.
+  WEB=$(curl -sL -o "$LOG_DIR/web.html" -w '%{http_code}' "http://127.0.0.1:$WEB_PORT/" 2>/dev/null || echo 000)
   if [[ "$WEB" == "200" ]]; then break; fi
   sleep 1
 done

@@ -1,7 +1,8 @@
 // Per-page i18n namespace for the DDNS screen.
-// `zh` is the source of truth; `en` must mirror its shape (enforced by the
-// `typeof` annotation). Interpolated strings use {placeholder} tokens that the
-// page fills in with String.prototype.replace.
+// `zh` is the source of truth; the en half lives in `ddns.en.ts` and is
+// shape-checked by the `Translations` annotation on `enUS` in `lib/i18n/en.ts`.
+// Interpolated strings use {placeholder} tokens that the page fills in with
+// String.prototype.replace.
 
 export const ddnsPage = {
   // notices / errors
@@ -49,46 +50,4 @@ export const ddnsPage = {
   fieldApiKey: "API Key",
   fieldApiSecret: "API Secret",
   saveConfig: "保存配置",
-};
-
-export const ddnsPageEn: typeof ddnsPage = {
-  configCreated: "DDNS config created.",
-  configDeleted: "DDNS config deleted.",
-  providersReloaded: "DDNS providers reloaded.",
-  checkTriggered: "DDNS check triggered.",
-  historyLoaded: "Loaded history for {name}.",
-  deleteConfigConfirm: "Delete DDNS config \"{name}\"?",
-  invalidTotp: "Enter a 6-digit TOTP code.",
-  eyebrow: "DNS",
-  title: "DDNS",
-  detail: "Dynamic DNS configuration, reload, and update history.",
-  reload: "Reload",
-  checkNow: "Check now",
-  addConfig: "New config",
-  emptyTitle: "No DDNS configs yet",
-  colName: "Name",
-  colProvider: "Provider",
-  colDomain: "Domain",
-  colIp: "IP",
-  colStatus: "Status",
-  colActions: "Actions",
-  disabled: "Disabled",
-  enabled: "Enabled",
-  history: "History",
-  delete: "Delete",
-  historyHeading: "History",
-  success: "Success",
-  failed: "Failed",
-  modalTitle: "New DDNS config",
-  fieldName: "Name",
-  fieldProvider: "Provider",
-  fieldAgentId: "Agent ID",
-  fieldDomain: "Domain",
-  fieldWebhookUrl: "Webhook URL",
-  fieldRecordId: "Record ID",
-  fieldZoneId: "Zone ID",
-  fieldApiToken: "API Token",
-  fieldApiKey: "API Key",
-  fieldApiSecret: "API Secret",
-  saveConfig: "Save config",
 };
