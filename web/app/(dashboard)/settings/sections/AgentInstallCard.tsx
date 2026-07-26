@@ -9,8 +9,10 @@ import {
   inputClass,
   responseError,
 } from "@/app/components/M7Primitives";
+import { showToast } from "@/app/components/Toasts";
 import { apiClient, getApiBaseUrl } from "@/lib/api";
 import { useI18n } from "@/lib/use-i18n";
+import { useBusy } from "@/app/lib/use-busy";
 import { SectionFeedback, subscribeRuntimeValue } from "./shared";
 import { useSensitiveTotp } from "./use-sensitive-totp";
 
@@ -26,7 +28,7 @@ export function AgentInstallCard() {
   const dialogs = useDialogs();
   const { t: copy } = useI18n();
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [busy, run] = useBusy();
   const sensitiveTotpCode = useSensitiveTotp(dialogs, setError);
   const runtimeApiBaseUrl = useRuntimeApiBaseUrl();
   const [agentServerUrlOverride, setAgentServerUrl] = useState<string | null>(null);
@@ -71,7 +73,7 @@ export function AgentInstallCard() {
     if (response.success && response.data) {
       setEnrollmentToken(response.data.token);
       setEnrollmentExpiresAt(response.data.expires_at);
-      setNotice(copy.settingsPage.enrollmentTokenCreated);
+      showToast(copy.settingsPage.enrollmentTokenCreated);
     } else {
       setError(responseError(response));
     }
@@ -123,7 +125,7 @@ export function AgentInstallCard() {
   async function copyAgentCommand() {
     try {
       await navigator.clipboard.writeText(agentInstallCommand);
-      setNotice(copy.settingsPage.agentCommandCopied);
+      showToast(copy.settingsPage.agentCommandCopied);
     } catch {
       setError(copy.settingsPage.clipboardCommandFailed);
     }
@@ -132,7 +134,7 @@ export function AgentInstallCard() {
   return (
     <>
       <BrutalCard accent className="mb-6">
-        <SectionFeedback error={error} notice={notice} />
+        <SectionFeedback error={error} />
         <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.1fr)]">
           <div>
             <h2 className="mb-4 text-xl font-black uppercase">{copy.settingsPage.agentInstall}</h2>
@@ -180,7 +182,7 @@ export function AgentInstallCard() {
               {agentLatestVersionStatus}
             </p>
             <div className="mt-4 flex flex-wrap gap-2">
-              <button type="button" className={buttonClass("primary")} onClick={createEnrollmentToken}>
+              <button type="button" className={buttonClass("primary")} onClick={() => void run(createEnrollmentToken)} disabled={busy}>
                 {copy.settingsPage.generateEnrollmentToken}
               </button>
               <button type="button" className={buttonClass("secondary")} onClick={copyAgentCommand} disabled={!enrollmentToken}>

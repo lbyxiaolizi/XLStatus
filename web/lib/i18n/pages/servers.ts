@@ -53,6 +53,8 @@ export const serversPage = {
   // Selection / batch toolbar
   selectedCount: "已选择 {count} 台",
   clearSelection: "清空选择",
+  batchCollapse: "收起",
+  batchExpand: "展开批量操作",
   batchTagsPlaceholder: "分组标签，逗号分隔",
   setTags: "设置分组",
   addTags: "追加分组",
@@ -135,6 +137,7 @@ export const serversPage = {
   connConnecting: "连接中",
   connOpen: "已连接",
   connClosed: "已关闭",
+  wsDisconnectedBanner: "实时连接已断开，正在自动重连，数据可能短暂滞后。",
   connError: "错误",
 
   // Server status labels

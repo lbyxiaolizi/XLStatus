@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import {
   EmptyState,
   Field,
@@ -22,6 +22,8 @@ import {
 import { apiClient, type JsonObject, type TotpStatusResponse } from "@/lib/api";
 import { useDialogs } from "@/app/components/Dialogs";
 import { useServerData } from "@/app/components/ServerDataProvider";
+import { showToast } from "@/app/components/Toasts";
+import { useBusy } from "@/app/lib/use-busy";
 import { useI18n } from "@/lib/use-i18n";
 import type { Translations } from "@/lib/i18n";
 import type { servicesPage } from "@/lib/i18n/pages/services";
@@ -98,13 +100,18 @@ export default function ServicesPage() {
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const [modal, setModal] = useState<"create" | "edit" | null>(null);
   const [editing, setEditing] = useState<Service | null>(null);
   const [form, setForm] = useState<ServiceForm>(blankForm);
   const [totpStatus, setTotpStatus] = useState<TotpStatusResponse | null>(null);
   const [probeResult, setProbeResult] = useState<string | null>(null);
   const [query, setQuery] = useState("");
+  // Modal writes (save/probe) and table writes (delete) guard each other only
+  // within their own group so one never greys out the other.
+  const [formBusy, runForm] = useBusy();
+  const [rowBusy, runRow] = useBusy();
+  // Probes can take seconds; a separate gate keeps Save usable meanwhile.
+  const [probeBusy, runProbe] = useBusy();
   const initialLoadRef = useRef(true);
   const servicesLoadRequestIdRef = useRef(0);
 
@@ -183,8 +190,7 @@ export default function ServicesPage() {
     setModal("edit");
   }
 
-  async function submitForm(event: FormEvent) {
-    event.preventDefault();
+  async function submitForm() {
     setSaving(true);
     const payload = formToPayload(form);
     const totpCode = await sensitiveTotpCode();
@@ -200,7 +206,7 @@ export default function ServicesPage() {
 
     if (response.success) {
       setModal(null);
-      setNotice(modal === "edit" ? copy.servicesPage.noticeUpdated : copy.servicesPage.noticeCreated);
+      showToast(modal === "edit" ? copy.servicesPage.noticeUpdated : copy.servicesPage.noticeCreated);
       await loadServices();
     } else {
       setError(responseError(response));
@@ -266,7 +272,7 @@ export default function ServicesPage() {
     if (totpCode === null) return;
     const response = await apiClient.deleteService(service.id, totpCode);
     if (response.success) {
-      setNotice(copy.servicesPage.noticeDeleted);
+      showToast(copy.servicesPage.noticeDeleted);
       await loadServices();
     } else {
       setError(responseError(response));
@@ -286,7 +292,6 @@ export default function ServicesPage() {
           <input value={query} onChange={(event) => setQuery(event.target.value)} className={inputClass} placeholder={copy.servicesPage.searchPlaceholder} />
           <InlineError message={error} />
           <InlineError message={serverError} />
-          {notice ? <InlineNotice tone="green">{notice}</InlineNotice> : null}
         </div>
 
         {loading ? (
@@ -327,7 +332,7 @@ export default function ServicesPage() {
                     <td className={tdClass}>{service.cert_not_after ? formatDate(service.cert_not_after) : "N/A"}</td>
                     <td className={`${tdClass} flex flex-wrap gap-2`}>
                       <button className={buttonClass("secondary")} onClick={() => openEdit(service)}>{copy.servicesPage.edit}</button>
-                      <button className={buttonClass("danger")} onClick={() => void deleteService(service)}>{copy.servicesPage.delete}</button>
+                      <button className={buttonClass("danger")} disabled={rowBusy} onClick={() => void runRow(() => deleteService(service))}>{copy.servicesPage.delete}</button>
                     </td>
                   </tr>
                 ))}
@@ -338,7 +343,7 @@ export default function ServicesPage() {
 
         {modal ? (
           <Modal title={modal === "edit" ? copy.servicesPage.modalTitleEdit : copy.servicesPage.modalTitleCreate} onClose={() => setModal(null)}>
-            <form onSubmit={submitForm} className="space-y-4">
+            <form onSubmit={(event) => { event.preventDefault(); void runForm(() => submitForm()); }} className="space-y-4">
               <InlineError message={serverError} />
               {editing && serviceConfigWarnings(editing).length ? (
                 <InlineNotice tone="yellow">{serviceWarningText(copy, editing)}</InlineNotice>
@@ -408,8 +413,8 @@ export default function ServicesPage() {
               </div>
               {probeResult ? <InlineNotice tone="pink">{probeResult}</InlineNotice> : null}
               <div className="flex flex-wrap gap-2">
-                <button type="submit" disabled={saving} className={buttonClass("primary")}>{saving ? copy.servicesPage.saving : copy.servicesPage.save}</button>
-                <button type="button" disabled={testing} onClick={() => void testProbe()} className={buttonClass("secondary")}>{testing ? copy.servicesPage.testing : copy.servicesPage.testProbe}</button>
+                <button type="submit" disabled={saving || formBusy} className={buttonClass("primary")}>{saving ? copy.servicesPage.saving : copy.servicesPage.save}</button>
+                <button type="button" disabled={testing || probeBusy} onClick={() => void runProbe(() => testProbe())} className={buttonClass("secondary")}>{testing ? copy.servicesPage.testing : copy.servicesPage.testProbe}</button>
               </div>
             </form>
           </Modal>

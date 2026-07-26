@@ -1,6 +1,6 @@
 "use client";
 
-import { InlineError, InlineNotice, StatusBadge } from "@/app/components/M7Primitives";
+import { InlineError, StatusBadge } from "@/app/components/M7Primitives";
 import type { Translations } from "@/lib/i18n";
 
 // Ban defaults shared by the WAF form and the one-click ban on the sessions
@@ -44,20 +44,14 @@ export function saveBlob(blob: Blob, filename: string) {
   window.URL.revokeObjectURL(url);
 }
 
-// Feedback lives per card: an error raised by one card must not be attributed
-// to another one further down the page.
-export function SectionFeedback({
-  error,
-  notice,
-}: {
-  error: string | null;
-  notice: string | null;
-}) {
-  if (!error && !notice) return null;
+// Errors live per card: one raised here must not be attributed to another card
+// further down the page. Success confirmations go through toasts instead, so
+// this slot only carries errors, which must stay on screen until resolved.
+export function SectionFeedback({ error }: { error: string | null }) {
+  if (!error) return null;
   return (
-    <div className="mb-4 space-y-3">
+    <div className="mb-4">
       <InlineError message={error} />
-      {notice ? <InlineNotice tone="green">{notice}</InlineNotice> : null}
     </div>
   );
 }

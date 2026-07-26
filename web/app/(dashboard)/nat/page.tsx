@@ -1,11 +1,10 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   EmptyState,
   Field,
   InlineError,
-  InlineNotice,
   Modal,
   PageHeader,
   PageShell,
@@ -20,6 +19,8 @@ import {
 import { apiClient, type JsonObject, type NatMapping, type TotpStatusResponse } from "@/lib/api";
 import { useDialogs } from "@/app/components/Dialogs";
 import { useServerData } from "@/app/components/ServerDataProvider";
+import { showToast } from "@/app/components/Toasts";
+import { useBusy } from "@/app/lib/use-busy";
 import { useI18n } from "@/lib/use-i18n";
 
 export default function NatPage() {
@@ -32,9 +33,11 @@ export default function NatPage() {
   } = useServerData();
   const [mappings, setMappings] = useState<NatMapping[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const [totpStatus, setTotpStatus] = useState<TotpStatusResponse | null>(null);
   const [modal, setModal] = useState(false);
+  // One guard for the create form, one for per-row deletes.
+  const [formBusy, runForm] = useBusy();
+  const [rowBusy, runRow] = useBusy();
   const [form, setForm] = useState({ agent_id: "", description: "", protocol: "tcp", local_host: "127.0.0.1", local_port: "80", public_port: "10080", allowed_sources: "", max_active_tunnels: "", idle_timeout_seconds: "", max_bytes_per_tunnel: "", max_bandwidth_bytes_per_second: "", rate_limit_window_seconds: "", max_connections_per_window: "", max_bytes_per_window: "" });
 
   const load = useCallback(async () => {
@@ -64,8 +67,7 @@ export default function NatPage() {
     });
   }, [servers]);
 
-  async function submit(event: FormEvent) {
-    event.preventDefault();
+  async function submit() {
     const payload: JsonObject = {
       agent_id: form.agent_id,
       protocol: form.protocol,
@@ -86,7 +88,7 @@ export default function NatPage() {
     if (totpCode === null) return;
     const response = await apiClient.createNatMapping(payload, totpCode);
     if (response.success) {
-      setNotice(copy.natPage.mappingCreated);
+      showToast(copy.natPage.mappingCreated);
       setModal(false);
       await load();
     } else {
@@ -100,7 +102,7 @@ export default function NatPage() {
     if (totpCode === null) return;
     const response = await apiClient.deleteNatMapping(mapping.id, totpCode);
     if (response.success) {
-      setNotice(copy.natPage.mappingDeleted);
+      showToast(copy.natPage.mappingDeleted);
       await load();
     } else {
       setError(responseError(response));
@@ -140,7 +142,6 @@ export default function NatPage() {
         />
         <div className="mb-5 space-y-3">
           <InlineError message={error ?? serverLoadError} />
-          {notice ? <InlineNotice tone="green">{notice}</InlineNotice> : null}
         </div>
 
         {mappings.length === 0 ? (
@@ -171,7 +172,7 @@ export default function NatPage() {
                       </div>
                     </td>
                     <td className={tdClass}><StatusBadge tone={mapping.enabled === false ? "gray" : "green"}>{mapping.enabled === false ? copy.natPage.disabled : copy.natPage.enabled}</StatusBadge></td>
-                    <td className={tdClass}><button className={buttonClass("danger")} onClick={() => void deleteMapping(mapping)}>{copy.natPage.delete}</button></td>
+                    <td className={tdClass}><button className={buttonClass("danger")} disabled={rowBusy} onClick={() => void runRow(() => deleteMapping(mapping))}>{copy.natPage.delete}</button></td>
                   </tr>
                 ))}
               </tbody>
@@ -181,7 +182,7 @@ export default function NatPage() {
 
         {modal ? (
           <Modal title={copy.natPage.modalTitle} onClose={() => setModal(false)}>
-            <form onSubmit={submit} className="space-y-4">
+            <form onSubmit={(event) => { event.preventDefault(); void runForm(() => submit()); }} className="space-y-4">
               <div className="grid gap-4 sm:grid-cols-2">
                 <Field label={copy.natPage.fieldAgent}><select className={selectClass} value={form.agent_id} onChange={(e) => setForm((f) => ({ ...f, agent_id: e.target.value }))}>{servers.map((server) => <option key={server.id} value={server.id}>{server.name}</option>)}</select></Field>
                 <Field label={copy.natPage.fieldDescription}><input className={inputClass} value={form.description} onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))} /></Field>
@@ -206,7 +207,7 @@ export default function NatPage() {
                 <Field label={copy.natPage.fieldMaxConnectionsPerWindow}><input className={inputClass} value={form.max_connections_per_window} onChange={(e) => setForm((f) => ({ ...f, max_connections_per_window: e.target.value }))} placeholder="30" /></Field>
                 <Field label={copy.natPage.fieldMaxBytesPerWindow}><input className={inputClass} value={form.max_bytes_per_window} onChange={(e) => setForm((f) => ({ ...f, max_bytes_per_window: e.target.value }))} placeholder="104857600" /></Field>
               </div>
-              <button className={buttonClass("primary")}>{copy.natPage.saveMapping}</button>
+              <button disabled={formBusy} className={buttonClass("primary")}>{copy.natPage.saveMapping}</button>
             </form>
           </Modal>
         ) : null}

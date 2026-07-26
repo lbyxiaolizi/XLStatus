@@ -1,11 +1,10 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   EmptyState,
   Field,
   InlineError,
-  InlineNotice,
   Modal,
   PageHeader,
   PageShell,
@@ -21,6 +20,8 @@ import {
 } from "@/app/components/M7Primitives";
 import { apiClient, type JsonObject, type TotpStatusResponse } from "@/lib/api";
 import { useDialogs } from "@/app/components/Dialogs";
+import { showToast } from "@/app/components/Toasts";
+import { useBusy } from "@/app/lib/use-busy";
 import { useI18n } from "@/lib/use-i18n";
 import type { Translations } from "@/lib/i18n";
 
@@ -131,7 +132,6 @@ export default function NotificationsPage() {
   const [providers, setProviders] = useState<NotificationProvider[]>(defaultProviders);
   const [selectedMembers, setSelectedMembers] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const [modal, setModal] = useState<ModalState>(null);
   const [totpStatus, setTotpStatus] = useState<TotpStatusResponse | null>(null);
   const [notificationForm, setNotificationForm] = useState(emptyNotificationForm);
@@ -141,6 +141,11 @@ export default function NotificationsPage() {
     body_template: "",
   });
   const [groupForm, setGroupForm] = useState(emptyGroupForm);
+  // One guard per surface: the open modal, the channel table, the group cards.
+  // Only one modal is open at a time, so both forms can share formBusy.
+  const [formBusy, runForm] = useBusy();
+  const [channelBusy, runChannel] = useBusy();
+  const [groupBusy, runGroup] = useBusy();
   const loadRequestIdRef = useRef(0);
 
   const load = useCallback(async (force = false) => {
@@ -259,8 +264,7 @@ export default function NotificationsPage() {
     return trimmed;
   }
 
-  async function submitNotification(event: FormEvent) {
-    event.preventDefault();
+  async function submitNotification() {
     setError(null);
     const totpCode = await sensitiveTotpCode();
     if (totpCode === null) return;
@@ -287,7 +291,7 @@ export default function NotificationsPage() {
         : await apiClient.createNotification(payload, totpCode);
 
     if (response.success) {
-      setNotice(modal?.type === "notification" && modal.item ? copy.notificationsPage.channelUpdated : copy.notificationsPage.channelCreated);
+      showToast(modal?.type === "notification" && modal.item ? copy.notificationsPage.channelUpdated : copy.notificationsPage.channelCreated);
       setModal(null);
       await load();
     } else {
@@ -295,8 +299,7 @@ export default function NotificationsPage() {
     }
   }
 
-  async function submitGroup(event: FormEvent) {
-    event.preventDefault();
+  async function submitGroup() {
     setError(null);
     const totpCode = await sensitiveTotpCode();
     if (totpCode === null) return;
@@ -307,7 +310,7 @@ export default function NotificationsPage() {
         : await apiClient.createNotificationGroup(payload, totpCode);
 
     if (response.success) {
-      setNotice(modal?.type === "group" && modal.item ? copy.notificationsPage.groupUpdated : copy.notificationsPage.groupCreated);
+      showToast(modal?.type === "group" && modal.item ? copy.notificationsPage.groupUpdated : copy.notificationsPage.groupCreated);
       setModal(null);
       await load();
     } else {
@@ -321,7 +324,7 @@ export default function NotificationsPage() {
     if (totpCode === null) return;
     const response = await apiClient.testNotification(item.id, totpCode);
     if (response.success) {
-      setNotice(copy.notificationsPage.testSent.replace("{name}", String(item.name)));
+      showToast(copy.notificationsPage.testSent.replace("{name}", String(item.name)));
     } else {
       setError(responseError(response));
     }
@@ -334,7 +337,7 @@ export default function NotificationsPage() {
     if (totpCode === null) return;
     const response = await apiClient.deleteNotification(item.id, totpCode);
     if (response.success) {
-      setNotice(copy.notificationsPage.channelDeleted);
+      showToast(copy.notificationsPage.channelDeleted);
       await load();
     } else {
       setError(responseError(response));
@@ -348,7 +351,7 @@ export default function NotificationsPage() {
     if (totpCode === null) return;
     const response = await apiClient.deleteNotificationGroup(item.id, totpCode);
     if (response.success) {
-      setNotice(copy.notificationsPage.groupDeleted);
+      showToast(copy.notificationsPage.groupDeleted);
       await load();
     } else {
       setError(responseError(response));
@@ -364,7 +367,7 @@ export default function NotificationsPage() {
     const response = await apiClient.addNotificationGroupMember(group.id, notificationId, totpCode);
     if (response.success) {
       const notification = notificationById.get(notificationId);
-      setNotice(copy.notificationsPage.memberAdded.replace("{name}", String(notification?.name || notificationId)));
+      showToast(copy.notificationsPage.memberAdded.replace("{name}", String(notification?.name || notificationId)));
       setSelectedMembers((current) => ({ ...current, [group.id]: "" }));
       await load();
     } else {
@@ -378,7 +381,7 @@ export default function NotificationsPage() {
     if (totpCode === null) return;
     const response = await apiClient.deleteNotificationGroupMember(group.id, member.id, totpCode);
     if (response.success) {
-      setNotice(copy.notificationsPage.memberRemoved.replace("{name}", String(member.name)));
+      showToast(copy.notificationsPage.memberRemoved.replace("{name}", String(member.name)));
       await load();
     } else {
       setError(responseError(response));
@@ -409,7 +412,6 @@ export default function NotificationsPage() {
 
         <div className="mb-5 space-y-3">
           <InlineError message={error} />
-          {notice ? <InlineNotice tone="green">{notice}</InlineNotice> : null}
         </div>
 
         <div className="grid gap-6 xl:grid-cols-[minmax(0,1.1fr)_minmax(340px,0.9fr)]">
@@ -454,13 +456,13 @@ export default function NotificationsPage() {
                         <td className={tdClass}>{formatDate(item.updated_at || item.created_at)}</td>
                         <td className={`${tdClass} min-w-[220px]`}>
                           <div className="flex flex-wrap gap-2">
-                            <button type="button" className={buttonClass("secondary")} onClick={() => void testNotification(item)}>
+                            <button type="button" className={buttonClass("secondary")} disabled={channelBusy} onClick={() => void runChannel(() => testNotification(item))}>
                               {copy.notificationsPage.test}
                             </button>
                             <button type="button" className={buttonClass("secondary")} onClick={() => openEditNotification(item)}>
                               {copy.notificationsPage.edit}
                             </button>
-                            <button type="button" className={buttonClass("danger")} onClick={() => void deleteNotification(item)}>
+                            <button type="button" className={buttonClass("danger")} disabled={channelBusy} onClick={() => void runChannel(() => deleteNotification(item))}>
                               {copy.notificationsPage.delete}
                             </button>
                           </div>
@@ -499,7 +501,7 @@ export default function NotificationsPage() {
                           <button type="button" className={buttonClass("secondary")} onClick={() => openEditGroup(group)}>
                             {copy.notificationsPage.edit}
                           </button>
-                          <button type="button" className={buttonClass("danger")} onClick={() => void deleteGroup(group)}>
+                          <button type="button" className={buttonClass("danger")} disabled={groupBusy} onClick={() => void runGroup(() => deleteGroup(group))}>
                             {copy.notificationsPage.delete}
                           </button>
                         </div>
@@ -517,7 +519,7 @@ export default function NotificationsPage() {
                                 <p className="break-words text-sm font-black">{member.name}</p>
                                 <p className="break-all text-xs font-bold text-[var(--text-muted)]">{member.url || member.id}</p>
                               </div>
-                              <button type="button" className={buttonClass("secondary")} onClick={() => void removeMember(group, member)}>
+                              <button type="button" className={buttonClass("secondary")} disabled={groupBusy} onClick={() => void runGroup(() => removeMember(group, member))}>
                                 {copy.notificationsPage.removeMember}
                               </button>
                             </div>
@@ -546,8 +548,8 @@ export default function NotificationsPage() {
                         <button
                           type="button"
                           className={buttonClass("good")}
-                          disabled={!selectedMembers[group.id] || candidates.length === 0}
-                          onClick={() => void addMember(group)}
+                          disabled={groupBusy || !selectedMembers[group.id] || candidates.length === 0}
+                          onClick={() => void runGroup(() => addMember(group))}
                         >
                           {copy.notificationsPage.join}
                         </button>
@@ -562,7 +564,7 @@ export default function NotificationsPage() {
 
         {modal?.type === "notification" ? (
           <Modal title={modal.item ? copy.notificationsPage.editChannel : copy.notificationsPage.createChannel} onClose={() => setModal(null)}>
-            <form onSubmit={submitNotification} className="space-y-4">
+            <form onSubmit={(event) => { event.preventDefault(); void runForm(() => submitNotification()); }} className="space-y-4">
               <div className="grid gap-4 sm:grid-cols-2">
                 <Field label={copy.notificationsPage.fieldName}>
                   <input className={inputClass} value={notificationForm.name} onChange={(event) => setNotificationForm((form) => ({ ...form, name: event.target.value }))} required />
@@ -614,7 +616,7 @@ export default function NotificationsPage() {
                   {copy.notificationsPage.formatMetricUnits}
                 </label>
               </div>
-              <button type="submit" className={buttonClass("primary")}>
+              <button type="submit" disabled={formBusy} className={buttonClass("primary")}>
                 {copy.notificationsPage.saveChannel}
               </button>
             </form>
@@ -623,11 +625,11 @@ export default function NotificationsPage() {
 
         {modal?.type === "group" ? (
           <Modal title={modal.item ? copy.notificationsPage.editGroup : copy.notificationsPage.createGroup} onClose={() => setModal(null)}>
-            <form onSubmit={submitGroup} className="space-y-4">
+            <form onSubmit={(event) => { event.preventDefault(); void runForm(() => submitGroup()); }} className="space-y-4">
               <Field label={copy.notificationsPage.fieldName}>
                 <input className={inputClass} value={groupForm.name} onChange={(event) => setGroupForm({ name: event.target.value })} required />
               </Field>
-              <button type="submit" className={buttonClass("primary")}>
+              <button type="submit" disabled={formBusy} className={buttonClass("primary")}>
                 {copy.notificationsPage.saveGroup}
               </button>
             </form>

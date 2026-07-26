@@ -1,11 +1,10 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   EmptyState,
   Field,
   InlineError,
-  InlineNotice,
   Modal,
   PageHeader,
   PageShell,
@@ -21,6 +20,8 @@ import {
 } from "@/app/components/M7Primitives";
 import { apiClient, type DdnsConfig, type JsonObject } from "@/lib/api";
 import { useDialogs } from "@/app/components/Dialogs";
+import { showToast } from "@/app/components/Toasts";
+import { useBusy } from "@/app/lib/use-busy";
 import { useI18n } from "@/lib/use-i18n";
 
 interface DdnsHistory {
@@ -36,9 +37,13 @@ export default function DdnsPage() {
   const [configs, setConfigs] = useState<DdnsConfig[]>([]);
   const [history, setHistory] = useState<DdnsHistory[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const [totpStatus, setTotpStatus] = useState<{ enabled?: boolean } | null>(null);
   const [modal, setModal] = useState(false);
+  // Three independent guards: provider-wide actions, the create form, and
+  // per-row deletes never need to block one another.
+  const [actionBusy, runAction] = useBusy();
+  const [formBusy, runForm] = useBusy();
+  const [rowBusy, runRow] = useBusy();
   const [form, setForm] = useState({
     agent_id: "",
     name: "",
@@ -88,8 +93,7 @@ export default function DdnsPage() {
     return trimmed;
   }
 
-  async function submit(event: FormEvent) {
-    event.preventDefault();
+  async function submit() {
     const payload: JsonObject = {
       name: form.name,
       provider: form.provider,
@@ -107,7 +111,7 @@ export default function DdnsPage() {
     if (totpCode === null) return;
     const response = await apiClient.createDdnsConfig(payload, totpCode);
     if (response.success) {
-      setNotice(copy.ddnsPage.configCreated);
+      showToast(copy.ddnsPage.configCreated);
       setModal(false);
       await load();
     } else {
@@ -119,7 +123,7 @@ export default function DdnsPage() {
     const totpCode = await sensitiveTotpCode();
     if (totpCode === null) return;
     const response = await apiClient.reloadDdnsProviders(totpCode);
-    if (response.success) setNotice(copy.ddnsPage.providersReloaded);
+    if (response.success) showToast(copy.ddnsPage.providersReloaded);
     else setError(responseError(response));
   }
 
@@ -127,7 +131,7 @@ export default function DdnsPage() {
     const totpCode = await sensitiveTotpCode();
     if (totpCode === null) return;
     const response = await apiClient.checkDdnsNow(totpCode);
-    if (response.success) setNotice(copy.ddnsPage.checkTriggered);
+    if (response.success) showToast(copy.ddnsPage.checkTriggered);
     else setError(responseError(response));
   }
 
@@ -135,7 +139,7 @@ export default function DdnsPage() {
     const response = await apiClient.listDdnsHistory(config.id);
     if (response.success && response.data) {
       setHistory((response.data.history as DdnsHistory[]) ?? []);
-      setNotice(copy.ddnsPage.historyLoaded.replace("{name}", String(config.name || config.domain || config.id)));
+      showToast(copy.ddnsPage.historyLoaded.replace("{name}", String(config.name || config.domain || config.id)));
     } else {
       setError(responseError(response));
     }
@@ -147,7 +151,7 @@ export default function DdnsPage() {
     if (totpCode === null) return;
     const response = await apiClient.deleteDdnsConfig(config.id, totpCode);
     if (response.success) {
-      setNotice(copy.ddnsPage.configDeleted);
+      showToast(copy.ddnsPage.configDeleted);
       await load();
     } else {
       setError(responseError(response));
@@ -163,15 +167,14 @@ export default function DdnsPage() {
           detail={copy.ddnsPage.detail}
           actions={
             <>
-              <button className={buttonClass("secondary")} onClick={() => void reload()}>{copy.ddnsPage.reload}</button>
-              <button className={buttonClass("secondary")} onClick={() => void checkNow()}>{copy.ddnsPage.checkNow}</button>
+              <button className={buttonClass("secondary")} disabled={actionBusy} onClick={() => void runAction(() => reload())}>{copy.ddnsPage.reload}</button>
+              <button className={buttonClass("secondary")} disabled={actionBusy} onClick={() => void runAction(() => checkNow())}>{copy.ddnsPage.checkNow}</button>
               <button className={buttonClass("primary")} onClick={() => setModal(true)}>{copy.ddnsPage.addConfig}</button>
             </>
           }
         />
         <div className="mb-5 space-y-3">
           <InlineError message={error} />
-          {notice ? <InlineNotice tone="green">{notice}</InlineNotice> : null}
         </div>
 
         {configs.length === 0 ? (
@@ -190,7 +193,7 @@ export default function DdnsPage() {
                     <td className={tdClass}><StatusBadge tone={config.enabled === false ? "gray" : "green"}>{config.enabled === false ? copy.ddnsPage.disabled : copy.ddnsPage.enabled}</StatusBadge></td>
                     <td className={`${tdClass} flex flex-wrap gap-2`}>
                       <button className={buttonClass("secondary")} onClick={() => void showHistory(config)}>{copy.ddnsPage.history}</button>
-                      <button className={buttonClass("danger")} onClick={() => void deleteConfig(config)}>{copy.ddnsPage.delete}</button>
+                      <button className={buttonClass("danger")} disabled={rowBusy} onClick={() => void runRow(() => deleteConfig(config))}>{copy.ddnsPage.delete}</button>
                     </td>
                   </tr>
                 ))}
@@ -216,7 +219,7 @@ export default function DdnsPage() {
 
         {modal ? (
           <Modal title={copy.ddnsPage.modalTitle} onClose={() => setModal(false)}>
-            <form onSubmit={submit} className="space-y-4">
+            <form onSubmit={(event) => { event.preventDefault(); void runForm(() => submit()); }} className="space-y-4">
               <div className="grid gap-4 sm:grid-cols-2">
                 <Field label={copy.ddnsPage.fieldName}><input className={inputClass} value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} /></Field>
                 <Field label={copy.ddnsPage.fieldProvider}><select className={selectClass} value={form.provider} onChange={(e) => setForm((f) => ({ ...f, provider: e.target.value }))}><option value="webhook">webhook</option><option value="cloudflare">cloudflare</option><option value="aliyun">aliyun</option></select></Field>
@@ -231,7 +234,7 @@ export default function DdnsPage() {
                 <Field label={copy.ddnsPage.fieldApiKey}><input className={inputClass} value={form.api_key} onChange={(e) => setForm((f) => ({ ...f, api_key: e.target.value }))} /></Field>
               </div>
               <Field label={copy.ddnsPage.fieldApiSecret}><input className={inputClass} value={form.api_secret} onChange={(e) => setForm((f) => ({ ...f, api_secret: e.target.value }))} /></Field>
-              <button className={buttonClass("primary")}>{copy.ddnsPage.saveConfig}</button>
+              <button disabled={formBusy} className={buttonClass("primary")}>{copy.ddnsPage.saveConfig}</button>
             </form>
           </Modal>
         ) : null}

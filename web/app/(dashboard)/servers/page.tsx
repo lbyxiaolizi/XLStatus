@@ -34,12 +34,14 @@ import {
   responseError,
   useStoredUser,
 } from "@/app/components/M7Primitives";
+import { showToast } from "@/app/components/Toasts";
 import { apiClient, type JsonObject, type ServerGroup, type ServerOwnerTransfer } from "@/lib/api";
 import { clampPercent, durationLabel, formatRate, optionalNumber } from "@/app/lib/format";
 import { useI18n } from "@/lib/use-i18n";
 import type { Translations } from "@/lib/i18n";
 import { useStoredPreference } from "@/app/lib/client-store";
 import { mapWithConcurrency } from "@/app/lib/concurrency";
+import { useBusy } from "@/app/lib/use-busy";
 import { useServerRealtime } from "@/app/lib/use-server-realtime";
 
 const WorldServerMap = dynamic(
@@ -123,21 +125,37 @@ export default function ServersPage() {
     revalidate: revalidateServers,
   } = useServerData();
   const { live, connection: conn, now: realtimeNow } = useServerRealtime(realtimeScope, realtimeRevision);
-  // Single in-flight gate for toolbar mutations so a double-click can't fire
-  // duplicate POSTs. The ref mirrors the state for a synchronous guard.
-  const actionBusyRef = useRef(false);
-  const [actionBusy, setActionBusy] = useState(false);
-  const runExclusive = useCallback(async (fn: () => Promise<void>) => {
-    if (actionBusyRef.current) return;
-    actionBusyRef.current = true;
-    setActionBusy(true);
-    try {
-      await fn();
-    } finally {
-      actionBusyRef.current = false;
-      setActionBusy(false);
+  // The disconnect banner needs a latch + delay: the hook reports "closed"
+  // before its effect ever connects (and after the hidden-tab pause), so a
+  // bare status check would flash the banner on every mount. Only a drop
+  // after a successful open, persisting >1.5s in a visible tab, counts.
+  const [showWsBanner, setShowWsBanner] = useState(false);
+  const wsSawOpenRef = useRef(false);
+  // The floating batch bar is five control rows tall; on small screens it
+  // would otherwise permanently cover the bottom of the viewport while a
+  // selection exists.
+  const [batchCollapsed, setBatchCollapsed] = useState(false);
+  useEffect(() => {
+    if (conn === "open") {
+      wsSawOpenRef.current = true;
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- reset must track the external socket state synchronously or the banner lingers one frame into a live connection
+      setShowWsBanner(false);
+      return;
     }
-  }, []);
+    if (!wsSawOpenRef.current || (conn !== "closed" && conn !== "error")) {
+      setShowWsBanner(false);
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      if (document.visibilityState === "visible") setShowWsBanner(true);
+    }, 1500);
+    return () => window.clearTimeout(timer);
+  }, [conn]);
+  // One in-flight gate per logical toolbar so a double-click can't fire
+  // duplicate POSTs, without a group edit locking the batch bar (or vice versa).
+  const [groupBusy, runGroup] = useBusy();
+  const [batchBusy, runBatch] = useBusy();
+  const [transferBusy, runTransfer] = useBusy();
   const [services, setServices] = useState<ServiceSummary[]>([]);
   const [serviceTrackers, setServiceTrackers] = useState<ServiceTrackerItem[]>([]);
   const [ownerTransfers, setOwnerTransfers] = useState<ServerOwnerTransfer[]>([]);
@@ -146,7 +164,6 @@ export default function ServersPage() {
   const [error, setError] = useState<string | null>(null);
   const [serviceError, setServiceError] = useState<string | null>(null);
   const [transferError, setTransferError] = useState<string | null>(null);
-  const [batchNotice, setBatchNotice] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<ServerStatusFilter>("all");
   const [groupFilter, setGroupFilter] = useState("all");
@@ -394,7 +411,6 @@ export default function ServersPage() {
   async function runBatchAction(action: string, extra: JsonObject = {}) {
     if (selectedIds.length === 0) return false;
     setError(null);
-    setBatchNotice(null);
     const totpCode = await sensitiveTotpCodeForAction(
       action === "delete" ||
         action === "transfer_owner" ||
@@ -416,7 +432,7 @@ export default function ServersPage() {
       return false;
     }
     const data = response.data as { updated?: number; failed?: number } | undefined;
-    setBatchNotice(
+    showToast(
       copy.serversPage.batchActionDone
         .replace("{updated}", String(data?.updated ?? selectedIds.length))
         .replace("{failed}", String(data?.failed ?? 0)),
@@ -459,7 +475,7 @@ export default function ServersPage() {
       setSelectedServerGroupId(response.data.id);
       setServerGroupEdit(serverGroupDraft(response.data));
     }
-    setBatchNotice(copy.serversPage.groupCreated.replace("{name}", name));
+    showToast(copy.serversPage.groupCreated.replace("{name}", name));
     await loadServerGroups();
   }
 
@@ -493,7 +509,7 @@ export default function ServersPage() {
       setError(responseError(response));
       return;
     }
-    setBatchNotice(copy.serversPage.groupUpdated.replace("{name}", name));
+    showToast(copy.serversPage.groupUpdated.replace("{name}", name));
     await loadServerGroups();
   }
 
@@ -513,7 +529,7 @@ export default function ServersPage() {
       setError(responseError(response));
       return;
     }
-    setBatchNotice(copy.serversPage.addedToGroup);
+    showToast(copy.serversPage.addedToGroup);
     await loadServerGroups();
   }
 
@@ -547,7 +563,7 @@ export default function ServersPage() {
     setSelectedServerGroupId("");
     setServerGroupEdit(serverGroupDraft());
     setGroupFilter("all");
-    setBatchNotice(copy.serversPage.groupDeleted);
+    showToast(copy.serversPage.groupDeleted);
     await loadServerGroups();
   }
 
@@ -580,6 +596,12 @@ export default function ServersPage() {
     await runBatchAction(action, { tags });
   }
 
+  // Drops runBatchAction's boolean result so the handler matches useBusy's
+  // `() => Promise<void>` contract.
+  async function setSelectedDashboardVisible(visible: boolean) {
+    await runBatchAction("set_dashboard_visible", { dashboard_visible: visible });
+  }
+
   async function transferSelectedOwner() {
     const ownerUserId = batchOwnerUserId.trim();
     if (!ownerUserId) {
@@ -598,7 +620,7 @@ export default function ServersPage() {
       setTransferError(responseError(response));
       return;
     }
-    setBatchNotice(copy.serversPage.transferRetried.replace("{id}", compactId(transfer.id)));
+    showToast(copy.serversPage.transferRetried.replace("{id}", compactId(transfer.id)));
     await loadOwnerTransfers();
     await loadServers();
     await loadServerGroups();
@@ -614,7 +636,7 @@ export default function ServersPage() {
       setTransferError(responseError(response));
       return;
     }
-    setBatchNotice(copy.serversPage.transferCancelled.replace("{id}", compactId(transfer.id)));
+    showToast(copy.serversPage.transferCancelled.replace("{id}", compactId(transfer.id)));
     await loadOwnerTransfers();
   }
 
@@ -628,7 +650,9 @@ export default function ServersPage() {
           actions={<button type="button" onClick={() => { setError(null); void loadServers(true); }} className={buttonClass("secondary")}>{copy.serversPage.refresh}</button>}
         />
         <InlineError message={error ?? serverLoadError} />
-        {batchNotice ? <div className="mt-3"><InlineNotice tone="green">{batchNotice}</InlineNotice></div> : null}
+        {showWsBanner ? (
+          <div className="mt-3"><InlineNotice tone="yellow">{copy.serversPage.wsDisconnectedBanner}</InlineNotice></div>
+        ) : null}
         <ServerSummaryGrid summary={summary} copy={copy} />
         <div className="mt-5 mb-5 grid gap-3">
           <input value={query} onChange={(event) => setQuery(event.target.value)} className={inputClass} placeholder={copy.serversPage.searchPlaceholder} />
@@ -709,7 +733,7 @@ export default function ServersPage() {
               </div>
               <div className="grid gap-3 xl:grid-cols-[minmax(12rem,1fr)_auto_minmax(12rem,1fr)_minmax(10rem,0.8fr)_7rem_7rem_auto_auto] xl:items-end">
                 <input value={newServerGroupName} onChange={(event) => setNewServerGroupName(event.target.value)} className={inputClass} placeholder={copy.serversPage.newServerGroupPlaceholder} />
-                <button type="button" className={buttonClass("secondary")} onClick={() => void runExclusive(createServerGroup)} disabled={actionBusy}>{copy.serversPage.createGroup}</button>
+                <button type="button" className={buttonClass("secondary")} onClick={() => void runGroup(createServerGroup)} disabled={groupBusy}>{copy.serversPage.createGroup}</button>
                 <select value={selectedServerGroupId} onChange={(event) => selectServerGroup(event.target.value)} className={inputClass}>
                   <option value="">{copy.serversPage.selectServerGroupOption}</option>
                   {serverGroups.map((group) => (
@@ -726,52 +750,11 @@ export default function ServersPage() {
                   disabled={!selectedServerGroupId}
                   aria-label={copy.serversPage.groupColorAriaLabel}
                 />
-                <button type="button" className={buttonClass("secondary")} onClick={() => void updateSelectedServerGroup()} disabled={!selectedServerGroupId}>{copy.serversPage.saveGroup}</button>
-                <button type="button" className={buttonClass("danger")} onClick={() => void deleteSelectedServerGroup()} disabled={!selectedServerGroupId}>{copy.serversPage.deleteGroup}</button>
+                <button type="button" className={buttonClass("secondary")} onClick={() => void runGroup(updateSelectedServerGroup)} disabled={!selectedServerGroupId || groupBusy}>{copy.serversPage.saveGroup}</button>
+                <button type="button" className={buttonClass("danger")} onClick={() => void runGroup(deleteSelectedServerGroup)} disabled={!selectedServerGroupId || groupBusy}>{copy.serversPage.deleteGroup}</button>
               </div>
             </div>
           </details>
-          {selectedIds.length ? (
-            <div className="grid gap-3 border-2 border-black bg-[var(--bg-card)] p-3 shadow-[var(--shadow-brutal)]">
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <span className="border-2 border-black bg-[var(--accent-bg)] px-3 py-2 text-xs font-black uppercase shadow-[var(--shadow-brutal-sm)]">
-                  {copy.serversPage.selectedCount.replace("{count}", String(selectedIds.length))}
-                </span>
-                <button type="button" className={buttonClass("secondary")} onClick={() => setSelectedIds([])}>
-                  {copy.serversPage.clearSelection}
-                </button>
-              </div>
-              <div className="grid gap-3 xl:grid-cols-[minmax(12rem,1fr)_auto_auto_auto_auto_auto]">
-                <input value={batchTags} onChange={(event) => setBatchTags(event.target.value)} className={inputClass} placeholder={copy.serversPage.batchTagsPlaceholder} />
-                <button type="button" className={buttonClass("secondary")} onClick={() => void runTagBatch("set_tags")}>{copy.serversPage.setTags}</button>
-                <button type="button" className={buttonClass("secondary")} onClick={() => void runTagBatch("add_tags")}>{copy.serversPage.addTags}</button>
-                <button type="button" className={buttonClass("secondary")} onClick={() => void runTagBatch("remove_tags")}>{copy.serversPage.removeTags}</button>
-                <button type="button" className={buttonClass("good")} onClick={() => void runBatchAction("set_dashboard_visible", { dashboard_visible: true })}>{copy.serversPage.showOnDashboard}</button>
-                <button type="button" className={buttonClass("danger")} onClick={() => void runBatchAction("set_dashboard_visible", { dashboard_visible: false })}>{copy.serversPage.hideOnDashboard}</button>
-              </div>
-              <div className="grid gap-3 md:grid-cols-[minmax(12rem,1fr)_auto]">
-                <input value={batchOwnerUserId} onChange={(event) => setBatchOwnerUserId(event.target.value)} className={inputClass} placeholder={copy.serversPage.ownerUserIdPlaceholder} />
-                <button type="button" className={buttonClass("secondary")} onClick={() => void runExclusive(transferSelectedOwner)} disabled={actionBusy}>
-                  {copy.serversPage.transferOwner}
-                </button>
-              </div>
-              <div className="grid gap-3 xl:grid-cols-[minmax(12rem,1fr)_auto_auto]">
-                <select value={selectedServerGroupId} onChange={(event) => selectServerGroup(event.target.value)} className={inputClass}>
-                  <option value="">{copy.serversPage.selectServerGroupOption}</option>
-                  {serverGroups.map((group) => (
-                    <option key={group.id} value={group.id}>{group.name}</option>
-                  ))}
-                </select>
-                <button type="button" className={buttonClass("secondary")} onClick={() => void addSelectedToServerGroup()}>{copy.serversPage.addToGroup}</button>
-                <button type="button" className={buttonClass("secondary")} onClick={() => void moveSelectedToServerGroup()}>{copy.serversPage.moveToGroup}</button>
-              </div>
-              <div className="flex flex-wrap justify-end gap-2">
-                <button type="button" className={buttonClass("danger")} onClick={() => void deleteSelectedServers()}>
-                  {copy.serversPage.deleteSelectedServers}
-                </button>
-              </div>
-            </div>
-          ) : null}
           {canManageTransfers ? (
             <details
               className="border-2 border-black bg-[var(--bg-card)] shadow-[var(--shadow-brutal)]"
@@ -796,11 +779,12 @@ export default function ServersPage() {
                 <OwnerTransferPanel
                   transfers={ownerTransfers}
                   loading={transfersLoading}
+                  busy={transferBusy}
                   error={transferError}
                   copy={copy}
                   onRefresh={() => void loadOwnerTransfers()}
-                  onRetry={(transfer) => void retryOwnerTransfer(transfer)}
-                  onCancel={(transfer) => void cancelOwnerTransfer(transfer)}
+                  onRetry={(transfer) => void runTransfer(() => retryOwnerTransfer(transfer))}
+                  onCancel={(transfer) => void runTransfer(() => cancelOwnerTransfer(transfer))}
                 />
               </div>
             </details>
@@ -841,6 +825,65 @@ export default function ServersPage() {
             ))}
           </div>
         )}
+        {selectedIds.length ? (
+          // Last child of the page flow + sticky bottom: the bar floats at the
+          // viewport bottom from anywhere in the list and settles into place
+          // at the end of the page. Opaque background covers rows behind it.
+          <section
+            aria-label={copy.serversPage.selectedCount.replace("{count}", String(selectedIds.length))}
+            className="sticky bottom-4 z-30 mt-5 grid gap-3 border-2 border-black bg-[var(--bg-card)] p-3 shadow-[var(--shadow-brutal)]"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <span className="border-2 border-black bg-[var(--accent-bg)] px-3 py-2 text-xs font-black uppercase shadow-[var(--shadow-brutal-sm)]">
+                {copy.serversPage.selectedCount.replace("{count}", String(selectedIds.length))}
+              </span>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  className={buttonClass("secondary")}
+                  onClick={() => setBatchCollapsed((current) => !current)}
+                  aria-expanded={!batchCollapsed}
+                >
+                  {batchCollapsed ? copy.serversPage.batchExpand : copy.serversPage.batchCollapse}
+                </button>
+                <button type="button" className={buttonClass("secondary")} onClick={() => setSelectedIds([])}>
+                  {copy.serversPage.clearSelection}
+                </button>
+              </div>
+            </div>
+            {batchCollapsed ? null : (<>
+            <div className="grid gap-3 xl:grid-cols-[minmax(12rem,1fr)_auto_auto_auto_auto_auto]">
+              <input value={batchTags} onChange={(event) => setBatchTags(event.target.value)} className={inputClass} placeholder={copy.serversPage.batchTagsPlaceholder} />
+              <button type="button" className={buttonClass("secondary")} onClick={() => void runBatch(() => runTagBatch("set_tags"))} disabled={batchBusy}>{copy.serversPage.setTags}</button>
+              <button type="button" className={buttonClass("secondary")} onClick={() => void runBatch(() => runTagBatch("add_tags"))} disabled={batchBusy}>{copy.serversPage.addTags}</button>
+              <button type="button" className={buttonClass("secondary")} onClick={() => void runBatch(() => runTagBatch("remove_tags"))} disabled={batchBusy}>{copy.serversPage.removeTags}</button>
+              <button type="button" className={buttonClass("good")} onClick={() => void runBatch(() => setSelectedDashboardVisible(true))} disabled={batchBusy}>{copy.serversPage.showOnDashboard}</button>
+              <button type="button" className={buttonClass("danger")} onClick={() => void runBatch(() => setSelectedDashboardVisible(false))} disabled={batchBusy}>{copy.serversPage.hideOnDashboard}</button>
+            </div>
+            <div className="grid gap-3 md:grid-cols-[minmax(12rem,1fr)_auto]">
+              <input value={batchOwnerUserId} onChange={(event) => setBatchOwnerUserId(event.target.value)} className={inputClass} placeholder={copy.serversPage.ownerUserIdPlaceholder} />
+              <button type="button" className={buttonClass("secondary")} onClick={() => void runBatch(transferSelectedOwner)} disabled={batchBusy}>
+                {copy.serversPage.transferOwner}
+              </button>
+            </div>
+            <div className="grid gap-3 xl:grid-cols-[minmax(12rem,1fr)_auto_auto]">
+              <select value={selectedServerGroupId} onChange={(event) => selectServerGroup(event.target.value)} className={inputClass}>
+                <option value="">{copy.serversPage.selectServerGroupOption}</option>
+                {serverGroups.map((group) => (
+                  <option key={group.id} value={group.id}>{group.name}</option>
+                ))}
+              </select>
+              <button type="button" className={buttonClass("secondary")} onClick={() => void runBatch(addSelectedToServerGroup)} disabled={batchBusy}>{copy.serversPage.addToGroup}</button>
+              <button type="button" className={buttonClass("secondary")} onClick={() => void runBatch(moveSelectedToServerGroup)} disabled={batchBusy}>{copy.serversPage.moveToGroup}</button>
+            </div>
+            <div className="flex flex-wrap justify-end gap-2">
+              <button type="button" className={buttonClass("danger")} onClick={() => void runBatch(deleteSelectedServers)} disabled={batchBusy}>
+                {copy.serversPage.deleteSelectedServers}
+              </button>
+            </div>
+            </>)}
+          </section>
+        ) : null}
       </PageShell>
       {dialogs.element}
     </div>
@@ -891,6 +934,7 @@ function WorldMapSkeleton() {
 function OwnerTransferPanel({
   transfers,
   loading,
+  busy,
   error,
   copy,
   onRefresh,
@@ -899,6 +943,7 @@ function OwnerTransferPanel({
 }: {
   transfers: ServerOwnerTransfer[];
   loading: boolean;
+  busy: boolean;
   error: string | null;
   copy: Copy;
   onRefresh: () => void;
@@ -944,10 +989,10 @@ function OwnerTransferPanel({
               <div className="flex flex-wrap justify-end gap-2">
                 {transfer.status !== "completed" ? (
                   <>
-                    <button type="button" className={buttonClass("secondary")} onClick={() => onRetry(transfer)}>
+                    <button type="button" className={buttonClass("secondary")} onClick={() => onRetry(transfer)} disabled={busy}>
                       {copy.serversPage.retry}
                     </button>
-                    <button type="button" className={buttonClass("danger")} onClick={() => onCancel(transfer)}>
+                    <button type="button" className={buttonClass("danger")} onClick={() => onCancel(transfer)} disabled={busy}>
                       {copy.serversPage.cancel}
                     </button>
                   </>

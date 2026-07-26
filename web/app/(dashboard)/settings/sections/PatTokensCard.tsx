@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useState, useSyncExternalStore } from "react";
+import { useState, useSyncExternalStore } from "react";
 import { useDialogs } from "@/app/components/Dialogs";
 import {
   BrutalCard,
@@ -12,8 +12,10 @@ import {
   responseError,
   textareaClass,
 } from "@/app/components/M7Primitives";
+import { showToast } from "@/app/components/Toasts";
 import { apiClient, type PatInfo } from "@/lib/api";
 import { useI18n } from "@/lib/use-i18n";
+import { useBusy } from "@/app/lib/use-busy";
 import { useLoadOnVisible } from "@/app/lib/use-load-on-visible";
 import {
   SectionFeedback,
@@ -27,7 +29,7 @@ export function PatTokensCard() {
   const dialogs = useDialogs();
   const { t: copy } = useI18n();
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [busy, run] = useBusy();
   const sensitiveTotpCode = useSensitiveTotp(dialogs, setError);
   const [name, setName] = useState("");
   const [scopes, setScopes] = useState("server:read service:read task:* nat:* ddns:*");
@@ -51,8 +53,7 @@ export function PatTokensCard() {
     }
   }
 
-  async function createToken(event: FormEvent) {
-    event.preventDefault();
+  async function createToken() {
     const serverIds = splitSettingList(patServerIds);
     const expiresAt = new Date(patExpiresAt);
     if (Number.isNaN(expiresAt.getTime())) {
@@ -72,7 +73,7 @@ export function PatTokensCard() {
     }, totpCode);
     if (response.success && response.data) {
       setCreatedToken(response.data.token);
-      setNotice(copy.settingsPage.patCreated.replace("{expiresAt}", String(formatDate(response.data.expires_at))));
+      showToast(copy.settingsPage.patCreated.replace("{expiresAt}", String(formatDate(response.data.expires_at))));
       setName("");
       setPatExpiresAt(defaultPatExpiresAt());
       setPatServerIds("");
@@ -87,13 +88,19 @@ export function PatTokensCard() {
       <div ref={cardRef} className="grid gap-6 lg:grid-cols-2">
         <BrutalCard accent>
           <h2 className="mb-4 text-xl font-black uppercase">{copy.settingsPage.createPat}</h2>
-          <SectionFeedback error={error} notice={notice} />
-          <form onSubmit={createToken} className="space-y-4">
+          <SectionFeedback error={error} />
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              void run(createToken);
+            }}
+            className="space-y-4"
+          >
             <Field label={copy.settingsPage.nameLabel}><input className={inputClass} value={name} onChange={(e) => setName(e.target.value)} required /></Field>
             <Field label={copy.settingsPage.scopeLabel}><textarea className={`${textareaClass} min-h-24`} value={scopes} onChange={(e) => setScopes(e.target.value)} /></Field>
             <Field label={copy.settingsPage.expiryLabel}><input className={inputClass} type="datetime-local" value={patExpiresAt} onChange={(e) => setPatExpiresAt(e.target.value)} required /></Field>
             <Field label={copy.settingsPage.serverAllowlist}><textarea className={`${textareaClass} min-h-20`} value={patServerIds} onChange={(e) => setPatServerIds(e.target.value)} placeholder="server id, server id" /></Field>
-            <button className={buttonClass("primary")}>{copy.settingsPage.createToken}</button>
+            <button className={buttonClass("primary")} disabled={busy}>{copy.settingsPage.createToken}</button>
           </form>
           {createdToken ? (
             <div className="mt-5 border-2 border-black bg-black p-3 font-mono text-xs text-green-300">

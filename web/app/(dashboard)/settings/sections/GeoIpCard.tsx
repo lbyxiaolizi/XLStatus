@@ -11,6 +11,7 @@ import {
   inputClass,
   responseError,
 } from "@/app/components/M7Primitives";
+import { showToast } from "@/app/components/Toasts";
 import {
   apiClient,
   type GeoIpLookupResponse,
@@ -18,6 +19,7 @@ import {
   type SystemSettingsResponse,
 } from "@/lib/api";
 import { useI18n } from "@/lib/use-i18n";
+import { useBusy } from "@/app/lib/use-busy";
 import { useLoadOnVisible } from "@/app/lib/use-load-on-visible";
 import { SectionFeedback, splitSettingList } from "./shared";
 import { useSensitiveTotp } from "./use-sensitive-totp";
@@ -34,7 +36,7 @@ export function GeoIpCard() {
   const dialogs = useDialogs();
   const { t: copy } = useI18n();
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [busy, run] = useBusy();
   const sensitiveTotpCode = useSensitiveTotp(dialogs, setError);
   const [systemSettings, setSystemSettings] = useState<SystemSettingsResponse | null>(null);
   const [settingsLoading, setSettingsLoading] = useState(true);
@@ -97,7 +99,7 @@ export function GeoIpCard() {
     setGeoIpLoading(false);
     if (response.success && response.data) {
       setGeoIpResult(response.data);
-      setNotice(copy.settingsPage.geoIpQueryDone);
+      showToast(copy.settingsPage.geoIpQueryDone);
     } else {
       setError(responseError(response));
     }
@@ -114,8 +116,7 @@ export function GeoIpCard() {
     setGeoIpLoading(false);
     if (response.success && response.data) {
       if (response.data.status) setGeoIpMmdbStatus(response.data.status);
-      const message = response.data.message || copy.settingsPage.geoIpUpdateDone;
-      setNotice(message);
+      showToast(response.data.message || copy.settingsPage.geoIpUpdateDone);
     } else {
       setError(responseError(response));
     }
@@ -134,7 +135,7 @@ export function GeoIpCard() {
     if (response.success && response.data) {
       if (response.data.status) setGeoIpMmdbStatus(response.data.status);
       setGeoIpMmdbFile(null);
-      setNotice(response.data.message || copy.settingsPage.mmdbUploadDone);
+      showToast(response.data.message || copy.settingsPage.mmdbUploadDone);
     } else {
       setError(responseError(response));
     }
@@ -165,7 +166,7 @@ export function GeoIpCard() {
         severity: settings.geoip_ip_change_severity || "info",
       });
       setDdnsResolverUrl(settings.ddns_resolver_url || "");
-      setNotice(copy.settingsPage.geoIpProviderSaved);
+      showToast(copy.settingsPage.geoIpProviderSaved);
     } else {
       setError(responseError(response));
     }
@@ -191,10 +192,10 @@ export function GeoIpCard() {
               </div>
             </div>
             <div className="flex flex-wrap gap-2">
-              <button type="button" className={buttonClass("secondary")} onClick={() => void saveGeoIpSettings()} disabled={settingsLoading}>
+              <button type="button" className={buttonClass("secondary")} onClick={() => void run(saveGeoIpSettings)} disabled={settingsLoading || busy}>
                 {settingsLoading ? (systemSettings ? copy.settingsPage.saving : copy.settingsPage.loading) : copy.settingsPage.saveDefault}
               </button>
-              <button type="button" className={buttonClass("secondary")} onClick={() => void updateGeoIpDatabase()} disabled={geoIpLoading}>
+              <button type="button" className={buttonClass("secondary")} onClick={() => void run(updateGeoIpDatabase)} disabled={geoIpLoading || busy}>
                 {copy.settingsPage.mmdbUpdate}
               </button>
               <button type="button" className={buttonClass("secondary")} onClick={() => void loadGeoIpStatus()} disabled={geoIpLoading}>
@@ -202,7 +203,7 @@ export function GeoIpCard() {
               </button>
             </div>
           </div>
-          <SectionFeedback error={error} notice={notice} />
+          <SectionFeedback error={error} />
           <div className="grid gap-4 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
             <div className="grid content-start gap-3">
               <Field label="IP">
@@ -245,7 +246,7 @@ export function GeoIpCard() {
                   <input className={inputClass} value={geoIpIpChange.server_ids} onChange={(event) => setGeoIpIpChange((current) => ({ ...current, server_ids: event.target.value }))} placeholder="server id, server id" />
                 </Field>
               </div>
-              <button type="button" className={buttonClass("primary")} onClick={() => void testGeoIp()} disabled={geoIpLoading}>
+              <button type="button" className={buttonClass("primary")} onClick={() => void run(testGeoIp)} disabled={geoIpLoading || busy}>
                 {geoIpLoading ? copy.settingsPage.querying : copy.settingsPage.testGeoIp}
               </button>
               <div className="border-t-2 border-black pt-3">
@@ -260,7 +261,7 @@ export function GeoIpCard() {
                     <input className={inputClass} type="file" accept=".mmdb" onChange={(event) => setGeoIpMmdbFile(event.target.files?.[0] ?? null)} />
                   </Field>
                   {geoIpMmdbFile ? <div className="break-all text-xs font-black text-[var(--text-muted)]">{geoIpMmdbFile.name}</div> : null}
-                  <button type="button" className={buttonClass("secondary")} onClick={() => void uploadGeoIpDatabase()} disabled={geoIpLoading || !geoIpMmdbFile}>
+                  <button type="button" className={buttonClass("secondary")} onClick={() => void run(uploadGeoIpDatabase)} disabled={geoIpLoading || busy || !geoIpMmdbFile}>
                     {copy.settingsPage.uploadMmdb}
                   </button>
                 </div>
@@ -319,7 +320,7 @@ export function GeoIpCard() {
               </StatusBadge>
             </div>
           </div>
-          <button type="button" className={buttonClass("secondary")} onClick={() => void saveGeoIpSettings()} disabled={settingsLoading}>
+          <button type="button" className={buttonClass("secondary")} onClick={() => void run(saveGeoIpSettings)} disabled={settingsLoading || busy}>
             {settingsLoading ? (systemSettings ? copy.settingsPage.saving : copy.settingsPage.loading) : copy.settingsPage.saveDdns}
           </button>
         </div>

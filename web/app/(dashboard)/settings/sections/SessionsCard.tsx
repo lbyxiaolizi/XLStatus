@@ -9,8 +9,10 @@ import {
   formatDate,
   responseError,
 } from "@/app/components/M7Primitives";
+import { showToast } from "@/app/components/Toasts";
 import { apiClient } from "@/lib/api";
 import { useI18n } from "@/lib/use-i18n";
+import { useBusy } from "@/app/lib/use-busy";
 import { useLoadOnVisible } from "@/app/lib/use-load-on-visible";
 import {
   DEFAULT_WAF_BAN_MINUTES,
@@ -36,7 +38,7 @@ export function SessionsCard() {
   const dialogs = useDialogs();
   const { t: copy } = useI18n();
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [busy, run] = useBusy();
   const sensitiveTotpCode = useSensitiveTotp(dialogs, setError);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [sessionsLoading, setSessionsLoading] = useState(true);
@@ -62,7 +64,7 @@ export function SessionsCard() {
     if (totpCode === null) return;
     const response = await apiClient.deleteSession(session.id, totpCode);
     if (response.success) {
-      setNotice(copy.settingsPage.sessionRevoked);
+      showToast(copy.settingsPage.sessionRevoked);
       await loadSessions();
       if (session.is_current) {
         localStorage.removeItem("session_token");
@@ -92,7 +94,7 @@ export function SessionsCard() {
     }, totpCode);
     if (response.success && response.data) {
       const count = Array.isArray(response.data.bans) ? response.data.bans.length : 1;
-      setNotice(copy.settingsPage.wafBansCreated.replace("{count}", String(count)));
+      showToast(copy.settingsPage.wafBansCreated.replace("{count}", String(count)));
     } else {
       setError(responseError(response));
     }
@@ -109,7 +111,7 @@ export function SessionsCard() {
             {sessionsLoading ? copy.settingsPage.loading : copy.settingsPage.refresh}
           </button>
         </div>
-        <SectionFeedback error={error} notice={notice} />
+        <SectionFeedback error={error} />
         <div className="grid gap-3">
           {sessionsLoading && sessions.length === 0 ? (
             <SettingsListSkeleton />
@@ -134,10 +136,10 @@ export function SessionsCard() {
                   <div>{copy.settingsPage.expiresLabel.replace("{date}", String(formatDate(session.expires_at)))}</div>
                 </div>
                 <div className="flex flex-wrap gap-2 xl:justify-end">
-                  <button type="button" className={buttonClass("secondary")} onClick={() => void banSessionIp(session)} disabled={!session.ip}>
+                  <button type="button" className={buttonClass("secondary")} onClick={() => void run(() => banSessionIp(session))} disabled={busy || !session.ip}>
                     {copy.settingsPage.banIp}
                   </button>
-                  <button type="button" className={buttonClass("danger")} onClick={() => void deletePanelSession(session)}>
+                  <button type="button" className={buttonClass("danger")} onClick={() => void run(() => deletePanelSession(session))} disabled={busy}>
                     {copy.settingsPage.revoke}
                   </button>
                 </div>

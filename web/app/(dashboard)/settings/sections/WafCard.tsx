@@ -11,8 +11,10 @@ import {
   inputClass,
   responseError,
 } from "@/app/components/M7Primitives";
+import { showToast } from "@/app/components/Toasts";
 import { apiClient } from "@/lib/api";
 import { useI18n } from "@/lib/use-i18n";
+import { useBusy } from "@/app/lib/use-busy";
 import { useLoadOnVisible } from "@/app/lib/use-load-on-visible";
 import {
   DEFAULT_WAF_BAN_MINUTES,
@@ -36,7 +38,7 @@ export function WafCard() {
   const dialogs = useDialogs();
   const { t: copy } = useI18n();
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [busy, run] = useBusy();
   const sensitiveTotpCode = useSensitiveTotp(dialogs, setError);
   const [wafBans, setWafBans] = useState<WafBan[]>([]);
   const [wafLoading, setWafLoading] = useState(true);
@@ -78,7 +80,7 @@ export function WafCard() {
     }, totpCode);
     if (response.success && response.data) {
       const count = Array.isArray(response.data.bans) ? response.data.bans.length : ips.length;
-      setNotice(copy.settingsPage.wafBansCreated.replace("{count}", String(count)));
+      showToast(copy.settingsPage.wafBansCreated.replace("{count}", String(count)));
       setWafBanDraft((current) => ({ ...current, ips: "" }));
       await loadWafBans();
     } else {
@@ -92,7 +94,7 @@ export function WafCard() {
     if (totpCode === null) return;
     const response = await apiClient.deleteWafBan(ban.id, totpCode);
     if (response.success) {
-      setNotice(copy.settingsPage.wafBanRemoved.replace("{ip}", String(ban.ip)));
+      showToast(copy.settingsPage.wafBanRemoved.replace("{ip}", String(ban.ip)));
       await loadWafBans();
     } else {
       setError(responseError(response));
@@ -110,7 +112,7 @@ export function WafCard() {
             {wafLoading ? copy.settingsPage.loading : copy.settingsPage.refresh}
           </button>
         </div>
-        <SectionFeedback error={error} notice={notice} />
+        <SectionFeedback error={error} />
         <div className="mb-4 grid gap-3 border-b-2 border-black pb-4 xl:grid-cols-[minmax(0,1fr)_minmax(0,0.8fr)_9rem_auto] xl:items-end">
           <Field label={copy.settingsPage.ipList}>
             <input
@@ -137,7 +139,7 @@ export function WafCard() {
               onChange={(event) => setWafBanDraft((current) => ({ ...current, minutes: event.target.value }))}
             />
           </Field>
-          <button type="button" className={buttonClass("danger")} onClick={() => void createPanelWafBan()} disabled={wafLoading}>
+          <button type="button" className={buttonClass("danger")} onClick={() => void run(createPanelWafBan)} disabled={wafLoading || busy}>
             {copy.settingsPage.bulkBan}
           </button>
         </div>
@@ -161,7 +163,7 @@ export function WafCard() {
                   <div>{copy.settingsPage.unbanLabel.replace("{date}", String(formatDate(ban.banned_until)))}</div>
                   <div>{copy.settingsPage.updatedLabel.replace("{date}", String(formatDate(ban.updated_at || ban.created_at)))}</div>
                 </div>
-                <button type="button" className={buttonClass("danger")} onClick={() => void deletePanelWafBan(ban)}>
+                <button type="button" className={buttonClass("danger")} onClick={() => void run(() => deletePanelWafBan(ban))} disabled={busy}>
                   {copy.settingsPage.remove}
                 </button>
               </div>

@@ -11,8 +11,10 @@ import {
   responseError,
   textareaClass,
 } from "@/app/components/M7Primitives";
+import { showToast } from "@/app/components/Toasts";
 import { apiClient, type SystemSettingsResponse } from "@/lib/api";
 import { useI18n } from "@/lib/use-i18n";
+import { useBusy } from "@/app/lib/use-busy";
 import { useLoadOnVisible } from "@/app/lib/use-load-on-visible";
 import { SectionFeedback, nullableText } from "./shared";
 import { useSensitiveTotp } from "./use-sensitive-totp";
@@ -21,7 +23,7 @@ export function PublicSiteCard() {
   const dialogs = useDialogs();
   const { t: copy } = useI18n();
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [busy, run] = useBusy();
   const sensitiveTotpCode = useSensitiveTotp(dialogs, setError);
   const [systemSettings, setSystemSettings] = useState<SystemSettingsResponse | null>(null);
   const [settingsLoading, setSettingsLoading] = useState(true);
@@ -65,7 +67,7 @@ export function PublicSiteCard() {
     setSettingsLoading(false);
     if (response.success && response.data) {
       setSystemSettings(response.data);
-      setNotice(enabled ? copy.settingsPage.publicSiteEnabled : copy.settingsPage.publicSiteDisabled);
+      showToast(enabled ? copy.settingsPage.publicSiteEnabled : copy.settingsPage.publicSiteDisabled);
     } else {
       setError(responseError(response));
     }
@@ -79,7 +81,7 @@ export function PublicSiteCard() {
     setSettingsLoading(false);
     if (response.success && response.data) {
       setSystemSettings(response.data);
-      setNotice(enabled ? copy.settingsPage.publicServerDetailsShown : copy.settingsPage.publicServerDetailsHidden);
+      showToast(enabled ? copy.settingsPage.publicServerDetailsShown : copy.settingsPage.publicServerDetailsHidden);
     } else {
       setError(responseError(response));
     }
@@ -107,7 +109,7 @@ export function PublicSiteCard() {
     if (response.success && response.data) {
       setSystemSettings(response.data);
       setPublicBranding((current) => ({ ...current, customHead: "", customBody: "" }));
-      setNotice(copy.settingsPage.publicBrandingSaved);
+      showToast(copy.settingsPage.publicBrandingSaved);
     } else {
       setError(responseError(response));
     }
@@ -124,7 +126,7 @@ export function PublicSiteCard() {
             {settingsLoading ? copy.settingsPage.loading : copy.settingsPage.refresh}
           </button>
         </div>
-        <SectionFeedback error={error} notice={notice} />
+        <SectionFeedback error={error} />
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex flex-wrap items-center gap-2">
             <StatusBadge tone={systemSettings ? (systemSettings.public_site_enabled ? "green" : "red") : "gray"}>
@@ -138,8 +140,8 @@ export function PublicSiteCard() {
             <input
               type="checkbox"
               checked={systemSettings?.public_site_enabled === true}
-              onChange={(event) => void updatePublicSiteEnabled(event.target.checked)}
-              disabled={settingsLoading || !systemSettings}
+              onChange={(event) => void run(() => updatePublicSiteEnabled(event.target.checked))}
+              disabled={settingsLoading || busy || !systemSettings}
             />
             {copy.settingsPage.anonymousAccess}
           </label>
@@ -157,8 +159,8 @@ export function PublicSiteCard() {
             <input
               type="checkbox"
               checked={systemSettings?.public_server_details_enabled === true}
-              onChange={(event) => void updatePublicServerDetailsEnabled(event.target.checked)}
-              disabled={settingsLoading || !systemSettings}
+              onChange={(event) => void run(() => updatePublicServerDetailsEnabled(event.target.checked))}
+              disabled={settingsLoading || busy || !systemSettings}
             />
             {copy.settingsPage.serverDetails}
           </label>
@@ -201,7 +203,7 @@ export function PublicSiteCard() {
             />
           </Field>
           <div className="flex items-end justify-end">
-            <button type="button" className={buttonClass("primary")} onClick={() => void savePublicBranding()} disabled={settingsLoading}>
+            <button type="button" className={buttonClass("primary")} onClick={() => void run(savePublicBranding)} disabled={settingsLoading || busy}>
               {copy.settingsPage.saveBranding}
             </button>
           </div>

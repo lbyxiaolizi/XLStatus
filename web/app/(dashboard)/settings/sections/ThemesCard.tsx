@@ -12,6 +12,7 @@ import {
   responseError,
   textareaClass,
 } from "@/app/components/M7Primitives";
+import { showToast } from "@/app/components/Toasts";
 import { apiClient, type ImportThemeRequest, type ThemeDefinition } from "@/lib/api";
 import { useI18n } from "@/lib/use-i18n";
 import {
@@ -19,6 +20,7 @@ import {
   DASHBOARD_THEME_CACHE_KEY,
 } from "@/app/lib/dashboard-theme";
 import { readStoredUser } from "@/app/lib/client-store";
+import { useBusy } from "@/app/lib/use-busy";
 import { useLoadOnVisible } from "@/app/lib/use-load-on-visible";
 import type { Translations } from "@/lib/i18n";
 import { SectionFeedback } from "./shared";
@@ -28,7 +30,7 @@ export function ThemesCard() {
   const dialogs = useDialogs();
   const { t: copy } = useI18n();
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [busy, run] = useBusy();
   const sensitiveTotpCode = useSensitiveTotp(dialogs, setError);
   const [themes, setThemes] = useState<ThemeDefinition[]>([]);
   const [selectedPublicThemeId, setSelectedPublicThemeId] = useState("");
@@ -107,7 +109,7 @@ export function ThemesCard() {
     setThemeLoading(false);
     if (readStoredUser()?.id !== requestUserId) return;
     if (response.success && response.data) {
-      setNotice(copy.settingsPage.themeImported.replace("{name}", String(response.data.name)));
+      showToast(copy.settingsPage.themeImported.replace("{name}", String(response.data.name)));
       await loadThemes();
     } else {
       const message = responseError(response);
@@ -146,7 +148,7 @@ export function ThemesCard() {
         nextThemes.find((item) => item.id === dashboardThemeId) ?? null,
         true,
       );
-      setNotice(copy.settingsPage.themeApplied.replace("{name}", String(theme.name)));
+      showToast(copy.settingsPage.themeApplied.replace("{name}", String(theme.name)));
     } else {
       const message = responseError(response);
       setThemeError(message);
@@ -166,7 +168,7 @@ export function ThemesCard() {
     setThemeLoading(false);
     if (readStoredUser()?.id !== requestUserId) return;
     if (response.success) {
-      setNotice(copy.settingsPage.themeDeleted.replace("{name}", String(theme.name)));
+      showToast(copy.settingsPage.themeDeleted.replace("{name}", String(theme.name)));
       await loadThemes(true, true);
     } else {
       const message = responseError(response);
@@ -188,7 +190,7 @@ export function ThemesCard() {
         </div>
         {/* Theme load/apply failures already render below as themeError, so only
             client-side validation errors surface in the card feedback slot. */}
-        <SectionFeedback error={error === themeError ? null : error} notice={notice} />
+        <SectionFeedback error={error === themeError ? null : error} />
         <InlineError message={themeError} />
         <div className="grid gap-5 xl:grid-cols-[minmax(0,1.2fr)_minmax(0,0.8fr)]">
           <div className="grid content-start gap-3">
@@ -232,29 +234,29 @@ export function ThemesCard() {
                     <button
                       type="button"
                       className={buttonClass("secondary")}
-                      onClick={() => void selectTheme(theme, "public")}
-                      disabled={themeLoading || !themeSupportsTarget(theme, "public") || selectedPublicThemeId === theme.id}
+                      onClick={() => void run(() => selectTheme(theme, "public"))}
+                      disabled={themeLoading || busy || !themeSupportsTarget(theme, "public") || selectedPublicThemeId === theme.id}
                     >
                       {copy.settingsPage.publicAction}
                     </button>
                     <button
                       type="button"
                       className={buttonClass("secondary")}
-                      onClick={() => void selectTheme(theme, "dashboard")}
-                      disabled={themeLoading || !themeSupportsTarget(theme, "dashboard") || selectedDashboardThemeId === theme.id}
+                      onClick={() => void run(() => selectTheme(theme, "dashboard"))}
+                      disabled={themeLoading || busy || !themeSupportsTarget(theme, "dashboard") || selectedDashboardThemeId === theme.id}
                     >
                       {copy.settingsPage.dashboardAction}
                     </button>
                     <button
                       type="button"
                       className={buttonClass("primary")}
-                      onClick={() => void selectTheme(theme, "both")}
-                      disabled={themeLoading || theme.target !== "both" || (selectedPublicThemeId === theme.id && selectedDashboardThemeId === theme.id)}
+                      onClick={() => void run(() => selectTheme(theme, "both"))}
+                      disabled={themeLoading || busy || theme.target !== "both" || (selectedPublicThemeId === theme.id && selectedDashboardThemeId === theme.id)}
                     >
                       {copy.settingsPage.bothAction}
                     </button>
                     {!theme.builtin ? (
-                      <button type="button" className={buttonClass("danger")} onClick={() => void deleteTheme(theme)} disabled={themeLoading}>
+                      <button type="button" className={buttonClass("danger")} onClick={() => void run(() => deleteTheme(theme))} disabled={themeLoading || busy}>
                         {copy.settingsPage.delete}
                       </button>
                     ) : null}
@@ -284,7 +286,7 @@ export function ThemesCard() {
               <button type="button" className={buttonClass("secondary")} onClick={() => setThemeImportText(defaultThemeImportText())}>
                 {copy.settingsPage.example}
               </button>
-              <button type="button" className={buttonClass("primary")} onClick={() => void importTheme()} disabled={themeLoading}>
+              <button type="button" className={buttonClass("primary")} onClick={() => void run(importTheme)} disabled={themeLoading || busy}>
                 {copy.settingsPage.importTheme}
               </button>
             </div>

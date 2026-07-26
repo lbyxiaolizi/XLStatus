@@ -2,6 +2,7 @@ import { ReactNode } from "react";
 import DashboardIdentityBoundary from "@/app/components/DashboardIdentityBoundary";
 import Navigation from "@/app/components/Navigation";
 import { ServerDataProvider } from "@/app/components/ServerDataProvider";
+import { Toaster } from "@/app/components/Toasts";
 
 // Shared chrome for all dashboard routes. Navigation was previously rendered
 // by every page individually inside its own `min-h-screen` wrapper; hoisting it
@@ -13,6 +14,7 @@ export default function DashboardLayout({ children }: { children: ReactNode }) {
         <ServerDataProvider>
           <Navigation />
           {children}
+          <Toaster />
         </ServerDataProvider>
       </DashboardIdentityBoundary>
     </div>

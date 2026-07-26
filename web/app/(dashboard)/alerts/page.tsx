@@ -1,11 +1,10 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   EmptyState,
   Field,
   InlineError,
-  InlineNotice,
   Modal,
   PageHeader,
   PageShell,
@@ -20,6 +19,8 @@ import {
 } from "@/app/components/M7Primitives";
 import { apiClient, type JsonObject, type TotpStatusResponse } from "@/lib/api";
 import { useDialogs } from "@/app/components/Dialogs";
+import { showToast } from "@/app/components/Toasts";
+import { useBusy } from "@/app/lib/use-busy";
 import { useI18n } from "@/lib/use-i18n";
 import type { Translations } from "@/lib/i18n";
 
@@ -47,9 +48,11 @@ export default function AlertsPage() {
   const [rules, setRules] = useState<AlertRule[]>([]);
   const [events, setEvents] = useState<AlertEvent[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const [modal, setModal] = useState(false);
   const [totpStatus, setTotpStatus] = useState<TotpStatusResponse | null>(null);
+  // One guard for the rule form, one for per-row deletes.
+  const [formBusy, runForm] = useBusy();
+  const [rowBusy, runRow] = useBusy();
   const [form, setForm] = useState({
     name: "",
     trigger: "once",
@@ -89,8 +92,7 @@ export default function AlertsPage() {
     void load();
   }, [load]);
 
-  async function submit(event: FormEvent) {
-    event.preventDefault();
+  async function submit() {
     const payload: JsonObject = {
       name: form.name,
       trigger: form.trigger,
@@ -103,7 +105,7 @@ export default function AlertsPage() {
     if (totpCode === null) return;
     const response = await apiClient.createAlertRule(payload, totpCode);
     if (response.success) {
-      setNotice(copy.alertsPage.ruleCreated);
+      showToast(copy.alertsPage.ruleCreated);
       setModal(false);
       await load();
     } else {
@@ -117,7 +119,7 @@ export default function AlertsPage() {
     if (totpCode === null) return;
     const response = await apiClient.deleteAlertRule(rule.id, totpCode);
     if (response.success) {
-      setNotice(copy.alertsPage.ruleDeleted);
+      showToast(copy.alertsPage.ruleDeleted);
       await load();
     } else {
       setError(responseError(response));
@@ -157,7 +159,6 @@ export default function AlertsPage() {
         />
         <div className="mb-5 space-y-3">
           <InlineError message={error} />
-          {notice ? <InlineNotice tone="green">{notice}</InlineNotice> : null}
         </div>
 
         <div className="grid gap-6 lg:grid-cols-2">
@@ -177,7 +178,7 @@ export default function AlertsPage() {
                         <td className={tdClass}>{rule.name}</td>
                         <td className={tdClass}>{formatConditions(copy, rule.conditions)}</td>
                         <td className={tdClass}><StatusBadge tone={rule.enabled === false ? "gray" : "green"}>{rule.enabled === false ? copy.alertsPage.disabled : copy.alertsPage.enabled}</StatusBadge></td>
-                        <td className={tdClass}><button className={buttonClass("danger")} onClick={() => void deleteRule(rule)}>{copy.alertsPage.delete}</button></td>
+                        <td className={tdClass}><button className={buttonClass("danger")} disabled={rowBusy} onClick={() => void runRow(() => deleteRule(rule))}>{copy.alertsPage.delete}</button></td>
                       </tr>
                     ))}
                   </tbody>
@@ -202,7 +203,7 @@ export default function AlertsPage() {
 
         {modal ? (
           <Modal title={copy.alertsPage.modalTitle} onClose={() => setModal(false)}>
-            <form onSubmit={submit} className="space-y-4">
+            <form onSubmit={(event) => { event.preventDefault(); void runForm(() => submit()); }} className="space-y-4">
               <Field label={copy.alertsPage.fieldName}><input className={inputClass} value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} required /></Field>
               <div className="grid gap-4 sm:grid-cols-2">
                 <Field label={copy.alertsPage.fieldTrigger}><select className={selectClass} value={form.trigger} onChange={(e) => setForm((f) => ({ ...f, trigger: e.target.value }))}><option value="once">once</option><option value="always">always</option></select></Field>
@@ -261,7 +262,7 @@ export default function AlertsPage() {
                   <input className={inputClass} value={form.recovery_task_ids} onChange={(e) => setForm((f) => ({ ...f, recovery_task_ids: e.target.value }))} />
                 </Field>
               </div>
-              <button className={buttonClass("primary")}>{copy.alertsPage.saveRule}</button>
+              <button disabled={formBusy} className={buttonClass("primary")}>{copy.alertsPage.saveRule}</button>
             </form>
           </Modal>
         ) : null}

@@ -34,11 +34,13 @@ import {
   type ChartPoint,
   type ChartSeries,
 } from "@/app/components/charts";
+import { showToast } from "@/app/components/Toasts";
 import { apiClient, type FileEntry, type JsonObject } from "@/lib/api";
 import { durationLabel, formatRate, maxOf, minOf, optionalNumber } from "@/app/lib/format";
 import { useI18n } from "@/lib/use-i18n";
 import { useStoredPreference } from "@/app/lib/client-store";
 import { mapWithConcurrency } from "@/app/lib/concurrency";
+import { useBusy } from "@/app/lib/use-busy";
 
 const BINARY_PREFERENCE_VALUES = ["0", "1"] as const;
 
@@ -244,8 +246,14 @@ export default function ServerDetailPage({ params }: PageProps) {
   const [updateForm, setUpdateForm] = useState({ version: "", download_url: "", checksum: "" });
   const [loading, setLoading] = useState(true);
   const [filesLoading, setFilesLoading] = useState(false);
-  const [saving, setSaving] = useState(false);
+  // One gate per panel: a file write must not disable the agent-ops form, and
+  // each gate doubles as the synchronous double-submit guard the forms need.
+  const [metadataBusy, runMetadata] = useBusy();
+  const [filesBusy, runFiles] = useBusy();
+  const [opsBusy, runOps] = useBusy();
   const [error, setError] = useState<string | null>(null);
+  // Kept inline (not a toast) because createTempUrl puts a URL here that the
+  // user has to read and copy.
   const [notice, setNotice] = useState<string | null>(null);
   const [metadataForm, setMetadataForm] = useState<ServerMetadataForm>(blankMetadataForm);
   const [metricsRange, setMetricsRange] = useState<MetricsRange>("1d");
@@ -453,6 +461,10 @@ export default function ServerDetailPage({ params }: PageProps) {
   function openSecondaryPanel(panel: SecondaryPanel) {
     const next = secondaryPanel === panel ? null : panel;
     setSecondaryPanel(next);
+    // The inline notice only ever carries a signed temp URL from the files
+    // panel; leaving that panel is the natural point for it to expire (other
+    // actions became toasts, so nothing overwrites it anymore).
+    if (next !== "files") setNotice(null);
     if (next === "files" && files.length === 0 && !filesLoading) {
       void loadFiles(path || "/");
     }
@@ -474,7 +486,7 @@ export default function ServerDetailPage({ params }: PageProps) {
     if (response.success && response.data) {
       setWritePath(nextPath);
       setWriteContent(response.data.content);
-      setNotice(copy.serverDetailPage.readFileNotice.replace("{path}", nextPath).replace("{bytes}", String(response.data.bytes)));
+      showToast(copy.serverDetailPage.readFileNotice.replace("{path}", nextPath).replace("{bytes}", String(response.data.bytes)));
     } else {
       setError(responseError(response));
     }
@@ -482,108 +494,116 @@ export default function ServerDetailPage({ params }: PageProps) {
 
   async function writeFile(event: FormEvent) {
     event.preventDefault();
-    if (!writePath.trim()) {
-      setError(copy.serverDetailPage.writePathRequired);
-      return;
-    }
-    const totpCode = await sensitiveTotpCode();
-    if (totpCode === null) return;
-    setSaving(true);
-    const response = await apiClient.writeServerFile(serverId, {
-      path: writePath.trim(),
-      content: writeContent,
-      encoding: "utf8",
-      create_dirs: true,
-    }, totpCode);
-    setSaving(false);
-    if (response.success) {
-      setNotice(copy.serverDetailPage.writeFileNotice.replace("{path}", writePath.trim()));
-      await loadFiles(path);
-    } else {
-      setError(responseError(response));
-    }
+    await runFiles(async () => {
+      if (!writePath.trim()) {
+        setError(copy.serverDetailPage.writePathRequired);
+        return;
+      }
+      const totpCode = await sensitiveTotpCode();
+      if (totpCode === null) return;
+      const response = await apiClient.writeServerFile(serverId, {
+        path: writePath.trim(),
+        content: writeContent,
+        encoding: "utf8",
+        create_dirs: true,
+      }, totpCode);
+      if (response.success) {
+        showToast(copy.serverDetailPage.writeFileNotice.replace("{path}", writePath.trim()));
+        await loadFiles(path);
+      } else {
+        setError(responseError(response));
+      }
+    });
   }
 
   async function deleteEntry(entryPath: string, recursive: boolean) {
-    if (!(await dialogs.confirm({ message: copy.serverDetailPage.deleteEntryConfirm.replace("{path}", entryPath), danger: true }))) return;
-    const totpCode = await sensitiveTotpCode();
-    if (totpCode === null) return;
-    const response = await apiClient.deleteServerFile(serverId, { path: entryPath, recursive }, totpCode);
-    if (response.success) {
-      setNotice(copy.serverDetailPage.deleteEntryNotice.replace("{path}", entryPath));
-      await loadFiles(path);
-    } else {
-      setError(responseError(response));
-    }
+    // Confirm inside the gate so a double-click can't stack two dialogs.
+    await runFiles(async () => {
+      if (!(await dialogs.confirm({ message: copy.serverDetailPage.deleteEntryConfirm.replace("{path}", entryPath), danger: true }))) return;
+      const totpCode = await sensitiveTotpCode();
+      if (totpCode === null) return;
+      const response = await apiClient.deleteServerFile(serverId, { path: entryPath, recursive }, totpCode);
+      if (response.success) {
+        showToast(copy.serverDetailPage.deleteEntryNotice.replace("{path}", entryPath));
+        await loadFiles(path);
+      } else {
+        setError(responseError(response));
+      }
+    });
   }
 
   async function createTempUrl(kind: "download" | "upload") {
-    const target = kind === "download" ? selectedPath || writePath : writePath;
-    if (!target.trim()) {
-      setError(copy.serverDetailPage.selectFilePathFirst);
-      return;
-    }
-    const totpCode = kind === "upload" ? await sensitiveTotpCode() : undefined;
-    if (totpCode === null) return;
-    const response =
-      kind === "download"
-        ? await apiClient.getServerDownloadUrl(serverId, target.trim())
-        : await apiClient.getServerUploadUrl(serverId, target.trim(), totpCode);
-    if (response.success && response.data) {
-      setNotice(`${response.data.method} ${response.data.url}`);
-    } else {
-      setError(responseError(response));
-    }
+    await runFiles(async () => {
+      // Drop the previous URL up front so a failed request cannot leave a
+      // stale signed URL on screen next to the new error.
+      setNotice(null);
+      const target = kind === "download" ? selectedPath || writePath : writePath;
+      if (!target.trim()) {
+        setError(copy.serverDetailPage.selectFilePathFirst);
+        return;
+      }
+      const totpCode = kind === "upload" ? await sensitiveTotpCode() : undefined;
+      if (totpCode === null) return;
+      const response =
+        kind === "download"
+          ? await apiClient.getServerDownloadUrl(serverId, target.trim())
+          : await apiClient.getServerUploadUrl(serverId, target.trim(), totpCode);
+      if (response.success && response.data) {
+        setNotice(`${response.data.method} ${response.data.url}`);
+      } else {
+        setError(responseError(response));
+      }
+    });
   }
 
   async function applyConfig(event: FormEvent) {
     event.preventDefault();
-    const totpCode = await sensitiveTotpCode();
-    if (totpCode === null) return;
-    const config: JsonObject = {
-      report_interval_seconds: Number(configForm.report_interval_seconds),
-      ip_report_interval_seconds: Number(configForm.ip_report_interval_seconds),
-      disable_auto_update: configForm.disable_auto_update,
-      disable_force_update: configForm.disable_force_update,
-      disable_command_execute: configForm.disable_command_execute,
-      disable_nat: configForm.disable_nat,
-      disable_send_query: configForm.disable_send_query,
-    };
-    setSaving(true);
-    const response = await apiClient.applyServerConfig(serverId, config, totpCode);
-    setSaving(false);
-    if (response.success) {
-      setNotice(copy.serverDetailPage.configPatchSent);
-      await loadServer();
-    } else {
-      setError(responseError(response));
-    }
+    await runOps(async () => {
+      const totpCode = await sensitiveTotpCode();
+      if (totpCode === null) return;
+      const config: JsonObject = {
+        report_interval_seconds: Number(configForm.report_interval_seconds),
+        ip_report_interval_seconds: Number(configForm.ip_report_interval_seconds),
+        disable_auto_update: configForm.disable_auto_update,
+        disable_force_update: configForm.disable_force_update,
+        disable_command_execute: configForm.disable_command_execute,
+        disable_nat: configForm.disable_nat,
+        disable_send_query: configForm.disable_send_query,
+      };
+      const response = await apiClient.applyServerConfig(serverId, config, totpCode);
+      if (response.success) {
+        showToast(copy.serverDetailPage.configPatchSent);
+        await loadServer();
+      } else {
+        setError(responseError(response));
+      }
+    });
   }
 
   async function forceUpdate(event: FormEvent) {
     event.preventDefault();
-    const version = updateForm.version.trim();
-    const downloadUrl = updateForm.download_url.trim();
-    const checksum = updateForm.checksum.trim();
-    if (!version || !downloadUrl || !checksum) {
-      setError(copy.serverDetailPage.updateFieldsRequired);
-      return;
-    }
-    const totpCode = await sensitiveTotpCode();
-    if (totpCode === null) return;
-    setSaving(true);
-    const response = await apiClient.forceUpdateServer(serverId, {
-      version,
-      download_url: downloadUrl,
-      checksum,
-    }, totpCode);
-    setSaving(false);
-    if (response.success) {
-      setNotice(copy.serverDetailPage.forceUpdateSent);
-      setUpdateForm({ version: "", download_url: "", checksum: "" });
-    } else {
-      setError(responseError(response));
-    }
+    await runOps(async () => {
+      const version = updateForm.version.trim();
+      const downloadUrl = updateForm.download_url.trim();
+      const checksum = updateForm.checksum.trim();
+      if (!version || !downloadUrl || !checksum) {
+        setError(copy.serverDetailPage.updateFieldsRequired);
+        return;
+      }
+      const totpCode = await sensitiveTotpCode();
+      if (totpCode === null) return;
+      const response = await apiClient.forceUpdateServer(serverId, {
+        version,
+        download_url: downloadUrl,
+        checksum,
+      }, totpCode);
+      if (response.success) {
+        showToast(copy.serverDetailPage.forceUpdateSent);
+        setUpdateForm({ version: "", download_url: "", checksum: "" });
+      } else {
+        setError(responseError(response));
+      }
+    });
   }
 
   async function sensitiveTotpCode(): Promise<string | undefined | null> {
@@ -605,45 +625,45 @@ export default function ServerDetailPage({ params }: PageProps) {
 
   async function saveServerMetadata(event: FormEvent) {
     event.preventDefault();
-    const totpCode = await sensitiveTotpCode();
-    if (totpCode === null) return;
-    setSaving(true);
-    const response = await apiClient.updateServer(serverId, {
-      name: metadataForm.name.trim(),
-      remark: metadataForm.remark.trim() || null,
-      public_note: metadataForm.public_note.trim() || null,
-      expires_at: metadataForm.expires_at.trim() || null,
-      renewal_price: metadataForm.renewal_price.trim() || null,
-      price: metadataForm.price.trim() || null,
-      currency: metadataForm.currency.trim() || null,
-      billing_cycle: metadataForm.billing_cycle.trim() || null,
-      auto_renew: metadataForm.auto_renew,
-      traffic_quota_bytes: metadataForm.traffic_quota_bytes.trim() ? Number(metadataForm.traffic_quota_bytes) : null,
-      traffic_quota_type: metadataForm.traffic_quota_type.trim() || null,
-      provider: metadataForm.provider.trim() || null,
-      region: metadataForm.region.trim() || null,
-      country: metadataForm.country.trim() || null,
-      city: metadataForm.city.trim() || null,
-      latitude: metadataForm.latitude.trim() ? Number(metadataForm.latitude) : null,
-      longitude: metadataForm.longitude.trim() ? Number(metadataForm.longitude) : null,
-      plan: metadataForm.plan.trim() || null,
-      tags: splitTags(metadataForm.tags),
-      accent_color: metadataForm.accent_color.trim() || null,
-      dashboard_visible: metadataForm.dashboard_visible,
-      hide_for_guest: metadataForm.hide_for_guest,
-      display_order: metadataForm.display_order.trim() ? Number(metadataForm.display_order) : null,
-    }, totpCode);
-    setSaving(false);
-    if (response.success && response.data) {
-      // The update response already carries the persisted detail, so re-reading
-      // the server would only cost a second round trip.
-      const detail = response.data as unknown as ServerDetail;
-      setServer(detail);
-      setMetadataForm(metadataFormFromDetail(detail));
-      setNotice(copy.serverDetailPage.metadataSaved);
-    } else {
-      setError(responseError(response));
-    }
+    await runMetadata(async () => {
+      const totpCode = await sensitiveTotpCode();
+      if (totpCode === null) return;
+      const response = await apiClient.updateServer(serverId, {
+        name: metadataForm.name.trim(),
+        remark: metadataForm.remark.trim() || null,
+        public_note: metadataForm.public_note.trim() || null,
+        expires_at: metadataForm.expires_at.trim() || null,
+        renewal_price: metadataForm.renewal_price.trim() || null,
+        price: metadataForm.price.trim() || null,
+        currency: metadataForm.currency.trim() || null,
+        billing_cycle: metadataForm.billing_cycle.trim() || null,
+        auto_renew: metadataForm.auto_renew,
+        traffic_quota_bytes: metadataForm.traffic_quota_bytes.trim() ? Number(metadataForm.traffic_quota_bytes) : null,
+        traffic_quota_type: metadataForm.traffic_quota_type.trim() || null,
+        provider: metadataForm.provider.trim() || null,
+        region: metadataForm.region.trim() || null,
+        country: metadataForm.country.trim() || null,
+        city: metadataForm.city.trim() || null,
+        latitude: metadataForm.latitude.trim() ? Number(metadataForm.latitude) : null,
+        longitude: metadataForm.longitude.trim() ? Number(metadataForm.longitude) : null,
+        plan: metadataForm.plan.trim() || null,
+        tags: splitTags(metadataForm.tags),
+        accent_color: metadataForm.accent_color.trim() || null,
+        dashboard_visible: metadataForm.dashboard_visible,
+        hide_for_guest: metadataForm.hide_for_guest,
+        display_order: metadataForm.display_order.trim() ? Number(metadataForm.display_order) : null,
+      }, totpCode);
+      if (response.success && response.data) {
+        // The update response already carries the persisted detail, so re-reading
+        // the server would only cost a second round trip.
+        const detail = response.data as unknown as ServerDetail;
+        setServer(detail);
+        setMetadataForm(metadataFormFromDetail(detail));
+        showToast(copy.serverDetailPage.metadataSaved);
+      } else {
+        setError(responseError(response));
+      }
+    });
   }
 
   return (
@@ -672,7 +692,7 @@ export default function ServerDetailPage({ params }: PageProps) {
             <ServerOverview server={server} showMissing={showMissingInfo} onShowMissingChange={changeShowMissingInfo} />
             <SecondaryPanelNav active={secondaryPanel} onOpen={openSecondaryPanel} />
             {secondaryPanel === "custom" ? (
-              <ServerMetadataEditor form={metadataForm} saving={saving} onChange={setMetadataForm} onSubmit={saveServerMetadata} />
+              <ServerMetadataEditor form={metadataForm} saving={metadataBusy} onChange={setMetadataForm} onSubmit={saveServerMetadata} />
             ) : null}
             {secondaryPanel === "files" ? (
               <FileSystemPanel
@@ -683,7 +703,7 @@ export default function ServerDetailPage({ params }: PageProps) {
                 selectedPath={selectedPath}
                 writePath={writePath}
                 writeContent={writeContent}
-                saving={saving}
+                saving={filesBusy}
                 onLoad={loadFiles}
                 onRead={readSelectedFile}
                 onDelete={deleteEntry}
@@ -697,7 +717,7 @@ export default function ServerDetailPage({ params }: PageProps) {
               <AgentOpsPanel
                 configForm={configForm}
                 updateForm={updateForm}
-                saving={saving}
+                saving={opsBusy}
                 onConfigChange={setConfigForm}
                 onUpdateChange={setUpdateForm}
                 onApplyConfig={applyConfig}
@@ -845,7 +865,7 @@ function FileSystemPanel({
                         ) : (
                           <button className={buttonClass("primary")} onClick={() => void onRead(nextPath)}>{copy.serverDetailPage.read}</button>
                         )}
-                        <button className={buttonClass("danger")} onClick={() => void onDelete(nextPath, entry.file_type === "dir")}>{copy.serverDetailPage.delete}</button>
+                        <button className={buttonClass("danger")} onClick={() => void onDelete(nextPath, entry.file_type === "dir")} disabled={saving}>{copy.serverDetailPage.delete}</button>
                       </td>
                     </tr>
                   );
@@ -867,8 +887,8 @@ function FileSystemPanel({
           </Field>
           <div className="flex flex-wrap gap-2">
             <button disabled={saving} className={buttonClass("primary")}>{copy.serverDetailPage.writeFileButton}</button>
-            <button type="button" className={buttonClass("secondary")} onClick={() => void onTempUrl("download")}>{copy.serverDetailPage.downloadUrl}</button>
-            <button type="button" className={buttonClass("secondary")} onClick={() => void onTempUrl("upload")}>{copy.serverDetailPage.uploadUrl}</button>
+            <button type="button" className={buttonClass("secondary")} onClick={() => void onTempUrl("download")} disabled={saving}>{copy.serverDetailPage.downloadUrl}</button>
+            <button type="button" className={buttonClass("secondary")} onClick={() => void onTempUrl("upload")} disabled={saving}>{copy.serverDetailPage.uploadUrl}</button>
           </div>
         </form>
       </BrutalCard>

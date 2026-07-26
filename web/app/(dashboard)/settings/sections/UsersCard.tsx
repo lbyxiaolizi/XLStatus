@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useState } from "react";
+import { useState } from "react";
 import { useDialogs } from "@/app/components/Dialogs";
 import {
   BrutalCard,
@@ -11,8 +11,10 @@ import {
   inputClass,
   responseError,
 } from "@/app/components/M7Primitives";
+import { showToast } from "@/app/components/Toasts";
 import { apiClient } from "@/lib/api";
 import { useI18n } from "@/lib/use-i18n";
+import { useBusy } from "@/app/lib/use-busy";
 import { useLoadOnVisible } from "@/app/lib/use-load-on-visible";
 import { SectionFeedback, SettingsListSkeleton } from "./shared";
 import { useSensitiveTotp } from "./use-sensitive-totp";
@@ -29,7 +31,7 @@ export function UsersCard() {
   const dialogs = useDialogs();
   const { t: copy } = useI18n();
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [busy, run] = useBusy();
   const sensitiveTotpCode = useSensitiveTotp(dialogs, setError);
   const [users, setUsers] = useState<UserAccount[]>([]);
   const [usersLoading, setUsersLoading] = useState(true);
@@ -48,8 +50,7 @@ export function UsersCard() {
     }
   }
 
-  async function createPanelUser(event: FormEvent) {
-    event.preventDefault();
+  async function createPanelUser() {
     if (newUser.password.length < 8) {
       setError(copy.settingsPage.userPasswordTooShort);
       return;
@@ -62,7 +63,7 @@ export function UsersCard() {
       role: newUser.role,
     }, totpCode);
     if (response.success) {
-      setNotice(copy.settingsPage.userCreated);
+      showToast(copy.settingsPage.userCreated);
       setNewUser({ username: "", password: "", role: "member" });
       await loadUsers();
     } else {
@@ -75,7 +76,7 @@ export function UsersCard() {
     if (totpCode === null) return;
     const response = await apiClient.updateUser(user.id, { role }, totpCode);
     if (response.success) {
-      setNotice(copy.settingsPage.userRoleUpdated.replace("{username}", String(user.username)));
+      showToast(copy.settingsPage.userRoleUpdated.replace("{username}", String(user.username)));
       await loadUsers();
     } else {
       setError(responseError(response));
@@ -92,7 +93,7 @@ export function UsersCard() {
     if (totpCode === null) return;
     const response = await apiClient.updateUser(user.id, { password }, totpCode);
     if (response.success) {
-      setNotice(copy.settingsPage.userPasswordReset.replace("{username}", String(user.username)));
+      showToast(copy.settingsPage.userPasswordReset.replace("{username}", String(user.username)));
       setPasswordEdits((current) => ({ ...current, [user.id]: "" }));
       await loadUsers();
     } else {
@@ -106,7 +107,7 @@ export function UsersCard() {
     if (totpCode === null) return;
     const response = await apiClient.deleteUser(user.id, totpCode);
     if (response.success) {
-      setNotice(copy.settingsPage.userDeleted.replace("{username}", String(user.username)));
+      showToast(copy.settingsPage.userDeleted.replace("{username}", String(user.username)));
       await loadUsers();
     } else {
       setError(responseError(response));
@@ -124,8 +125,14 @@ export function UsersCard() {
             {usersLoading ? copy.settingsPage.loading : copy.settingsPage.refresh}
           </button>
         </div>
-        <SectionFeedback error={error} notice={notice} />
-        <form onSubmit={createPanelUser} className="mb-5 grid gap-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_10rem_auto] md:items-end">
+        <SectionFeedback error={error} />
+        <form
+          onSubmit={(event) => {
+            event.preventDefault();
+            void run(createPanelUser);
+          }}
+          className="mb-5 grid gap-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_10rem_auto] md:items-end"
+        >
           <Field label={copy.settingsPage.username}>
             <input className={inputClass} value={newUser.username} onChange={(e) => setNewUser({ ...newUser, username: e.target.value })} required />
           </Field>
@@ -138,7 +145,7 @@ export function UsersCard() {
               <option value="admin">admin</option>
             </select>
           </Field>
-          <button className={buttonClass("primary")}>{copy.settingsPage.createUser}</button>
+          <button className={buttonClass("primary")} disabled={busy}>{copy.settingsPage.createUser}</button>
         </form>
         <div className="grid gap-3">
           {usersLoading && users.length === 0 ? (
@@ -156,7 +163,7 @@ export function UsersCard() {
                   <div className="mt-1 break-all font-mono text-[11px] font-bold text-[var(--text-muted)]">{user.id}</div>
                   <div className="mt-1 text-xs font-bold text-[var(--text-muted)]">{copy.settingsPage.createdAt.replace("{date}", String(formatDate(user.created_at)))}</div>
                 </div>
-                <select className={inputClass} value={user.role} onChange={(e) => void updateUserRole(user, e.target.value)}>
+                <select className={inputClass} value={user.role} onChange={(e) => void run(() => updateUserRole(user, e.target.value))} disabled={busy}>
                   <option value="member">member</option>
                   <option value="admin">admin</option>
                 </select>
@@ -168,11 +175,11 @@ export function UsersCard() {
                     value={passwordEdits[user.id] ?? ""}
                     onChange={(e) => setPasswordEdits((current) => ({ ...current, [user.id]: e.target.value }))}
                   />
-                  <button type="button" className={buttonClass("secondary")} onClick={() => void resetUserPassword(user)}>
+                  <button type="button" className={buttonClass("secondary")} onClick={() => void run(() => resetUserPassword(user))} disabled={busy}>
                     {copy.settingsPage.reset}
                   </button>
                 </div>
-                <button type="button" className={buttonClass("danger")} onClick={() => void deletePanelUser(user)}>
+                <button type="button" className={buttonClass("danger")} onClick={() => void run(() => deletePanelUser(user))} disabled={busy}>
                   {copy.settingsPage.delete}
                 </button>
               </div>

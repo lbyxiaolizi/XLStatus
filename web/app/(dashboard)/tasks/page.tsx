@@ -6,7 +6,6 @@ import {
   EmptyState,
   Field,
   InlineError,
-  InlineNotice,
   Modal,
   PageHeader,
   PageShell,
@@ -26,6 +25,8 @@ import {
 import { apiClient, type JsonObject, type ServerGroup, type TotpStatusResponse } from "@/lib/api";
 import { useDialogs } from "@/app/components/Dialogs";
 import { useServerData, type Server } from "@/app/components/ServerDataProvider";
+import { showToast } from "@/app/components/Toasts";
+import { useBusy } from "@/app/lib/use-busy";
 import { useI18n } from "@/lib/use-i18n";
 import type { tasksPage } from "@/lib/i18n/pages/tasks";
 
@@ -117,12 +118,14 @@ export default function TasksPage() {
   const [saving, setSaving] = useState(false);
   const [runningTaskId, setRunningTaskId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const [modal, setModal] = useState<"create" | "edit" | "runs" | null>(null);
   const [editing, setEditing] = useState<Task | null>(null);
   const [form, setForm] = useState<TaskForm>(blankForm);
   const [query, setQuery] = useState("");
   const [totpStatus, setTotpStatus] = useState<TotpStatusResponse | null>(null);
+  // Separate guards so a row action never disables the modal form (and back).
+  const [formBusy, runForm] = useBusy();
+  const [rowBusy, runRow] = useBusy();
   const runsRequestId = useRef(0);
   const runsAbortRef = useRef<AbortController | null>(null);
   const initialLoadRef = useRef(true);
@@ -243,8 +246,7 @@ export default function TasksPage() {
     setRunsLoading(false);
   }
 
-  async function submitForm(event: FormEvent) {
-    event.preventDefault();
+  async function submitForm() {
     setSaving(true);
     const payload = formToPayload(form);
     const totpCode = await sensitiveTotpCode();
@@ -259,7 +261,7 @@ export default function TasksPage() {
     setSaving(false);
     if (response.success) {
       setModal(null);
-      setNotice(modal === "edit" ? copy.tasksPage.noticeUpdated : copy.tasksPage.noticeCreated);
+      showToast(modal === "edit" ? copy.tasksPage.noticeUpdated : copy.tasksPage.noticeCreated);
       await loadTasks();
     } else {
       setError(responseError(response));
@@ -274,7 +276,7 @@ export default function TasksPage() {
     const response = await apiClient.runTask(task.id, totpCode);
     setRunningTaskId(null);
     if (response.success) {
-      setNotice(copy.tasksPage.noticeRunRequested);
+      showToast(copy.tasksPage.noticeRunRequested);
       await loadTasks();
     } else {
       setError(responseError(response));
@@ -309,7 +311,7 @@ export default function TasksPage() {
     if (totpCode === null) return;
     const response = await apiClient.deleteTask(task.id, totpCode);
     if (response.success) {
-      setNotice(copy.tasksPage.noticeDeleted);
+      showToast(copy.tasksPage.noticeDeleted);
       await loadTasks();
     } else {
       setError(responseError(response));
@@ -328,7 +330,6 @@ export default function TasksPage() {
         <div className="mb-5 space-y-3">
           <input className={inputClass} value={query} onChange={(e) => setQuery(e.target.value)} placeholder={copy.tasksPage.searchPlaceholder} />
           <InlineError message={error ?? serverLoadError} />
-          {notice ? <InlineNotice tone="green">{notice}</InlineNotice> : null}
         </div>
 
         {loading ? (
@@ -355,10 +356,10 @@ export default function TasksPage() {
                     <td className={tdClass}>{task.schedule || copy.tasksPage.scheduleManual}</td>
                     <td className={tdClass}><StatusBadge tone={task.last_result === "success" ? "green" : task.last_result ? "red" : "gray"}>{resultLabel(copy.tasksPage, task.last_result)}</StatusBadge></td>
                     <td className={`${tdClass} flex flex-wrap gap-2`}>
-                      <button className={buttonClass("good")} disabled={runningTaskId === task.id} onClick={() => void runTask(task)}>{copy.tasksPage.run}</button>
+                      <button className={buttonClass("good")} disabled={rowBusy || runningTaskId === task.id} onClick={() => void runRow(() => runTask(task))}>{copy.tasksPage.run}</button>
                       <button className={buttonClass("secondary")} onClick={() => openEdit(task)}>{copy.tasksPage.edit}</button>
                       <button className={buttonClass("secondary")} onClick={() => void openRuns(task)}>{copy.tasksPage.runsLink}</button>
-                      <button className={buttonClass("danger")} onClick={() => void deleteTask(task)}>{copy.tasksPage.delete}</button>
+                      <button className={buttonClass("danger")} disabled={rowBusy} onClick={() => void runRow(() => deleteTask(task))}>{copy.tasksPage.delete}</button>
                     </td>
                   </tr>
                 ))}
@@ -380,8 +381,8 @@ export default function TasksPage() {
                   servers={servers}
                   serverGroups={serverGroups}
                   notificationGroups={notificationGroups}
-                  saving={saving}
-                  onSubmit={submitForm}
+                  saving={saving || formBusy}
+                  onSubmit={(event) => { event.preventDefault(); void runForm(() => submitForm()); }}
                 />
               </>
             )}

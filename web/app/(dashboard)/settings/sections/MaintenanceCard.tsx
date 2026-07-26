@@ -10,6 +10,7 @@ import {
   inputClass,
   responseError,
 } from "@/app/components/M7Primitives";
+import { showToast } from "@/app/components/Toasts";
 import {
   apiClient,
   type MaintenanceRestoreResponse,
@@ -18,6 +19,7 @@ import {
   type TsdbRetentionResponse,
 } from "@/lib/api";
 import { useI18n } from "@/lib/use-i18n";
+import { useBusy } from "@/app/lib/use-busy";
 import { useLoadOnVisible } from "@/app/lib/use-load-on-visible";
 import { MaintenanceCapability, SectionFeedback, saveBlob } from "./shared";
 import { useSensitiveTotp } from "./use-sensitive-totp";
@@ -26,7 +28,7 @@ export function MaintenanceCard() {
   const dialogs = useDialogs();
   const { t: copy } = useI18n();
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [busy, run] = useBusy();
   const sensitiveTotpCode = useSensitiveTotp(dialogs, setError);
   const [maintenanceStatus, setMaintenanceStatus] = useState<MaintenanceStatusResponse | null>(null);
   const [maintenanceLoading, setMaintenanceLoading] = useState(true);
@@ -59,7 +61,7 @@ export function MaintenanceCard() {
     const response = await apiClient.vacuumSqlite(totpCode);
     setMaintenanceLoading(false);
     if (response.success) {
-      setNotice(copy.settingsPage.vacuumDone);
+      showToast(copy.settingsPage.vacuumDone);
       await loadMaintenanceStatus();
     } else {
       setError(responseError(response));
@@ -75,7 +77,7 @@ export function MaintenanceCard() {
     setMaintenanceLoading(false);
     if (response.success && response.data) {
       setTsdbCompactResult(response.data);
-      setNotice(copy.settingsPage.tsdbCompactDone.replace("{count}", String(response.data.removed_samples)));
+      showToast(copy.settingsPage.tsdbCompactDone.replace("{count}", String(response.data.removed_samples)));
       await loadMaintenanceStatus();
     } else {
       setError(responseError(response));
@@ -95,7 +97,7 @@ export function MaintenanceCard() {
     setMaintenanceLoading(false);
     if (response.success && response.data) {
       setTsdbRetentionResult(response.data);
-      setNotice(copy.settingsPage.tsdbRetentionUpdated.replace("{days}", String(response.data.retention_days)));
+      showToast(copy.settingsPage.tsdbRetentionUpdated.replace("{days}", String(response.data.retention_days)));
       await loadMaintenanceStatus();
     } else {
       setError(responseError(response));
@@ -114,7 +116,7 @@ export function MaintenanceCard() {
     setMaintenanceLoading(false);
     if (response.success && response.data) {
       saveBlob(response.data.blob, response.data.filename);
-      setNotice(kind === "backup" ? copy.settingsPage.backupDownloadStarted : copy.settingsPage.archiveDownloadStarted);
+      showToast(kind === "backup" ? copy.settingsPage.backupDownloadStarted : copy.settingsPage.archiveDownloadStarted);
     } else {
       setError(responseError(response));
     }
@@ -137,7 +139,7 @@ export function MaintenanceCard() {
     setMaintenanceLoading(false);
     if (response.success && response.data) {
       setRestoreResult(response.data);
-      setNotice(dryRun ? copy.settingsPage.backupVerified : copy.settingsPage.backupRestored);
+      showToast(dryRun ? copy.settingsPage.backupVerified : copy.settingsPage.backupRestored);
       await loadMaintenanceStatus();
     } else {
       setError(responseError(response));
@@ -155,7 +157,7 @@ export function MaintenanceCard() {
             {maintenanceLoading ? copy.settingsPage.loading : copy.settingsPage.refresh}
           </button>
         </div>
-        <SectionFeedback error={error} notice={notice} />
+        <SectionFeedback error={error} />
         <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_auto] xl:items-end">
           <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-8">
             <div className="border-2 border-black bg-[var(--accent-bg)] p-3 shadow-[var(--shadow-brutal-sm)]">
@@ -191,40 +193,40 @@ export function MaintenanceCard() {
             <button
               type="button"
               className={buttonClass("secondary")}
-              onClick={() => void updateTsdbRetention()}
-              disabled={!maintenanceStatus?.tsdb_retention_configurable || maintenanceLoading}
+              onClick={() => void run(updateTsdbRetention)}
+              disabled={!maintenanceStatus?.tsdb_retention_configurable || maintenanceLoading || busy}
             >
               {copy.settingsPage.saveRetention}
             </button>
             <button
               type="button"
               className={buttonClass(maintenanceStatus?.backup_supported ? "primary" : "secondary")}
-              disabled={!maintenanceStatus?.backup_supported || maintenanceLoading}
-              onClick={() => void downloadMaintenanceExport("backup")}
+              disabled={!maintenanceStatus?.backup_supported || maintenanceLoading || busy}
+              onClick={() => void run(() => downloadMaintenanceExport("backup"))}
             >
               {copy.settingsPage.downloadBackup}
             </button>
             <button
               type="button"
               className={buttonClass(maintenanceStatus?.archive_supported ? "primary" : "secondary")}
-              disabled={!maintenanceStatus?.archive_supported || maintenanceLoading}
-              onClick={() => void downloadMaintenanceExport("archive")}
+              disabled={!maintenanceStatus?.archive_supported || maintenanceLoading || busy}
+              onClick={() => void run(() => downloadMaintenanceExport("archive"))}
             >
               {copy.settingsPage.downloadArchive}
             </button>
             <button
               type="button"
               className={buttonClass("secondary")}
-              onClick={() => void runSqliteVacuum()}
-              disabled={!maintenanceStatus?.vacuum_supported || maintenanceLoading}
+              onClick={() => void run(runSqliteVacuum)}
+              disabled={!maintenanceStatus?.vacuum_supported || maintenanceLoading || busy}
             >
               {copy.settingsPage.runVacuum}
             </button>
             <button
               type="button"
               className={buttonClass("secondary")}
-              onClick={() => void runTsdbCompact()}
-              disabled={!maintenanceStatus?.tsdb_compact_supported || maintenanceLoading}
+              onClick={() => void run(runTsdbCompact)}
+              disabled={!maintenanceStatus?.tsdb_compact_supported || maintenanceLoading || busy}
             >
               {copy.settingsPage.runTsdbCompact}
             </button>
@@ -246,16 +248,16 @@ export function MaintenanceCard() {
             <button
               type="button"
               className={buttonClass("secondary")}
-              onClick={() => void restoreSqliteBackup(true)}
-              disabled={!maintenanceStatus?.restore_supported || !restoreFile || maintenanceLoading}
+              onClick={() => void run(() => restoreSqliteBackup(true))}
+              disabled={!maintenanceStatus?.restore_supported || !restoreFile || maintenanceLoading || busy}
             >
               {copy.settingsPage.verifyBackup}
             </button>
             <button
               type="button"
               className={buttonClass("danger")}
-              onClick={() => void restoreSqliteBackup(false)}
-              disabled={!maintenanceStatus?.restore_supported || !restoreFile || maintenanceLoading}
+              onClick={() => void run(() => restoreSqliteBackup(false))}
+              disabled={!maintenanceStatus?.restore_supported || !restoreFile || maintenanceLoading || busy}
             >
               {copy.settingsPage.restoreBackupAction}
             </button>

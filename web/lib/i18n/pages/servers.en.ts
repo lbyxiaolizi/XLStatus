@@ -49,6 +49,8 @@ export const serversPageEn = {
 
   selectedCount: "{count} selected",
   clearSelection: "Clear selection",
+  batchCollapse: "Collapse",
+  batchExpand: "Batch actions",
   batchTagsPlaceholder: "Tags, comma-separated",
   setTags: "Set tags",
   addTags: "Add tags",
@@ -124,6 +126,7 @@ export const serversPageEn = {
   connConnecting: "Connecting",
   connOpen: "Connected",
   connClosed: "Closed",
+  wsDisconnectedBanner: "Live connection lost, reconnecting automatically; data may lag briefly.",
   connError: "Error",
 
   statusOnline: "Online",
