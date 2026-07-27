@@ -424,10 +424,11 @@ async fn sqlite_add_column_if_missing(
 ) -> anyhow::Result<()> {
     let pragma = format!("PRAGMA table_info({table})");
     let rows = sqlx::query(&pragma).fetch_all(pool).await?;
-    let exists = rows
+    let names = rows
         .iter()
-        .filter_map(|row| row.try_get::<String, _>("name").ok())
-        .any(|name| name == column);
+        .map(|row| row.try_get::<String, _>("name"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let exists = names.iter().any(|name| name == column);
 
     if !exists {
         let sql = format!("ALTER TABLE {table} ADD COLUMN {definition}");
@@ -441,10 +442,18 @@ async fn sqlite_repair_legacy_audit_log_token_fk(pool: &Pool<Sqlite>) -> anyhow:
     let foreign_keys = sqlx::query("PRAGMA foreign_key_list(audit_logs)")
         .fetch_all(pool)
         .await?;
-    let has_legacy_target = foreign_keys.iter().any(|row| {
-        row.try_get::<String, _>("from").ok().as_deref() == Some("api_token_id")
-            && row.try_get::<String, _>("table").ok().as_deref() == Some("api_tokens")
-    });
+    let foreign_key_targets = foreign_keys
+        .iter()
+        .map(|row| {
+            Ok((
+                row.try_get::<String, _>("from")?,
+                row.try_get::<String, _>("table")?,
+            ))
+        })
+        .collect::<Result<Vec<_>, sqlx::Error>>()?;
+    let has_legacy_target = foreign_key_targets
+        .iter()
+        .any(|(from, table)| from == "api_token_id" && table == "api_tokens");
     if !has_legacy_target {
         return Ok(());
     }
@@ -1011,7 +1020,7 @@ mod tests {
     // fails at decode time on postgres only (sqlite integers are always
     // 8 bytes), which is how the waf_bans.failed_count login 500 shipped.
     #[tokio::test]
-    async fn postgres_migrations_replay_and_column_widths() {
+    async fn postgres_migrations_replay_column_widths_and_row_decoding() {
         let Ok(url) = std::env::var("XLSTATUS_TEST_PG_URL") else {
             eprintln!("skipping: XLSTATUS_TEST_PG_URL not set");
             return;
@@ -1047,5 +1056,90 @@ mod tests {
         // Intentionally INT4: its readers decode i32 (public status, service
         // history, monitor writes). Widening it would silently null those out.
         assert_eq!(width_of("service_results", "delay_ms"), "integer");
+
+        let service_id = Uuid::now_v7();
+        let result_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO services \
+             (id, name, type, target, interval_seconds, timeout_seconds, enabled, created_at, updated_at) \
+             VALUES ($1, 'pg decode smoke', 'http', 'https://example.com', 75, 12, true, NOW(), NOW())",
+        )
+        .bind(service_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO service_results \
+             (id, service_id, status, delay_ms, status_code, created_at) \
+             VALUES ($1, $2, 'success', 42, 204, NOW())",
+        )
+        .bind(result_id)
+        .bind(service_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let service_projection = |interval_expression: &str| {
+            format!(
+                "SELECT id::text AS id, name, type, target, \
+                 {interval_expression} AS interval_seconds, timeout_seconds, enabled, \
+                 server_id::text AS server_id, notification_group_id::text AS notification_group_id, \
+                 created_at::text AS created_at, updated_at::text AS updated_at, \
+                 COALESCE(cover_mode, 'local') AS cover_mode, exclude_server_ids_json, \
+                 failure_task_ids_json, recovery_task_ids_json, \
+                 NULL::text AS last_status, NULL::text AS last_check_at, \
+                 NULL::text AS cert_fingerprint, NULL::text AS cert_not_after \
+                 FROM services WHERE id = $1"
+            )
+        };
+        let row = sqlx::query(&service_projection("interval_seconds"))
+            .bind(service_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let service = crate::api::v1::services::service_from_postgres_row(row).unwrap();
+        assert_eq!(service.interval_seconds, 75);
+        assert!(service.enabled);
+
+        let mismatched_row = sqlx::query(&service_projection("interval_seconds::text"))
+            .bind(service_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert!(crate::api::v1::services::service_from_postgres_row(mismatched_row).is_err());
+
+        let history_projection = |delay_expression: &str| {
+            format!(
+                "SELECT id::text AS id, service_id::text AS service_id, \
+                 server_id::text AS server_id, status, {delay_expression} AS delay_ms, \
+                 status_code, error, cert_fingerprint, cert_not_after::text AS cert_not_after, \
+                 created_at::text AS created_at FROM service_results WHERE id = $1"
+            )
+        };
+        let row = sqlx::query(&history_projection("delay_ms"))
+            .bind(result_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let result =
+            crate::api::v1::service_history::service_result_from_postgres_row(row).unwrap();
+        assert_eq!(result.delay_ms, Some(42));
+        assert_eq!(result.status_code, Some(204));
+
+        let mismatched_row = sqlx::query(&history_projection("delay_ms::bigint"))
+            .bind(result_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert!(
+            crate::api::v1::service_history::service_result_from_postgres_row(mismatched_row)
+                .is_err()
+        );
+
+        sqlx::query("DELETE FROM services WHERE id = $1")
+            .bind(service_id)
+            .execute(pool)
+            .await
+            .unwrap();
     }
 }

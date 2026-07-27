@@ -588,10 +588,10 @@ async fn load_sqlite_columns(pool: &Pool<Sqlite>, table: &str) -> Result<Vec<Str
     .fetch_all(pool)
     .await
     .map_err(db_err)?;
-    Ok(rows
-        .into_iter()
-        .filter_map(|row| row.try_get::<String, _>("name").ok())
-        .collect())
+    rows.into_iter()
+        .map(|row| row.try_get::<String, _>("name"))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)
 }
 
 fn ensure_schema_compatible(

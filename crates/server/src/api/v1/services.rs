@@ -276,7 +276,8 @@ async fn list_services_for_auth(
             let mut services = rows
                 .into_iter()
                 .map(service_from_sqlite_row)
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db_err)?;
             attach_service_server_ids(db, &mut services).await?;
             apply_visible_latest_results(db, auth, &mut services).await?;
             Ok(ServiceListResponse { services, total })
@@ -314,7 +315,8 @@ async fn list_services_for_auth(
             let mut services = rows
                 .into_iter()
                 .map(service_from_postgres_row)
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db_err)?;
             attach_service_server_ids(db, &mut services).await?;
             apply_visible_latest_results(db, auth, &mut services).await?;
             Ok(ServiceListResponse { services, total })
@@ -873,6 +875,8 @@ pub(crate) async fn load_service(
             .map_err(db_err)?;
             let mut service = row
                 .map(service_from_sqlite_row)
+                .transpose()
+                .map_err(db_err)?
                 .ok_or_else(|| AppError::NotFound("service not found".into()))?;
             attach_service_server_ids(db, std::slice::from_mut(&mut service)).await?;
             Ok(service)
@@ -907,6 +911,8 @@ pub(crate) async fn load_service(
             .map_err(db_err)?;
             let mut service = row
                 .map(service_from_postgres_row)
+                .transpose()
+                .map_err(db_err)?
                 .ok_or_else(|| AppError::NotFound("service not found".into()))?;
             attach_service_server_ids(db, std::slice::from_mut(&mut service)).await?;
             Ok(service)
@@ -925,128 +931,110 @@ async fn load_service_for_auth(
     Ok(service)
 }
 
-fn service_from_sqlite_row(row: sqlx::sqlite::SqliteRow) -> ServiceResponse {
-    let kind: String = row.try_get("type").unwrap_or_else(|_| "http".into());
-    let id: String = row.try_get("id").unwrap_or_default();
+fn service_from_sqlite_row(row: sqlx::sqlite::SqliteRow) -> Result<ServiceResponse, sqlx::Error> {
+    let kind: String = row.try_get("type")?;
+    let id: String = row.try_get("id")?;
     let mut config_warnings = Vec::new();
     let exclude_server_ids = parse_server_ids_json(
-        row.try_get::<Option<String>, _>("exclude_server_ids_json")
-            .ok()
-            .flatten(),
+        row.try_get::<Option<String>, _>("exclude_server_ids_json")?,
         &id,
         &mut config_warnings,
     );
     let failure_task_ids = parse_task_ids_json(
-        row.try_get::<Option<String>, _>("failure_task_ids_json")
-            .ok()
-            .flatten(),
+        row.try_get::<Option<String>, _>("failure_task_ids_json")?,
         "failure_task_ids_json",
         &id,
         &mut config_warnings,
     );
     let recovery_task_ids = parse_task_ids_json(
-        row.try_get::<Option<String>, _>("recovery_task_ids_json")
-            .ok()
-            .flatten(),
+        row.try_get::<Option<String>, _>("recovery_task_ids_json")?,
         "recovery_task_ids_json",
         &id,
         &mut config_warnings,
     );
-    ServiceResponse {
+    Ok(ServiceResponse {
         id,
-        name: row.try_get("name").unwrap_or_default(),
+        name: row.try_get("name")?,
         service_type: kind.clone(),
         kind: kind.clone(),
         service_type_alias: kind,
-        target: row.try_get("target").unwrap_or_default(),
-        interval_seconds: row.try_get::<i64, _>("interval_seconds").unwrap_or(60) as i32,
-        timeout_seconds: row.try_get::<i64, _>("timeout_seconds").unwrap_or(10) as i32,
-        enabled: row.try_get::<i64, _>("enabled").unwrap_or(0) != 0,
-        server_id: row.try_get("server_id").ok(),
+        target: row.try_get("target")?,
+        interval_seconds: row.try_get::<i64, _>("interval_seconds")? as i32,
+        timeout_seconds: row.try_get::<i64, _>("timeout_seconds")? as i32,
+        enabled: row.try_get::<i64, _>("enabled")? != 0,
+        server_id: row.try_get("server_id")?,
         server_ids: row
-            .try_get::<Option<String>, _>("server_id")
-            .ok()
-            .flatten()
+            .try_get::<Option<String>, _>("server_id")?
             .into_iter()
             .collect(),
-        cover_mode: row
-            .try_get::<String, _>("cover_mode")
-            .unwrap_or_else(|_| "local".into()),
+        cover_mode: row.try_get("cover_mode")?,
         exclude_server_ids,
-        notification_group_id: row.try_get("notification_group_id").ok(),
+        notification_group_id: row.try_get("notification_group_id")?,
         failure_task_ids,
         recovery_task_ids,
         config_warnings,
-        last_status: row.try_get("last_status").ok(),
-        last_check_at: row.try_get("last_check_at").ok(),
-        cert_fingerprint: row.try_get("cert_fingerprint").ok(),
-        cert_not_after: row.try_get("cert_not_after").ok(),
-        created_at: row.try_get("created_at").unwrap_or_default(),
-        updated_at: row.try_get("updated_at").unwrap_or_default(),
+        last_status: row.try_get("last_status")?,
+        last_check_at: row.try_get("last_check_at")?,
+        cert_fingerprint: row.try_get("cert_fingerprint")?,
+        cert_not_after: row.try_get("cert_not_after")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
         history: None,
-    }
+    })
 }
 
-fn service_from_postgres_row(row: sqlx::postgres::PgRow) -> ServiceResponse {
-    let kind: String = row.try_get("type").unwrap_or_else(|_| "http".into());
-    let id: String = row.try_get("id").unwrap_or_default();
+pub(crate) fn service_from_postgres_row(
+    row: sqlx::postgres::PgRow,
+) -> Result<ServiceResponse, sqlx::Error> {
+    let kind: String = row.try_get("type")?;
+    let id: String = row.try_get("id")?;
     let mut config_warnings = Vec::new();
     let exclude_server_ids = parse_server_ids_json(
-        row.try_get::<Option<String>, _>("exclude_server_ids_json")
-            .ok()
-            .flatten(),
+        row.try_get::<Option<String>, _>("exclude_server_ids_json")?,
         &id,
         &mut config_warnings,
     );
     let failure_task_ids = parse_task_ids_json(
-        row.try_get::<Option<String>, _>("failure_task_ids_json")
-            .ok()
-            .flatten(),
+        row.try_get::<Option<String>, _>("failure_task_ids_json")?,
         "failure_task_ids_json",
         &id,
         &mut config_warnings,
     );
     let recovery_task_ids = parse_task_ids_json(
-        row.try_get::<Option<String>, _>("recovery_task_ids_json")
-            .ok()
-            .flatten(),
+        row.try_get::<Option<String>, _>("recovery_task_ids_json")?,
         "recovery_task_ids_json",
         &id,
         &mut config_warnings,
     );
-    ServiceResponse {
+    Ok(ServiceResponse {
         id,
-        name: row.try_get("name").unwrap_or_default(),
+        name: row.try_get("name")?,
         service_type: kind.clone(),
         kind: kind.clone(),
         service_type_alias: kind,
-        target: row.try_get("target").unwrap_or_default(),
-        interval_seconds: row.try_get("interval_seconds").unwrap_or(60),
-        timeout_seconds: row.try_get("timeout_seconds").unwrap_or(10),
-        enabled: row.try_get("enabled").unwrap_or(false),
-        server_id: row.try_get("server_id").ok(),
+        target: row.try_get("target")?,
+        interval_seconds: row.try_get("interval_seconds")?,
+        timeout_seconds: row.try_get("timeout_seconds")?,
+        enabled: row.try_get("enabled")?,
+        server_id: row.try_get("server_id")?,
         server_ids: row
-            .try_get::<Option<String>, _>("server_id")
-            .ok()
-            .flatten()
+            .try_get::<Option<String>, _>("server_id")?
             .into_iter()
             .collect(),
-        cover_mode: row
-            .try_get::<String, _>("cover_mode")
-            .unwrap_or_else(|_| "local".into()),
+        cover_mode: row.try_get("cover_mode")?,
         exclude_server_ids,
-        notification_group_id: row.try_get("notification_group_id").ok(),
+        notification_group_id: row.try_get("notification_group_id")?,
         failure_task_ids,
         recovery_task_ids,
         config_warnings,
-        last_status: row.try_get("last_status").ok(),
-        last_check_at: row.try_get("last_check_at").ok(),
-        cert_fingerprint: row.try_get("cert_fingerprint").ok(),
-        cert_not_after: row.try_get("cert_not_after").ok(),
-        created_at: row.try_get("created_at").unwrap_or_default(),
-        updated_at: row.try_get("updated_at").unwrap_or_default(),
+        last_status: row.try_get("last_status")?,
+        last_check_at: row.try_get("last_check_at")?,
+        cert_fingerprint: row.try_get("cert_fingerprint")?,
+        cert_not_after: row.try_get("cert_not_after")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
         history: None,
-    }
+    })
 }
 
 struct LatestServiceResult {
@@ -1125,12 +1113,16 @@ async fn load_latest_service_result_for_servers(
                 query = query.bind(server_id);
             }
             let row = query.fetch_optional(pool).await.map_err(db_err)?;
-            Ok(row.map(|row| LatestServiceResult {
-                status: row.try_get("status").ok(),
-                created_at: row.try_get("created_at").ok(),
-                cert_fingerprint: row.try_get("cert_fingerprint").ok(),
-                cert_not_after: row.try_get("cert_not_after").ok(),
-            }))
+            row.map(|row| {
+                Ok(LatestServiceResult {
+                    status: row.try_get("status")?,
+                    created_at: row.try_get("created_at")?,
+                    cert_fingerprint: row.try_get("cert_fingerprint")?,
+                    cert_not_after: row.try_get("cert_not_after")?,
+                })
+            })
+            .transpose()
+            .map_err(db_err)
         }
         crate::db::DatabaseBackend::Postgres(pool) => {
             let parsed_service_id = Uuid::parse_str(service_id)
@@ -1151,12 +1143,16 @@ async fn load_latest_service_result_for_servers(
             .fetch_optional(pool)
             .await
             .map_err(db_err)?;
-            Ok(row.map(|row| LatestServiceResult {
-                status: row.try_get("status").ok(),
-                created_at: row.try_get("created_at").ok(),
-                cert_fingerprint: row.try_get("cert_fingerprint").ok(),
-                cert_not_after: row.try_get("cert_not_after").ok(),
-            }))
+            row.map(|row| {
+                Ok(LatestServiceResult {
+                    status: row.try_get("status")?,
+                    created_at: row.try_get("created_at")?,
+                    cert_fingerprint: row.try_get("cert_fingerprint")?,
+                    cert_not_after: row.try_get("cert_not_after")?,
+                })
+            })
+            .transpose()
+            .map_err(db_err)
         }
     }
 }
@@ -1263,9 +1259,7 @@ async fn fetch_service_history_batch_sqlite(
         .await
         .map_err(db_err)?;
 
-    Ok(group_service_history(
-        rows.into_iter().map(service_result_from_sqlite_row),
-    ))
+    group_service_history(rows.into_iter().map(service_result_from_sqlite_row)).map_err(db_err)
 }
 
 async fn fetch_service_history_batch_postgres(
@@ -1316,22 +1310,21 @@ async fn fetch_service_history_batch_postgres(
         .await
         .map_err(db_err)?;
 
-    Ok(group_service_history(
-        rows.into_iter().map(service_result_from_postgres_row),
-    ))
+    group_service_history(rows.into_iter().map(service_result_from_postgres_row)).map_err(db_err)
 }
 
 fn group_service_history(
-    results: impl Iterator<Item = ServiceResult>,
-) -> HashMap<String, Vec<ServiceResult>> {
+    results: impl Iterator<Item = Result<ServiceResult, sqlx::Error>>,
+) -> Result<HashMap<String, Vec<ServiceResult>>, sqlx::Error> {
     let mut grouped: HashMap<String, Vec<ServiceResult>> = HashMap::new();
     for result in results {
+        let result = result?;
         grouped
             .entry(result.service_id.clone())
             .or_default()
             .push(result);
     }
-    grouped
+    Ok(grouped)
 }
 
 pub(crate) async fn visible_server_ids_for_auth(
@@ -1373,10 +1366,10 @@ pub(crate) async fn visible_server_ids_for_auth(
                 }
             }
             let rows = sql.fetch_all(pool).await.map_err(db_err)?;
-            Ok(rows
-                .into_iter()
-                .filter_map(|row| row.try_get::<String, _>("id").ok())
-                .collect())
+            rows.into_iter()
+                .map(|row| row.try_get::<String, _>("id"))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db_err)
         }
         crate::db::DatabaseBackend::Postgres(pool) => {
             let mut query = if auth.role.is_admin() {
@@ -1408,10 +1401,10 @@ pub(crate) async fn visible_server_ids_for_auth(
                 }
             }
             let rows = sql.fetch_all(pool).await.map_err(db_err)?;
-            Ok(rows
-                .into_iter()
-                .filter_map(|row| row.try_get::<String, _>("id").ok())
-                .collect())
+            rows.into_iter()
+                .map(|row| row.try_get::<String, _>("id"))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db_err)
         }
     }
 }
