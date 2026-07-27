@@ -694,16 +694,17 @@ async fn list_owned_agent_records(
             .bind(owner_user_id)
             .fetch_all(pool)
             .await?;
-            Ok(rows
-                .into_iter()
-                .map(|row| AgentSelectorRecord {
-                    id: row.try_get::<String, _>("id").unwrap_or_default(),
-                    name: row.try_get::<String, _>("name").unwrap_or_default(),
-                    dashboard_metadata_json: row.try_get("dashboard_metadata_json").ok(),
-                    last_info_json: row.try_get("last_info_json").ok(),
-                    last_state_json: row.try_get("last_state_json").ok(),
+            rows.into_iter()
+                .map(|row| {
+                    Ok(AgentSelectorRecord {
+                        id: row.try_get("id")?,
+                        name: row.try_get("name")?,
+                        dashboard_metadata_json: row.try_get("dashboard_metadata_json")?,
+                        last_info_json: row.try_get("last_info_json")?,
+                        last_state_json: row.try_get("last_state_json")?,
+                    })
                 })
-                .collect())
+                .collect()
         }
         crate::db::DatabaseBackend::Postgres(pool) => {
             let owner_id = uuid::Uuid::parse_str(owner_user_id)?;
@@ -723,16 +724,17 @@ async fn list_owned_agent_records(
             .bind(AGENT_TELEMETRY_JSON_MAX_BYTES as i64)
             .fetch_all(pool)
             .await?;
-            Ok(rows
-                .into_iter()
-                .map(|row| AgentSelectorRecord {
-                    id: row.try_get::<String, _>("id").unwrap_or_default(),
-                    name: row.try_get::<String, _>("name").unwrap_or_default(),
-                    dashboard_metadata_json: row.try_get("dashboard_metadata_json").ok(),
-                    last_info_json: row.try_get("last_info_json").ok(),
-                    last_state_json: row.try_get("last_state_json").ok(),
+            rows.into_iter()
+                .map(|row| {
+                    Ok(AgentSelectorRecord {
+                        id: row.try_get("id")?,
+                        name: row.try_get("name")?,
+                        dashboard_metadata_json: row.try_get("dashboard_metadata_json")?,
+                        last_info_json: row.try_get("last_info_json")?,
+                        last_state_json: row.try_get("last_state_json")?,
+                    })
                 })
-                .collect())
+                .collect()
         }
     }
 }
@@ -771,7 +773,8 @@ async fn list_group_agent_ids(
                 .await?;
                 out.extend(
                     rows.into_iter()
-                        .filter_map(|row| row.try_get::<String, _>("agent_id").ok()),
+                        .map(|row| row.try_get::<String, _>("agent_id"))
+                        .collect::<Result<Vec<_>, _>>()?,
                 );
             }
         }
@@ -800,7 +803,8 @@ async fn list_group_agent_ids(
                 .await?;
                 out.extend(
                     rows.into_iter()
-                        .filter_map(|row| row.try_get::<String, _>("agent_id").ok()),
+                        .map(|row| row.try_get::<String, _>("agent_id"))
+                        .collect::<Result<Vec<_>, _>>()?,
                 );
             }
         }

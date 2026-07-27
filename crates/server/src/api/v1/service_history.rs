@@ -180,10 +180,11 @@ async fn list_service_history_for_auth(
                 .fetch_all(pool)
                 .await
                 .map_err(db_err)
-                .map(|rows| {
+                .and_then(|rows| {
                     rows.into_iter()
                         .map(service_result_from_sqlite_row)
-                        .collect()
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(db_err)
                 })
         }
         crate::db::DatabaseBackend::Postgres(pool) => {
@@ -231,10 +232,11 @@ async fn list_service_history_for_auth(
                 .fetch_all(pool)
                 .await
                 .map_err(db_err)
-                .map(|rows| {
+                .and_then(|rows| {
                     rows.into_iter()
                         .map(service_result_from_postgres_row)
-                        .collect()
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(db_err)
                 })
         }
     }
@@ -355,34 +357,38 @@ fn parse_uuid_ids(ids: &[String]) -> Result<Vec<Uuid>, AppError> {
         .collect()
 }
 
-pub(crate) fn service_result_from_sqlite_row(row: sqlx::sqlite::SqliteRow) -> ServiceResult {
-    ServiceResult {
-        id: row.try_get("id").unwrap_or_default(),
-        service_id: row.try_get("service_id").unwrap_or_default(),
-        server_id: row.try_get("server_id").ok(),
-        status: row.try_get("status").unwrap_or_default(),
-        delay_ms: row.try_get("delay_ms").ok(),
-        status_code: row.try_get("status_code").ok(),
-        error: row.try_get("error").ok(),
-        cert_fingerprint: row.try_get("cert_fingerprint").ok(),
-        cert_not_after: row.try_get("cert_not_after").ok(),
-        created_at: row.try_get("created_at").unwrap_or_default(),
-    }
+pub(crate) fn service_result_from_sqlite_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<ServiceResult, sqlx::Error> {
+    Ok(ServiceResult {
+        id: row.try_get("id")?,
+        service_id: row.try_get("service_id")?,
+        server_id: row.try_get("server_id")?,
+        status: row.try_get("status")?,
+        delay_ms: row.try_get("delay_ms")?,
+        status_code: row.try_get("status_code")?,
+        error: row.try_get("error")?,
+        cert_fingerprint: row.try_get("cert_fingerprint")?,
+        cert_not_after: row.try_get("cert_not_after")?,
+        created_at: row.try_get("created_at")?,
+    })
 }
 
-pub(crate) fn service_result_from_postgres_row(row: sqlx::postgres::PgRow) -> ServiceResult {
-    ServiceResult {
-        id: row.try_get("id").unwrap_or_default(),
-        service_id: row.try_get("service_id").unwrap_or_default(),
-        server_id: row.try_get("server_id").ok(),
-        status: row.try_get("status").unwrap_or_default(),
-        delay_ms: row.try_get("delay_ms").ok(),
-        status_code: row.try_get("status_code").ok(),
-        error: row.try_get("error").ok(),
-        cert_fingerprint: row.try_get("cert_fingerprint").ok(),
-        cert_not_after: row.try_get("cert_not_after").ok(),
-        created_at: row.try_get("created_at").unwrap_or_default(),
-    }
+pub(crate) fn service_result_from_postgres_row(
+    row: sqlx::postgres::PgRow,
+) -> Result<ServiceResult, sqlx::Error> {
+    Ok(ServiceResult {
+        id: row.try_get("id")?,
+        service_id: row.try_get("service_id")?,
+        server_id: row.try_get("server_id")?,
+        status: row.try_get("status")?,
+        delay_ms: row.try_get("delay_ms")?,
+        status_code: row.try_get("status_code")?,
+        error: row.try_get("error")?,
+        cert_fingerprint: row.try_get("cert_fingerprint")?,
+        cert_not_after: row.try_get("cert_not_after")?,
+        created_at: row.try_get("created_at")?,
+    })
 }
 
 fn require_scope(auth: &AuthSession, scope: &str) -> Result<(), AppError> {

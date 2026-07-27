@@ -447,7 +447,9 @@ async fn public_services(state: &AppState) -> Result<Vec<PublicServiceView>, App
                 let Some(server_ids) = public_service_server_ids(state, &service_id).await? else {
                     continue;
                 };
-                let legacy_server_id: Option<String> = row.try_get("server_id").ok();
+                let legacy_server_id: Option<String> = row
+                    .try_get("server_id")
+                    .map_err(|e| AppError::Database(e.into()))?;
                 let visible_server_ids = visible_public_service_server_ids(
                     server_ids,
                     legacy_server_id,
@@ -518,7 +520,9 @@ async fn public_services_postgres(
             let Some(server_ids) = public_service_server_ids(state, &service_id).await? else {
                 continue;
             };
-            let legacy_server_id: Option<String> = row.try_get("server_id").ok();
+            let legacy_server_id: Option<String> = row
+                .try_get("server_id")
+                .map_err(|e| AppError::Database(e.into()))?;
             let visible_server_ids =
                 visible_public_service_server_ids(server_ids, legacy_server_id, public_server_ids);
             if visible_server_ids.is_empty() {
@@ -850,18 +854,17 @@ async fn public_service_history_sqlite(
 
     let history = rows
         .into_iter()
-        .filter_map(|row| {
-            let server_id = row.try_get("server_id").ok();
-            visible_server_ids
-                .contains(server_id.as_ref()?)
-                .then(|| PublicServiceResultView {
-                    server_id,
-                    status: row.try_get("status").unwrap_or_default(),
-                    delay_ms: row.try_get("delay_ms").ok(),
-                    created_at: row.try_get("created_at").unwrap_or_default(),
-                })
+        .map(|row| {
+            let server_id: String = row.try_get("server_id")?;
+            Ok(PublicServiceResultView {
+                server_id: Some(server_id),
+                status: row.try_get("status")?,
+                delay_ms: row.try_get("delay_ms")?,
+                created_at: row.try_get("created_at")?,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, sqlx::Error>>()
+        .map_err(|e| AppError::Database(e.into()))?;
     Ok(history)
 }
 
@@ -898,20 +901,18 @@ async fn public_service_history_postgres(
     .await
     .map_err(|e| AppError::Database(e.into()))?;
 
-    Ok(rows
-        .into_iter()
-        .filter_map(|row| {
-            let server_id = row.try_get("server_id").ok();
-            visible_server_ids
-                .contains(server_id.as_ref()?)
-                .then(|| PublicServiceResultView {
-                    server_id,
-                    status: row.try_get("status").unwrap_or_default(),
-                    delay_ms: row.try_get("delay_ms").ok(),
-                    created_at: row.try_get("created_at").unwrap_or_default(),
-                })
+    rows.into_iter()
+        .map(|row| {
+            let server_id: String = row.try_get("server_id")?;
+            Ok(PublicServiceResultView {
+                server_id: Some(server_id),
+                status: row.try_get("status")?,
+                delay_ms: row.try_get("delay_ms")?,
+                created_at: row.try_get("created_at")?,
+            })
         })
-        .collect())
+        .collect::<Result<Vec<_>, sqlx::Error>>()
+        .map_err(|e| AppError::Database(e.into()))
 }
 
 async fn public_service_server_ids(
@@ -931,8 +932,9 @@ async fn public_service_server_ids(
             let row_count = rows.len();
             let ids = rows
                 .into_iter()
-                .filter_map(|row| row.try_get::<String, _>("server_id").ok())
-                .collect::<Vec<_>>();
+                .map(|row| row.try_get::<String, _>("server_id"))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| AppError::Database(e.into()))?;
             Ok(bound_public_service_server_ids(service_id, row_count, ids))
         }
         DatabaseBackend::Postgres(pool) => {
@@ -949,8 +951,9 @@ async fn public_service_server_ids(
             let row_count = rows.len();
             let ids = rows
                 .into_iter()
-                .filter_map(|row| row.try_get::<String, _>("server_id").ok())
-                .collect::<Vec<_>>();
+                .map(|row| row.try_get::<String, _>("server_id"))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| AppError::Database(e.into()))?;
             Ok(bound_public_service_server_ids(service_id, row_count, ids))
         }
     }

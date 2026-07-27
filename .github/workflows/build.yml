@@ -73,6 +73,15 @@ jobs:
           grep -F "DEFAULT_AGENT_VERSION = \"$GITHUB_REF_NAME\"" 'web/app/(dashboard)/settings/sections/AgentInstallCard.tsx'
       - name: Check formatting
         run: cargo fmt --check
+      - name: Reject silently swallowed SQL row decode errors
+        shell: bash
+        run: |
+          set -euo pipefail
+          pattern='try_get(?:<[^>]+>)?\([^)]*\)\s*\.(?:ok\(\)|unwrap_or(?:_default|_else)?\s*\()'
+          if rg --line-number --multiline "$pattern" crates/server/src; then
+            echo "::error::Do not turn sqlx row decode errors into None/default values; decode Option<T> explicitly and propagate errors."
+            exit 1
+          fi
       - name: Check workspace
         run: cargo check --workspace --locked
       - name: Lint workspace
