@@ -19,6 +19,7 @@ const TENCENT_DNSPOD_API_HOST: &str = "dnspod.tencentcloudapi.com";
 const TENCENT_DNSPOD_API_URL: &str = "https://dnspod.tencentcloudapi.com/";
 
 /// DDNS provider trait
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait DdnsProviderTrait: Send + Sync {
     /// Update DNS record with new IP

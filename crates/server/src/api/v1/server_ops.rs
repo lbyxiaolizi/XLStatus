@@ -1116,7 +1116,7 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
         return Err("length is not a multiple of 4".to_string());
     }
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    for chunk in bytes.chunks_exact(4) {
+    for chunk in bytes.as_chunks::<4>().0 {
         let mut vals = [0u8; 4];
         let mut padding = 0;
         for (idx, b) in chunk.iter().copied().enumerate() {

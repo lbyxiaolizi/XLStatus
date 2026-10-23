@@ -95,6 +95,7 @@ pub fn ddns_body_limit() -> DefaultBodyLimit {
     DefaultBodyLimit::max(DDNS_API_MAX_BODY_BYTES)
 }
 
+#[allow(clippy::result_large_err)]
 pub async fn create_ddns_config(
     State(state): State<AppState>,
     auth_user: AuthUser,

@@ -260,6 +260,7 @@ impl AgentService for AgentServiceImpl {
     }
 }
 
+#[allow(clippy::result_large_err)]
 async fn authenticate_agent_request(
     db: &DatabaseBackend,
     jwt_secret: &str,
