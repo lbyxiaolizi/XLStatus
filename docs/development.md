@@ -1,6 +1,6 @@
 # 开发者与贡献指南 (Development Guide)
 
-本文档面向参与 **XLStatus `v0.2`** 开发的贡献者与维护者，介绍 Rust Workspace 各模块职责、Next.js 前端工程规范、数据库双后端迁移约定、开发辅助工具 (`xtask`) 以及合并前必须通过的 CI/CD 质量门禁。
+本文档面向参与 **XLStatus `v0.3`** 开发的贡献者与维护者，介绍 Rust Workspace 各模块职责、Next.js 前端工程规范、数据库双后端迁移约定、开发辅助工具 (`xtask`) 以及合并前必须通过的 CI/CD 质量门禁。
 
 ---
 

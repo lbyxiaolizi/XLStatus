@@ -1,6 +1,6 @@
 # XLStatus 自动化测试与端到端验收指南 (`TESTING.md`)
 
-本文档是 **XLStatus `v0.2`** 自动化测试体系的权威指南，涵盖 **849+ 个单元与集成测试用例**（Rust Workspace、Next.js 前端安全与组件逻辑、MCP Stdio 桥接、Python 数据库迁移工具）以及 `test-run/` 目录下的 **21 个里程碑端到端 (E2E) 与安全回归验收脚本**。
+本文档是 **XLStatus `v0.3`** 自动化测试体系的权威指南，涵盖 **849+ 个单元与集成测试用例**（Rust Workspace、Next.js 前端安全与组件逻辑、MCP Stdio 桥接、Python 数据库迁移工具）以及 `test-run/` 目录下的 **21 个里程碑端到端 (E2E) 与安全回归验收脚本**。
 
 ---
 

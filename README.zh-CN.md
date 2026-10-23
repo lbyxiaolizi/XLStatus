@@ -3,7 +3,7 @@
 # XLStatus
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Release](https://img.shields.io/badge/release-v0.2-10b981.svg)](https://github.com/lbyxiaolizi/XLStatus/releases)
+[![Release](https://img.shields.io/badge/release-v0.3-10b981.svg)](https://github.com/lbyxiaolizi/XLStatus/releases)
 [![Rust](https://img.shields.io/badge/Rust-Axum%20%2B%20Tonic%20gRPC-orange.svg)](./crates/)
 [![Frontend](https://img.shields.io/badge/Next.js%2016-React%2019%20%2B%20Strict%20TS-000000.svg)](./web/)
 [![MCP](https://img.shields.io/badge/MCP-2024--11--05-6366f1.svg)](./docs/mcp.md)
@@ -12,7 +12,7 @@
 
 它将主机实时遥测、可定制公开状态页、分布式与本地服务拨测、多条件告警与自愈联动、批量/定时任务调度、WebSocket PTY 终端、安全远程文件管理、多厂商 DDNS、NAT 反向隧道以及原生 **Model Context Protocol（`MCP 2024-11-05`）** 服务端整合进同一套经过深度安全审计的部署栈中。
 
-> **当前正式版本**：`v0.2` —— 推荐从 [文档索引](./docs/README.md)、[AI 与 MCP 运维指南](./docs/mcp.md) 以及 [安全架构与加固白皮书](./security.md) 开始阅读。
+> **当前正式版本**：`v0.3` —— 推荐从 [文档索引](./docs/README.md)、[AI 与 MCP 运维指南](./docs/mcp.md) 以及 [安全架构与加固白皮书](./security.md) 开始阅读。
 
 ---
 
@@ -118,8 +118,8 @@ docker compose -f docker-compose.pg.yml up -d
 ### 安装 Server
 
 ```bash
-curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.2/install-server.sh \
-  | sudo VERSION=v0.2 bash
+curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.3/install-server.sh \
+  | sudo VERSION=v0.3 bash
 ```
 
 ### 注册并安装 Agent
@@ -129,10 +129,10 @@ curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.2/instal
 ```bash
 sudo SERVER_URL=https://status.example.com \
   GRPC_SERVER=https://grpc.status.example.com:50051 \
-  VERSION=v0.2 \
+  VERSION=v0.3 \
   ENROLLMENT_TOKEN=xle_your_single_use_enrollment_token \
   AGENT_NAME="$(hostname)" \
-  bash -c 'curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.2/install-agent.sh | bash'
+  bash -c 'curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.3/install-agent.sh | bash'
 ```
 
 Server 与 Agent 安装脚本均采用同目录原子暂存与替换机制，内置 systemd 内核级沙箱加固（`NoNewPrivileges`、`ProtectSystem`、`ProtectHome`、`UMask=0077`），并在健康检查失败时自动回滚至升级前状态。

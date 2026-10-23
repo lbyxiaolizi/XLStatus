@@ -1240,7 +1240,7 @@ function AgentOpsPanel({
               className={inputClass}
               value={updateForm.version}
               onChange={(e) => onUpdateChange({ ...updateForm, version: e.target.value })}
-              placeholder="v0.2"
+              placeholder="v0.3"
             />
           </Field>
           <Field label={copy.serverDetailPage.downloadUrlLabel}>
@@ -1248,7 +1248,7 @@ function AgentOpsPanel({
               className={inputClass}
               value={updateForm.download_url}
               onChange={(e) => onUpdateChange({ ...updateForm, download_url: e.target.value })}
-              placeholder="https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.2/xlstatus-agent-linux-x86_64"
+              placeholder="https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.3/xlstatus-agent-linux-x86_64"
             />
           </Field>
           <Field label="SHA-256">

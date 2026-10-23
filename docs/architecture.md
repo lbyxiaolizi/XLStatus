@@ -317,7 +317,7 @@ flowchart LR
 
 ### 5.2 systemd 原生守护进程拓扑
 - `deploy/install.sh`：自动检测 Linux 架构（`x86_64` / `arm64` / `i386`），安装 `xlstatus-server` 与 `/etc/systemd/system/xlstatus-server.service`。
-- `deploy/install-agent.sh`：支持从 GitHub Release（默认 fallback `v0.2`）下载对应架构二进制，完成节点 enrollment 并注册 `xlstatus-agent.service`。
+- `deploy/install-agent.sh`：支持从 GitHub Release（默认 fallback `v0.3`）下载对应架构二进制，完成节点 enrollment 并注册 `xlstatus-agent.service`。
 
 ### 5.3 GitHub Release 多平台构建矩阵
 推送 `v*` 标签后，`.github/workflows/` 自动交叉编译并发布 10 种平台架构的 `server` 与 `agent` 二进制资产：

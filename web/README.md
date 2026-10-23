@@ -6,7 +6,7 @@ The **XLStatus Web Ops Workbench** is a high-density, neo-brutalist infrastructu
 
 ## Tech Stack & Strict TypeScript Guarantees
 
-- **Framework**: Next.js `16.2.9` (App Router) + React `19.2.4`
+- **Framework**: Next.js `16.4.1` (App Router) + React `19.2.4`
 - **Styling & Theme**: Tailwind CSS v4 (`@tailwindcss/postcss`) with dual Neo-Brutalist palettes:
   - **Light Mode**: High-contrast ink-black borders (`#121212`) and vibrant pink accents on `#f8f8f8`
   - **Dark Mode**: Crisp emerald telemetry accents on `#121212`

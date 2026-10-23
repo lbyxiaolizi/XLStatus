@@ -1,6 +1,6 @@
 # XLStatus 权威文档索引 (Documentation Index)
 
-欢迎查阅 **XLStatus** 官方技术与运维文档库。`docs/` 目录收录了当前发布版本（`v0.2+`）在安装部署、配置治理、Web 控制台、Agent 接入、AI-Native MCP 运维、日常排障与架构研发所需的全部权威参考文档。
+欢迎查阅 **XLStatus** 官方技术与运维文档库。`docs/` 目录收录了当前发布版本（`v0.3+`）在安装部署、配置治理、Web 控制台、Agent 接入、AI-Native MCP 运维、日常排障与架构研发所需的全部权威参考文档。
 
 ---
 
@@ -60,7 +60,7 @@
 - **时序与关系存储 (`xlstatus-tsdb` + SQLite / PostgreSQL)**：内置数据库 Schema 自动迁移，支持零外部依赖的嵌入式 SQLite（WAL 模式）或生产级 PostgreSQL，配合 `xlstatus-tsdb` 提供 1h / 24h / 7d / 30d 降采样指标查询。
 - **Web 运维工作台 (`web/`)**：基于 Next.js 16 (App Router)、React 19 与 Tailwind CSS v4 构建，包含实时集群大盘、3D/SVG 世界地图、Web 终端、文件管理器、服务拨测 SLA、告警规则、NAT/DDNS 管理、MCP AI Ops Studio 与公开状态页（含 MJPEG 摘要流）。
 - **AI-Native MCP 体系 (`crates/server/src/mcp/` + `scripts/xlstatus-mcp-stdio.mjs`)**：原生实现 Model Context Protocol `2024-11-05`，支持 Streamable HTTP (`POST /mcp`)、Web AI Ops Studio 与 Stdio 桥接器三种接入形态，内置 19 项工具、6 套只读 SRE 诊断剧本、6 类 `xlstatus://` 上下文资源与 4 套动态注入实时遥测的 SRE 提示词。
-- **跨平台分发**：GitHub Release 提供 Linux (`x86_64` / `arm64` / `i386`)、Windows (`x86_64` / `arm64` / `i386`)、macOS (`x86_64` / `arm64`) 与 FreeBSD (`x86_64` / `i386`) 预编译二进制，配套 `deploy/install.sh` 与 `deploy/install-agent.sh` 一键部署脚本（默认 fallback 版本 `v0.2`）。
+- **跨平台分发**：GitHub Release 提供 Linux (`x86_64` / `arm64` / `i386`)、Windows (`x86_64` / `arm64` / `i386`)、macOS (`x86_64` / `arm64`) 与 FreeBSD (`x86_64` / `i386`) 预编译二进制，配套 `deploy/install.sh` 与 `deploy/install-agent.sh` 一键部署脚本（默认 fallback 版本 `v0.3`）。
 
 ---
 

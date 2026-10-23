@@ -1,6 +1,6 @@
 # 日常运维手册 (Day-2 Operations)
 
-本文档面向生产环境管理员，涵盖 **XLStatus `v0.2`** 的健康检查、服务生命周期管理、SQLite 在线热备份与加固恢复、SQLite 到 PostgreSQL 原子迁移、以及 Agent 节点集群与安全运营（远程配置下发、强制升级、会话/PAT 管控、WAF 封禁与审计日志）。
+本文档面向生产环境管理员，涵盖 **XLStatus `v0.3`** 的健康检查、服务生命周期管理、SQLite 在线热备份与加固恢复、SQLite 到 PostgreSQL 原子迁移、以及 Agent 节点集群与安全运营（远程配置下发、强制升级、会话/PAT 管控、WAF 封禁与审计日志）。
 
 ---
 

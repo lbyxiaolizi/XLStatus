@@ -1,6 +1,6 @@
 # 快速开始 (5 分钟上手指南)
 
-本文档提供在 5 分钟内启动 **XLStatus `v0.2`** 完整控制面（Server + Web UI + Agent + MCP AI 桥接）的分步指南。你可以选择 **路径 A（Docker Compose 容器化启动）** 或 **路径 B（本地源码编译运行）**。
+本文档提供在 5 分钟内启动 **XLStatus `v0.3`** 完整控制面（Server + Web UI + Agent + MCP AI 桥接）的分步指南。你可以选择 **路径 A（Docker Compose 容器化启动）** 或 **路径 B（本地源码编译运行）**。
 
 生产环境加固、反向代理与 systemd 守护进程部署请继续阅读 [安装部署](./installation.md) 与 [配置参考](./configuration.md)。
 
@@ -190,7 +190,7 @@ NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm start
 2. 点击 **生成注册令牌 (Enrollment Token)**，获得形如 `xle_...` 的一次性注册令牌。
 3. **Linux systemd 一键安装**（自动复制面板生成的带参命令）：
    ```bash
-   curl -fsSL 'http://localhost:8080/api/v1/agents/install.sh?enrollment_token=xle_...&agent_name=node-01&version=v0.2' | sudo bash
+   curl -fsSL 'http://localhost:8080/api/v1/agents/install.sh?enrollment_token=xle_...&agent_name=node-01&version=v0.3' | sudo bash
    ```
 4. **或者使用本地编译的 `xlstatus-agent` 手动注册并运行**：
    ```bash

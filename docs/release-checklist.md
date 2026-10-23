@@ -1,31 +1,31 @@
 # 发布检查清单 (Release Checklist)
 
-在创建 Git Release Tag（如 `v0.2`）并发布新版本前，必须逐项完成本清单中的核验步骤。任何一项未通过均不得打标发布。
+在创建 Git Release Tag（如 `v0.3`）并发布新版本前，必须逐项完成本清单中的核验步骤。任何一项未通过均不得打标发布。
 
 ---
 
 ## 1. 版本号全仓同步核验 (Version Sync)
 
-GitHub Actions (`.github/workflows/build.yml` 中的 `Verify release version metadata` 步骤) 会在推送 `v*` 标签时强制校验以下 6 处版本号完全同步（对于二维标签如 `v0.2`，Cargo 与 npm 清单版本应为 `0.2.0`）：
+GitHub Actions (`.github/workflows/build.yml` 中的 `Verify release version metadata` 步骤) 会在推送 `v*` 标签时强制校验以下 6 处版本号完全同步（对于二维标签如 `v0.3`，Cargo 与 npm 清单版本应为 `0.3.0`）：
 
 1. **Rust Workspace 全部 6 个 Crate (`crates/*/Cargo.toml`)**：
-   - `xlstatus-shared`、`xlstatus-proto-gen`、`xlstatus-tsdb`、`xlstatus-server`、`xlstatus-agent`、`xtask` 的 `version` 均等于 `0.2.0`。
+   - `xlstatus-shared`、`xlstatus-proto-gen`、`xlstatus-tsdb`、`xlstatus-server`、`xlstatus-agent`、`xtask` 的 `version` 均等于 `0.3.0`。
 2. **Web 前端清单 (`web/package.json`)**：
-   - `"version": "0.2.0"`。
+   - `"version": "0.3.0"`。
 3. **Server 安装脚本 (`deploy/install.sh`)**：
-   - `VERSION="${VERSION:-v0.2}"`。
+   - `VERSION="${VERSION:-v0.3}"`。
 4. **Agent 安装脚本 (`deploy/install-agent.sh`)**：
-   - `VERSION="${VERSION:-v0.2}"`。
+   - `VERSION="${VERSION:-v0.3}"`。
 5. **Server 内置 Agent Bootstrap 默认版本 (`crates/server/src/main.rs`)**：
-   - `const DEFAULT_AGENT_INSTALL_VERSION: &str = "v0.2";`。
+   - `const DEFAULT_AGENT_INSTALL_VERSION: &str = "v0.3";`。
 6. **Web 设置页 Agent 安装卡片回退版本 (`web/app/(dashboard)/settings/sections/AgentInstallCard.tsx`)**：
-   - `const DEFAULT_AGENT_VERSION = "v0.2";`。
+   - `const DEFAULT_AGENT_VERSION = "v0.3";`。
 
 ### 一键核验脚本
 
 ```bash
-TAG="v0.2"
-MANIFEST_VERSION="0.2.0"
+TAG="v0.3"
+MANIFEST_VERSION="0.3.0"
 
 cargo metadata --locked --no-deps --format-version 1 \
   | jq -e --arg version "$MANIFEST_VERSION" 'all(.packages[]; .version == $version)'
@@ -141,8 +141,8 @@ python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 1. 确认 GitHub Release 页面已完整上传 20 个二进制资产及 `install-server.sh`、`install-agent.sh`。
 2. 在干净的 Linux 主机或容器中执行一键安装与 `/healthz` 验证：
    ```bash
-   curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.2/install-server.sh | \
-     sudo INTERACTIVE=false VERSION=v0.2 ADMIN_PASSWORD='SmokeTestStrongPassword!2026' bash
+   curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.3/install-server.sh | \
+     sudo INTERACTIVE=false VERSION=v0.3 ADMIN_PASSWORD='SmokeTestStrongPassword!2026' bash
    curl -fsS http://127.0.0.1:8080/healthz
    ```
 3. 登录 Web UI，生成注册令牌并验证 Agent 一键接入与 MCP Studio 调用正常。

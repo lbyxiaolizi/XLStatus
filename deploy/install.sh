@@ -4,7 +4,7 @@ set -e
 # XLStatus Installation Script
 # Usage: bash install.sh
 
-VERSION="${VERSION:-v0.2}"
+VERSION="${VERSION:-v0.3}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/xlstatus}"
 DATA_DIR="${DATA_DIR:-/var/lib/xlstatus}"
 BINARY_PATH="${BINARY_PATH:-}"  # User can provide compiled binary path

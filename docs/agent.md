@@ -13,10 +13,10 @@
 ```bash
 sudo SERVER_URL=http://dashboard.example.com:8080 \
   GRPC_SERVER=https://grpc.dashboard.example.com:50051 \
-  VERSION=v0.2 \
+  VERSION=v0.3 \
   ENROLLMENT_TOKEN=xle_your_enrollment_token \
   AGENT_NAME="$(hostname)" \
-  bash -c 'curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.2/install-agent.sh | bash'
+  bash -c 'curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.3/install-agent.sh | bash'
 ```
 
 安装脚本会自动完成以下安全步骤：

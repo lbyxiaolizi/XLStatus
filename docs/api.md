@@ -1,6 +1,6 @@
 # XLStatus API、WebSocket、MCP 与 gRPC 协议参考
 
-本文档完整描述 XLStatus `v0.2` 的接口体系，涵盖 HTTP REST API（`/api/v1/*`）、实时 WebSocket 流（`/ws/servers`、`/api/v1/ws`）、AI-Native MCP 端点（`/mcp`、`/api/v1/mcp/*`）以及 Agent gRPC 控制/数据平面协议（`xlstatus.v1.AgentControl`、`xlstatus.v1.NatTunnel`）。
+本文档完整描述 XLStatus `v0.3` 的接口体系，涵盖 HTTP REST API（`/api/v1/*`）、实时 WebSocket 流（`/ws/servers`、`/api/v1/ws`）、AI-Native MCP 端点（`/mcp`、`/api/v1/mcp/*`）以及 Agent gRPC 控制/数据平面协议（`xlstatus.v1.AgentControl`、`xlstatus.v1.NatTunnel`）。
 
 ---
 

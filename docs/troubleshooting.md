@@ -1,6 +1,6 @@
 # 故障排查指南 (Troubleshooting)
 
-本文档按 **症状 (Symptom) -> 根因 (Cause) -> 修复步骤 (Fix)** 的结构，汇总 **XLStatus `v0.2`** 在启动、数据库、密钥校验、CORS/WebSocket、TOTP 二步验证、Agent gRPC、NAT 穿透以及 MCP AI 接口中的常见故障定位方法。
+本文档按 **症状 (Symptom) -> 根因 (Cause) -> 修复步骤 (Fix)** 的结构，汇总 **XLStatus `v0.3`** 在启动、数据库、密钥校验、CORS/WebSocket、TOTP 二步验证、Agent gRPC、NAT 穿透以及 MCP AI 接口中的常见故障定位方法。
 
 ---
 
@@ -44,7 +44,7 @@ sudo ss -tlnp | grep -E ':(8080|50051)\b' || true
 - 或启动时报错：`Secret migration failed: failed to decrypt secret`
 
 ### 根因
-1. **启动安全强校验**：`v0.2` 强制要求 `SESSION_SECRET` 与 `SECRET_ENCRYPTION_KEY` 长度至少为 **32 字符**、至少包含 **4 个不同字节**（例如全 `a` 的 32 位字符串会被拒绝），且严禁使用 `replace-with-a-long-random-secret`、`CHANGE_ME_IN_PRODUCTION` 等文档占位符。
+1. **启动安全强校验**：`v0.3` 强制要求 `SESSION_SECRET` 与 `SECRET_ENCRYPTION_KEY` 长度至少为 **32 字符**、至少包含 **4 个不同字节**（例如全 `a` 的 32 位字符串会被拒绝），且严禁使用 `replace-with-a-long-random-secret`、`CHANGE_ME_IN_PRODUCTION` 等文档占位符。
 2. **密钥被意外更换**：如果升级或重装时更换了 `SECRET_ENCRYPTION_KEY`（或未配置 `SECRET_ENCRYPTION_KEY` 时更换了 `SESSION_SECRET`），数据库中已用旧密钥加密的 `xlsec:v1:...` 密文（DDNS、Cloudflared、GeoIP、TOTP）将无法解密。
 
 ### 修复

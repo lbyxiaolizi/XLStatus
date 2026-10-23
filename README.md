@@ -3,7 +3,7 @@ English | [简体中文](./README.zh-CN.md)
 # XLStatus
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Release](https://img.shields.io/badge/release-v0.2-10b981.svg)](https://github.com/lbyxiaolizi/XLStatus/releases)
+[![Release](https://img.shields.io/badge/release-v0.3-10b981.svg)](https://github.com/lbyxiaolizi/XLStatus/releases)
 [![Rust](https://img.shields.io/badge/Rust-Axum%20%2B%20Tonic%20gRPC-orange.svg)](./crates/)
 [![Frontend](https://img.shields.io/badge/Next.js%2016-React%2019%20%2B%20Strict%20TS-000000.svg)](./web/)
 [![MCP](https://img.shields.io/badge/MCP-2024--11--05-6366f1.svg)](./docs/mcp.md)
@@ -12,7 +12,7 @@ English | [简体中文](./README.zh-CN.md)
 
 It unifies real-time fleet telemetry, customizable public status pages, distributed & local service probes, automated alerting & self-healing, remote task scheduling, WebSocket PTY terminals, safe remote file operations, multi-provider DDNS, NAT reverse tunnels, and a full **Model Context Protocol (`MCP 2024-11-05`)** server into a single audited stack.
 
-> **Current Release**: `v0.2` — Start with the [Documentation Index](./docs/README.md), [AI & MCP Guide](./docs/mcp.md), and [Security Architecture](./security.md).
+> **Current Release**: `v0.3` — Start with the [Documentation Index](./docs/README.md), [AI & MCP Guide](./docs/mcp.md), and [Security Architecture](./security.md).
 
 ---
 
@@ -118,8 +118,8 @@ docker compose -f docker-compose.pg.yml up -d
 ### Install Server
 
 ```bash
-curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.2/install-server.sh \
-  | sudo VERSION=v0.2 bash
+curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.3/install-server.sh \
+  | sudo VERSION=v0.3 bash
 ```
 
 ### Enroll & Install Agent
@@ -129,10 +129,10 @@ Generate a parameterized one-line bootstrap command from **Settings -> Agent Ins
 ```bash
 sudo SERVER_URL=https://status.example.com \
   GRPC_SERVER=https://grpc.status.example.com:50051 \
-  VERSION=v0.2 \
+  VERSION=v0.3 \
   ENROLLMENT_TOKEN=xle_your_single_use_enrollment_token \
   AGENT_NAME="$(hostname)" \
-  bash -c 'curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.2/install-agent.sh | bash'
+  bash -c 'curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.3/install-agent.sh | bash'
 ```
 
 Both installers stage binaries and systemd units atomically in the target directory, enforce systemd sandboxing (`NoNewPrivileges`, `ProtectSystem`, `ProtectHome`, `UMask=0077`), and automatically roll back on health-check failure.

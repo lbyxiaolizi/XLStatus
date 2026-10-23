@@ -1,6 +1,6 @@
 # 安装部署指南 (生产环境)
 
-本文档提供 **XLStatus `v0.2`** 的完整生产环境部署指南，涵盖 Docker Compose 三种拓扑、Linux systemd 一键安装脚本（含原子暂存、健康检查自动回滚与沙箱加固）、PostgreSQL 生产库初始化、Nginx/Caddy 反向代理以及 gRPC TLS/mTLS 双向认证配置。
+本文档提供 **XLStatus `v0.3`** 的完整生产环境部署指南，涵盖 Docker Compose 三种拓扑、Linux systemd 一键安装脚本（含原子暂存、健康检查自动回滚与沙箱加固）、PostgreSQL 生产库初始化、Nginx/Caddy 反向代理以及 gRPC TLS/mTLS 双向认证配置。
 
 ---
 
@@ -87,14 +87,14 @@ XLSTATUS_GRPC_PUBLISH_ADDRESS=127.0.0.1
 
 ## 3. Linux systemd 一键安装 (`install-server.sh` & `install-agent.sh`)
 
-GitHub Release (`v0.2`) 随附 Linux systemd 自动化安装与升级脚本 `install-server.sh`（仓库内路径 `deploy/install.sh`）与 `install-agent.sh`（仓库内路径 `deploy/install-agent.sh`）。
+GitHub Release (`v0.3`) 随附 Linux systemd 自动化安装与升级脚本 `install-server.sh`（仓库内路径 `deploy/install.sh`）与 `install-agent.sh`（仓库内路径 `deploy/install-agent.sh`）。
 
 ### 3.1 一键安装 Server (`install-server.sh`)
 
 #### 交互式安装
 
 ```bash
-curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.2/install-server.sh | sudo VERSION=v0.2 bash
+curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.3/install-server.sh | sudo VERSION=v0.3 bash
 ```
 
 在交互式终端下，脚本会依次引导配置版本号、安装目录、数据目录、监听地址、数据库后端（SQLite / PostgreSQL）、CORS 允许源、密钥以及初始管理员密码。
@@ -102,9 +102,9 @@ curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.2/instal
 #### 无人值守安装 (`INTERACTIVE=false`)
 
 ```bash
-curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.2/install-server.sh | \
+curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.3/install-server.sh | \
   sudo INTERACTIVE=false \
-    VERSION=v0.2 \
+    VERSION=v0.3 \
     HTTP_BIND=127.0.0.1:8080 \
     GRPC_BIND=127.0.0.1:50051 \
     DATABASE_URL="sqlite:///var/lib/xlstatus/xlstatus.db?mode=rwc" \
@@ -132,7 +132,7 @@ curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.2/instal
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `VERSION` | `v0.2` | 下载的 GitHub Release 版本标签（支持 `latest`） |
+| `VERSION` | `v0.3` | 下载的 GitHub Release 版本标签（支持 `latest`） |
 | `BINARY_PATH` | 空 | 本地已编译二进制路径；设置后跳过网络下载 |
 | `INSTALL_DIR` | `/opt/xlstatus` | Server 二进制存放目录 |
 | `DATA_DIR` | `/var/lib/xlstatus` | 数据与工作目录 |
@@ -160,8 +160,8 @@ curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.2/instal
 先在管理后台生成 `xle_...` 注册令牌，然后在目标节点执行：
 
 ```bash
-curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.2/install-agent.sh | \
-  sudo VERSION=v0.2 \
+curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.3/install-agent.sh | \
+  sudo VERSION=v0.3 \
     SERVER_URL=https://status.example.com \
     GRPC_SERVER=https://status.example.com:50051 \
     ENROLLMENT_TOKEN=xle_你的注册令牌 \
@@ -174,7 +174,7 @@ curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.2/instal
 管理后台 **系统设置 -> Agent 接入** 会生成指向当前主控 `/install-agent.sh` 或 `/api/v1/agents/install.sh` 的一键命令：
 
 ```bash
-curl -fsSL 'https://status.example.com/api/v1/agents/install.sh?enrollment_token=xle_...&agent_name=node-01&version=v0.2' | sudo bash
+curl -fsSL 'https://status.example.com/api/v1/agents/install.sh?enrollment_token=xle_...&agent_name=node-01&version=v0.3' | sudo bash
 ```
 
 > **Bootstrap 安全防护机制**：

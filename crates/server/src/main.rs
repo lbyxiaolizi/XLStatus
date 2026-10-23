@@ -111,7 +111,7 @@ const GRPC_MESSAGE_LIMIT: usize = 256 * 1024 * 1024;
 const HTTP_MAX_PATH_BYTES: usize = 4096;
 const HTTP_MAX_QUERY_BYTES: usize = 16 * 1024;
 const TSDB_COMPACTION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
-const DEFAULT_AGENT_INSTALL_VERSION: &str = "v0.2";
+const DEFAULT_AGENT_INSTALL_VERSION: &str = "v0.3";
 const INSTALL_BOOTSTRAP_MAX_QUERY_BYTES: usize = 16 * 1024;
 const INSTALL_BOOTSTRAP_MAX_HOST_BYTES: usize = 512;
 const INSTALL_BOOTSTRAP_MAX_URL_BYTES: usize = 2048;
@@ -1654,7 +1654,7 @@ mod tests {
 
         assert!(body.contains("export SERVER_URL='http://status.example.com'"));
         assert!(body.contains("export GRPC_SERVER='http://status.example.com:50051'"));
-        assert!(body.contains("export VERSION='v0.2'"));
+        assert!(body.contains("export VERSION='v0.3'"));
     }
 
     #[test]

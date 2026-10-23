@@ -1,6 +1,6 @@
 # 配置参考手册
 
-本文档提供 **XLStatus `v0.2`** 服务端 (`xlstatus-server`)、Web 前端 (`web/`) 与 Agent 的完整配置参考，涵盖配置加载优先级、完整 `config.toml` 示例、全量环境变量参考表、应用层密钥加密 (`HKDF-SHA256` + `AES-256-GCM`) 以及启动诊断脱敏规则。
+本文档提供 **XLStatus `v0.3`** 服务端 (`xlstatus-server`)、Web 前端 (`web/`) 与 Agent 的完整配置参考，涵盖配置加载优先级、完整 `config.toml` 示例、全量环境变量参考表、应用层密钥加密 (`HKDF-SHA256` + `AES-256-GCM`) 以及启动诊断脱敏规则。
 
 ---
 
@@ -166,7 +166,7 @@ username_field = "preferred_username"
 | `SECRET_ENCRYPTION_KEY` | 回退至 `SESSION_SECRET` | 数据库敏感字段加密主密钥。建议单独生成 64 位 hex 随机串并妥善备份。 |
 | `SESSION_TTL_HOURS` | `24` | Cookie 会话过期时间（小时），合法范围 `1..=8760`。 |
 | `SECURITY_COOKIE_SECURE` | `true`（环境变量/TOML 模式） | 是否为会话与 CSRF Cookie 添加 `Secure` 标志。本地纯 HTTP 调试需设为 `false`。 |
-| `XLSTATUS_ALLOW_INSECURE_DEFAULTS` | 未启用 | **已废弃/禁止用于绕过密钥校验**：当前 `v0.2` 强制执行 `validate_deployment_security()`，任何低于 32 字符、低熵或命中弱默认占位符的密钥都会直接阻止进程启动。 |
+| `XLSTATUS_ALLOW_INSECURE_DEFAULTS` | 未启用 | **已废弃/禁止用于绕过密钥校验**：当前 `v0.3` 强制执行 `validate_deployment_security()`，任何低于 32 字符、低熵或命中弱默认占位符的密钥都会直接阻止进程启动。 |
 
 ### 3.2 管理员种子化、反向代理与出站安全环境变量
 
