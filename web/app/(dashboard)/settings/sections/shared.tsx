@@ -1,6 +1,7 @@
 "use client";
 
 import { InlineError, StatusBadge } from "@/app/components/M7Primitives";
+import { sanitizeDownloadFilename } from "@/app/lib/security";
 import type { Translations } from "@/lib/i18n";
 
 // Ban defaults shared by the WAF form and the one-click ban on the sessions
@@ -37,7 +38,7 @@ export function saveBlob(blob: Blob, filename: string) {
   const url = window.URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
-  link.download = filename || "download";
+  link.download = sanitizeDownloadFilename(filename, "download");
   document.body.appendChild(link);
   link.click();
   link.remove();
@@ -62,12 +63,12 @@ export function MaintenanceCapability({
   copy,
 }: {
   label: string;
-  enabled?: boolean;
+  enabled?: boolean | undefined;
   copy: Translations;
 }) {
   return (
-    <div className="border-2 border-black bg-[var(--accent-bg)] p-3 shadow-[var(--shadow-brutal-sm)]">
-      <div className="text-[11px] font-black uppercase text-[var(--text-muted)]">{label}</div>
+    <div className="rounded-xl border border-[var(--border-color)] bg-[var(--bg-subtle)] p-3.5">
+      <div className="text-xs font-medium text-[var(--text-muted)]">{label}</div>
       <div className="mt-2">
         <StatusBadge tone={enabled ? "green" : "gray"}>
           {enabled === undefined ? copy.common.notAvailable : enabled ? copy.settingsPage.supported : copy.settingsPage.unsupported}
@@ -77,11 +78,11 @@ export function MaintenanceCapability({
   );
 }
 
-export function SettingsListSkeleton({ rows = 3 }: { rows?: number }) {
+export function SettingsListSkeleton({ rows = 3 }: { rows?: number | undefined }) {
   return (
     <div className="grid gap-3" aria-busy="true">
       {Array.from({ length: rows }).map((_, index) => (
-        <div key={index} className="h-20 animate-pulse border-2 border-black bg-[var(--accent-bg)] shadow-[var(--shadow-brutal-sm)]" />
+        <div key={index} className="h-20 animate-pulse rounded-xl border border-[var(--border-color)] bg-[var(--bg-subtle)]" />
       ))}
     </div>
   );

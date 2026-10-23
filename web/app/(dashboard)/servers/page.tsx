@@ -32,11 +32,13 @@ import {
   isAdmin,
   inputClass,
   responseError,
+  selectClass,
   useStoredUser,
 } from "@/app/components/M7Primitives";
 import { showToast } from "@/app/components/Toasts";
 import { apiClient, type JsonObject, type ServerGroup, type ServerOwnerTransfer } from "@/lib/api";
 import { clampPercent, durationLabel, formatRate, optionalNumber } from "@/app/lib/format";
+import { sanitizeCssVariableValue } from "@/app/lib/security";
 import { useI18n } from "@/lib/use-i18n";
 import type { Translations } from "@/lib/i18n";
 import { useStoredPreference } from "@/app/lib/client-store";
@@ -57,15 +59,15 @@ type Copy = Translations;
 interface ServiceSummary {
   id: string;
   name: string;
-  server_id?: string | null;
-  server_ids?: string[];
+  server_id?: string | null | undefined;
+  server_ids?: string[] | undefined;
 }
 
 interface ServiceResult {
   service_id: string;
-  server_id?: string | null;
+  server_id?: string | null | undefined;
   status: string;
-  delay_ms?: number | null;
+  delay_ms?: number | null | undefined;
   created_at: string;
 }
 
@@ -78,7 +80,7 @@ interface ServiceTrackerItem {
   id: string;
   name: string;
   uptime: number;
-  avgDelay?: number;
+  avgDelay?: number | undefined;
   days: ServiceDay[];
 }
 
@@ -86,7 +88,7 @@ interface ServiceDay {
   key: string;
   label: string;
   uptime: number;
-  avgDelay?: number;
+  avgDelay?: number | undefined;
   total: number;
 }
 
@@ -102,11 +104,21 @@ interface ServerSummary {
 
 type ServerStatusFilter = "all" | "online" | "offline" | "other";
 type ServerViewMode = "cards" | "compact";
-type ServerSortKey = "default" | "name" | "status" | "cpu" | "memory" | "load" | "uptime" | "upload" | "download" | "totalUpload" | "totalDownload";
+type ServerSortKey =
+  | "default"
+  | "name"
+  | "status"
+  | "cpu"
+  | "memory"
+  | "load"
+  | "uptime"
+  | "upload"
+  | "download"
+  | "totalUpload"
+  | "totalDownload";
 type SortOrder = "asc" | "desc";
 const SERVER_VIEW_MODES = ["cards", "compact"] as const;
 const BINARY_PREFERENCE_VALUES = ["0", "1"] as const;
-// Roughly a month of checks per service, which is what the 30-day tracker grid needs.
 const SERVICE_TRACKER_HISTORY_LIMIT = 1200;
 
 export default function ServersPage() {
@@ -125,15 +137,8 @@ export default function ServersPage() {
     revalidate: revalidateServers,
   } = useServerData();
   const { live, connection: conn, now: realtimeNow } = useServerRealtime(realtimeScope, realtimeRevision);
-  // The disconnect banner needs a latch + delay: the hook reports "closed"
-  // before its effect ever connects (and after the hidden-tab pause), so a
-  // bare status check would flash the banner on every mount. Only a drop
-  // after a successful open, persisting >1.5s in a visible tab, counts.
   const [showWsBanner, setShowWsBanner] = useState(false);
   const wsSawOpenRef = useRef(false);
-  // The floating batch bar is five control rows tall; on small screens it
-  // would otherwise permanently cover the bottom of the viewport while a
-  // selection exists.
   const [batchCollapsed, setBatchCollapsed] = useState(false);
   useEffect(() => {
     if (conn === "open") {
@@ -151,8 +156,6 @@ export default function ServersPage() {
     }, 1500);
     return () => window.clearTimeout(timer);
   }, [conn]);
-  // One in-flight gate per logical toolbar so a double-click can't fire
-  // duplicate POSTs, without a group edit locking the batch bar (or vice versa).
   const [groupBusy, runGroup] = useBusy();
   const [batchBusy, runBatch] = useBusy();
   const [transferBusy, runTransfer] = useBusy();
@@ -167,9 +170,21 @@ export default function ServersPage() {
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<ServerStatusFilter>("all");
   const [groupFilter, setGroupFilter] = useState("all");
-  const [viewMode, setViewMode] = useStoredPreference<ServerViewMode>("xlstatus_server_view", "cards", SERVER_VIEW_MODES);
-  const [showServicesPreference, setShowServicesPreference] = useStoredPreference("xlstatus_show_services", "0", BINARY_PREFERENCE_VALUES);
-  const [showMapPreference, setShowMapPreference] = useStoredPreference("xlstatus_show_server_map", "0", BINARY_PREFERENCE_VALUES);
+  const [viewMode, setViewMode] = useStoredPreference<ServerViewMode>(
+    "xlstatus_server_view",
+    "cards",
+    SERVER_VIEW_MODES,
+  );
+  const [showServicesPreference, setShowServicesPreference] = useStoredPreference(
+    "xlstatus_show_services",
+    "0",
+    BINARY_PREFERENCE_VALUES,
+  );
+  const [showMapPreference, setShowMapPreference] = useStoredPreference(
+    "xlstatus_show_server_map",
+    "0",
+    BINARY_PREFERENCE_VALUES,
+  );
   const showServices = showServicesPreference === "1";
   const showMap = showMapPreference === "1";
   const [sortKey, setSortKey] = useState<ServerSortKey>("default");
@@ -181,6 +196,8 @@ export default function ServersPage() {
   const [newServerGroupName, setNewServerGroupName] = useState("");
   const [selectedServerGroupId, setSelectedServerGroupId] = useState("");
   const [serverGroupEdit, setServerGroupEdit] = useState({ name: "", color: "#2563eb", displayOrder: "" });
+  const [groupsDrawerOpen, setGroupsDrawerOpen] = useState(false);
+  const [transfersDrawerOpen, setTransfersDrawerOpen] = useState(false);
   const servicesLoadedRef = useRef(false);
   const ownerTransfersLoadedRef = useRef(false);
   const serverGroupsLoadRequestIdRef = useRef(0);
@@ -231,7 +248,7 @@ export default function ServersPage() {
     setServicesLoading(true);
     setServiceError(null);
     const response = await apiClient.listServices(200, 0, false, {
-      signal,
+      ...(signal ? { signal } : {}),
       includeHistory: true,
       historyLimit: SERVICE_TRACKER_HISTORY_LIMIT,
     });
@@ -244,29 +261,27 @@ export default function ServersPage() {
       return;
     }
 
-    const nextServices = ((response.data.services as ServiceSummary[]) ?? []).filter((service) => service.id);
+    const nextServices = ((response.data["services"] as ServiceSummary[]) ?? []).filter((service) => service.id);
     setServices(nextServices);
-    // Servers that support batched history answer in a single request; the
-    // per-service fan-out below only runs against older deployments.
     const embedded = readEmbeddedHistories(nextServices);
     const histories: (ServiceHistoryEntry | null)[] =
       embedded ??
-      (await mapWithConcurrency(
-        nextServices,
-        6,
-        async (service) => {
-          if (signal?.aborted) return null;
-          const history = await apiClient.getServiceHistory(service.id, SERVICE_TRACKER_HISTORY_LIMIT, { signal });
-          if (!history.success || !history.data) return null;
-          const results = Array.isArray(history.data.results) ? history.data.results : [];
-          return {
-            service,
-            results: results
-              .map((result) => normalizeServiceResult(result))
-              .filter((result): result is ServiceResult => Boolean(result)),
-          };
-        },
-      ));
+      (await mapWithConcurrency(nextServices, 6, async (service) => {
+        if (signal?.aborted) return null;
+        const history = await apiClient.getServiceHistory(
+          service.id,
+          SERVICE_TRACKER_HISTORY_LIMIT,
+          signal ? { signal } : {},
+        );
+        if (!history.success || !history.data) return null;
+        const results = Array.isArray(history.data["results"]) ? history.data["results"] : [];
+        return {
+          service,
+          results: results
+            .map((result) => normalizeServiceResult(result))
+            .filter((result): result is ServiceResult => Boolean(result)),
+        };
+      }));
     if (signal?.aborted) return;
 
     setServiceTrackers(
@@ -285,7 +300,9 @@ export default function ServersPage() {
     return () => controller.abort();
   }, [loadServices, showServices]);
 
-  const mergedCacheRef = useRef<Map<string, { server: Server; state: LiveState | undefined; status: string; merged: Server }>>(new Map());
+  const mergedCacheRef = useRef<
+    Map<string, { server: Server; state: LiveState | undefined; status: string; merged: Server }>
+  >(new Map());
   const merged = useMemo(() => {
     const cache = mergedCacheRef.current;
     const nextIds = new Set<string>();
@@ -294,10 +311,6 @@ export default function ServersPage() {
       const status = currentServerStatus(server, state, realtimeNow, serversObservedAt);
       nextIds.add(server.id);
       const cached = cache.get(server.id);
-      // Reuse the previous merged object when neither the base server row nor
-      // its live state changed identity. This keeps object references stable
-      // across WS frames so memoized ServerCard rows don't all re-render when
-      // a single agent reports in.
       if (cached && cached.server === server && cached.state === state && cached.status === status) {
         return cached.merged;
       }
@@ -318,7 +331,6 @@ export default function ServersPage() {
       cache.set(server.id, { server, state, status, merged: mergedServer });
       return mergedServer;
     });
-    // Drop cache entries for servers that no longer exist.
     for (const id of cache.keys()) {
       if (!nextIds.has(id)) cache.delete(id);
     }
@@ -336,13 +348,7 @@ export default function ServersPage() {
       ),
     [serverGroups],
   );
-  const selectedServerGroup = useMemo(
-    () => serverGroups.find((group) => group.id === selectedServerGroupId),
-    [selectedServerGroupId, serverGroups],
-  );
   const summary = useMemo(() => buildServerSummary(merged), [merged]);
-  // Defer the text filter so typing stays responsive even with a live WS feed
-  // re-deriving `merged`; React filters in the background off the latest input.
   const deferredQuery = useDeferredValue(query);
   const filtered = useMemo(
     () =>
@@ -431,7 +437,7 @@ export default function ServersPage() {
       setError(responseError(response));
       return false;
     }
-    const data = response.data as { updated?: number; failed?: number } | undefined;
+    const data = response.data as { updated?: number | undefined; failed?: number | undefined } | undefined;
     showToast(
       copy.serversPage.batchActionDone
         .replace("{updated}", String(data?.updated ?? selectedIds.length))
@@ -489,10 +495,16 @@ export default function ServersPage() {
       setError(copy.serversPage.groupNameRequired);
       return;
     }
+    const rawColor = serverGroupEdit.color.trim();
+    const safeColor = rawColor ? sanitizeCssVariableValue(rawColor) : null;
+    if (rawColor && !safeColor) {
+      setError("Invalid group color value");
+      return;
+    }
     const displayOrder = serverGroupEdit.displayOrder.trim();
     const payload: JsonObject = {
       name,
-      color: serverGroupEdit.color.trim(),
+      color: safeColor ?? "",
     };
     if (displayOrder) {
       const parsed = Number.parseInt(displayOrder, 10);
@@ -500,7 +512,7 @@ export default function ServersPage() {
         setError(copy.serversPage.orderMustBeNumber);
         return;
       }
-      payload.display_order = parsed;
+      payload["display_order"] = parsed;
     }
     const totpCode = await sensitiveTotpCodeForAction(true);
     if (totpCode === null) return;
@@ -552,7 +564,17 @@ export default function ServersPage() {
       return;
     }
     const group = serverGroups.find((item) => item.id === selectedServerGroupId);
-    if (!(await dialogs.confirm({ message: copy.serversPage.deleteGroupConfirm.replace("{name}", String(group?.name ?? selectedServerGroupId)), danger: true }))) return;
+    if (
+      !(await dialogs.confirm({
+        message: copy.serversPage.deleteGroupConfirm.replace(
+          "{name}",
+          String(group?.name ?? selectedServerGroupId),
+        ),
+        danger: true,
+      }))
+    ) {
+      return;
+    }
     const totpCode = await sensitiveTotpCodeForAction(true);
     if (totpCode === null) return;
     const response = await apiClient.deleteServerGroup(selectedServerGroupId, totpCode);
@@ -572,7 +594,14 @@ export default function ServersPage() {
       setError(copy.serversPage.selectServersFirst);
       return;
     }
-    if (!(await dialogs.confirm({ message: copy.serversPage.deleteServersConfirm.replace("{count}", String(selectedIds.length)), danger: true }))) return;
+    if (
+      !(await dialogs.confirm({
+        message: copy.serversPage.deleteServersConfirm.replace("{count}", String(selectedIds.length)),
+        danger: true,
+      }))
+    ) {
+      return;
+    }
     const ok = await runBatchAction("delete");
     if (ok) {
       setSelectedIds([]);
@@ -596,8 +625,6 @@ export default function ServersPage() {
     await runBatchAction(action, { tags });
   }
 
-  // Drops runBatchAction's boolean result so the handler matches useBusy's
-  // `() => Promise<void>` contract.
   async function setSelectedDashboardVisible(visible: boolean) {
     await runBatchAction("set_dashboard_visible", { dashboard_visible: visible });
   }
@@ -627,7 +654,14 @@ export default function ServersPage() {
   }
 
   async function cancelOwnerTransfer(transfer: ServerOwnerTransfer) {
-    if (!(await dialogs.confirm({ message: copy.serversPage.cancelTransferConfirm.replace("{id}", compactId(transfer.id)), danger: true }))) return;
+    if (
+      !(await dialogs.confirm({
+        message: copy.serversPage.cancelTransferConfirm.replace("{id}", compactId(transfer.id)),
+        danger: true,
+      }))
+    ) {
+      return;
+    }
     setTransferError(null);
     const totpCode = await sensitiveTotpCodeForAction(true);
     if (totpCode === null) return;
@@ -647,147 +681,367 @@ export default function ServersPage() {
           eyebrow={`ws: ${connectionLabel(conn, copy)}`}
           title={copy.serversPage.title}
           detail={copy.serversPage.detail}
-          actions={<button type="button" onClick={() => { setError(null); void loadServers(true); }} className={buttonClass("secondary")}>{copy.serversPage.refresh}</button>}
+          actions={
+            <button
+              type="button"
+              onClick={() => {
+                setError(null);
+                void loadServers(true);
+              }}
+              className={buttonClass("secondary")}
+            >
+              {copy.serversPage.refresh}
+            </button>
+          }
         />
         <InlineError message={error ?? serverLoadError} />
         {showWsBanner ? (
-          <div className="mt-3"><InlineNotice tone="yellow">{copy.serversPage.wsDisconnectedBanner}</InlineNotice></div>
+          <div className="mt-3">
+            <InlineNotice tone="yellow">{copy.serversPage.wsDisconnectedBanner}</InlineNotice>
+          </div>
         ) : null}
         <ServerSummaryGrid summary={summary} copy={copy} />
+
+        {/* Unified High-Density Control Bar */}
         <div className="mt-5 mb-5 grid gap-3">
-          <input value={query} onChange={(event) => setQuery(event.target.value)} className={inputClass} placeholder={copy.serversPage.searchPlaceholder} />
-          <div className="flex flex-wrap items-center justify-between gap-3 border-2 border-black bg-[var(--bg-card)] p-3 shadow-[var(--shadow-brutal)]">
-            <div className="flex flex-wrap gap-2">
-              {(
-                [
-                  ["all", copy.serversPage.filterAll],
-                  ["online", copy.serversPage.filterOnline],
-                  ["offline", copy.serversPage.filterOffline],
-                  ["other", copy.serversPage.filterOther],
-                ] as Array<[ServerStatusFilter, string]>
-              ).map(([value, label]) => (
-                <button key={value} type="button" onClick={() => setStatusFilter(value)} className={buttonClass(statusFilter === value ? "primary" : "secondary")}>
-                  {label}
+          <div className="grid gap-3 rounded-xl border border-[var(--border-color)] bg-[var(--bg-card)] p-3.5 shadow-[var(--shadow-xs)]">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              {/* Search + Status Segmented Control */}
+              <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2.5">
+                <div className="relative min-w-[14rem] flex-1 sm:max-w-xs">
+                  <svg
+                    viewBox="0 0 16 16"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.75"
+                    className="pointer-events-none absolute top-1/2 left-3 h-3.5 w-3.5 -translate-y-1/2 text-[var(--text-faint)]"
+                    aria-hidden="true"
+                  >
+                    <circle cx="7" cy="7" r="4.5" />
+                    <path d="M10.5 10.5L14 14" strokeLinecap="round" />
+                  </svg>
+                  <input
+                    value={query}
+                    onChange={(event) => setQuery(event.target.value)}
+                    className={`${inputClass} mt-0 pl-8 py-1.5 text-xs`}
+                    placeholder={copy.serversPage.searchPlaceholder}
+                  />
+                </div>
+
+                <div className="inline-flex rounded-lg border border-[var(--border-color)] bg-[var(--bg-subtle)] p-0.5">
+                  {(
+                    [
+                      ["all", copy.serversPage.filterAll],
+                      ["online", copy.serversPage.filterOnline],
+                      ["offline", copy.serversPage.filterOffline],
+                      ["other", copy.serversPage.filterOther],
+                    ] as Array<[ServerStatusFilter, string]>
+                  ).map(([value, label]) => (
+                    <button
+                      key={value}
+                      type="button"
+                      onClick={() => setStatusFilter(value)}
+                      className={`rounded-md px-2.5 py-1 text-xs font-medium transition ${
+                        statusFilter === value
+                          ? "bg-[var(--bg-card)] text-[var(--text-main)] shadow-[var(--shadow-xs)]"
+                          : "text-[var(--text-muted)] hover:text-[var(--text-main)]"
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Sort & View Switchers */}
+              <div className="flex flex-wrap items-center gap-2">
+                <select
+                  value={groupFilter}
+                  onChange={(event) => setGroupFilter(event.target.value)}
+                  className={`${selectClass} mt-0 w-auto py-1.5 text-xs`}
+                >
+                  <option value="all">{copy.serversPage.groupFilterAll}</option>
+                  {serverGroups.length ? (
+                    <optgroup label="Server groups">
+                      {serverGroups.map((group) => (
+                        <option key={group.id} value={`group:${group.id}`}>
+                          {group.name}
+                        </option>
+                      ))}
+                    </optgroup>
+                  ) : null}
+                  {tagGroups.length ? (
+                    <optgroup label="Tags">
+                      {tagGroups.map((group) => (
+                        <option key={group} value={`tag:${group}`}>
+                          {group}
+                        </option>
+                      ))}
+                    </optgroup>
+                  ) : null}
+                </select>
+
+                <select
+                  value={sortKey}
+                  onChange={(event) => setSortKey(event.target.value as ServerSortKey)}
+                  className={`${selectClass} mt-0 w-auto py-1.5 text-xs`}
+                >
+                  <option value="default">{copy.serversPage.sortDefault}</option>
+                  <option value="name">{copy.serversPage.sortName}</option>
+                  <option value="status">{copy.serversPage.sortStatus}</option>
+                  <option value="cpu">CPU</option>
+                  <option value="memory">{copy.serversPage.sortMemory}</option>
+                  <option value="load">{copy.serversPage.sortLoad}</option>
+                  <option value="uptime">{copy.serversPage.sortUptime}</option>
+                  <option value="upload">{copy.serversPage.sortUpload}</option>
+                  <option value="download">{copy.serversPage.sortDownload}</option>
+                  <option value="totalUpload">{copy.serversPage.sortTotalUpload}</option>
+                  <option value="totalDownload">{copy.serversPage.sortTotalDownload}</option>
+                </select>
+
+                <button
+                  type="button"
+                  onClick={() => setSortOrder((current) => (current === "asc" ? "desc" : "asc"))}
+                  className={buttonClass("secondary")}
+                >
+                  {sortOrder === "asc" ? copy.serversPage.sortAsc : copy.serversPage.sortDesc}
                 </button>
-              ))}
+
+                <div className="inline-flex rounded-lg border border-[var(--border-color)] bg-[var(--bg-subtle)] p-0.5">
+                  <button
+                    type="button"
+                    onClick={() => changeViewMode("cards")}
+                    className={`rounded-md px-2.5 py-1 text-xs font-medium transition ${
+                      viewMode === "cards"
+                        ? "bg-[var(--bg-card)] text-[var(--text-main)] shadow-[var(--shadow-xs)]"
+                        : "text-[var(--text-muted)] hover:text-[var(--text-main)]"
+                    }`}
+                  >
+                    {copy.serversPage.viewCards}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => changeViewMode("compact")}
+                    className={`rounded-md px-2.5 py-1 text-xs font-medium transition ${
+                      viewMode === "compact"
+                        ? "bg-[var(--bg-card)] text-[var(--text-main)] shadow-[var(--shadow-xs)]"
+                        : "text-[var(--text-muted)] hover:text-[var(--text-main)]"
+                    }`}
+                  >
+                    {copy.serversPage.viewCompact}
+                  </button>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={toggleMap}
+                  className={buttonClass(showMap ? "primary" : "secondary")}
+                >
+                  {copy.serversPage.toggleMap}
+                </button>
+                <button
+                  type="button"
+                  onClick={toggleServices}
+                  className={buttonClass(showServices ? "primary" : "secondary")}
+                >
+                  {copy.serversPage.toggleServices}
+                </button>
+              </div>
             </div>
-            <div className="grid gap-2 sm:grid-cols-[minmax(9rem,auto)_minmax(9rem,auto)_auto]">
-              <select value={groupFilter} onChange={(event) => setGroupFilter(event.target.value)} className={inputClass}>
-                <option value="all">{copy.serversPage.groupFilterAll}</option>
-                {serverGroups.length ? (
-                  <optgroup label="Server groups">
-                    {serverGroups.map((group) => (
-                      <option key={group.id} value={`group:${group.id}`}>{group.name}</option>
-                    ))}
-                  </optgroup>
+
+            {/* Secondary Row: Quick Group Pills + Drawer Toggles + Page Selection */}
+            <div className="flex flex-wrap items-center justify-between gap-2 border-t border-[var(--border-color)] pt-2.5">
+              <div className="flex flex-wrap items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => setGroupFilter("all")}
+                  className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition ${
+                    groupFilter === "all"
+                      ? "border-[var(--border-strong)] bg-[var(--bg-muted)] text-[var(--text-main)]"
+                      : "border-[var(--border-color)] bg-[var(--bg-subtle)] text-[var(--text-muted)] hover:text-[var(--text-main)]"
+                  }`}
+                >
+                  <span>{copy.serversPage.groupFilterAll}</span>
+                  <span className="font-mono text-[10px] opacity-70">{servers.length}</span>
+                </button>
+                {serverGroups.map((group) => {
+                  const key = `group:${group.id}`;
+                  const active = groupFilter === key;
+                  return (
+                    <button
+                      key={group.id}
+                      type="button"
+                      onClick={() => setGroupFilter(active ? "all" : key)}
+                      className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition ${
+                        active
+                          ? "border-[var(--border-strong)] bg-[var(--bg-muted)] text-[var(--text-main)]"
+                          : "border-[var(--border-color)] bg-[var(--bg-subtle)] text-[var(--text-muted)] hover:text-[var(--text-main)]"
+                      }`}
+                    >
+                      <span
+                        className="h-2 w-2 rounded-full"
+                        style={{
+                          backgroundColor:
+                            sanitizeCssVariableValue(group.color) ?? "var(--accent-color)",
+                        }}
+                      />
+                      <span>{group.name}</span>
+                      <span className="font-mono text-[10px] opacity-70">
+                        {group.server_ids.length}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+
+              <div className="flex flex-wrap items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={toggleFilteredSelection}
+                  className={buttonClass(allFilteredSelected ? "primary" : "secondary")}
+                >
+                  {allFilteredSelected ? copy.serversPage.deselectPage : copy.serversPage.selectPage}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setGroupsDrawerOpen((prev) => !prev)}
+                  className={buttonClass(groupsDrawerOpen ? "primary" : "secondary")}
+                >
+                  <span>Server groups</span>
+                  <span className="rounded-full bg-[var(--bg-muted)] px-1.5 py-0.2 font-mono text-[10px] text-[var(--text-muted)]">
+                    {serverGroups.length}
+                  </span>
+                </button>
+                {canManageTransfers ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const next = !transfersDrawerOpen;
+                      setTransfersDrawerOpen(next);
+                      if (next && !ownerTransfersLoadedRef.current && !transfersLoading) {
+                        void loadOwnerTransfers();
+                      }
+                    }}
+                    className={buttonClass(transfersDrawerOpen ? "primary" : "secondary")}
+                  >
+                    <span>{copy.serversPage.ownerTransfersTitle}</span>
+                    {ownerTransfers.length > 0 ? (
+                      <span className="rounded-full bg-[var(--bg-muted)] px-1.5 py-0.2 font-mono text-[10px] text-[var(--text-muted)]">
+                        {ownerTransfers.length}
+                      </span>
+                    ) : null}
+                  </button>
                 ) : null}
-                {tagGroups.length ? (
-                  <optgroup label="Tags">
-                    {tagGroups.map((group) => (
-                      <option key={group} value={`tag:${group}`}>{group}</option>
-                    ))}
-                  </optgroup>
-                ) : null}
-              </select>
-              <select value={sortKey} onChange={(event) => setSortKey(event.target.value as ServerSortKey)} className={inputClass}>
-                <option value="default">{copy.serversPage.sortDefault}</option>
-                <option value="name">{copy.serversPage.sortName}</option>
-                <option value="status">{copy.serversPage.sortStatus}</option>
-                <option value="cpu">CPU</option>
-                <option value="memory">{copy.serversPage.sortMemory}</option>
-                <option value="load">{copy.serversPage.sortLoad}</option>
-                <option value="uptime">{copy.serversPage.sortUptime}</option>
-                <option value="upload">{copy.serversPage.sortUpload}</option>
-                <option value="download">{copy.serversPage.sortDownload}</option>
-                <option value="totalUpload">{copy.serversPage.sortTotalUpload}</option>
-                <option value="totalDownload">{copy.serversPage.sortTotalDownload}</option>
-              </select>
-              <button type="button" onClick={() => setSortOrder((current) => (current === "asc" ? "desc" : "asc"))} className={buttonClass("secondary")}>
-                {sortOrder === "asc" ? copy.serversPage.sortAsc : copy.serversPage.sortDesc}
-              </button>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              <button type="button" onClick={toggleFilteredSelection} className={buttonClass(allFilteredSelected ? "primary" : "secondary")}>
-                {allFilteredSelected ? copy.serversPage.deselectPage : copy.serversPage.selectPage}
-              </button>
-              <button type="button" onClick={() => changeViewMode("cards")} className={buttonClass(viewMode === "cards" ? "primary" : "secondary")}>{copy.serversPage.viewCards}</button>
-              <button type="button" onClick={() => changeViewMode("compact")} className={buttonClass(viewMode === "compact" ? "primary" : "secondary")}>{copy.serversPage.viewCompact}</button>
-              <button type="button" onClick={toggleMap} className={buttonClass(showMap ? "primary" : "secondary")}>{copy.serversPage.toggleMap}</button>
-              <button type="button" onClick={toggleServices} className={buttonClass(showServices ? "primary" : "secondary")}>{copy.serversPage.toggleServices}</button>
+              </div>
             </div>
           </div>
-          <details className="border-2 border-black bg-[var(--bg-card)] shadow-[var(--shadow-brutal)]">
-            <summary className="flex cursor-pointer flex-wrap items-center justify-between gap-3 p-3 text-sm font-black uppercase">
-              <span className="flex flex-wrap items-center gap-2">
-                <span>Server groups</span>
-                <StatusBadge tone="blue">{copy.serversPage.serverGroupsBadge.replace("{count}", String(serverGroups.length))}</StatusBadge>
-                {selectedServerGroup ? <StatusBadge tone="gray">{copy.serversPage.serverGroupsSelectedCount.replace("{count}", String(selectedServerGroup.server_ids.length))}</StatusBadge> : null}
-              </span>
-              <span className="text-xs text-[var(--text-muted)]">{copy.serversPage.serverGroupsExpand}</span>
-            </summary>
-            <div className="grid gap-3 border-t-2 border-black p-3">
-              <div className="flex justify-end">
-                <button type="button" className={buttonClass("secondary")} onClick={() => void loadServerGroups(true)}>
+
+          {groupsDrawerOpen ? (
+            <div className="rounded-xl border border-[var(--border-color)] bg-[var(--bg-card)] p-4 shadow-[var(--shadow-sm)]">
+              <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <h3 className="text-sm font-semibold text-[var(--text-main)]">Server groups</h3>
+                  <StatusBadge tone="blue">
+                    {copy.serversPage.serverGroupsBadge.replace("{count}", String(serverGroups.length))}
+                  </StatusBadge>
+                </div>
+                <button
+                  type="button"
+                  className={buttonClass("secondary")}
+                  onClick={() => void loadServerGroups(true)}
+                >
                   {copy.serversPage.refreshGroups}
                 </button>
               </div>
               <div className="grid gap-3 xl:grid-cols-[minmax(12rem,1fr)_auto_minmax(12rem,1fr)_minmax(10rem,0.8fr)_7rem_7rem_auto_auto] xl:items-end">
-                <input value={newServerGroupName} onChange={(event) => setNewServerGroupName(event.target.value)} className={inputClass} placeholder={copy.serversPage.newServerGroupPlaceholder} />
-                <button type="button" className={buttonClass("secondary")} onClick={() => void runGroup(createServerGroup)} disabled={groupBusy}>{copy.serversPage.createGroup}</button>
-                <select value={selectedServerGroupId} onChange={(event) => selectServerGroup(event.target.value)} className={inputClass}>
+                <input
+                  value={newServerGroupName}
+                  onChange={(event) => setNewServerGroupName(event.target.value)}
+                  className={inputClass}
+                  placeholder={copy.serversPage.newServerGroupPlaceholder}
+                />
+                <button
+                  type="button"
+                  className={buttonClass("secondary")}
+                  onClick={() => void runGroup(createServerGroup)}
+                  disabled={groupBusy}
+                >
+                  {copy.serversPage.createGroup}
+                </button>
+                <select
+                  value={selectedServerGroupId}
+                  onChange={(event) => selectServerGroup(event.target.value)}
+                  className={selectClass}
+                >
                   <option value="">{copy.serversPage.selectServerGroupOption}</option>
                   {serverGroups.map((group) => (
-                    <option key={group.id} value={group.id}>{group.name}</option>
+                    <option key={group.id} value={group.id}>
+                      {group.name}
+                    </option>
                   ))}
                 </select>
-                <input value={serverGroupEdit.name} onChange={(event) => setServerGroupEdit((current) => ({ ...current, name: event.target.value }))} className={inputClass} placeholder={copy.serversPage.groupNamePlaceholder} disabled={!selectedServerGroupId} />
-                <input value={serverGroupEdit.displayOrder} onChange={(event) => setServerGroupEdit((current) => ({ ...current, displayOrder: event.target.value }))} className={inputClass} inputMode="numeric" placeholder={copy.serversPage.groupOrderPlaceholder} disabled={!selectedServerGroupId} />
+                <input
+                  value={serverGroupEdit.name}
+                  onChange={(event) =>
+                    setServerGroupEdit((current) => ({ ...current, name: event.target.value }))
+                  }
+                  className={inputClass}
+                  placeholder={copy.serversPage.groupNamePlaceholder}
+                  disabled={!selectedServerGroupId}
+                />
+                <input
+                  value={serverGroupEdit.displayOrder}
+                  onChange={(event) =>
+                    setServerGroupEdit((current) => ({ ...current, displayOrder: event.target.value }))
+                  }
+                  className={inputClass}
+                  inputMode="numeric"
+                  placeholder={copy.serversPage.groupOrderPlaceholder}
+                  disabled={!selectedServerGroupId}
+                />
                 <input
                   type="color"
                   value={serverGroupEdit.color}
-                  onChange={(event) => setServerGroupEdit((current) => ({ ...current, color: event.target.value }))}
-                  className="h-11 w-full border-2 border-black bg-[var(--accent-bg)] p-1 shadow-[var(--shadow-brutal-sm)] disabled:opacity-60"
+                  onChange={(event) =>
+                    setServerGroupEdit((current) => ({ ...current, color: event.target.value }))
+                  }
+                  className="h-9 w-full rounded-lg border border-[var(--border-color)] bg-[var(--bg-subtle)] p-1 disabled:opacity-60"
                   disabled={!selectedServerGroupId}
                   aria-label={copy.serversPage.groupColorAriaLabel}
                 />
-                <button type="button" className={buttonClass("secondary")} onClick={() => void runGroup(updateSelectedServerGroup)} disabled={!selectedServerGroupId || groupBusy}>{copy.serversPage.saveGroup}</button>
-                <button type="button" className={buttonClass("danger")} onClick={() => void runGroup(deleteSelectedServerGroup)} disabled={!selectedServerGroupId || groupBusy}>{copy.serversPage.deleteGroup}</button>
+                <button
+                  type="button"
+                  className={buttonClass("secondary")}
+                  onClick={() => void runGroup(updateSelectedServerGroup)}
+                  disabled={!selectedServerGroupId || groupBusy}
+                >
+                  {copy.serversPage.saveGroup}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void runGroup(deleteSelectedServerGroup)}
+                  className={buttonClass("danger")}
+                  disabled={!selectedServerGroupId || groupBusy}
+                >
+                  {copy.serversPage.deleteGroup}
+                </button>
               </div>
             </div>
-          </details>
-          {canManageTransfers ? (
-            <details
-              className="border-2 border-black bg-[var(--bg-card)] shadow-[var(--shadow-brutal)]"
-              onToggle={(event) => {
-                if (
-                  event.currentTarget.open
-                  && !ownerTransfersLoadedRef.current
-                  && !transfersLoading
-                ) {
-                  void loadOwnerTransfers();
-                }
-              }}
-            >
-              <summary className="flex cursor-pointer flex-wrap items-center justify-between gap-3 p-3 text-sm font-black uppercase">
-                <span className="flex flex-wrap items-center gap-2">
-                  <span>{copy.serversPage.ownerTransfersTitle}</span>
-                  <StatusBadge tone="blue">{copy.serversPage.ownerTransfersBadge.replace("{count}", String(ownerTransfers.length))}</StatusBadge>
-                </span>
-                <span className="text-xs text-[var(--text-muted)]">{copy.serversPage.ownerTransfersExpand}</span>
-              </summary>
-              <div className="border-t-2 border-black p-3">
-                <OwnerTransferPanel
-                  transfers={ownerTransfers}
-                  loading={transfersLoading}
-                  busy={transferBusy}
-                  error={transferError}
-                  copy={copy}
-                  onRefresh={() => void loadOwnerTransfers()}
-                  onRetry={(transfer) => void runTransfer(() => retryOwnerTransfer(transfer))}
-                  onCancel={(transfer) => void runTransfer(() => cancelOwnerTransfer(transfer))}
-                />
-              </div>
-            </details>
+          ) : null}
+
+          {canManageTransfers && transfersDrawerOpen ? (
+            <div className="rounded-xl border border-[var(--border-color)] bg-[var(--bg-card)] p-4 shadow-[var(--shadow-sm)]">
+              <OwnerTransferPanel
+                transfers={ownerTransfers}
+                loading={transfersLoading}
+                busy={transferBusy}
+                error={transferError}
+                copy={copy}
+                onRefresh={() => void loadOwnerTransfers()}
+                onRetry={(transfer) => void runTransfer(() => retryOwnerTransfer(transfer))}
+                onCancel={(transfer) => void runTransfer(() => cancelOwnerTransfer(transfer))}
+              />
+            </div>
           ) : null}
         </div>
 
@@ -801,7 +1055,12 @@ export default function ServersPage() {
         ) : null}
 
         {showServices ? (
-          <ServiceTrackerPanel loading={servicesLoading || servicesPending} error={serviceError} trackers={visibleServiceTrackers} copy={copy} />
+          <ServiceTrackerPanel
+            loading={servicesLoading || servicesPending}
+            error={serviceError}
+            trackers={visibleServiceTrackers}
+            copy={copy}
+          />
         ) : null}
 
         {loading ? (
@@ -811,32 +1070,45 @@ export default function ServersPage() {
             ))}
           </div>
         ) : filtered.length === 0 ? (
-          <EmptyState title={copy.serversPage.serversEmptyTitle} detail={copy.serversPage.serversEmptyDetail} />
+          <EmptyState
+            title={copy.serversPage.serversEmptyTitle}
+            detail={copy.serversPage.serversEmptyDetail}
+          />
         ) : viewMode === "compact" ? (
           <div className="grid gap-2">
             {filtered.map((server) => (
-              <CompactServerRow key={server.id} server={server} selected={selectedSet.has(server.id)} onToggle={toggleServerSelection} copy={copy} />
+              <CompactServerRow
+                key={server.id}
+                server={server}
+                selected={selectedSet.has(server.id)}
+                onToggle={toggleServerSelection}
+                copy={copy}
+              />
             ))}
           </div>
         ) : (
           <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
             {filtered.map((server) => (
-              <ServerCard key={server.id} server={server} selected={selectedSet.has(server.id)} onToggle={toggleServerSelection} copy={copy} />
+              <ServerCard
+                key={server.id}
+                server={server}
+                selected={selectedSet.has(server.id)}
+                onToggle={toggleServerSelection}
+                copy={copy}
+              />
             ))}
           </div>
         )}
+
         {selectedIds.length ? (
-          // Last child of the page flow + sticky bottom: the bar floats at the
-          // viewport bottom from anywhere in the list and settles into place
-          // at the end of the page. Opaque background covers rows behind it.
           <section
             aria-label={copy.serversPage.selectedCount.replace("{count}", String(selectedIds.length))}
-            className="sticky bottom-4 z-30 mt-5 grid gap-3 border-2 border-black bg-[var(--bg-card)] p-3 shadow-[var(--shadow-brutal)]"
+            className="sticky bottom-4 z-30 mt-5 grid gap-3 rounded-xl border border-[var(--border-strong)] bg-[var(--bg-card)]/95 p-4 shadow-[var(--shadow-lg)] backdrop-blur-md"
           >
             <div className="flex flex-wrap items-center justify-between gap-3">
-              <span className="border-2 border-black bg-[var(--accent-bg)] px-3 py-2 text-xs font-black uppercase shadow-[var(--shadow-brutal-sm)]">
+              <StatusBadge tone="green">
                 {copy.serversPage.selectedCount.replace("{count}", String(selectedIds.length))}
-              </span>
+              </StatusBadge>
               <div className="flex flex-wrap gap-2">
                 <button
                   type="button"
@@ -846,42 +1118,123 @@ export default function ServersPage() {
                 >
                   {batchCollapsed ? copy.serversPage.batchExpand : copy.serversPage.batchCollapse}
                 </button>
-                <button type="button" className={buttonClass("secondary")} onClick={() => setSelectedIds([])}>
+                <button
+                  type="button"
+                  className={buttonClass("secondary")}
+                  onClick={() => setSelectedIds([])}
+                >
                   {copy.serversPage.clearSelection}
                 </button>
               </div>
             </div>
-            {batchCollapsed ? null : (<>
-            <div className="grid gap-3 xl:grid-cols-[minmax(12rem,1fr)_auto_auto_auto_auto_auto]">
-              <input value={batchTags} onChange={(event) => setBatchTags(event.target.value)} className={inputClass} placeholder={copy.serversPage.batchTagsPlaceholder} />
-              <button type="button" className={buttonClass("secondary")} onClick={() => void runBatch(() => runTagBatch("set_tags"))} disabled={batchBusy}>{copy.serversPage.setTags}</button>
-              <button type="button" className={buttonClass("secondary")} onClick={() => void runBatch(() => runTagBatch("add_tags"))} disabled={batchBusy}>{copy.serversPage.addTags}</button>
-              <button type="button" className={buttonClass("secondary")} onClick={() => void runBatch(() => runTagBatch("remove_tags"))} disabled={batchBusy}>{copy.serversPage.removeTags}</button>
-              <button type="button" className={buttonClass("good")} onClick={() => void runBatch(() => setSelectedDashboardVisible(true))} disabled={batchBusy}>{copy.serversPage.showOnDashboard}</button>
-              <button type="button" className={buttonClass("danger")} onClick={() => void runBatch(() => setSelectedDashboardVisible(false))} disabled={batchBusy}>{copy.serversPage.hideOnDashboard}</button>
-            </div>
-            <div className="grid gap-3 md:grid-cols-[minmax(12rem,1fr)_auto]">
-              <input value={batchOwnerUserId} onChange={(event) => setBatchOwnerUserId(event.target.value)} className={inputClass} placeholder={copy.serversPage.ownerUserIdPlaceholder} />
-              <button type="button" className={buttonClass("secondary")} onClick={() => void runBatch(transferSelectedOwner)} disabled={batchBusy}>
-                {copy.serversPage.transferOwner}
-              </button>
-            </div>
-            <div className="grid gap-3 xl:grid-cols-[minmax(12rem,1fr)_auto_auto]">
-              <select value={selectedServerGroupId} onChange={(event) => selectServerGroup(event.target.value)} className={inputClass}>
-                <option value="">{copy.serversPage.selectServerGroupOption}</option>
-                {serverGroups.map((group) => (
-                  <option key={group.id} value={group.id}>{group.name}</option>
-                ))}
-              </select>
-              <button type="button" className={buttonClass("secondary")} onClick={() => void runBatch(addSelectedToServerGroup)} disabled={batchBusy}>{copy.serversPage.addToGroup}</button>
-              <button type="button" className={buttonClass("secondary")} onClick={() => void runBatch(moveSelectedToServerGroup)} disabled={batchBusy}>{copy.serversPage.moveToGroup}</button>
-            </div>
-            <div className="flex flex-wrap justify-end gap-2">
-              <button type="button" className={buttonClass("danger")} onClick={() => void runBatch(deleteSelectedServers)} disabled={batchBusy}>
-                {copy.serversPage.deleteSelectedServers}
-              </button>
-            </div>
-            </>)}
+            {batchCollapsed ? null : (
+              <>
+                <div className="grid gap-2.5 xl:grid-cols-[minmax(12rem,1fr)_auto_auto_auto_auto_auto]">
+                  <input
+                    value={batchTags}
+                    onChange={(event) => setBatchTags(event.target.value)}
+                    className={inputClass}
+                    placeholder={copy.serversPage.batchTagsPlaceholder}
+                  />
+                  <button
+                    type="button"
+                    className={buttonClass("secondary")}
+                    onClick={() => void runBatch(() => runTagBatch("set_tags"))}
+                    disabled={batchBusy}
+                  >
+                    {copy.serversPage.setTags}
+                  </button>
+                  <button
+                    type="button"
+                    className={buttonClass("secondary")}
+                    onClick={() => void runBatch(() => runTagBatch("add_tags"))}
+                    disabled={batchBusy}
+                  >
+                    {copy.serversPage.addTags}
+                  </button>
+                  <button
+                    type="button"
+                    className={buttonClass("secondary")}
+                    onClick={() => void runBatch(() => runTagBatch("remove_tags"))}
+                    disabled={batchBusy}
+                  >
+                    {copy.serversPage.removeTags}
+                  </button>
+                  <button
+                    type="button"
+                    className={buttonClass("good")}
+                    onClick={() => void runBatch(() => setSelectedDashboardVisible(true))}
+                    disabled={batchBusy}
+                  >
+                    {copy.serversPage.showOnDashboard}
+                  </button>
+                  <button
+                    type="button"
+                    className={buttonClass("danger")}
+                    onClick={() => void runBatch(() => setSelectedDashboardVisible(false))}
+                    disabled={batchBusy}
+                  >
+                    {copy.serversPage.hideOnDashboard}
+                  </button>
+                </div>
+                <div className="grid gap-2.5 md:grid-cols-[minmax(12rem,1fr)_auto]">
+                  <input
+                    value={batchOwnerUserId}
+                    onChange={(event) => setBatchOwnerUserId(event.target.value)}
+                    className={inputClass}
+                    placeholder={copy.serversPage.ownerUserIdPlaceholder}
+                  />
+                  <button
+                    type="button"
+                    className={buttonClass("secondary")}
+                    onClick={() => void runBatch(transferSelectedOwner)}
+                    disabled={batchBusy}
+                  >
+                    {copy.serversPage.transferOwner}
+                  </button>
+                </div>
+                <div className="grid gap-2.5 xl:grid-cols-[minmax(12rem,1fr)_auto_auto]">
+                  <select
+                    value={selectedServerGroupId}
+                    onChange={(event) => selectServerGroup(event.target.value)}
+                    className={selectClass}
+                  >
+                    <option value="">{copy.serversPage.selectServerGroupOption}</option>
+                    {serverGroups.map((group) => (
+                      <option key={group.id} value={group.id}>
+                        {group.name}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    className={buttonClass("secondary")}
+                    onClick={() => void runBatch(addSelectedToServerGroup)}
+                    disabled={batchBusy}
+                  >
+                    {copy.serversPage.addToGroup}
+                  </button>
+                  <button
+                    type="button"
+                    className={buttonClass("secondary")}
+                    onClick={() => void runBatch(moveSelectedToServerGroup)}
+                    disabled={batchBusy}
+                  >
+                    {copy.serversPage.moveToGroup}
+                  </button>
+                </div>
+                <div className="flex flex-wrap justify-end gap-2">
+                  <button
+                    type="button"
+                    className={buttonClass("danger")}
+                    onClick={() => void runBatch(deleteSelectedServers)}
+                    disabled={batchBusy}
+                  >
+                    {copy.serversPage.deleteSelectedServers}
+                  </button>
+                </div>
+              </>
+            )}
           </section>
         ) : null}
       </PageShell>
@@ -896,13 +1249,25 @@ function ServerSummaryGrid({ summary, copy }: { summary: ServerSummary; copy: Co
       <SummaryTile
         label={copy.serversPage.summaryServers}
         value={String(summary.total)}
-        detail={copy.serversPage.summaryOnlineOffline.replace("{online}", String(summary.online)).replace("{offline}", String(summary.offline))}
+        detail={copy.serversPage.summaryOnlineOffline
+          .replace("{online}", String(summary.online))
+          .replace("{offline}", String(summary.offline))}
       />
-      <SummaryTile label={copy.serversPage.summaryUpload} value={formatRate(summary.uploadSpeed)} detail={copy.serversPage.summaryTotal.replace("{total}", formatBytes(summary.totalUpload))} />
-      <SummaryTile label={copy.serversPage.summaryDownload} value={formatRate(summary.downloadSpeed)} detail={copy.serversPage.summaryTotal.replace("{total}", formatBytes(summary.totalDownload))} />
+      <SummaryTile
+        label={copy.serversPage.summaryUpload}
+        value={formatRate(summary.uploadSpeed)}
+        detail={copy.serversPage.summaryTotal.replace("{total}", formatBytes(summary.totalUpload))}
+      />
+      <SummaryTile
+        label={copy.serversPage.summaryDownload}
+        value={formatRate(summary.downloadSpeed)}
+        detail={copy.serversPage.summaryTotal.replace("{total}", formatBytes(summary.totalDownload))}
+      />
       <SummaryTile
         label={copy.serversPage.summaryStatus}
-        value={summary.offline > 0 ? copy.serversPage.summaryPartialOffline : copy.serversPage.summaryRunning}
+        value={
+          summary.offline > 0 ? copy.serversPage.summaryPartialOffline : copy.serversPage.summaryRunning
+        }
         detail={summary.total ? copy.serversPage.summaryWsLive : copy.serversPage.summaryWsWaiting}
       />
     </div>
@@ -911,19 +1276,22 @@ function ServerSummaryGrid({ summary, copy }: { summary: ServerSummary; copy: Co
 
 function WorldMapSkeleton() {
   return (
-    <section className="mb-5 border-2 border-black bg-[var(--accent-bg)] p-4 shadow-[var(--shadow-brutal)]" aria-busy="true">
-      <div className="mb-3 flex items-end justify-between gap-3 border-b-4 border-black pb-3">
+    <section
+      className="mb-5 rounded-xl border border-[var(--border-color)] bg-[var(--bg-card)] p-4 shadow-[var(--shadow-xs)]"
+      aria-busy="true"
+    >
+      <div className="mb-3 flex items-end justify-between gap-3 border-b border-[var(--border-color)] pb-3">
         <div className="grid gap-2">
-          <Skeleton className="h-7 w-44" />
+          <Skeleton className="h-6 w-44" />
           <Skeleton className="h-4 w-64 max-w-full" />
         </div>
-        <Skeleton className="h-7 w-20" />
+        <Skeleton className="h-6 w-20" />
       </div>
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_18rem]">
         <Skeleton className="aspect-[9/5] min-h-72 w-full" />
         <div className="grid content-start gap-3">
           {Array.from({ length: 3 }).map((_, index) => (
-            <Skeleton key={index} className="h-24 w-full" />
+            <Skeleton key={index} className="h-20 w-full" />
           ))}
         </div>
       </div>
@@ -954,10 +1322,12 @@ function OwnerTransferPanel({
     <div className="grid gap-3">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-2">
-          <span className="border-2 border-black bg-[var(--accent-bg)] px-3 py-2 text-xs font-black uppercase shadow-[var(--shadow-brutal-sm)]">
+          <span className="text-xs font-semibold tracking-wider uppercase text-[var(--text-muted)]">
             {copy.serversPage.ownerTransfersTitle}
           </span>
-          <StatusBadge tone="blue">{copy.serversPage.ownerTransfersBadge.replace("{count}", String(transfers.length))}</StatusBadge>
+          <StatusBadge tone="blue">
+            {copy.serversPage.ownerTransfersBadge.replace("{count}", String(transfers.length))}
+          </StatusBadge>
           {loading ? <StatusBadge tone="gray">{copy.serversPage.ownerTransfersLoading}</StatusBadge> : null}
         </div>
         <button type="button" className={buttonClass("secondary")} onClick={onRefresh}>
@@ -966,33 +1336,53 @@ function OwnerTransferPanel({
       </div>
       <InlineError message={error} />
       {transfers.length === 0 ? (
-        <EmptyState title={copy.serversPage.ownerTransfersEmptyTitle} detail={copy.serversPage.ownerTransfersEmptyDetail} />
+        <EmptyState
+          title={copy.serversPage.ownerTransfersEmptyTitle}
+          detail={copy.serversPage.ownerTransfersEmptyDetail}
+        />
       ) : (
         <div className="grid gap-2">
           {transfers.map((transfer) => (
-            <div key={transfer.id} className="grid gap-3 border-2 border-black bg-[var(--bg-card)] p-3 lg:grid-cols-[minmax(10rem,1fr)_minmax(10rem,1fr)_minmax(12rem,1.4fr)_auto] lg:items-center">
+            <div
+              key={transfer.id}
+              className="grid gap-3 rounded-lg border border-[var(--border-color)] bg-[var(--bg-subtle)] p-3 lg:grid-cols-[minmax(10rem,1fr)_minmax(10rem,1fr)_minmax(12rem,1.4fr)_auto] lg:items-center"
+            >
               <div className="min-w-0">
                 <div className="flex flex-wrap items-center gap-2">
                   <StatusBadge tone={transferStatusTone(transfer.status)}>{transfer.status}</StatusBadge>
-                  <span className="text-xs font-black uppercase text-[var(--text-muted)]">#{transfer.attempts}</span>
+                  <span className="font-mono text-xs text-[var(--text-muted)]">#{transfer.attempts}</span>
                 </div>
-                <p className="mt-1 truncate text-sm font-black">{compactId(transfer.server_id)}</p>
+                <p className="mt-1 truncate font-mono text-sm font-medium text-[var(--text-main)]">
+                  {compactId(transfer.server_id)}
+                </p>
               </div>
-              <div className="min-w-0 text-xs font-bold text-[var(--text-muted)]">
+              <div className="min-w-0 font-mono text-xs text-[var(--text-muted)]">
                 <p className="truncate">from {compactId(transfer.from_user_id ?? "-")}</p>
                 <p className="truncate">to {compactId(transfer.to_user_id)}</p>
               </div>
-              <div className="min-w-0 text-xs font-bold text-[var(--text-muted)]">
+              <div className="min-w-0 font-mono text-xs text-[var(--text-muted)]">
                 <p className="truncate">{formatDate(transfer.last_attempt_at)}</p>
-                {transfer.error ? <p className="truncate text-[var(--danger)]">{transfer.error}</p> : null}
+                {transfer.error ? (
+                  <p className="truncate text-rose-600 dark:text-rose-400">{transfer.error}</p>
+                ) : null}
               </div>
               <div className="flex flex-wrap justify-end gap-2">
                 {transfer.status !== "completed" ? (
                   <>
-                    <button type="button" className={buttonClass("secondary")} onClick={() => onRetry(transfer)} disabled={busy}>
+                    <button
+                      type="button"
+                      className={buttonClass("secondary")}
+                      onClick={() => onRetry(transfer)}
+                      disabled={busy}
+                    >
                       {copy.serversPage.retry}
                     </button>
-                    <button type="button" className={buttonClass("danger")} onClick={() => onCancel(transfer)} disabled={busy}>
+                    <button
+                      type="button"
+                      className={buttonClass("danger")}
+                      onClick={() => onCancel(transfer)}
+                      disabled={busy}
+                    >
                       {copy.serversPage.cancel}
                     </button>
                   </>
@@ -1011,28 +1401,48 @@ function OwnerTransferPanel({
 function SummaryTile({ label, value, detail }: { label: string; value: string; detail: string }) {
   return (
     <BrutalCard accent>
-      <div className="text-xs font-black uppercase text-[var(--text-muted)]">{label}</div>
-      <div className="mt-2 break-words text-2xl font-black">{value}</div>
-      <div className="mt-1 text-sm font-bold text-[var(--text-muted)]">{detail}</div>
+      <div className="text-xs font-medium tracking-wider uppercase text-[var(--text-muted)]">{label}</div>
+      <div className="mt-2 break-words font-mono text-2xl font-semibold tracking-tight text-[var(--text-main)]">
+        {value}
+      </div>
+      <div className="mt-1 text-xs text-[var(--text-muted)]">{detail}</div>
     </BrutalCard>
   );
 }
 
-function ServiceTrackerPanel({ loading, error, trackers, copy }: { loading: boolean; error: string | null; trackers: ServiceTrackerItem[]; copy: Copy }) {
+function ServiceTrackerPanel({
+  loading,
+  error,
+  trackers,
+  copy,
+}: {
+  loading: boolean;
+  error: string | null;
+  trackers: ServiceTrackerItem[];
+  copy: Copy;
+}) {
   return (
-    <section className="mb-5 border-2 border-black bg-[var(--accent-bg)] p-4 shadow-[var(--shadow-brutal)]">
-      <div className="mb-3 flex flex-wrap items-center justify-between gap-3 border-b-4 border-black pb-3">
-        <h2 className="text-xl font-black uppercase">{copy.serversPage.servicesTitle}</h2>
-        <span className="border-2 border-black bg-[var(--bg-card)] px-2 py-1 text-xs font-black shadow-[var(--shadow-brutal-sm)]">
-          {loading ? copy.serversPage.servicesLoading : copy.serversPage.servicesItemCount.replace("{count}", String(trackers.length))}
-        </span>
+    <section className="mb-5 rounded-xl border border-[var(--border-color)] bg-[var(--bg-card)] p-4 shadow-[var(--shadow-xs)]">
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-3 border-b border-[var(--border-color)] pb-3">
+        <h2 className="text-base font-semibold tracking-tight text-[var(--text-main)]">
+          {copy.serversPage.servicesTitle}
+        </h2>
+        <StatusBadge tone="blue">
+          {loading
+            ? copy.serversPage.servicesLoading
+            : copy.serversPage.servicesItemCount.replace("{count}", String(trackers.length))}
+        </StatusBadge>
       </div>
       <InlineError message={error} />
       {loading && trackers.length === 0 ? (
         <BrutalCard>{copy.serversPage.servicesLoadingCard}</BrutalCard>
       ) : trackers.length === 0 ? (
-        // Don't double up the empty state under an error banner.
-        error ? null : <EmptyState title={copy.serversPage.servicesEmptyTitle} detail={copy.serversPage.servicesEmptyDetail} />
+        error ? null : (
+          <EmptyState
+            title={copy.serversPage.servicesEmptyTitle}
+            detail={copy.serversPage.servicesEmptyDetail}
+          />
+        )
       ) : (
         <div className="grid gap-3 lg:grid-cols-2">
           {trackers.map((tracker) => (
@@ -1040,7 +1450,7 @@ function ServiceTrackerPanel({ loading, error, trackers, copy }: { loading: bool
           ))}
         </div>
       )}
-      <div className="mt-3 border-2 border-black bg-[var(--bg-card)] px-3 py-2 text-xs font-black text-[var(--text-muted)] shadow-[var(--shadow-brutal-sm)]">
+      <div className="mt-3 rounded-lg border border-[var(--border-color)] bg-[var(--bg-subtle)] px-3 py-2 text-xs text-[var(--text-muted)]">
         {copy.serversPage.servicesTrafficSummary}
       </div>
     </section>
@@ -1049,11 +1459,13 @@ function ServiceTrackerPanel({ loading, error, trackers, copy }: { loading: bool
 
 function ServiceTrackerCard({ tracker, copy }: { tracker: ServiceTrackerItem; copy: Copy }) {
   return (
-    <div className="border-2 border-black bg-[var(--bg-card)] p-3 shadow-[var(--shadow-brutal-sm)]">
+    <div className="rounded-lg border border-[var(--border-color)] bg-[var(--bg-subtle)] p-3.5">
       <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
         <div>
-          <h3 className="text-sm font-black">{tracker.name}</h3>
-          <p className="mt-1 text-xs font-bold text-[var(--text-muted)]">{formatMs(Math.round(tracker.avgDelay ?? 0))}</p>
+          <h3 className="text-sm font-semibold text-[var(--text-main)]">{tracker.name}</h3>
+          <p className="mt-0.5 font-mono text-xs text-[var(--text-muted)]">
+            {formatMs(Math.round(tracker.avgDelay ?? 0))}
+          </p>
         </div>
         <StatusBadge tone={tracker.uptime >= 99 ? "green" : tracker.uptime >= 95 ? "yellow" : "red"}>
           {formatPercent(tracker.uptime)}
@@ -1063,12 +1475,14 @@ function ServiceTrackerCard({ tracker, copy }: { tracker: ServiceTrackerItem; co
         {tracker.days.map((day) => (
           <span
             key={day.key}
-            title={`${day.label} ${formatPercent(day.uptime)} ${day.avgDelay === undefined ? "" : formatMs(Math.round(day.avgDelay))}`}
-            className={`h-7 border-2 border-black ${serviceDayClass(day)}`}
+            title={`${day.label} ${formatPercent(day.uptime)} ${
+              day.avgDelay === undefined ? "" : formatMs(Math.round(day.avgDelay))
+            }`}
+            className={`h-6 rounded-sm transition-opacity hover:opacity-80 ${serviceDayClass(day)}`}
           />
         ))}
       </div>
-      <div className="mt-2 flex justify-between text-xs font-black text-[var(--text-muted)]">
+      <div className="mt-2 flex justify-between text-[11px] text-[var(--text-muted)]">
         <span>{copy.serversPage.serviceDays30Ago}</span>
         <span>{copy.serversPage.serviceDaysToday}</span>
       </div>
@@ -1094,77 +1508,147 @@ const ServerCard = memo(function ServerCard({
   const isOnline = server.status === "online";
   const expired = isExpired(expiresAt);
   const tags = Array.isArray(server.tags) ? server.tags.filter(Boolean) : [];
-  const metaRows = [
+  const metaRows: Array<{ label: string; value: string | null; danger?: boolean | undefined }> = [
     { label: copy.serversPage.metaRemark, value: remark },
     { label: copy.serversPage.metaProvider, value: optionalMetaLabel(server.provider) },
     { label: copy.serversPage.metaRegion, value: optionalMetaLabel(server.region) },
     { label: copy.serversPage.metaPlan, value: optionalMetaLabel(server.plan) },
-    { label: copy.serversPage.metaExpires, value: optionalMetaLabel(expiresAt ? formatDate(expiresAt) : null), danger: expired },
+    {
+      label: copy.serversPage.metaExpires,
+      value: optionalMetaLabel(expiresAt ? formatDate(expiresAt) : null),
+      danger: expired,
+    },
     { label: copy.serversPage.metaRenewal, value: optionalMetaLabel(renewalPrice) },
-  ].filter((row): row is { label: string; value: string; danger?: boolean } => row.value !== null);
+  ];
+  const visibleMetaRows = metaRows.filter(
+    (row): row is { label: string; value: string; danger?: boolean | undefined } => row.value !== null,
+  );
 
   return (
-    <article className="grid h-full gap-2 [contain-intrinsic-size:auto_34rem] [content-visibility:auto]">
-      <label className="flex items-center gap-2 border-2 border-black bg-[var(--bg-card)] px-3 py-2 text-xs font-black uppercase shadow-[var(--shadow-brutal-sm)]">
-        <input type="checkbox" checked={selected} onChange={() => onToggle(server.id)} />
-        {copy.serversPage.cardSelect}
-      </label>
-      <Link
-        href={`/servers/${encodeURIComponent(server.id)}`}
-        className="group block h-full border-2 border-black bg-[var(--bg-card)] p-4 text-[var(--text-main)] shadow-[var(--shadow-brutal)] transition-shadow hover:shadow-[8px_8px_0_0_var(--border-color)] focus:outline-none focus:ring-4 focus:ring-[var(--accent-color)]"
-        style={{ borderTopColor: server.accent_color || "var(--border-color)", borderTopWidth: "8px" }}
-        aria-label={copy.serversPage.cardOpenAria.replace("{name}", server.name)}
-      >
-        <div className="flex h-full flex-col gap-4">
+    <article
+      className={`group relative flex h-full flex-col rounded-xl border bg-[var(--bg-card)] p-4 text-[var(--text-main)] shadow-[var(--shadow-xs)] transition-all [contain-intrinsic-size:auto_28rem] [content-visibility:auto] hover:border-[var(--border-strong)] hover:shadow-[var(--shadow-md)] ${
+        selected
+          ? "border-[var(--accent-color)] ring-2 ring-[var(--accent-color)]/25"
+          : "border-[var(--border-color)]"
+      }`}
+      style={{
+        borderTopColor:
+          sanitizeCssVariableValue(server.accent_color) ?? "var(--accent-color)",
+        borderTopWidth: "3px",
+      }}
+    >
+      <div className="flex h-full flex-col gap-3.5">
         <div className="flex items-start justify-between gap-3">
-          <div className="min-w-0">
-            <div className="mb-2 flex items-center gap-2">
-              <span className={`h-3 w-3 shrink-0 border-2 border-black ${isOnline ? "bg-[var(--accent-color)]" : "bg-[var(--btn-bg)]"}`} />
-              <StatusBadge tone={isOnline ? "green" : server.status === "revoked" ? "yellow" : "red"}>
+          <div className="min-w-0 flex-1">
+            <div className="mb-1.5 flex items-center gap-2">
+              <label
+                className="inline-flex cursor-pointer items-center"
+                title={copy.serversPage.cardSelect}
+              >
+                <input
+                  type="checkbox"
+                  checked={selected}
+                  onChange={() => onToggle(server.id)}
+                  aria-label={copy.serversPage.cardSelectAria.replace("{name}", server.name)}
+                  className="h-3.5 w-3.5 rounded accent-[var(--accent-color)]"
+                />
+              </label>
+              <StatusBadge
+                tone={isOnline ? "green" : server.status === "revoked" ? "yellow" : "red"}
+              >
                 {serverStatusLabel(server.status, copy)}
               </StatusBadge>
+              {server.region || server.country ? (
+                <span className="truncate rounded-md border border-[var(--border-color)] bg-[var(--bg-subtle)] px-2 py-0.5 text-[11px] font-medium text-[var(--text-muted)]">
+                  {server.region || server.country}
+                </span>
+              ) : null}
             </div>
-            <h2 className="break-words text-2xl font-black uppercase">{server.name}</h2>
-            <p className="mt-1 break-all font-mono text-[11px] font-bold text-[var(--text-muted)]">{server.id}</p>
+            <Link
+              href={`/servers/${encodeURIComponent(server.id)}`}
+              className="block break-words text-base font-semibold tracking-tight text-[var(--text-main)] hover:text-[var(--accent-color)]"
+              aria-label={copy.serversPage.cardOpenAria.replace("{name}", server.name)}
+            >
+              {server.name}
+            </Link>
+            <p className="mt-0.5 truncate font-mono text-[11px] text-[var(--text-muted)]">
+              {compactId(server.id)}
+              {server.provider ? ` · ${server.provider}` : ""}
+            </p>
           </div>
-          <span className="border-2 border-black bg-[var(--accent-bg)] px-2 py-1 text-xs font-black shadow-[var(--shadow-brutal-sm)] transition group-hover:bg-[var(--accent-color)] group-hover:text-[var(--btn-text)]">
-            {copy.serversPage.cardDetail}
-          </span>
+
+          <div className="flex shrink-0 items-center gap-1.5">
+            <Link
+              href={`/terminal?server=${encodeURIComponent(server.id)}`}
+              className="rounded-md border border-[var(--border-color)] bg-[var(--bg-subtle)] px-2 py-1 font-mono text-[11px] font-medium text-[var(--text-muted)] transition-colors hover:border-[var(--border-strong)] hover:text-[var(--text-main)]"
+              title="Web Terminal"
+            >
+              &gt;_
+            </Link>
+            <Link
+              href={`/servers/${encodeURIComponent(server.id)}`}
+              className="rounded-md border border-[var(--border-color)] bg-[var(--bg-subtle)] px-2.5 py-1 text-xs font-medium text-[var(--text-muted)] transition-colors hover:border-[var(--accent-color)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-color)]"
+            >
+              {copy.serversPage.cardDetail}
+            </Link>
+          </div>
         </div>
 
-        {metaRows.length ? (
-          <div className="grid gap-2">
-            {metaRows.map((row) => (
+        {visibleMetaRows.length ? (
+          <div className="grid gap-1.5">
+            {visibleMetaRows.map((row) => (
               <MetaStrip key={row.label} label={row.label} value={row.value} danger={row.danger} />
             ))}
           </div>
         ) : null}
         {tags.length ? (
-          <div className="flex flex-wrap gap-2">
+          <div className="flex flex-wrap gap-1.5">
             {tags.map((tag) => (
-              <span key={tag} className="border-2 border-black bg-[var(--accent-bg)] px-2 py-1 text-[11px] font-black shadow-[var(--shadow-brutal-sm)]">
+              <span
+                key={tag}
+                className="rounded-md border border-[var(--border-color)] bg-[var(--bg-subtle)] px-2 py-0.5 text-[11px] font-medium text-[var(--text-muted)]"
+              >
                 {tag}
               </span>
             ))}
           </div>
         ) : null}
 
-        <div className="mt-auto grid grid-cols-2 gap-3">
+        <div className="mt-auto grid grid-cols-2 gap-2.5">
           <MetricBlock label={copy.serversPage.metricCpu} value={formatPercent(server.cpu_percent)}>
             <UsageBar value={server.cpu_percent} />
           </MetricBlock>
           <MetricBlock label={copy.serversPage.metricMemory} value={memoryLabel(server)}>
             <UsageBar value={memoryPercent} />
           </MetricBlock>
-          <MetricBlock label={copy.serversPage.metricLoad} value={server.load_1 === undefined || server.load_1 === null ? "N/A" : server.load_1.toFixed(2)} />
-          <MetricBlock label={copy.serversPage.metricUptime} value={durationLabel(server.uptime_seconds)} />
-          <MetricBlock label={copy.serversPage.metricUpload} value={formatRate(server.net_tx_bps)} />
-          <MetricBlock label={copy.serversPage.metricDownload} value={formatRate(server.net_rx_bps)} />
-          <MetricBlock label={copy.serversPage.metricTotalUpload} value={formatBytes(server.network_out_total)} />
-          <MetricBlock label={copy.serversPage.metricTotalDownload} value={formatBytes(server.network_in_total)} />
+          <MetricBlock
+            label={copy.serversPage.metricLoad}
+            value={
+              server.load_1 === undefined || server.load_1 === null ? "N/A" : server.load_1.toFixed(2)
+            }
+          />
+          <MetricBlock
+            label={copy.serversPage.metricUptime}
+            value={durationLabel(server.uptime_seconds)}
+          />
+          <MetricBlock
+            label={copy.serversPage.metricUpload}
+            value={formatRate(server.net_tx_bps)}
+          />
+          <MetricBlock
+            label={copy.serversPage.metricDownload}
+            value={formatRate(server.net_rx_bps)}
+          />
+          <MetricBlock
+            label={copy.serversPage.metricTotalUpload}
+            value={formatBytes(server.network_out_total)}
+          />
+          <MetricBlock
+            label={copy.serversPage.metricTotalDownload}
+            value={formatBytes(server.network_in_total)}
+          />
         </div>
-        </div>
-      </Link>
+      </div>
     </article>
   );
 });
@@ -1182,30 +1666,59 @@ const CompactServerRow = memo(function CompactServerRow({
 }) {
   const isOnline = server.status === "online";
   return (
-    <div className="grid gap-2 [contain-intrinsic-size:auto_5rem] [content-visibility:auto] sm:grid-cols-[auto_minmax(0,1fr)]">
-      <label className="flex items-center justify-center border-2 border-black bg-[var(--bg-card)] px-3 py-2 shadow-[var(--shadow-brutal-sm)]">
-        <input type="checkbox" checked={selected} onChange={() => onToggle(server.id)} aria-label={copy.serversPage.cardSelectAria.replace("{name}", server.name)} />
+    <div className="grid gap-2 [contain-intrinsic-size:auto_4.5rem] [content-visibility:auto] sm:grid-cols-[auto_minmax(0,1fr)]">
+      <label className="flex cursor-pointer items-center justify-center rounded-xl border border-[var(--border-color)] bg-[var(--bg-card)] px-3 py-2 transition-colors hover:border-[var(--border-strong)]">
+        <input
+          type="checkbox"
+          checked={selected}
+          onChange={() => onToggle(server.id)}
+          aria-label={copy.serversPage.cardSelectAria.replace("{name}", server.name)}
+          className="h-3.5 w-3.5 accent-[var(--accent-color)]"
+        />
       </label>
       <Link
         href={`/servers/${encodeURIComponent(server.id)}`}
-        className="grid gap-3 border-2 border-black bg-[var(--bg-card)] p-3 text-[var(--text-main)] shadow-[var(--shadow-brutal-sm)] transition-shadow hover:shadow-[var(--shadow-brutal)] lg:grid-cols-[minmax(12rem,1.4fr)_repeat(8,minmax(5.5rem,1fr))]"
+        className="grid gap-3 rounded-xl border border-[var(--border-color)] bg-[var(--bg-card)] p-3 text-[var(--text-main)] shadow-[var(--shadow-xs)] transition-all hover:border-[var(--border-strong)] hover:shadow-[var(--shadow-md)] lg:grid-cols-[minmax(12rem,1.4fr)_repeat(8,minmax(5.5rem,1fr))]"
         aria-label={copy.serversPage.cardOpenAria.replace("{name}", server.name)}
       >
         <div className="min-w-0">
           <div className="flex items-center gap-2">
-            <span className={`h-3 w-3 shrink-0 border-2 border-black ${isOnline ? "bg-[var(--accent-color)]" : "bg-[var(--btn-bg)]"}`} />
-            <span className="truncate text-sm font-black">{server.name}</span>
+            <span
+              className={`h-2 w-2 shrink-0 rounded-full ${
+                isOnline ? "bg-emerald-500" : "bg-rose-500"
+              }`}
+            />
+            <span className="truncate text-sm font-semibold text-[var(--text-main)]">
+              {server.name}
+            </span>
           </div>
-          <div className="mt-1 truncate font-mono text-[11px] font-bold text-[var(--text-muted)]">{compactId(server.id)}</div>
+          <div className="mt-0.5 truncate font-mono text-[11px] text-[var(--text-muted)]">
+            {compactId(server.id)}
+          </div>
         </div>
-        <CompactMetric label={copy.serversPage.metricStatus} value={serverStatusLabel(server.status, copy)} />
-        <CompactMetric label={copy.serversPage.metricCpu} value={formatPercent(server.cpu_percent)} />
+        <CompactMetric
+          label={copy.serversPage.metricStatus}
+          value={serverStatusLabel(server.status, copy)}
+        />
+        <CompactMetric
+          label={copy.serversPage.metricCpu}
+          value={formatPercent(server.cpu_percent)}
+        />
         <CompactMetric label={copy.serversPage.metricMemory} value={memoryLabel(server)} />
-        <CompactMetric label={copy.serversPage.metricLoad} value={server.load_1 === undefined || server.load_1 === null ? "N/A" : server.load_1.toFixed(2)} />
-        <CompactMetric label={copy.serversPage.metricUptimeShort} value={durationLabel(server.uptime_seconds)} />
+        <CompactMetric
+          label={copy.serversPage.metricLoad}
+          value={server.load_1 === undefined || server.load_1 === null ? "N/A" : server.load_1.toFixed(2)}
+        />
+        <CompactMetric
+          label={copy.serversPage.metricUptimeShort}
+          value={durationLabel(server.uptime_seconds)}
+        />
         <CompactMetric label={copy.serversPage.metricUpload} value={formatRate(server.net_tx_bps)} />
         <CompactMetric label={copy.serversPage.metricDownload} value={formatRate(server.net_rx_bps)} />
-        <CompactMetric label={copy.serversPage.metricTraffic} value={`↑${formatBytes(server.network_out_total)} ↓${formatBytes(server.network_in_total)}`} />
+        <CompactMetric
+          label={copy.serversPage.metricTraffic}
+          value={`↑${formatBytes(server.network_out_total)} ↓${formatBytes(server.network_in_total)}`}
+        />
       </Link>
     </div>
   );
@@ -1214,36 +1727,67 @@ const CompactServerRow = memo(function CompactServerRow({
 function CompactMetric({ label, value }: { label: string; value: string }) {
   return (
     <div className="min-w-0">
-      <div className="text-[11px] font-black text-[var(--text-muted)]">{label}</div>
-      <div className="mt-1 truncate text-xs font-black">{value}</div>
+      <div className="text-[11px] text-[var(--text-muted)]">{label}</div>
+      <div className="mt-0.5 truncate font-mono text-xs font-medium text-[var(--text-main)]">
+        {value}
+      </div>
     </div>
   );
 }
 
-function MetaStrip({ label, value, danger = false }: { label: string; value: string; danger?: boolean }) {
+function MetaStrip({
+  label,
+  value,
+  danger = false,
+}: {
+  label: string;
+  value: string;
+  danger?: boolean | undefined;
+}) {
   return (
-    <div className={`grid grid-cols-[4.5rem_minmax(0,1fr)] border-2 border-black ${danger ? "bg-[var(--btn-bg)] text-[var(--btn-text)]" : "bg-[var(--accent-bg)] text-[var(--text-main)]"} shadow-[var(--shadow-brutal-sm)]`}>
-      <span className="border-r-2 border-black px-2 py-1.5 text-xs font-black">{label}</span>
-      <span className="min-w-0 truncate px-2 py-1.5 text-xs font-black">{value}</span>
+    <div
+      className={`grid grid-cols-[4.5rem_minmax(0,1fr)] rounded-md border text-xs ${
+        danger
+          ? "border-rose-500/30 bg-rose-500/10 text-rose-700 dark:text-rose-300"
+          : "border-[var(--border-color)] bg-[var(--bg-subtle)] text-[var(--text-main)]"
+      }`}
+    >
+      <span className="border-r border-[var(--border-color)] px-2 py-1 font-medium text-[var(--text-muted)]">
+        {label}
+      </span>
+      <span className="min-w-0 truncate px-2 py-1 font-medium">{value}</span>
     </div>
   );
 }
 
-function MetricBlock({ label, value, children }: { label: string; value: string; children?: ReactNode }) {
+function MetricBlock({
+  label,
+  value,
+  children,
+}: {
+  label: string;
+  value: string;
+  children?: ReactNode | undefined;
+}) {
   return (
-    <div className="min-h-20 border-2 border-black bg-[var(--bg-card)] p-3 shadow-[var(--shadow-brutal-sm)]">
-      <div className="text-xs font-black text-[var(--text-muted)]">{label}</div>
-      <div className="mt-1 break-words text-lg font-black">{value}</div>
-      {children ? <div className="mt-2">{children}</div> : null}
+    <div className="rounded-lg border border-[var(--border-color)] bg-[var(--bg-subtle)] p-2.5">
+      <div className="text-[11px] font-medium text-[var(--text-muted)]">{label}</div>
+      <div className="mt-1 break-words font-mono text-sm font-semibold text-[var(--text-main)]">
+        {value}
+      </div>
+      {children ? <div className="mt-1.5">{children}</div> : null}
     </div>
   );
 }
 
-function UsageBar({ value }: { value?: number | null }) {
+function UsageBar({ value }: { value?: number | null | undefined }) {
   const percent = clampPercent(value);
   return (
-    <div className="h-3 border-2 border-black bg-[var(--bg-page)]">
-      <div className="h-full bg-[var(--accent-color)]" style={{ width: `${percent}%` }} />
+    <div className="h-1.5 overflow-hidden rounded-full bg-[var(--border-color)]">
+      <div
+        className="h-full rounded-full bg-[var(--accent-color)] transition-all duration-300"
+        style={{ width: `${percent}%` }}
+      />
     </div>
   );
 }
@@ -1254,7 +1798,9 @@ function memoryLabel(server: Server): string {
 }
 
 function memoryPercentValue(server: Server): number | null {
-  if (server.memory_used === undefined || server.memory_used === null || !server.memory_total) return null;
+  if (server.memory_used === undefined || server.memory_used === null || !server.memory_total) {
+    return null;
+  }
   return (server.memory_used / server.memory_total) * 100;
 }
 
@@ -1271,7 +1817,9 @@ function optionalMetaLabel(value: unknown): string | null {
 }
 
 function buildServerGroups(servers: Server[]): string[] {
-  return Array.from(new Set(servers.flatMap((server) => server.tags ?? []).filter(Boolean))).sort((a, b) => a.localeCompare(b, "zh-CN"));
+  return Array.from(new Set(servers.flatMap((server) => server.tags ?? []).filter(Boolean))).sort(
+    (a, b) => a.localeCompare(b, "zh-CN"),
+  );
 }
 
 function serverMatchesGroupFilter(
@@ -1301,7 +1849,15 @@ function buildServerSummary(servers: Server[]): ServerSummary {
       totalUpload: summary.totalUpload + (optionalNumber(server.network_out_total) ?? 0),
       totalDownload: summary.totalDownload + (optionalNumber(server.network_in_total) ?? 0),
     }),
-    { total: 0, online: 0, offline: 0, uploadSpeed: 0, downloadSpeed: 0, totalUpload: 0, totalDownload: 0 },
+    {
+      total: 0,
+      online: 0,
+      offline: 0,
+      uploadSpeed: 0,
+      downloadSpeed: 0,
+      totalUpload: 0,
+      totalDownload: 0,
+    },
   );
 }
 
@@ -1379,24 +1935,22 @@ function statusRank(status: string): number {
 
 function normalizeServiceResult(result: unknown): ServiceResult | null {
   const row = asRecord(result);
-  const serviceId = asString(row.service_id);
-  const createdAt = asString(row.created_at);
+  const serviceId = asString(row["service_id"]);
+  const createdAt = asString(row["created_at"]);
   if (!serviceId || !createdAt) return null;
   return {
     service_id: serviceId,
-    server_id: asString(row.server_id) || null,
-    status: asString(row.status),
-    delay_ms: optionalNumber(row.delay_ms),
+    server_id: asString(row["server_id"]) || null,
+    status: asString(row["status"]),
+    delay_ms: optionalNumber(row["delay_ms"]),
     created_at: createdAt,
   };
 }
 
-// Returns null as soon as one service lacks the inlined `history` array, which
-// means the server predates batched history and the caller must fan out.
 function readEmbeddedHistories(services: ServiceSummary[]): ServiceHistoryEntry[] | null {
   const entries: ServiceHistoryEntry[] = [];
   for (const service of services) {
-    const history = asRecord(service).history;
+    const history = asRecord(service)["history"];
     if (!Array.isArray(history)) return null;
     entries.push({
       service,
@@ -1412,12 +1966,16 @@ function buildServiceTracker(service: ServiceSummary, results: ServiceResult[]):
   const days = buildServiceDays(results);
   const totalChecks = results.length;
   const successful = results.filter((result) => serviceResultOk(result.status)).length;
-  const delays = results.map((result) => optionalNumber(result.delay_ms)).filter((value): value is number => value !== undefined);
+  const delays = results
+    .map((result) => optionalNumber(result.delay_ms))
+    .filter((value): value is number => value !== undefined);
   return {
     id: service.id,
     name: service.name || compactId(service.id),
     uptime: totalChecks ? (successful / totalChecks) * 100 : 0,
-    avgDelay: delays.length ? delays.reduce((sum, value) => sum + value, 0) / delays.length : undefined,
+    avgDelay: delays.length
+      ? delays.reduce((sum, value) => sum + value, 0) / delays.length
+      : undefined,
     days,
   };
 }
@@ -1440,12 +1998,16 @@ function buildServiceDays(results: ServiceResult[]): ServiceDay[] {
     const key = dayKey(date);
     const rows = buckets.get(key) ?? [];
     const success = rows.filter((result) => serviceResultOk(result.status)).length;
-    const delays = rows.map((result) => optionalNumber(result.delay_ms)).filter((value): value is number => value !== undefined);
+    const delays = rows
+      .map((result) => optionalNumber(result.delay_ms))
+      .filter((value): value is number => value !== undefined);
     return {
       key,
       label: date.toLocaleDateString("zh-CN"),
       uptime: rows.length ? (success / rows.length) * 100 : 0,
-      avgDelay: delays.length ? delays.reduce((sum, value) => sum + value, 0) / delays.length : undefined,
+      avgDelay: delays.length
+        ? delays.reduce((sum, value) => sum + value, 0) / delays.length
+        : undefined,
       total: rows.length,
     };
   });
@@ -1465,10 +2027,10 @@ function serviceResultOk(status: string): boolean {
 }
 
 function serviceDayClass(day: ServiceDay): string {
-  if (day.total === 0) return "bg-[var(--accent-bg)]";
-  if (day.uptime >= 99) return "bg-[var(--accent-color)]";
-  if (day.uptime >= 95) return "bg-yellow-300";
-  return "bg-[var(--btn-bg)]";
+  if (day.total === 0) return "bg-[var(--border-color)]";
+  if (day.uptime >= 99) return "bg-emerald-500";
+  if (day.uptime >= 95) return "bg-amber-400";
+  return "bg-rose-500";
 }
 
 function startOfDay(date: Date): Date {
@@ -1516,5 +2078,5 @@ function serverStatusLabel(status: string, copy: Copy): string {
     down: copy.serversPage.statusDown,
     degraded: copy.serversPage.statusDegraded,
   };
-  return labels[status] || status;
+  return labels[status] ?? status;
 }

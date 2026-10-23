@@ -8,41 +8,41 @@ import worldCountries from "@/app/components/world-countries-110m.json";
 import { useI18n } from "@/lib/use-i18n";
 
 interface ServerLocationLike {
-  source?: string | null;
-  provider?: string | null;
-  country?: string | null;
-  region?: string | null;
-  city?: string | null;
-  latitude?: number | null;
-  longitude?: number | null;
-  timezone?: string | null;
+  source?: string | null | undefined;
+  provider?: string | null | undefined;
+  country?: string | null | undefined;
+  region?: string | null | undefined;
+  city?: string | null | undefined;
+  latitude?: number | null | undefined;
+  longitude?: number | null | undefined;
+  timezone?: string | null | undefined;
 }
 
 export interface MapServerLike {
   id: string;
   name: string;
   status: string;
-  country?: string | null;
-  region?: string | null;
-  city?: string | null;
-  latitude?: number | null;
-  longitude?: number | null;
-  location?: ServerLocationLike | null;
+  country?: string | null | undefined;
+  region?: string | null | undefined;
+  city?: string | null | undefined;
+  latitude?: number | null | undefined;
+  longitude?: number | null | undefined;
+  location?: ServerLocationLike | null | undefined;
 }
 
 interface WorldServerMapProps<TServer extends MapServerLike> {
   servers: TServer[];
   title: string;
-  detailLabel?: string;
+  detailLabel?: string | undefined;
   ariaLabel: string;
-  serverHref?: (server: TServer) => string;
+  serverHref?: ((server: TServer) => string) | undefined;
 }
 
 interface CountryFeature {
   type: "Feature";
   properties: {
     iso2: string;
-    iso3?: string;
+    iso3?: string | undefined;
     name: string;
   };
   geometry: GeoJSON.Geometry;
@@ -51,7 +51,7 @@ interface CountryFeature {
 interface RegionPoint {
   key: string;
   label: string;
-  countryCode?: string;
+  countryCode?: string | undefined;
   longitude: number;
   latitude: number;
   source: "manual" | "geoip" | "country";
@@ -80,9 +80,6 @@ const pathGenerator = geoPath(projection);
 const countryFeatures = (worldCountries.features as CountryFeature[]).filter((feature) => feature.properties.iso2);
 const countryFeatureByIso2 = new Map(countryFeatures.map((feature) => [feature.properties.iso2.toUpperCase(), feature]));
 
-// Precompute each country's projected SVG path + centroid once at module load.
-// geoPath is deterministic given a fixed projection, so re-running it on every
-// render (177 countries × per WS frame) was pure waste. Look these up by iso2.
 interface CountryPath {
   iso2: string;
   name: string;
@@ -105,42 +102,42 @@ export function WorldServerMap<TServer extends MapServerLike>({
   serverHref,
 }: WorldServerMapProps<TServer>) {
   const buckets = useMemo(() => buildRegionBuckets(servers), [servers]);
-  const highlighted = useMemo(() => new Map(buckets.regions.filter((bucket) => bucket.point.countryCode).map((bucket) => [bucket.point.countryCode as string, bucket])), [buckets.regions]);
+  const highlighted = useMemo(
+    () => new Map(buckets.regions.filter((bucket) => bucket.point.countryCode).map((bucket) => [bucket.point.countryCode as string, bucket])),
+    [buckets.regions],
+  );
   const [tooltip, setTooltip] = useState<TooltipState<TServer> | null>(null);
   const { t: copy } = useI18n();
   const detail = detailLabel ?? copy.worldMap.serverUnit;
 
   return (
-    <section className="mb-5 border-2 border-black bg-[var(--accent-bg)] p-4 shadow-[var(--shadow-brutal)]">
-      <div className="mb-3 flex flex-wrap items-end justify-between gap-3 border-b-4 border-black pb-3">
+    <section className="mb-6 rounded-xl border border-[var(--border-color)] bg-[var(--bg-card)] p-5 shadow-[var(--shadow-xs)]">
+      <div className="mb-4 flex flex-wrap items-end justify-between gap-3 border-b border-[var(--border-color)] pb-3.5">
         <div>
-          <h2 className="text-xl font-black uppercase">{title}</h2>
-          <p className="mt-1 text-sm font-bold text-[var(--text-muted)]">
+          <h2 className="text-base font-semibold tracking-tight text-[var(--text-main)]">{title}</h2>
+          <p className="mt-0.5 text-xs text-[var(--text-muted)]">
             {copy.worldMap.regionsSummary
               .replace("{regions}", String(buckets.regions.length))
               .replace("{servers}", String(servers.length))
               .replace("{detail}", detail)}
           </p>
         </div>
-        <span className="border-2 border-black bg-[var(--bg-card)] px-2 py-1 text-xs font-black shadow-[var(--shadow-brutal-sm)]">
+        <span className="rounded-full border border-[var(--border-color)] bg-[var(--bg-subtle)] px-2.5 py-0.5 text-xs font-medium text-[var(--text-muted)]">
           {buckets.unmatched.length ? copy.worldMap.unmatchedCount.replace("{count}", String(buckets.unmatched.length)) : copy.worldMap.allIdentified}
         </span>
       </div>
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_18rem]">
         <div
-          className="relative overflow-hidden border-2 border-black bg-[var(--bg-page)] shadow-[var(--shadow-brutal-sm)]"
+          className="relative overflow-hidden rounded-xl border border-[var(--border-color)] bg-[var(--bg-subtle)]"
           onMouseLeave={() => setTooltip(null)}
         >
           <svg className="block aspect-[9/5] min-h-72 w-full" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={ariaLabel}>
             <defs>
-              <pattern id="world-map-grid" width="18" height="18" patternUnits="userSpaceOnUse">
-                <path d="M 18 0 L 0 0 0 18" fill="none" stroke="var(--border-color)" strokeOpacity="0.08" strokeWidth="1" />
+              <pattern id="world-map-grid" width="24" height="24" patternUnits="userSpaceOnUse">
+                <path d="M 24 0 L 0 0 0 24" fill="none" stroke="var(--border-color)" strokeOpacity="0.4" strokeWidth="1" />
               </pattern>
-              <filter id="world-map-shadow" x="-20%" y="-20%" width="140%" height="140%">
-                <feDropShadow dx="2" dy="2" stdDeviation="0" floodColor="var(--border-color)" floodOpacity="0.45" />
-              </filter>
             </defs>
-            <rect width={width} height={height} fill="var(--bg-page)" />
+            <rect width={width} height={height} fill="var(--bg-subtle)" />
             <rect width={width} height={height} fill="url(#world-map-grid)" />
             <g>
               {countryPaths.map((entry) => {
@@ -153,12 +150,11 @@ export function WorldServerMap<TServer extends MapServerLike>({
                     d={entry.d}
                     className={`transition-colors duration-150 ${
                       isHighlighted
-                        ? "cursor-pointer fill-[var(--accent-color)] stroke-[var(--border-color)]"
-                        : "fill-[color-mix(in_srgb,var(--bg-card)_76%,var(--text-muted)_24%)] stroke-[var(--border-color)]/30"
+                        ? "cursor-pointer fill-[var(--accent-color)] stroke-[var(--accent-color)]"
+                        : "fill-[var(--bg-muted)] stroke-[var(--border-strong)]"
                     }`}
-                    strokeWidth={isHighlighted ? 1.1 : 0.45}
-                    fillOpacity={isHighlighted ? 0.88 : 0.42}
-                    filter={isHighlighted ? "url(#world-map-shadow)" : undefined}
+                    strokeWidth={isHighlighted ? 1 : 0.5}
+                    fillOpacity={isHighlighted ? 0.85 : 0.7}
                     onMouseEnter={() => {
                       if (!bucket) {
                         setTooltip(null);
@@ -179,12 +175,12 @@ export function WorldServerMap<TServer extends MapServerLike>({
           </svg>
           {tooltip ? <MapTooltip tooltip={tooltip} serverHref={serverHref} /> : null}
         </div>
-        <div className="grid content-start gap-3">
+        <div className="grid content-start gap-2.5">
           {buckets.regions.length ? (
             buckets.regions.slice(0, 8).map((bucket) => (
-              <div key={bucket.point.key} className="border-2 border-black bg-[var(--bg-card)] p-3 shadow-[var(--shadow-brutal-sm)]">
+              <div key={bucket.point.key} className="rounded-xl border border-[var(--border-color)] bg-[var(--bg-subtle)] p-3">
                 <div className="flex items-center justify-between gap-2">
-                  <span className="min-w-0 truncate text-sm font-black">{bucket.point.label}</span>
+                  <span className="min-w-0 truncate text-xs font-semibold text-[var(--text-main)]">{bucket.point.label}</span>
                   <StatusBadge tone={bucket.servers.some((server) => server.status !== "online") ? "yellow" : "green"}>
                     {copy.worldMap.serversCount.replace("{count}", String(bucket.servers.length))}
                   </StatusBadge>
@@ -192,16 +188,20 @@ export function WorldServerMap<TServer extends MapServerLike>({
                 <div className="mt-2 grid gap-1">
                   {bucket.servers.slice(0, 4).map((server) =>
                     serverHref ? (
-                      <Link key={server.id} href={serverHref(server)} className="truncate text-xs font-bold text-[var(--text-muted)] underline decoration-2 underline-offset-2">
+                      <Link key={server.id} href={serverHref(server)} className="truncate text-xs text-[var(--text-muted)] hover:text-[var(--text-main)] hover:underline">
                         {server.name}
                       </Link>
                     ) : (
-                      <span key={server.id} className="truncate text-xs font-bold text-[var(--text-muted)]">
+                      <span key={server.id} className="truncate text-xs text-[var(--text-muted)]">
                         {server.name}
                       </span>
                     ),
                   )}
-                  {bucket.servers.length > 4 ? <span className="text-xs font-black text-[var(--text-muted)]">{copy.worldMap.moreServers.replace("{count}", String(bucket.servers.length - 4))}</span> : null}
+                  {bucket.servers.length > 4 ? (
+                    <span className="text-[11px] font-medium text-[var(--text-muted)]">
+                      {copy.worldMap.moreServers.replace("{count}", String(bucket.servers.length - 4))}
+                    </span>
+                  ) : null}
                 </div>
               </div>
             ))
@@ -209,16 +209,16 @@ export function WorldServerMap<TServer extends MapServerLike>({
             <EmptyState title={copy.worldMap.emptyTitle} detail={copy.worldMap.emptyDetail} />
           )}
           {buckets.regions.length > 8 ? (
-            <div className="border-2 border-black bg-[var(--bg-card)] px-3 py-2 text-xs font-black text-[var(--text-muted)] shadow-[var(--shadow-brutal-sm)]">
+            <div className="rounded-lg border border-[var(--border-color)] bg-[var(--bg-subtle)] px-3 py-2 text-xs font-medium text-[var(--text-muted)]">
               {copy.worldMap.moreRegions.replace("{count}", String(buckets.regions.length - 8))}
             </div>
           ) : null}
           {buckets.unmatched.length ? (
-            <div className="border-2 border-black bg-[var(--bg-card)] p-3 shadow-[var(--shadow-brutal-sm)]">
-              <div className="text-sm font-black">{copy.worldMap.unmatchedTitle}</div>
-              <div className="mt-2 flex flex-wrap gap-2">
+            <div className="rounded-xl border border-[var(--border-color)] bg-[var(--bg-subtle)] p-3">
+              <div className="text-xs font-semibold text-[var(--text-main)]">{copy.worldMap.unmatchedTitle}</div>
+              <div className="mt-2 flex flex-wrap gap-1.5">
                 {buckets.unmatched.slice(0, 8).map((server) => (
-                  <span key={server.id} className="border-2 border-black bg-[var(--accent-bg)] px-2 py-1 text-[11px] font-black">
+                  <span key={server.id} className="rounded-md border border-[var(--border-color)] bg-[var(--bg-card)] px-2 py-0.5 text-[11px] font-medium text-[var(--text-muted)]">
                     {server.name}
                   </span>
                 ))}
@@ -236,12 +236,12 @@ function MapTooltip<TServer extends MapServerLike>({
   serverHref,
 }: {
   tooltip: TooltipState<TServer>;
-  serverHref?: (server: TServer) => string;
+  serverHref?: ((server: TServer) => string) | undefined;
 }) {
   const { t: copy } = useI18n();
   return (
     <div
-      className="pointer-events-auto absolute z-20 hidden max-w-64 border-2 border-black bg-[var(--bg-card)] p-3 text-sm shadow-[var(--shadow-brutal-sm)] lg:block"
+      className="pointer-events-auto absolute z-20 hidden max-w-64 rounded-xl border border-[var(--border-color)] bg-[var(--bg-card)]/95 p-3 text-xs shadow-[var(--shadow-md)] backdrop-blur-md lg:block"
       style={{
         left: `${(tooltip.x / width) * 100}%`,
         top: `${(tooltip.y / height) * 100}%`,
@@ -249,20 +249,20 @@ function MapTooltip<TServer extends MapServerLike>({
       }}
     >
       <div className="min-w-44">
-        <p className="break-words text-sm font-black">{tooltip.label}</p>
-        <p className="mt-1 text-xs font-bold text-[var(--text-muted)]">
+        <p className="break-words text-xs font-semibold text-[var(--text-main)]">{tooltip.label}</p>
+        <p className="mt-0.5 text-[11px] text-[var(--text-muted)]">
           {copy.worldMap.tooltipSummary.replace("{servers}", String(tooltip.servers.length)).replace("{source}", tooltip.source)}
         </p>
       </div>
-      <div className="mt-2 grid max-h-48 gap-1 overflow-y-auto border-t-2 border-black pt-2">
+      <div className="mt-2 grid max-h-48 gap-1 overflow-y-auto border-t border-[var(--border-color)] pt-2">
         {tooltip.servers.map((server) =>
           serverHref ? (
-            <Link key={server.id} href={serverHref(server)} className="flex min-w-0 items-center gap-2 text-xs font-bold text-[var(--text-muted)] hover:text-[var(--text-main)]">
+            <Link key={server.id} href={serverHref(server)} className="flex min-w-0 items-center gap-2 text-xs text-[var(--text-muted)] hover:text-[var(--text-main)]">
               <ServerDot status={server.status} />
               <span className="truncate">{server.name}</span>
             </Link>
           ) : (
-            <span key={server.id} className="flex min-w-0 items-center gap-2 text-xs font-bold text-[var(--text-muted)]">
+            <span key={server.id} className="flex min-w-0 items-center gap-2 text-xs text-[var(--text-muted)]">
               <ServerDot status={server.status} />
               <span className="truncate">{server.name}</span>
             </span>
@@ -274,7 +274,7 @@ function MapTooltip<TServer extends MapServerLike>({
 }
 
 function ServerDot({ status }: { status: string }) {
-  return <span className={`h-2 w-2 shrink-0 rounded-full border border-black ${status === "online" ? "bg-[var(--accent-color)]" : "bg-[var(--btn-bg)]"}`} />;
+  return <span className={`h-2 w-2 shrink-0 rounded-full ${status === "online" ? "bg-emerald-500" : "bg-rose-500"}`} />;
 }
 
 function buildRegionBuckets<TServer extends MapServerLike>(servers: TServer[]): {
@@ -370,7 +370,8 @@ function centroidForLocation(location: ServerLocationLike | null, server: MapSer
   const keys = [location?.country, server.country, location?.region, server.region, location?.city, server.city];
   for (const value of keys) {
     const key = normalizeLocationKey(value);
-    if (key && locationCentroids[key]) return locationCentroids[key];
+    const matched = key ? locationCentroids[key] : undefined;
+    if (matched) return matched;
   }
   return null;
 }

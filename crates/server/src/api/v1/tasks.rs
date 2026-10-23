@@ -94,8 +94,12 @@ pub async fn create_task(
     validate_task_selector_for_write_or_403(&db, &auth_user, &req.server_selector_json).await?;
     let notification_group_id = normalize_optional_id(req.notification_group_id);
     ensure_task_notification_group_owned(&db, &auth_user, notification_group_id.as_deref()).await?;
+    let schedule = req
+        .schedule
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     // Validate schedule if present
-    if let Some(ref schedule) = req.schedule {
+    if let Some(ref schedule) = schedule {
         if parse_task_schedule(schedule).is_err() {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -114,7 +118,7 @@ pub async fn create_task(
         owner_user_id: auth_user.user.id.0.to_string(),
         name: req.name,
         task_type: req.task_type,
-        schedule: req.schedule,
+        schedule,
         command: req.command,
         payload_json: req.payload_json,
         cover_mode: req.cover_mode,
@@ -127,6 +131,7 @@ pub async fn create_task(
         created_at: now.clone(),
         updated_at: now,
     };
+    ensure_task_visible_to_auth(&auth_user, &task)?;
     validate_task_definition_or_403(&task)?;
 
     TaskRepository::create(&db, &task).await.map_err(|e| {
@@ -277,18 +282,23 @@ pub async fn update_task(
         task.name = name;
     }
     if let Some(schedule) = req.schedule {
-        // Validate schedule
-        if parse_task_schedule(&schedule).is_err() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(ApiResponse {
-                    success: false,
-                    data: None,
-                    error: Some("Invalid cron schedule".to_string()),
-                }),
-            ));
+        let trimmed = schedule.trim();
+        if trimmed.is_empty() {
+            task.schedule = None;
+        } else {
+            // Validate schedule
+            if parse_task_schedule(trimmed).is_err() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiResponse {
+                        success: false,
+                        data: None,
+                        error: Some("Invalid cron schedule".to_string()),
+                    }),
+                ));
+            }
+            task.schedule = Some(trimmed.to_string());
         }
-        task.schedule = Some(schedule);
     }
     if let Some(command) = req.command {
         task.command = Some(command);
@@ -311,6 +321,7 @@ pub async fn update_task(
     if let Some(enabled) = req.enabled {
         task.enabled = enabled;
     }
+    ensure_task_visible_to_auth(&auth_user, &task)?;
     validate_task_selector_for_write_or_403(&db, &auth_user, &task.server_selector_json).await?;
     ensure_task_notification_group_owned(&db, &auth_user, task.notification_group_id.as_deref())
         .await?;
@@ -583,6 +594,9 @@ pub(crate) async fn ensure_task_ids_visible_to_auth_session(
                 "task {task_id} does not exist or is not owned by current user"
             )));
         }
+        if auth.server_ids.is_some() && task.cover_mode != CoverMode::Specific {
+            return Err(AppError::Forbidden("trigger task not in scope".into()));
+        }
         validate_task_selector_for_session(auth, &task.server_selector_json)
             .map_err(|_| AppError::Forbidden("trigger task not in scope".into()))?;
     }
@@ -746,7 +760,8 @@ async fn validate_task_selector_for_write_or_403(
     validate_task_selector_or_403(auth_user, selector_json)?;
     let selector = parse_task_selector_or_403(selector_json)?;
     let explicit_server_ids = explicit_selector_server_ids(&selector);
-    ensure_explicit_selector_servers_active(db, auth_user, &explicit_server_ids).await
+    ensure_explicit_selector_servers_active(db, auth_user, &explicit_server_ids).await?;
+    ensure_selector_groups_owned(db, auth_user, &selector.group_ids).await
 }
 
 fn validate_task_selector_for_session(
@@ -762,7 +777,8 @@ fn validate_task_selector_for_session(
         let has_dynamic_selector = selector.source_server
             || !selector.group_ids.is_empty()
             || !selector.tag_names.is_empty()
-            || !selector.tags.is_empty();
+            || !selector.tags.is_empty()
+            || !selector.exclude_server_ids.is_empty();
         if has_dynamic_selector || selector.server_ids.is_empty() {
             return Err(api_error(
                 StatusCode::FORBIDDEN,
@@ -867,10 +883,74 @@ async fn ensure_explicit_selector_servers_active(
     Ok(())
 }
 
+async fn ensure_selector_groups_owned(
+    db: &Db,
+    auth_user: &AuthUser,
+    group_ids: &[String],
+) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
+    if group_ids.is_empty() {
+        return Ok(());
+    }
+
+    for group_id in group_ids {
+        let parsed = uuid::Uuid::parse_str(group_id).map_err(|_| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                format!("server_selector_json contains invalid group_id: {group_id}"),
+            )
+        })?;
+        let exists = match db {
+            Db::Sqlite(pool) => {
+                let row: (i64,) = sqlx::query_as(
+                    "SELECT COUNT(*) FROM server_groups WHERE id = ? AND owner_user_id = ?",
+                )
+                .bind(parsed.to_string())
+                .bind(auth_user.user.id.0.to_string())
+                .fetch_one(pool)
+                .await
+                .map_err(|e| {
+                    tracing::error!("Failed to validate task selector group: {}", e);
+                    api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+                })?;
+                row.0 > 0
+            }
+            Db::Postgres(pool) => {
+                let row: (i64,) = sqlx::query_as(
+                    "SELECT COUNT(*) FROM server_groups WHERE id = $1 AND owner_user_id = $2",
+                )
+                .bind(parsed)
+                .bind(auth_user.user.id.0)
+                .fetch_one(pool)
+                .await
+                .map_err(|e| {
+                    tracing::error!("Failed to validate task selector group: {}", e);
+                    api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+                })?;
+                row.0 > 0
+            }
+        };
+        if !exists {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "server_selector_json contains unknown or unauthorized group_id: {group_id}"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn ensure_task_visible_to_auth(
     auth_user: &AuthUser,
     task: &Task,
 ) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
+    if auth_user.server_ids.is_some() && task.cover_mode != CoverMode::Specific {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "PAT-scoped tasks must use specific cover mode",
+        ));
+    }
     validate_task_selector_or_403(auth_user, &task.server_selector_json)
 }
 
@@ -1294,6 +1374,116 @@ mod tests {
             .contains("unknown or revoked server"));
     }
 
+    #[test]
+    fn scoped_pat_rejects_broad_cover_mode_even_with_allowed_server_ids() {
+        let auth = pat_with_servers(vec!["server-a"]);
+        let all_task = task(CoverMode::All, json!({ "server_ids": ["server-a"] }));
+        let any_task = task(CoverMode::Any, json!({ "server_ids": ["server-a"] }));
+
+        assert!(!task_visible_to_auth(&auth, &all_task));
+        assert!(!task_visible_to_auth(&auth, &any_task));
+        assert!(ensure_task_visible_to_auth(&auth, &all_task).is_err());
+    }
+
+    #[test]
+    fn scoped_pat_rejects_task_selector_with_exclude_server_ids() {
+        let auth = pat_with_servers(vec!["server-a", "server-b"]);
+        let selector = json!({
+            "server_ids": ["server-a", "server-b"],
+            "exclude_server_ids": ["server-b"]
+        })
+        .to_string();
+
+        let err = validate_task_selector_or_403(&auth, &selector).unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn task_write_selector_requires_owned_groups() {
+        let db = test_db().await;
+        let auth = cookie_admin();
+        let owner = auth.user.id.0.to_string();
+        let other_owner = uuid::Uuid::from_bytes([5; 16]).to_string();
+        let owned_group = uuid::Uuid::from_bytes([7; 16]).to_string();
+        let other_group = uuid::Uuid::from_bytes([8; 16]).to_string();
+        seed_user(&db, &owner).await;
+        seed_user(&db, &other_owner).await;
+        seed_server_group(&db, &owned_group, &owner).await;
+        seed_server_group(&db, &other_group, &other_owner).await;
+
+        let owned_selector = json!({ "group_ids": [owned_group] }).to_string();
+        assert!(
+            validate_task_selector_for_write_or_403(&db, &auth, &owned_selector)
+                .await
+                .is_ok()
+        );
+
+        let other_selector = json!({ "group_ids": [other_group] }).to_string();
+        let err = validate_task_selector_for_write_or_403(&db, &auth, &other_selector)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err
+            .1
+             .0
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("unknown or unauthorized group_id"));
+
+        let invalid_selector = json!({ "group_ids": ["not-a-uuid"] }).to_string();
+        let err = validate_task_selector_for_write_or_403(&db, &auth, &invalid_selector)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn trigger_task_visibility_rejects_other_owner_and_broad_cover_mode_for_pat() {
+        let db = test_db().await;
+        let owner = uuid::Uuid::from_bytes([1; 16]).to_string();
+        let other = uuid::Uuid::from_bytes([2; 16]).to_string();
+        let allowed_server = "00000000-0000-0000-0000-0000000000aa";
+        let other_task = "00000000-0000-0000-0000-000000000301";
+        let broad_task = "00000000-0000-0000-0000-000000000302";
+        seed_user(&db, &owner).await;
+        seed_user(&db, &other).await;
+        seed_task_with_selector(
+            &db,
+            other_task,
+            &other,
+            json!({ "server_ids": [allowed_server] }),
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+        let DatabaseBackend::Sqlite(pool) = &db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO tasks (id, owner_user_id, name, task_type, cover_mode, server_selector_json, created_at, updated_at) VALUES (?, ?, 'broad', '\"shell\"', '\"all\"', ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(broad_task)
+        .bind(&owner)
+        .bind(json!({ "server_ids": [allowed_server] }).to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let pat_session = pat_with_servers(vec![allowed_server]).auth_session();
+        assert!(matches!(
+            ensure_task_ids_visible_to_auth_session(&db, &pat_session, &[other_task.to_string()])
+                .await
+                .unwrap_err(),
+            AppError::BadRequest(_)
+        ));
+        assert!(matches!(
+            ensure_task_ids_visible_to_auth_session(&db, &pat_session, &[broad_task.to_string()])
+                .await
+                .unwrap_err(),
+            AppError::Forbidden(_)
+        ));
+    }
+
     fn pat_with_servers(server_ids: Vec<&str>) -> AuthUser {
         let now = Utc::now();
         AuthUser {
@@ -1401,6 +1591,20 @@ mod tests {
         };
         sqlx::query(
             "INSERT INTO servers (id, owner_user_id, name, created_at, updated_at) VALUES (?, ?, 'server', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(owner_user_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_server_group(db: &DatabaseBackend, id: &str, owner_user_id: &str) {
+        let DatabaseBackend::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO server_groups (id, owner_user_id, name, created_at, updated_at) VALUES (?, ?, 'group', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
         )
         .bind(id)
         .bind(owner_user_id)

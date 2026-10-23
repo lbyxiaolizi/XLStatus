@@ -5,9 +5,6 @@ import { acquireBodyScrollLock } from "@/app/lib/body-scroll-lock";
 import type { ApiResponse } from "@/lib/api";
 import { formatLocaleDate, getTranslations } from "@/lib/i18n";
 
-// Auth identity + theme hooks now live in the synchronous client store (they
-// used to read via setTimeout(0) here, which caused a logged-out/light flash on
-// every mount). Re-exported so existing import sites keep working unchanged.
 export {
   useStoredUser,
   readStoredUser,
@@ -69,39 +66,52 @@ export function asNumber(value: unknown, fallback = 0): number {
   return typeof value === "number" && !Number.isNaN(value) ? value : fallback;
 }
 
+export type BadgeTone = "green" | "red" | "yellow" | "gray" | "blue" | "pink";
+
 export function StatusBadge({
   tone,
   children,
 }: {
-  tone: "green" | "red" | "yellow" | "gray" | "blue" | "pink";
+  tone: BadgeTone;
   children: ReactNode;
 }) {
-  const classes = {
-    green: "bg-[var(--accent-color)] text-[var(--btn-text)]",
-    red: "bg-[var(--btn-bg)] text-[var(--btn-text)]",
-    yellow: "bg-[var(--accent-bg)] text-[var(--text-main)]",
-    gray: "bg-[var(--bg-card)] text-[var(--text-muted)]",
-    blue: "bg-[var(--btn-bg)] text-[var(--btn-text)]",
-    pink: "bg-[var(--accent-color)] text-[var(--btn-text)]",
+  const classes: Record<BadgeTone, string> = {
+    green: "border-emerald-500/25 bg-[var(--status-ok-bg)] text-[var(--status-ok-text)]",
+    red: "border-rose-500/25 bg-[var(--status-danger-bg)] text-[var(--status-danger-text)]",
+    yellow: "border-amber-500/25 bg-[var(--status-warn-bg)] text-[var(--status-warn-text)]",
+    gray: "border-[var(--border-color)] bg-[var(--bg-muted)] text-[var(--text-muted)]",
+    blue: "border-indigo-500/25 bg-[var(--status-info-bg)] text-[var(--status-info-text)]",
+    pink: "border-fuchsia-500/25 bg-fuchsia-500/10 text-fuchsia-600 dark:text-fuchsia-300",
+  };
+
+  const dotColors: Record<BadgeTone, string> = {
+    green: "bg-emerald-500",
+    red: "bg-rose-500",
+    yellow: "bg-amber-500",
+    gray: "bg-zinc-400",
+    blue: "bg-indigo-500",
+    pink: "bg-fuchsia-500",
   };
 
   return (
     <span
-      className={`inline-flex items-center border-2 border-black px-2.5 py-1 text-xs font-black uppercase tracking-wide shadow-[2px_2px_0_0_#000] ${classes[tone]}`}
+      className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium leading-5 tracking-tight ${classes[tone]}`}
     >
-      {children}
+      <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${dotColors[tone]}`} aria-hidden="true" />
+      <span>{children}</span>
     </span>
   );
 }
 
-export function InlineError({ message }: { message: string | null }) {
+export function InlineError({ message }: { message: string | null | undefined }) {
   if (!message) return null;
   return (
     <div
       role="alert"
-      className="break-words border-2 border-black bg-[var(--btn-bg)] px-4 py-3 text-sm font-bold text-[var(--btn-text)] shadow-[var(--shadow-brutal-sm)]"
+      className="flex items-start gap-2.5 rounded-xl border border-rose-500/30 bg-[var(--status-danger-bg)] px-4 py-3 text-sm font-medium text-[var(--status-danger-text)] break-words"
     >
-      {message}
+      <span className="mt-1 h-2 w-2 shrink-0 rounded-full bg-rose-500" aria-hidden="true" />
+      <div className="min-w-0 flex-1">{message}</div>
     </div>
   );
 }
@@ -110,21 +120,18 @@ export function InlineNotice({
   tone = "blue",
   children,
 }: {
-  tone?: "blue" | "yellow" | "green" | "pink";
+  tone?: "blue" | "yellow" | "green" | "pink" | undefined;
   children: ReactNode;
 }) {
   const classes = {
-    blue: "bg-[var(--btn-bg)] text-[var(--btn-text)]",
-    yellow: "bg-[var(--accent-bg)] text-[var(--text-main)]",
-    green: "bg-[var(--accent-color)] text-[var(--btn-text)]",
-    pink: "bg-[var(--accent-bg)] text-[var(--text-main)]",
+    blue: "border-indigo-500/25 bg-[var(--status-info-bg)] text-[var(--status-info-text)]",
+    yellow: "border-amber-500/25 bg-[var(--status-warn-bg)] text-[var(--status-warn-text)]",
+    green: "border-emerald-500/25 bg-[var(--status-ok-bg)] text-[var(--status-ok-text)]",
+    pink: "border-fuchsia-500/25 bg-fuchsia-500/10 text-fuchsia-600 dark:text-fuchsia-300",
   };
 
   return (
-    // role="status" (implicit polite live region) so notices injected after
-    // hydration — e.g. the login page's session-expired banner — are announced
-    // by screen readers instead of silently appearing.
-    <div role="status" className={`border-2 border-black px-4 py-3 text-sm font-bold shadow-[var(--shadow-brutal-sm)] ${classes[tone]}`}>
+    <div role="status" className={`rounded-xl border px-4 py-3 text-sm font-medium ${classes[tone]}`}>
       {children}
     </div>
   );
@@ -133,30 +140,30 @@ export function InlineNotice({
 export function EmptyState({
   title,
   detail,
+  action,
 }: {
   title: string;
-  detail?: string;
+  detail?: string | undefined;
+  action?: ReactNode | undefined;
 }) {
   return (
-    <div className="border-2 border-black bg-[var(--bg-card)] px-4 py-12 text-center shadow-[var(--shadow-brutal)]">
-      <p className="text-lg font-black uppercase text-[var(--text-main)]">{title}</p>
-      {detail ? <p className="mx-auto mt-2 max-w-2xl text-sm font-bold text-[var(--text-muted)]">{detail}</p> : null}
+    <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-[var(--border-strong)] bg-[var(--bg-subtle)] px-6 py-12 text-center">
+      <p className="text-sm font-semibold text-[var(--text-main)]">{title}</p>
+      {detail ? <p className="mx-auto mt-1.5 max-w-xl text-xs leading-relaxed text-[var(--text-muted)]">{detail}</p> : null}
+      {action ? <div className="mt-4">{action}</div> : null}
     </div>
   );
 }
 
-// Animated placeholder block for loading states. Replaces bare "正在加载..."
-// text so the layout doesn't jump when data arrives.
-export function Skeleton({ className = "" }: { className?: string }) {
-  return <div className={`animate-pulse bg-black/10 ${className}`} aria-hidden />;
+export function Skeleton({ className = "" }: { className?: string | undefined }) {
+  return <div className={`animate-pulse rounded-md bg-[var(--bg-muted)] ${className}`} aria-hidden />;
 }
 
-// A card-shaped skeleton matching the brutalist card frame, for list grids.
-export function SkeletonCard({ lines = 4 }: { lines?: number }) {
+export function SkeletonCard({ lines = 4 }: { lines?: number | undefined }) {
   return (
-    <div className="border-2 border-black bg-[var(--bg-card)] p-4 shadow-[var(--shadow-brutal)]">
-      <Skeleton className="h-6 w-1/2" />
-      <Skeleton className="mt-3 h-4 w-3/4" />
+    <div className="rounded-xl border border-[var(--border-color)] bg-[var(--bg-card)] p-5 shadow-[var(--shadow-xs)]">
+      <Skeleton className="h-5 w-1/2" />
+      <Skeleton className="mt-2.5 h-3.5 w-3/4" />
       <div className="mt-4 grid grid-cols-2 gap-3">
         {Array.from({ length: lines }).map((_, index) => (
           <Skeleton key={index} className="h-8" />
@@ -170,29 +177,29 @@ export function TableSkeleton({
   columns = 5,
   rows = 5,
 }: {
-  columns?: number;
-  rows?: number;
+  columns?: number | undefined;
+  rows?: number | undefined;
 }) {
   const gridStyle = { gridTemplateColumns: `repeat(${columns}, minmax(8rem, 1fr))` };
   return (
     <div
-      className="overflow-hidden border-2 border-black bg-[var(--bg-card)] shadow-[var(--shadow-brutal)]"
+      className="overflow-hidden rounded-xl border border-[var(--border-color)] bg-[var(--bg-card)] shadow-[var(--shadow-xs)]"
       aria-busy="true"
       aria-label={getTranslations().common.loading}
     >
       <div className="min-w-max">
-        <div className="grid border-b-2 border-black bg-[var(--accent-bg)]" style={gridStyle}>
+        <div className="grid border-b border-[var(--border-color)] bg-[var(--bg-subtle)]" style={gridStyle}>
           {Array.from({ length: columns }).map((_, index) => (
-            <div key={index} className="border-r-2 border-black p-3 last:border-r-0">
-              <Skeleton className="h-4 w-20" />
+            <div key={index} className="p-3.5">
+              <Skeleton className="h-3.5 w-20" />
             </div>
           ))}
         </div>
         {Array.from({ length: rows }).map((_, row) => (
-          <div key={row} className="grid border-b border-black/20 last:border-b-0" style={gridStyle}>
+          <div key={row} className="grid border-b border-[var(--border-color)] last:border-b-0" style={gridStyle}>
             {Array.from({ length: columns }).map((_, column) => (
-              <div key={column} className="p-3">
-                <Skeleton className={`h-5 ${column === 0 ? "w-28" : "w-20"}`} />
+              <div key={column} className="p-3.5">
+                <Skeleton className={`h-4 ${column === 0 ? "w-28" : "w-20"}`} />
               </div>
             ))}
           </div>
@@ -204,20 +211,23 @@ export function TableSkeleton({
 
 export function Field({
   label,
+  hint,
   error,
   children,
 }: {
   label: string;
-  error?: string;
+  hint?: string | undefined;
+  error?: string | undefined;
   children: ReactNode;
 }) {
   return (
-    <label className="block">
-      <span className="mb-1.5 block text-xs font-black uppercase tracking-wide text-[var(--text-main)]">
+    <label className="block space-y-1.5">
+      <span className="block text-xs font-medium tracking-tight text-[var(--text-main)]">
         {label}
       </span>
       {children}
-      {error ? <span className="mt-1 block text-xs font-bold text-[var(--accent-color)]">{error}</span> : null}
+      {hint ? <span className="block text-xs text-[var(--text-muted)]">{hint}</span> : null}
+      {error ? <span className="block text-xs font-medium text-[var(--status-danger-text)]">{error}</span> : null}
     </label>
   );
 }
@@ -284,7 +294,8 @@ export function useDialogFocusTrap(onClose: () => void) {
       const nextIndex = event.shiftKey ? activeIndex - 1 : activeIndex + 1;
       if (activeIndex === -1 || nextIndex < 0 || nextIndex >= focusable.length) {
         event.preventDefault();
-        focusable[event.shiftKey ? focusable.length - 1 : 0].focus();
+        const target = focusable[event.shiftKey ? focusable.length - 1 : 0];
+        target?.focus();
       }
     }
 
@@ -312,17 +323,17 @@ export function Modal({
   const dialogRef = useDialogFocusTrap(onClose);
 
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/50 px-4 py-4 sm:py-8">
+    <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/55 backdrop-blur-xs px-4 py-6 sm:py-12">
       <div
         ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
         tabIndex={-1}
-        className="w-full max-w-3xl border-4 border-black bg-[var(--bg-card)] shadow-[10px_10px_0_0_#000] outline-none"
+        className="w-full max-w-3xl overflow-hidden rounded-2xl border border-[var(--border-color)] bg-[var(--bg-card)] shadow-[var(--shadow-lg)] outline-none"
       >
-        <div className="flex items-center justify-between gap-3 border-b-4 border-black bg-[var(--accent-bg)] px-5 py-4">
-          <h2 id={titleId} className="min-w-0 flex-1 break-words text-lg font-black uppercase text-[var(--text-main)] sm:text-xl">{title}</h2>
+        <div className="flex items-center justify-between gap-3 border-b border-[var(--border-color)] bg-[var(--bg-subtle)] px-5 py-3.5">
+          <h2 id={titleId} className="min-w-0 flex-1 break-words text-base font-semibold tracking-tight text-[var(--text-main)]">{title}</h2>
           <button type="button" onClick={onClose} className={`${buttonClass("secondary")} shrink-0`}>
             {getTranslations().common.close}
           </button>
@@ -333,9 +344,19 @@ export function Modal({
   );
 }
 
-export function PageShell({ children }: { children: ReactNode }) {
+export function PageShell({
+  children,
+  wide = false,
+}: {
+  children: ReactNode;
+  wide?: boolean | undefined;
+}) {
   return (
-    <main className="mx-auto w-full max-w-7xl px-4 py-6 sm:px-6 lg:px-8 lg:py-8">
+    <main
+      className={`mx-auto w-full ${
+        wide ? "max-w-[90rem]" : "max-w-7xl"
+      } px-4 py-6 sm:px-6 lg:px-8 lg:py-8`}
+    >
       {children}
     </main>
   );
@@ -348,24 +369,25 @@ export function PageHeader({
   actions,
 }: {
   title: string;
-  eyebrow?: string;
-  detail?: string;
-  actions?: ReactNode;
+  eyebrow?: string | undefined;
+  detail?: string | undefined;
+  actions?: ReactNode | undefined;
 }) {
   return (
-    <div className="mb-6 grid gap-4 border-b-4 border-black pb-5 md:grid-cols-[minmax(0,1fr)_auto] md:items-end">
+    <div className="mb-6 grid gap-4 border-b border-[var(--border-color)] pb-5 md:grid-cols-[minmax(0,1fr)_auto] md:items-end">
       <div>
         {eyebrow ? (
-          <p className="mb-2 inline-block border-2 border-black bg-[var(--accent-bg)] px-3 py-1 text-xs font-black uppercase tracking-wide shadow-[var(--shadow-brutal-sm)]">
+          <p className="mb-2 inline-flex items-center gap-1.5 rounded-full border border-[var(--border-color)] bg-[var(--bg-subtle)] px-2.5 py-0.5 text-[11px] font-medium tracking-wide text-[var(--text-muted)] uppercase">
+            <span className="h-1.5 w-1.5 rounded-full bg-[var(--accent-color)]" aria-hidden="true" />
             {eyebrow}
           </p>
         ) : null}
-        <h1 className="text-3xl font-black uppercase tracking-tight text-[var(--text-main)] sm:text-5xl">
+        <h1 className="text-2xl font-semibold tracking-tight text-[var(--text-main)] sm:text-3xl">
           {title}
         </h1>
-        {detail ? <p className="mt-2 max-w-3xl text-sm font-bold text-[var(--text-muted)]">{detail}</p> : null}
+        {detail ? <p className="mt-1.5 max-w-3xl text-sm text-[var(--text-muted)]">{detail}</p> : null}
       </div>
-      {actions ? <div className="flex flex-wrap gap-2">{actions}</div> : null}
+      {actions ? <div className="flex flex-wrap items-center gap-2">{actions}</div> : null}
     </div>
   );
 }
@@ -377,41 +399,106 @@ export function BrutalCard({
   ...props
 }: {
   children: ReactNode;
-  className?: string;
-  accent?: boolean;
+  className?: string | undefined;
+  accent?: boolean | undefined;
 } & Omit<HTMLAttributes<HTMLDivElement>, "children" | "className">) {
   return (
     <div
       {...props}
-      className={`border-2 border-black ${accent ? "bg-[var(--accent-bg)]" : "bg-[var(--bg-card)]"} p-4 shadow-[var(--shadow-brutal)] ${className}`}
+      className={`rounded-xl border border-[var(--border-color)] ${accent ? "bg-[var(--bg-subtle)]" : "bg-[var(--bg-card)]"} p-5 shadow-[var(--shadow-xs)] ${className}`}
     >
       {children}
     </div>
   );
 }
 
-export function buttonClass(variant: "primary" | "secondary" | "danger" | "good" = "secondary") {
+export function KpiCard({
+  label,
+  value,
+  hint,
+  badge,
+}: {
+  label: string;
+  value: ReactNode;
+  hint?: ReactNode | undefined;
+  badge?: ReactNode | undefined;
+}) {
+  return (
+    <div className="flex flex-col justify-between rounded-xl border border-[var(--border-color)] bg-[var(--bg-card)] p-4 shadow-[var(--shadow-xs)]">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-xs font-medium text-[var(--text-muted)]">{label}</span>
+        {badge}
+      </div>
+      <div className="mt-2 font-mono text-2xl font-semibold tracking-tight text-[var(--text-main)] tabular-nums">
+        {value}
+      </div>
+      {hint ? <div className="mt-1.5 text-xs text-[var(--text-muted)]">{hint}</div> : null}
+    </div>
+  );
+}
+
+export function ProgressBar({
+  value,
+  tone = "emerald",
+}: {
+  value?: number | null | undefined;
+  tone?: "emerald" | "indigo" | "amber" | "rose" | undefined;
+}) {
+  const safe = typeof value === "number" && Number.isFinite(value)
+    ? Math.max(0, Math.min(100, value))
+    : 0;
+  const fillColor = safe >= 90
+    ? "bg-rose-500"
+    : safe >= 75
+      ? "bg-amber-500"
+      : tone === "indigo"
+        ? "bg-indigo-500"
+        : tone === "amber"
+          ? "bg-amber-500"
+          : tone === "rose"
+            ? "bg-rose-500"
+            : "bg-emerald-500";
+  return (
+    <div className="h-1.5 w-full overflow-hidden rounded-full bg-[var(--bg-muted)]">
+      <div
+        className={`h-full rounded-full transition-all duration-300 ${fillColor}`}
+        style={{ width: `${safe}%` }}
+      />
+    </div>
+  );
+}
+
+export function buttonClass(variant: "primary" | "secondary" | "danger" | "good" | "ghost" = "secondary") {
   const base =
-    "inline-flex min-h-10 items-center justify-center border-2 border-black px-4 py-2 text-sm font-black uppercase tracking-wide shadow-[var(--shadow-brutal-sm)] transition hover:-translate-x-0.5 hover:-translate-y-0.5 hover:shadow-[var(--shadow-brutal)] disabled:pointer-events-none disabled:opacity-50";
-  if (variant === "primary") return `${base} bg-black text-white`;
-  if (variant === "danger") return `${base} bg-[var(--btn-bg)] text-[var(--btn-text)]`;
-  if (variant === "good") return `${base} bg-[var(--accent-color)] text-[var(--btn-text)]`;
-  return `${base} bg-[var(--bg-card)] text-[var(--text-main)]`;
+    "inline-flex min-h-9 items-center justify-center gap-1.5 rounded-lg border px-3.5 py-1.5 text-xs font-medium tracking-tight transition-all duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring-color)] disabled:pointer-events-none disabled:opacity-50 cursor-pointer";
+  if (variant === "primary") {
+    return `${base} border-transparent bg-[var(--text-main)] text-[var(--bg-card)] shadow-[var(--shadow-xs)] hover:opacity-90`;
+  }
+  if (variant === "danger") {
+    return `${base} border-rose-500/30 bg-[var(--status-danger-bg)] text-[var(--status-danger-text)] hover:bg-rose-500/20`;
+  }
+  if (variant === "good") {
+    return `${base} border-emerald-500/30 bg-[var(--status-ok-bg)] text-[var(--status-ok-text)] hover:bg-emerald-500/20`;
+  }
+  if (variant === "ghost") {
+    return `${base} border-transparent bg-transparent text-[var(--text-muted)] hover:bg-[var(--bg-muted)] hover:text-[var(--text-main)]`;
+  }
+  return `${base} border-[var(--border-color)] bg-[var(--bg-card)] text-[var(--text-main)] shadow-[var(--shadow-xs)] hover:border-[var(--border-strong)] hover:bg-[var(--bg-subtle)]`;
 }
 
 export const inputClass =
-  "mt-1 block w-full border-2 border-black bg-[var(--bg-card)] px-3 py-2 text-sm font-bold text-[var(--text-main)] shadow-[var(--shadow-brutal-sm)] outline-none placeholder:text-[var(--text-muted)] focus:-translate-x-0.5 focus:-translate-y-0.5 focus:shadow-[var(--shadow-brutal)]";
+  "mt-1 block w-full rounded-lg border border-[var(--border-color)] bg-[var(--bg-card)] px-3 py-2 text-sm text-[var(--text-main)] shadow-[var(--shadow-xs)] outline-none transition placeholder:text-[var(--text-faint)] focus:border-[var(--accent-color)] focus:ring-2 focus:ring-[var(--ring-color)]";
 
 export const selectClass =
-  "mt-1 block w-full border-2 border-black bg-[var(--bg-card)] px-3 py-2 text-sm font-bold text-[var(--text-main)] shadow-[var(--shadow-brutal-sm)] outline-none focus:-translate-x-0.5 focus:-translate-y-0.5 focus:shadow-[var(--shadow-brutal)]";
+  "mt-1 block w-full rounded-lg border border-[var(--border-color)] bg-[var(--bg-card)] px-3 py-2 text-sm text-[var(--text-main)] shadow-[var(--shadow-xs)] outline-none transition focus:border-[var(--accent-color)] focus:ring-2 focus:ring-[var(--ring-color)]";
 
 export const textareaClass =
-  "mt-1 block w-full border-2 border-black bg-[var(--bg-card)] px-3 py-2 text-sm font-mono text-[var(--text-main)] shadow-[var(--shadow-brutal-sm)] outline-none placeholder:text-[var(--text-muted)] focus:-translate-x-0.5 focus:-translate-y-0.5 focus:shadow-[var(--shadow-brutal)]";
+  "mt-1 block w-full rounded-lg border border-[var(--border-color)] bg-[var(--bg-card)] px-3 py-2 text-sm font-mono text-[var(--text-main)] shadow-[var(--shadow-xs)] outline-none transition placeholder:text-[var(--text-faint)] focus:border-[var(--accent-color)] focus:ring-2 focus:ring-[var(--ring-color)]";
 
 export const tableWrapClass =
-  "overflow-x-auto border-2 border-black bg-[var(--bg-card)] shadow-[var(--shadow-brutal)]";
+  "overflow-x-auto rounded-xl border border-[var(--border-color)] bg-[var(--bg-card)] shadow-[var(--shadow-xs)]";
 
 export const thClass =
-  "border-b-2 border-black bg-[var(--accent-bg)] px-4 py-3 text-left text-xs font-black uppercase tracking-wide";
+  "border-b border-[var(--border-color)] bg-[var(--bg-subtle)] px-4 py-3 text-left text-xs font-medium text-[var(--text-muted)]";
 
-export const tdClass = "border-b border-black/15 px-4 py-3 text-sm font-bold";
+export const tdClass = "border-b border-[var(--border-color)] px-4 py-3 text-sm text-[var(--text-main)]";

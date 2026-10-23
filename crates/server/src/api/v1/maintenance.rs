@@ -289,9 +289,7 @@ pub async fn restore_backup(
             "backup restore currently supports SQLite only".into(),
         ));
     };
-    if body.is_empty() {
-        return Err(AppError::BadRequest("backup file is empty".into()));
-    }
+    validate_sqlite_backup_bytes(&body)?;
 
     let tmp_dir = PrivateTempDir::new("xlstatus-restore")?;
     let tmp_path = tmp_dir.path().join("restore.sqlite3");
@@ -423,6 +421,27 @@ fn normalize_tsdb_retention_days(value: i64) -> Result<i64, AppError> {
     Ok(value)
 }
 
+const SQLITE_HEADER_MAGIC: &[u8; 16] = b"SQLite format 3\0";
+const SQLITE_MIN_HEADER_BYTES: usize = 100;
+
+fn validate_sqlite_backup_bytes(body: &[u8]) -> Result<(), AppError> {
+    if body.is_empty() {
+        return Err(AppError::BadRequest("backup file is empty".into()));
+    }
+    if body.len() > RESTORE_MAX_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "backup file exceeds maximum size of {RESTORE_MAX_BYTES} bytes"
+        )));
+    }
+    if body.len() < SQLITE_MIN_HEADER_BYTES || !body.starts_with(SQLITE_HEADER_MAGIC) {
+        return Err(AppError::BadRequest(
+            "uploaded file is not a valid SQLite database".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
 struct RestoreValidation {
     schema: Vec<TableSchema>,
     user_version: i64,
@@ -436,23 +455,29 @@ async fn validate_restore_candidate(
     let options = SqliteConnectOptions::new()
         .filename(restore_path)
         .read_only(true)
-        .create_if_missing(false);
+        .create_if_missing(false)
+        .pragma("trusted_schema", "OFF");
     let restore_pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect_with(options)
         .await
         .map_err(db_err)?;
 
-    let integrity: (String,) = sqlx::query_as("PRAGMA integrity_check")
-        .fetch_one(&restore_pool)
+    let integrity_rows: Vec<(String,)> = sqlx::query_as("PRAGMA integrity_check")
+        .fetch_all(&restore_pool)
         .await
         .map_err(db_err)?;
-    if integrity.0 != "ok" {
+    if integrity_rows.is_empty() || integrity_rows.iter().any(|(row,)| row != "ok") {
+        let detail = integrity_rows
+            .first()
+            .map(|(row,)| row.as_str())
+            .unwrap_or("empty result");
         return Err(AppError::BadRequest(format!(
-            "SQLite integrity check failed: {}",
-            integrity.0
+            "SQLite integrity check failed: {detail}"
         )));
     }
+
+    ensure_no_untrusted_sqlite_objects(&restore_pool).await?;
 
     let current_schema = load_sqlite_schema(current_pool).await?;
     let restore_schema = load_sqlite_schema(&restore_pool).await?;
@@ -462,12 +487,40 @@ async fn validate_restore_candidate(
         .await
         .map_err(db_err)?;
     let row_count = count_rows(&restore_pool, &current_schema).await?;
+    restore_pool.close().await;
 
     Ok(RestoreValidation {
         schema: current_schema,
         user_version: user_version.0,
         row_count,
     })
+}
+
+async fn ensure_no_untrusted_sqlite_objects(pool: &Pool<Sqlite>) -> Result<(), AppError> {
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        r#"
+        SELECT type, name, COALESCE(sql, '')
+        FROM sqlite_master
+        WHERE name NOT LIKE 'sqlite_%'
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(db_err)?;
+
+    for (object_type, name, sql) in rows {
+        if object_type != "table" && object_type != "index" {
+            return Err(AppError::BadRequest(format!(
+                "backup contains unsupported SQLite {object_type} '{name}'"
+            )));
+        }
+        if sql.to_ascii_uppercase().contains("CREATE VIRTUAL TABLE") {
+            return Err(AppError::BadRequest(format!(
+                "backup contains unsupported virtual table '{name}'"
+            )));
+        }
+    }
+    Ok(())
 }
 
 async fn apply_sqlite_restore(
@@ -477,6 +530,10 @@ async fn apply_sqlite_restore(
 ) -> Result<(), AppError> {
     let mut conn = pool.acquire().await.map_err(db_err)?;
     let result = async {
+        sqlx::query("PRAGMA trusted_schema = OFF")
+            .execute(&mut *conn)
+            .await
+            .map_err(db_err)?;
         sqlx::query("PRAGMA foreign_keys = OFF")
             .execute(&mut *conn)
             .await
@@ -797,6 +854,60 @@ mod tests {
             normalize_tsdb_retention_days(TSDB_RETENTION_MAX_DAYS + 1),
             Err(AppError::BadRequest(_))
         ));
+    }
+
+    #[test]
+    fn sqlite_backup_header_validation_rejects_non_sqlite_payloads() {
+        assert!(matches!(
+            validate_sqlite_backup_bytes(b""),
+            Err(AppError::BadRequest(_))
+        ));
+        assert!(matches!(
+            validate_sqlite_backup_bytes(b"not a sqlite file"),
+            Err(AppError::BadRequest(_))
+        ));
+        assert!(matches!(
+            validate_sqlite_backup_bytes(b"SQLite format 3\0short"),
+            Err(AppError::BadRequest(_))
+        ));
+
+        let mut valid_header = vec![0u8; 100];
+        valid_header[..16].copy_from_slice(b"SQLite format 3\0");
+        assert!(validate_sqlite_backup_bytes(&valid_header).is_ok());
+    }
+
+    #[tokio::test]
+    async fn restore_candidate_rejects_triggers_and_views() {
+        let current_db = crate::db::DatabaseBackend::connect("sqlite::memory:", true)
+            .await
+            .unwrap();
+        current_db.run_migrations().await.unwrap();
+        let crate::db::DatabaseBackend::Sqlite(current_pool) = &current_db else {
+            unreachable!();
+        };
+
+        let dir = PrivateTempDir::new("xlstatus-restore-trigger-test").unwrap();
+        let candidate_path = dir.path().join("candidate.sqlite3");
+        let candidate_url = format!("sqlite://{}?mode=rwc", candidate_path.to_string_lossy());
+        let candidate_db = crate::db::DatabaseBackend::connect(&candidate_url, true)
+            .await
+            .unwrap();
+        candidate_db.run_migrations().await.unwrap();
+        let crate::db::DatabaseBackend::Sqlite(candidate_pool) = &candidate_db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "CREATE TRIGGER evil_trigger AFTER INSERT ON users BEGIN DELETE FROM users; END;",
+        )
+        .execute(candidate_pool)
+        .await
+        .unwrap();
+        candidate_pool.close().await;
+
+        let err = validate_restore_candidate(current_pool, &candidate_path)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
     }
 
     fn auth_session(auth_kind: AuthKind, role: UserRole) -> AuthSession {

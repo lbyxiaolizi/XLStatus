@@ -10,6 +10,7 @@ import {
   responseError,
 } from "@/app/components/M7Primitives";
 import { showToast } from "@/app/components/Toasts";
+import { encodePathSegment } from "@/app/lib/security";
 import { apiClient, getApiBaseUrl } from "@/lib/api";
 import { useI18n } from "@/lib/use-i18n";
 import { useBusy } from "@/app/lib/use-busy";
@@ -20,7 +21,7 @@ const DEFAULT_AGENT_VERSION = "v0.2";
 const GITHUB_RELEASES_API = "https://api.github.com/repos/lbyxiaolizi/XLStatus/releases?per_page=20";
 const GITHUB_RELEASE_CACHE_KEY = "xlstatus:agent-latest-release:v1";
 const GITHUB_RELEASE_CACHE_TTL_MS = 45 * 60 * 1000;
-const HYDRATION_API_BASE_URL = (process.env.NEXT_PUBLIC_API_URL?.trim() || "http://localhost:8080").replace(/\/+$/, "");
+const HYDRATION_API_BASE_URL = (process.env["NEXT_PUBLIC_API_URL"]?.trim() || "http://localhost:8080").replace(/\/+$/, "");
 
 // First card on the page, so it loads eagerly instead of waiting for the
 // viewport observer used by the cards below it.
@@ -50,7 +51,7 @@ export function AgentInstallCard() {
     agent_name: agentName,
     version: agentVersion,
   }, runtimeApiBaseUrl);
-  const githubScriptUrl = `https://github.com/lbyxiaolizi/XLStatus/releases/download/${encodeURIComponent(agentVersion)}/install-agent.sh`;
+  const githubScriptUrl = `https://github.com/lbyxiaolizi/XLStatus/releases/download/${encodePathSegment(agentVersion)}/install-agent.sh`;
   const agentInstallCommand = buildAgentInstallCommand({
     installScriptUrl,
   });
@@ -137,7 +138,7 @@ export function AgentInstallCard() {
         <SectionFeedback error={error} />
         <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.1fr)]">
           <div>
-            <h2 className="mb-4 text-xl font-black uppercase">{copy.settingsPage.agentInstall}</h2>
+            <h2 className="mb-4 text-lg font-semibold tracking-tight text-[var(--text-main)]">{copy.settingsPage.agentInstall}</h2>
             <div className="grid gap-4 md:grid-cols-2">
               <Field label={copy.settingsPage.serverUrl}>
                 <input className={inputClass} value={agentServerUrl} onChange={(e) => setAgentServerUrl(e.target.value)} />
@@ -161,7 +162,7 @@ export function AgentInstallCard() {
               </Field>
             </div>
             <div className="mt-4 flex flex-wrap items-center gap-2">
-              <label className="inline-flex cursor-pointer items-center gap-2 border-2 border-black bg-[var(--accent-bg)] px-3 py-2 text-sm font-black shadow-[var(--shadow-brutal-sm)]">
+              <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-[var(--border-color)] bg-[var(--bg-subtle)] px-3 py-2 text-xs font-medium text-[var(--text-main)]">
                 <input
                   type="checkbox"
                   checked={agentUseLatestVersion}
@@ -178,7 +179,7 @@ export function AgentInstallCard() {
                 {agentLatestVersionLoading ? copy.settingsPage.fetching : copy.settingsPage.refreshVersion}
               </button>
             </div>
-            <p className="mt-2 text-xs font-bold text-[var(--text-muted)]">
+            <p className="mt-2 text-xs font-medium text-[var(--text-muted)]">
               {agentLatestVersionStatus}
             </p>
             <div className="mt-4 flex flex-wrap gap-2">
@@ -188,22 +189,22 @@ export function AgentInstallCard() {
               <button type="button" className={buttonClass("secondary")} onClick={copyAgentCommand} disabled={!enrollmentToken}>
                 {copy.settingsPage.copyInstallCommand}
               </button>
-              <a className={buttonClass("secondary")} href={installScriptUrl} target="_blank" rel="noreferrer">
+              <a className={buttonClass("secondary")} href={installScriptUrl} target="_blank" rel="noopener noreferrer">
                 {copy.settingsPage.openParameterizedLink}
               </a>
             </div>
             {enrollmentExpiresAt ? (
-              <p className="mt-3 text-xs font-black uppercase text-[var(--text-muted)]">
+              <p className="mt-3 text-xs font-medium text-[var(--text-muted)]">
                 {copy.settingsPage.tokenExpiresAt.replace("{value}", String(enrollmentExpiresAt))}
               </p>
             ) : null}
-            <p className="mt-3 break-all text-xs font-bold text-[var(--text-muted)]">
+            <p className="mt-3 break-all text-xs font-medium text-[var(--text-muted)]">
               {copy.settingsPage.githubScriptSource.replace("{url}", String(githubScriptUrl))}
             </p>
           </div>
           <div>
-            <p className="mb-2 text-xs font-black uppercase text-[var(--text-muted)]">{copy.settingsPage.oneLineInstallCommand}</p>
-            <pre className="min-h-40 overflow-auto whitespace-pre-wrap break-all border-2 border-black bg-black p-3 font-mono text-xs text-green-300 shadow-[var(--shadow-brutal-sm)]">
+            <p className="mb-2 text-xs font-medium text-[var(--text-muted)]">{copy.settingsPage.oneLineInstallCommand}</p>
+            <pre className="min-h-40 overflow-auto whitespace-pre-wrap break-all rounded-xl border border-zinc-800 bg-zinc-950 p-3.5 font-mono text-xs text-emerald-400">
               {agentInstallCommand}
             </pre>
           </div>
@@ -271,7 +272,7 @@ function defaultGrpcUrl(apiBaseUrl: string): string {
 }
 
 function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, "'\"'\"'")}'`;
+  return `'${value.replace(/[\u0000-\u001f\u007f]/g, "").replace(/'/g, "'\"'\"'")}'`;
 }
 
 function buildAgentInstallCommand({

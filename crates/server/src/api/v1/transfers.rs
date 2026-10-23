@@ -29,11 +29,14 @@ use crate::grpc::{base64_encoded_len, ensure_task_result_text_within};
 const TEMP_TRANSFER_MAX_BYTES: usize = 100 * 1024 * 1024;
 const TEMP_TRANSFER_MAX_QUERY_BYTES: usize = 512;
 const TEMP_TRANSFER_UUID_TEXT_LEN: usize = 36;
+const TEMP_TRANSFER_MAX_PATH_BYTES: usize = 4096;
+const TEMP_TRANSFER_MAX_FILENAME_BYTES: usize = 255;
 const DOWNLOAD_TIMEOUT_SECS: u64 = 60;
 const UPLOAD_TIMEOUT_SECS: u64 = 120;
 const TEMP_TRANSFER_RATE_LIMIT: u32 = 10;
 const TEMP_TRANSFER_RATE_WINDOW_SECS: u64 = 60;
 const TEMP_TRANSFER_RATE_CLEANUP_INTERVAL: u32 = 64;
+const MAX_TEMP_TRANSFER_RATE_ENTRIES: usize = 4096;
 const TEMP_TRANSFER_SMALL_RESULT_MAX_BYTES: usize = 4096;
 
 #[derive(Default)]
@@ -271,6 +274,7 @@ async fn run_temp_download(
     query: TempTransferQuery,
     client_ip: String,
 ) -> Result<Response, (StatusCode, String)> {
+    check_rate_limit(&client_ip)?;
     let transfer = validate_temporary_transfer(&state, &query.token, "download").await?;
     let path = transfer.path;
     let server_id = transfer.server_id;
@@ -407,6 +411,7 @@ async fn run_temp_upload(
     client_ip: String,
     body: Body,
 ) -> Result<Response, (StatusCode, String)> {
+    check_rate_limit(&client_ip)?;
     let transfer = validate_temporary_transfer(&state, &query.token, "upload").await?;
     let path = transfer.path;
     let server_id = transfer.server_id;
@@ -622,11 +627,23 @@ fn validate_transfer_record_state(
     record: &TemporaryTransferToken,
     op: &str,
 ) -> Result<(), (StatusCode, String)> {
+    let expected_scope = match op {
+        "download" => "transfer:read",
+        "upload" => "transfer:write",
+        _ => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "invalid or expired temporary URL".to_string(),
+            ));
+        }
+    };
     if record.op != op
+        || record.scope != expected_scope
+        || (op == "upload" && record.auth_kind != "session")
         || record.expires_at <= Utc::now()
         || record.used_at.is_some()
         || record.revoked_at.is_some()
-        || !record.path.starts_with('/')
+        || !valid_transfer_record_path(&record.path)
     {
         return Err((
             StatusCode::FORBIDDEN,
@@ -634,6 +651,20 @@ fn validate_transfer_record_state(
         ));
     }
     Ok(())
+}
+
+fn valid_transfer_record_path(path: &str) -> bool {
+    let trimmed = path.trim();
+    trimmed == path
+        && trimmed.starts_with('/')
+        && !trimmed.is_empty()
+        && trimmed.len() <= TEMP_TRANSFER_MAX_PATH_BYTES
+        && !trimmed.contains('\0')
+        && !trimmed.chars().any(char::is_control)
+        && !trimmed.split('/').any(|segment| segment == "..")
+        && trimmed
+            .split('/')
+            .any(|segment| !segment.is_empty() && segment != ".")
 }
 
 async fn validate_transfer_issuer(
@@ -668,7 +699,7 @@ async fn validate_transfer_issuer(
                         "temporary URL issuer is invalid".to_string(),
                     )
                 })?;
-            if session.user_id != record.issued_by_user_id {
+            if session.user_id != record.issued_by_user_id || session.expires_at <= Utc::now() {
                 return Err((
                     StatusCode::FORBIDDEN,
                     "temporary URL issuer is invalid".to_string(),
@@ -893,13 +924,26 @@ fn check_rate_limit_in(
 ) -> Result<(), (StatusCode, String)> {
     let window = std::time::Duration::from_secs(TEMP_TRANSFER_RATE_WINDOW_SECS);
     state.checks_since_cleanup = state.checks_since_cleanup.saturating_add(1);
-    if state.checks_since_cleanup >= TEMP_TRANSFER_RATE_CLEANUP_INTERVAL {
+    let at_capacity_for_new_key =
+        !state.entries.contains_key(token) && state.entries.len() >= MAX_TEMP_TRANSFER_RATE_ENTRIES;
+    if state.checks_since_cleanup >= TEMP_TRANSFER_RATE_CLEANUP_INTERVAL || at_capacity_for_new_key
+    {
         state.entries.retain(|_, (started_at, _)| {
             now.checked_duration_since(*started_at)
                 .map(|elapsed| elapsed < window)
                 .unwrap_or(false)
         });
         state.checks_since_cleanup = 0;
+    }
+    if !state.entries.contains_key(token) && state.entries.len() >= MAX_TEMP_TRANSFER_RATE_ENTRIES {
+        if let Some(oldest_key) = state
+            .entries
+            .iter()
+            .min_by_key(|(_, (started_at, _))| *started_at)
+            .map(|(key, _)| key.clone())
+        {
+            state.entries.remove(&oldest_key);
+        }
     }
     let entry = state.entries.entry(token.to_string()).or_insert((now, 0));
     if now
@@ -1027,13 +1071,21 @@ fn ensure_temporary_transfer_result_text(
 }
 
 fn sanitize_filename(filename: &str) -> String {
-    filename
+    let sanitized: String = filename
         .chars()
         .map(|ch| match ch {
-            '"' | '\\' | '/' | '\0' => '_',
+            '"' | '\'' | '\\' | '/' | '\0' | ';' => '_',
+            c if c.is_control() || !c.is_ascii() => '_',
             _ => ch,
         })
-        .collect()
+        .collect();
+    let bounded = &sanitized[..sanitized.len().min(TEMP_TRANSFER_MAX_FILENAME_BYTES)];
+    let trimmed = bounded.trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        "download.bin".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn json_error(status: StatusCode, message: String) -> Response {
@@ -1055,6 +1107,10 @@ fn temporary_download_headers(data_len: usize, filename: &str) -> Result<HeaderM
     headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/octet-stream"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
     );
     headers.insert(
         header::CONTENT_LENGTH,
@@ -1430,6 +1486,126 @@ mod tests {
                 .await
                 .unwrap();
         assert!(revoked_at.is_none());
+    }
+
+    #[test]
+    fn temporary_transfer_rate_limiter_caps_entries_and_evicts_oldest() {
+        let base = std::time::Instant::now();
+        let mut state = TemporaryTransferRateState::default();
+        for idx in 0..MAX_TEMP_TRANSFER_RATE_ENTRIES {
+            let key = format!("ip-{idx}");
+            let ts = base + std::time::Duration::from_millis(idx as u64);
+            state.entries.insert(key, (ts, 1));
+        }
+
+        let now = base + std::time::Duration::from_secs(10);
+        check_rate_limit_in(&mut state, "ip-new", now).unwrap();
+
+        assert_eq!(state.entries.len(), MAX_TEMP_TRANSFER_RATE_ENTRIES);
+        assert!(!state.entries.contains_key("ip-0"));
+        assert!(state.entries.contains_key("ip-new"));
+    }
+
+    #[tokio::test]
+    async fn temporary_transfer_rate_limits_client_ip_before_db_token_lookup() {
+        let state = test_state().await;
+        let client_ip = format!("198.51.100.{}", uuid::Uuid::now_v7().as_bytes()[15]);
+
+        for attempt in 0..TEMP_TRANSFER_RATE_LIMIT {
+            let err = run_temp_download(
+                state.clone(),
+                TempTransferQuery {
+                    token: format!("xlt_{:064x}", attempt),
+                },
+                client_ip.clone(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.0, StatusCode::FORBIDDEN);
+        }
+
+        let rate_limited = run_temp_download(
+            state,
+            TempTransferQuery {
+                token: format!("xlt_{}", "f".repeat(64)),
+            },
+            client_ip,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(rate_limited.0, StatusCode::TOO_MANY_REQUESTS);
+        assert!(rate_limited.1.contains("rate limit exceeded"));
+    }
+
+    #[test]
+    fn temporary_download_headers_sanitize_control_chars_quotes_and_traversal() {
+        assert_eq!(
+            sanitize_filename("report\"\r\nX-Evil: 1;../secret.txt"),
+            "report___X-Evil: 1_.._secret.txt"
+        );
+        assert_eq!(sanitize_filename(".."), "download.bin");
+        assert_eq!(sanitize_filename("."), "download.bin");
+        assert_eq!(sanitize_filename(""), "download.bin");
+
+        let headers =
+            temporary_download_headers(12, "evil\"\r\nContent-Type: text/html;.bin").unwrap();
+        assert_eq!(
+            headers.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+            "nosniff"
+        );
+        let disposition = headers
+            .get(header::CONTENT_DISPOSITION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            disposition,
+            "attachment; filename=\"evil___Content-Type: text_html_.bin\""
+        );
+    }
+
+    #[test]
+    fn validate_transfer_record_state_rejects_pat_uploads_and_unsafe_paths() {
+        let now = Utc::now();
+        let base_record = TemporaryTransferToken {
+            id: uuid::Uuid::now_v7().to_string(),
+            token_hash: "hash".into(),
+            server_id: AgentId(uuid::Uuid::now_v7()),
+            path: "/var/log/syslog".into(),
+            op: "upload".into(),
+            issued_by_user_id: UserId(uuid::Uuid::now_v7()),
+            auth_kind: "session".into(),
+            session_id: Some(uuid::Uuid::now_v7().to_string()),
+            api_token_id: None,
+            scope: "transfer:write".into(),
+            expires_at: now + Duration::minutes(5),
+            used_at: None,
+            used_ip: None,
+            used_status: None,
+            used_error: None,
+            agent_task_id: None,
+            revoked_at: None,
+            created_at: now,
+            created_ip: None,
+        };
+        assert!(validate_transfer_record_state(&base_record, "upload").is_ok());
+
+        let mut pat_upload = base_record.clone();
+        pat_upload.auth_kind = "pat".into();
+        assert!(validate_transfer_record_state(&pat_upload, "upload").is_err());
+
+        let mut wrong_scope = base_record.clone();
+        wrong_scope.scope = "transfer:read".into();
+        assert!(validate_transfer_record_state(&wrong_scope, "upload").is_err());
+
+        for unsafe_path in ["/", "//", "/.", "/var/log/../../etc/shadow", "/tmp/a\nb"] {
+            let mut bad_path = base_record.clone();
+            bad_path.path = unsafe_path.into();
+            assert!(
+                validate_transfer_record_state(&bad_path, "upload").is_err(),
+                "unsafe path {unsafe_path:?} must be rejected"
+            );
+        }
     }
 
     async fn test_state() -> AppState {

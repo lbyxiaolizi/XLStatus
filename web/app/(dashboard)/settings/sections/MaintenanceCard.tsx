@@ -151,7 +151,7 @@ export function MaintenanceCard() {
       <BrutalCard>
         <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
           <div>
-            <h2 className="text-xl font-black uppercase">{copy.settingsPage.backupAndMaintenance}</h2>
+            <h2 className="text-lg font-semibold tracking-tight text-[var(--text-main)]">{copy.settingsPage.backupAndMaintenance}</h2>
           </div>
           <button type="button" className={buttonClass("secondary")} onClick={() => void loadMaintenanceStatus()} disabled={maintenanceLoading}>
             {maintenanceLoading ? copy.settingsPage.loading : copy.settingsPage.refresh}
@@ -160,17 +160,17 @@ export function MaintenanceCard() {
         <SectionFeedback error={error} />
         <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_auto] xl:items-end">
           <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-8">
-            <div className="border-2 border-black bg-[var(--accent-bg)] p-3 shadow-[var(--shadow-brutal-sm)]">
-              <div className="text-[11px] font-black uppercase text-[var(--text-muted)]">{copy.settingsPage.database}</div>
-              <div className="mt-2 text-lg font-black">{maintenanceStatus?.database_backend ?? "N/A"}</div>
+            <div className="rounded-xl border border-[var(--border-color)] bg-[var(--bg-subtle)] p-3.5">
+              <div className="text-xs font-medium text-[var(--text-muted)]">{copy.settingsPage.database}</div>
+              <div className="mt-2 font-mono text-base font-semibold text-[var(--text-main)]">{maintenanceStatus?.database_backend ?? "N/A"}</div>
             </div>
-            <div className="border-2 border-black bg-[var(--accent-bg)] p-3 shadow-[var(--shadow-brutal-sm)]">
-              <div className="text-[11px] font-black uppercase text-[var(--text-muted)]">{copy.settingsPage.tsdb}</div>
-              <div className="mt-2 text-sm font-black">{maintenanceStatus?.tsdb_backend ?? "N/A"}</div>
-              <div className="mt-1 text-xs font-bold text-[var(--text-muted)]">
+            <div className="rounded-xl border border-[var(--border-color)] bg-[var(--bg-subtle)] p-3.5">
+              <div className="text-xs font-medium text-[var(--text-muted)]">{copy.settingsPage.tsdb}</div>
+              <div className="mt-2 font-mono text-sm font-semibold text-[var(--text-main)]">{maintenanceStatus?.tsdb_backend ?? "N/A"}</div>
+              <div className="mt-1 text-xs text-[var(--text-muted)]">
                 {maintenanceStatus?.tsdb_status ?? "unknown"} / {maintenanceStatus?.tsdb_samples ?? "N/A"} samples
               </div>
-              <div className="mt-1 text-xs font-bold text-[var(--text-muted)]">
+              <div className="mt-1 text-xs text-[var(--text-muted)]">
                 {copy.settingsPage.retentionDays.replace("{days}", String(maintenanceStatus?.tsdb_retention_days ?? "N/A"))}
               </div>
             </div>
@@ -232,7 +232,7 @@ export function MaintenanceCard() {
             </button>
           </div>
         </div>
-        <div className="mt-4 grid gap-3 border-t-2 border-black pt-4 xl:grid-cols-[minmax(0,1fr)_auto] xl:items-end">
+        <div className="mt-4 grid gap-3 border-t border-[var(--border-color)] pt-4 xl:grid-cols-[minmax(0,1fr)_auto] xl:items-end">
           <Field label={copy.settingsPage.sqliteBackupFile}>
             <input
               className={inputClass}

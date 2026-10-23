@@ -42,6 +42,12 @@ const PUBLIC_SERVICE_HISTORY_LIMIT: i64 = 240;
 const PUBLIC_SERVER_ID_PATH_BYTES: usize = 36;
 const PUBLIC_STATUS_SERVER_LIMIT: i64 = 100;
 const PUBLIC_STATUS_SERVICE_LIMIT: i64 = 100;
+const PUBLIC_SITE_NAME_MAX_CHARS: usize = 120;
+const PUBLIC_SERVER_NAME_MAX_CHARS: usize = 128;
+const PUBLIC_SERVICE_NAME_MAX_CHARS: usize = 128;
+const PUBLIC_NOTE_MAX_CHARS: usize = 280;
+const PUBLIC_BRANDING_URL_MAX_LEN: usize = 1024;
+const PUBLIC_SERVICE_STATUS_MAX_CHARS: usize = 32;
 
 static PUBLIC_MJPEG_CONNECTIONS: once_cell::sync::Lazy<Arc<Semaphore>> =
     once_cell::sync::Lazy::new(|| Arc::new(Semaphore::new(PUBLIC_MJPEG_MAX_CONNECTIONS)));
@@ -162,8 +168,8 @@ pub async fn public_status(
         servers,
         services,
         updated_at: Utc::now().to_rfc3339(),
-        site: public_site_branding(&state.db).await?,
-        theme: selected_public_theme(&state.db).await?,
+        site: public_status_site_branding(&state.db).await?,
+        theme: public_status_theme(&state.db).await,
     })))
 }
 
@@ -185,12 +191,14 @@ pub async fn public_server_detail(
     }
 
     let agent = row.agent;
+    let name = sanitize_public_display_text(&agent.name, PUBLIC_SERVER_NAME_MAX_CHARS)
+        .unwrap_or_else(|| "Server".to_string());
     let public_note = public_note_from_metadata(&dashboard);
     let parsed = parse_agent_telemetry_json(row.last_state_json.as_deref());
     let network_rates = network_rates_from_store(&state.metrics, agent.id.0);
     Ok(Json(ApiResponse::success(PublicServerDetailView {
         id: agent.id.0.to_string(),
-        name: agent.name,
+        name,
         remark: public_note.clone(),
         public_note,
         accent_color: dashboard.accent_color,
@@ -306,7 +314,7 @@ fn public_site_disabled_error(err: &AppError) -> bool {
 async fn build_public_status_mjpeg_frame(state: &AppState) -> Result<Vec<u8>, AppError> {
     let servers = public_servers_summary(state).await?;
     let services = public_services(state).await?;
-    let site = public_site_branding(&state.db).await?;
+    let site = public_status_site_branding(&state.db).await?;
     let online_servers = servers
         .iter()
         .filter(|server| server.status == "online")
@@ -443,7 +451,13 @@ async fn public_services(state: &AppState) -> Result<Vec<PublicServiceView>, App
             let mut services = Vec::with_capacity(rows.len());
             for row in rows {
                 let service_id: String = row.get("id");
+                let raw_name: String = row.get("name");
                 let service_type: String = row.get("type");
+                let Some((service_id, name, service_type)) =
+                    sanitize_public_service_row(&service_id, &raw_name, &service_type)
+                else {
+                    continue;
+                };
                 let Some(server_ids) = public_service_server_ids(state, &service_id).await? else {
                     continue;
                 };
@@ -463,7 +477,7 @@ async fn public_services(state: &AppState) -> Result<Vec<PublicServiceView>, App
                 let (last_status, last_check_at) = public_service_last_from_history(&history);
                 services.push(PublicServiceView {
                     id: service_id,
-                    name: row.get("name"),
+                    name,
                     service_type: service_type.clone(),
                     kind: service_type.clone(),
                     service_type_alias: service_type,
@@ -516,7 +530,13 @@ async fn public_services_postgres(
                 break;
             }
             let service_id: String = row.get("id");
+            let raw_name: String = row.get("name");
             let service_type: String = row.get("type");
+            let Some((service_id, name, service_type)) =
+                sanitize_public_service_row(&service_id, &raw_name, &service_type)
+            else {
+                continue;
+            };
             let Some(server_ids) = public_service_server_ids(state, &service_id).await? else {
                 continue;
             };
@@ -533,7 +553,7 @@ async fn public_services_postgres(
             let (last_status, last_check_at) = public_service_last_from_history(&history);
             services.push(PublicServiceView {
                 id: service_id,
-                name: row.get("name"),
+                name,
                 service_type: service_type.clone(),
                 kind: service_type.clone(),
                 service_type_alias: service_type,
@@ -565,7 +585,7 @@ async fn public_server_id_set(state: &AppState) -> Result<HashSet<String>, AppEr
     let mut ids = HashSet::new();
     for row in rows {
         let dashboard = dashboard_metadata(row.dashboard_metadata_json.as_deref());
-        if visible_to_public(&dashboard) {
+        if agent_visible_to_public(&row.agent, &dashboard) {
             ids.insert(row.agent.id.0.to_string());
         }
     }
@@ -760,42 +780,54 @@ fn public_agent_row_to_state(row: PublicAgentRow) -> Result<AgentWithState, anyh
     let (
         id,
         name,
-        public_key,
+        _public_key,
         owner_user_id,
         last_seen_at,
         revoked_at,
         created_at,
         updated_at,
-        remark,
-        expires_at,
-        renewal_price,
+        _remark,
+        _expires_at,
+        _renewal_price,
         dashboard_metadata_json,
         last_state_json,
         _last_state_at,
-        last_info_json,
+        _last_info_json,
         _last_info_at,
     ) = row;
-    let id = Uuid::parse_str(&id).map_err(|e| anyhow::anyhow!("invalid public agent id: {e}"))?;
-    let owner_user_id = Uuid::parse_str(&owner_user_id)
-        .map_err(|e| anyhow::anyhow!("invalid public agent owner: {e}"))?;
+    let id = parse_canonical_uuid(&id, "public agent id")?;
+    let owner_user_id = parse_canonical_uuid(&owner_user_id, "public agent owner")?;
+    let name = sanitize_public_display_text(&name, PUBLIC_SERVER_NAME_MAX_CHARS)
+        .ok_or_else(|| anyhow::anyhow!("public agent name is empty after sanitization"))?;
     Ok(AgentWithState {
         agent: Agent {
             id: AgentId(id),
             name,
-            public_key,
+            public_key: String::new(),
             owner_user_id: xlstatus_shared::UserId(owner_user_id),
             last_seen_at: parse_optional_public_rfc3339(last_seen_at.as_deref(), "last_seen_at")?,
             revoked_at: parse_optional_public_rfc3339(revoked_at.as_deref(), "revoked_at")?,
             created_at: parse_public_rfc3339(&created_at, "created_at")?,
             updated_at: parse_public_rfc3339(&updated_at, "updated_at")?,
         },
-        remark,
-        expires_at,
-        renewal_price,
+        remark: None,
+        expires_at: None,
+        renewal_price: None,
         dashboard_metadata_json,
         last_state_json,
-        last_info_json,
+        last_info_json: None,
     })
+}
+
+fn parse_canonical_uuid(value: &str, field: &str) -> Result<Uuid, anyhow::Error> {
+    if value.len() != PUBLIC_SERVER_ID_PATH_BYTES {
+        return Err(anyhow::anyhow!("invalid {field}: non-canonical length"));
+    }
+    let parsed = Uuid::parse_str(value).map_err(|e| anyhow::anyhow!("invalid {field}: {e}"))?;
+    if parsed.to_string() != value {
+        return Err(anyhow::anyhow!("invalid {field}: non-canonical format"));
+    }
+    Ok(parsed)
 }
 
 fn parse_public_rfc3339(value: &str, field: &str) -> Result<DateTime<Utc>, anyhow::Error> {
@@ -856,11 +888,14 @@ async fn public_service_history_sqlite(
         .into_iter()
         .map(|row| {
             let server_id: String = row.try_get("server_id")?;
+            let status: String = row.try_get("status")?;
+            let created_at: String = row.try_get("created_at")?;
             Ok(PublicServiceResultView {
                 server_id: Some(server_id),
-                status: row.try_get("status")?,
+                status: sanitize_public_display_text(&status, PUBLIC_SERVICE_STATUS_MAX_CHARS)
+                    .unwrap_or_else(|| "unknown".to_string()),
                 delay_ms: row.try_get("delay_ms")?,
-                created_at: row.try_get("created_at")?,
+                created_at: sanitize_public_display_text(&created_at, 64).unwrap_or_default(),
             })
         })
         .collect::<Result<Vec<_>, sqlx::Error>>()
@@ -904,11 +939,14 @@ async fn public_service_history_postgres(
     rows.into_iter()
         .map(|row| {
             let server_id: String = row.try_get("server_id")?;
+            let status: String = row.try_get("status")?;
+            let created_at: String = row.try_get("created_at")?;
             Ok(PublicServiceResultView {
                 server_id: Some(server_id),
-                status: row.try_get("status")?,
+                status: sanitize_public_display_text(&status, PUBLIC_SERVICE_STATUS_MAX_CHARS)
+                    .unwrap_or_else(|| "unknown".to_string()),
                 delay_ms: row.try_get("delay_ms")?,
-                created_at: row.try_get("created_at")?,
+                created_at: sanitize_public_display_text(&created_at, 64).unwrap_or_default(),
             })
         })
         .collect::<Result<Vec<_>, sqlx::Error>>()
@@ -1655,8 +1693,7 @@ fn dashboard_metadata(stored: Option<&str>) -> DashboardMetadata {
 
     out.public_note = out
         .public_note
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+        .and_then(|value| sanitize_public_display_text(&value, PUBLIC_NOTE_MAX_CHARS));
     out.accent_color = out.accent_color.and_then(normalize_accent_color);
     out
 }
@@ -1666,7 +1703,201 @@ fn normalize_accent_color(value: String) -> Option<String> {
     let is_hex = value.len() == 7
         && value.starts_with('#')
         && value.chars().skip(1).all(|ch| ch.is_ascii_hexdigit());
-    is_hex.then(|| value.to_string())
+    is_hex.then(|| value.to_ascii_lowercase())
+}
+
+async fn public_status_site_branding(db: &DatabaseBackend) -> Result<PublicSiteBranding, AppError> {
+    let site = public_site_branding(db).await?;
+    Ok(sanitize_public_site_branding(site))
+}
+
+fn sanitize_public_site_branding(mut site: PublicSiteBranding) -> PublicSiteBranding {
+    let cleaned_name: String = site
+        .site_name
+        .chars()
+        .filter(|ch| !ch.is_control() && !matches!(ch, '<' | '>'))
+        .take(PUBLIC_SITE_NAME_MAX_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_string();
+    site.site_name = if cleaned_name.is_empty() {
+        "XLStatus".to_string()
+    } else {
+        cleaned_name
+    };
+    site.logo_url = site
+        .logo_url
+        .and_then(|url| sanitize_public_branding_url(&url, PUBLIC_BRANDING_URL_MAX_LEN));
+    site.favicon_url = site
+        .favicon_url
+        .and_then(|url| sanitize_public_branding_url(&url, PUBLIC_BRANDING_URL_MAX_LEN));
+    site.background_url = site
+        .background_url
+        .and_then(|url| sanitize_public_branding_url(&url, PUBLIC_BRANDING_URL_MAX_LEN));
+    site.theme_color = site.theme_color.and_then(normalize_accent_color);
+    site.custom_head = None;
+    site.custom_body = None;
+    site
+}
+
+fn sanitize_public_branding_url(value: &str, max_len: usize) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > max_len
+        || trimmed.chars().any(|ch| {
+            ch.is_control()
+                || ch.is_whitespace()
+                || matches!(
+                    ch,
+                    '(' | ')' | '\'' | '"' | '\\' | '<' | '>' | ';' | '{' | '}'
+                )
+        })
+    {
+        return None;
+    }
+
+    if trimmed.starts_with('/') {
+        if trimmed.starts_with("//")
+            || trimmed.starts_with("/\\")
+            || trimmed.contains("..")
+            || trimmed.contains('\\')
+            || trimmed.contains('?')
+            || trimmed.contains('#')
+            || trimmed.contains(':')
+        {
+            return None;
+        }
+        return Some(trimmed.to_string());
+    }
+
+    let parsed = reqwest::Url::parse(trimmed).ok()?;
+    if !matches!(parsed.scheme(), "https" | "http")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+    {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    if is_private_or_internal_branding_host(host) {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn is_private_or_internal_branding_host(raw_host: &str) -> bool {
+    let host = raw_host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if host.is_empty()
+        || host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+        || host.ends_with(".home.arpa")
+        || host.ends_with(".lan")
+        || host.ends_with(".corp")
+        || matches!(
+            host.as_str(),
+            "metadata" | "metadata.google.internal" | "169.254.169.254" | "100.100.100.200"
+        )
+    {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return is_disallow_public_ip(ip);
+    }
+    !host.contains('.')
+}
+
+fn is_disallow_public_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || octets[0] == 0
+                || octets[0] >= 240
+                || (octets[0] == 100 && (octets[1] & 0b1100_0000) == 64)
+                || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+        }
+        std::net::IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_disallow_public_ip(std::net::IpAddr::V4(mapped));
+            }
+            let segments = v6.segments();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (segments[0] & 0xfe00) == 0xfc00
+                || (segments[0] & 0xffc0) == 0xfe80
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        }
+    }
+}
+
+async fn public_status_theme(db: &DatabaseBackend) -> Option<ThemeDefinition> {
+    match selected_public_theme(db).await {
+        Ok(Some(theme)) => sanitize_public_theme(theme),
+        Ok(None) => None,
+        Err(err) => {
+            tracing::warn!("ignoring invalid selected public theme: {:?}", err);
+            None
+        }
+    }
+}
+
+fn sanitize_public_theme(mut theme: ThemeDefinition) -> Option<ThemeDefinition> {
+    if !matches!(theme.target.as_str(), "public" | "both") {
+        return None;
+    }
+    theme.name =
+        sanitize_public_display_text(&theme.name, 80).unwrap_or_else(|| "Public Theme".to_string());
+    theme.description = theme
+        .description
+        .and_then(|desc| sanitize_public_display_text(&desc, 280));
+    theme.custom_css = None;
+    theme.light_custom_css = None;
+    theme.dark_custom_css = None;
+    Some(theme)
+}
+
+fn sanitize_public_service_row(
+    service_id: &str,
+    raw_name: &str,
+    raw_service_type: &str,
+) -> Option<(String, String, String)> {
+    let parsed_id = parse_canonical_uuid(service_id, "public service id").ok()?;
+    let service_type = raw_service_type.trim().to_ascii_lowercase();
+    if !matches!(service_type.as_str(), "http" | "tcp" | "icmp") {
+        tracing::warn!(
+            service_id = %service_id,
+            service_type = %raw_service_type,
+            "skipping public service with unsupported type"
+        );
+        return None;
+    }
+    let name = sanitize_public_display_text(raw_name, PUBLIC_SERVICE_NAME_MAX_CHARS)?;
+    Some((parsed_id.to_string(), name, service_type))
+}
+
+fn sanitize_public_display_text(value: &str, max_chars: usize) -> Option<String> {
+    let cleaned: String = value
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(max_chars)
+        .collect::<String>()
+        .trim()
+        .to_string();
+    (!cleaned.is_empty()).then_some(cleaned)
 }
 
 #[cfg(test)]
@@ -2661,5 +2892,214 @@ mod tests {
         drop(first);
         assert!(acquire_public_mjpeg_permit_from(semaphore).is_ok());
         drop(second);
+    }
+
+    #[tokio::test]
+    async fn public_status_branding_and_theme_strip_injection_and_private_urls() {
+        let state = test_state_with_public_site(true).await;
+        let DatabaseBackend::Sqlite(pool) = &state.db else {
+            unreachable!();
+        };
+        for (key, value) in [
+            (
+                "public_site_name",
+                r#""<script>alert(1)</script>XLStatus\u0007""#,
+            ),
+            ("public_logo_url", r#""http://127.0.0.1:8080/logo.png""#),
+            ("public_favicon_url", r#""javascript:alert(1)""#),
+            (
+                "public_background_url",
+                r#""https://cdn.example.com/bg.png');background:url(x""#,
+            ),
+            ("public_theme_color", r##""#DB2777""##),
+            ("public_custom_head", r#""<script>evil()</script>""#),
+            ("public_custom_body", r#""<img src=x onerror=evil()>""#),
+            (
+                "theme_custom_catalog",
+                r##"[{"id":"custom-pub","name":"Dirty\u0000Theme","description":"desc\u0007","target":"public","variables":{"--bg-page":"#000000"},"custom_css":"body{background:url(javascript:alert(1))}","light_custom_css":"body{}","dark_custom_css":"body{}"}]"##,
+            ),
+            ("theme_selected_public", r#""custom-pub""#),
+        ] {
+            sqlx::query(
+                "INSERT INTO system_settings (key, value_json, updated_at) VALUES (?, ?, '2026-06-22T00:00:00Z')",
+            )
+            .bind(key)
+            .bind(value)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        let response = public_status(axum::extract::State(state)).await.unwrap();
+        let data = response.0.data.expect("public status response data");
+        assert!(!data.site.site_name.contains('<'));
+        assert!(!data.site.site_name.contains('>'));
+        assert!(!data.site.site_name.chars().any(|c| c.is_control()));
+        assert!(data.site.logo_url.is_none());
+        assert!(data.site.favicon_url.is_none());
+        assert!(data.site.background_url.is_none());
+        assert_eq!(data.site.theme_color.as_deref(), Some("#db2777"));
+        assert!(data.site.custom_head.is_none());
+        assert!(data.site.custom_body.is_none());
+
+        // Dirty custom theme with custom_css / control chars is rejected and degrades to None:
+        assert!(data.theme.is_none());
+
+        let sanitized_theme = sanitize_public_theme(ThemeDefinition {
+            id: "custom-pub".to_string(),
+            name: "Dirty\u{0000}Theme".to_string(),
+            description: Some("desc\u{0007}".to_string()),
+            target: "public".to_string(),
+            variables: std::collections::HashMap::new(),
+            light_variables: std::collections::HashMap::new(),
+            dark_variables: std::collections::HashMap::new(),
+            custom_css: Some("body{background:url(javascript:alert(1))}".to_string()),
+            light_custom_css: Some("body{}".to_string()),
+            dark_custom_css: Some("body{}".to_string()),
+            builtin: false,
+            created_at: None,
+            updated_at: None,
+        })
+        .expect("public target theme is accepted after sanitization");
+        assert_eq!(sanitized_theme.name, "DirtyTheme");
+        assert_eq!(sanitized_theme.description.as_deref(), Some("desc"));
+        assert!(sanitized_theme.custom_css.is_none());
+        assert!(sanitized_theme.light_custom_css.is_none());
+        assert!(sanitized_theme.dark_custom_css.is_none());
+        assert!(sanitize_public_theme(ThemeDefinition {
+            target: "dashboard".to_string(),
+            ..sanitized_theme
+        })
+        .is_none());
+
+        let direct_branding = sanitize_public_site_branding(PublicSiteBranding {
+            site_name: "<img src=x>".to_string(),
+            logo_url: Some("http://10.0.0.1/logo.png".to_string()),
+            favicon_url: Some("data:text/html,<script>".to_string()),
+            theme_color: Some("expression(alert(1))".to_string()),
+            background_url: Some("http://169.254.169.254/latest/meta-data".to_string()),
+            custom_head: Some("<script>alert(1)</script>".to_string()),
+            custom_body: Some("<script>alert(2)</script>".to_string()),
+        });
+        assert_eq!(direct_branding.site_name, "img src=x");
+        assert!(direct_branding.logo_url.is_none());
+        assert!(direct_branding.favicon_url.is_none());
+        assert!(direct_branding.theme_color.is_none());
+        assert!(direct_branding.background_url.is_none());
+        assert!(direct_branding.custom_head.is_none());
+        assert!(direct_branding.custom_body.is_none());
+
+        assert_eq!(
+            sanitize_public_branding_url("https://cdn.example.com/assets/logo.svg", 1024)
+                .as_deref(),
+            Some("https://cdn.example.com/assets/logo.svg")
+        );
+        assert_eq!(
+            sanitize_public_branding_url("/static/logo.svg", 1024).as_deref(),
+            Some("/static/logo.svg")
+        );
+        for unsafe_url in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://localhost:3000/a.png",
+            "https://user:pass@cdn.example.com/a.png",
+            "//evil.example.com/a.png",
+            "/../secret.png",
+        ] {
+            assert!(
+                sanitize_public_branding_url(unsafe_url, 1024).is_none(),
+                "unsafe branding URL must be rejected: {unsafe_url}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn public_agent_state_and_service_rows_strip_private_fields_and_skip_dirty_rows() {
+        let state = test_state_with_public_site(true).await;
+        let DatabaseBackend::Sqlite(pool) = &state.db else {
+            unreachable!();
+        };
+        let owner = Uuid::now_v7();
+        let owner_str = owner.to_string();
+        seed_public_user(pool, &owner_str).await;
+
+        let raw_row: PublicAgentRow = (
+            Uuid::now_v7().to_string(),
+            "edge-\u{0007}node".to_string(),
+            "ed25519-private-looking-public-key".to_string(),
+            owner_str.clone(),
+            Some("2026-06-22T00:00:00Z".to_string()),
+            None,
+            "2026-06-22T00:00:00Z".to_string(),
+            "2026-06-22T00:00:00Z".to_string(),
+            Some("PRIVATE OPS REMARK: root pass in vault".to_string()),
+            Some("2027-01-01T00:00:00Z".to_string()),
+            Some("$99/mo".to_string()),
+            Some(
+                serde_json::json!({
+                    "dashboard_visible": true,
+                    "hide_for_guest": false,
+                    "public_note": "Public\u{0000} Note"
+                })
+                .to_string(),
+            ),
+            None,
+            None,
+            Some(r#"{"ipv4":"10.0.0.99","hostname":"internal-host"}"#.to_string()),
+            None,
+        );
+        let converted = public_agent_row_to_state(raw_row).expect("valid row converts");
+        assert_eq!(converted.agent.name, "edge-node");
+        assert!(converted.agent.public_key.is_empty());
+        assert!(converted.remark.is_none());
+        assert!(converted.expires_at.is_none());
+        assert!(converted.renewal_price.is_none());
+        assert!(converted.last_info_json.is_none());
+
+        let public_server = Uuid::now_v7().to_string();
+        seed_public_agent(
+            pool,
+            &public_server,
+            &owner_str,
+            "public-server",
+            true,
+            false,
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+        let valid_service = Uuid::now_v7().to_string();
+        seed_public_service(
+            pool,
+            &valid_service,
+            &owner_str,
+            "valid\u{0007}-service",
+            &public_server,
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+        // Dirty service with non-canonical UUID and dirty service with unsupported type:
+        seed_public_service(
+            pool,
+            "not-a-uuid",
+            &owner_str,
+            "bad-id-service",
+            &public_server,
+            "2026-01-02T00:00:00Z",
+        )
+        .await;
+        let bad_type_service = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO services (id, owner_user_id, name, type, target, interval_seconds, timeout_seconds, enabled, server_id, cover_mode, created_at, updated_at) VALUES (?, ?, 'bad-type', 'shell', 'https://example.com', 60, 10, 1, ?, 'specific', '2026-01-03T00:00:00Z', '2026-01-03T00:00:00Z')",
+        )
+        .bind(&bad_type_service)
+        .bind(&owner_str)
+        .bind(&public_server)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let services = public_services(&state).await.unwrap();
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].id, valid_service);
+        assert_eq!(services[0].name, "valid-service");
     }
 }

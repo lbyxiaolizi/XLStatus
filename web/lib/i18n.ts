@@ -70,6 +70,7 @@ export const zhCN = {
     services: "服务",
     tasks: "任务",
     terminal: "终端",
+    mcp: "AI 运维",
     alerts: "告警",
     notifications: "通知",
     nat: "NAT",
@@ -102,16 +103,22 @@ export const zhCN = {
   worldMap,
 };
 
+const enUSNavPatch = {
+  mcp: "AI & MCP",
+};
+
 // en-US is deliberately absent: it is not resolvable synchronously.
 export const translations = {
   "zh-CN": zhCN,
 } satisfies Partial<Record<Locale, typeof zhCN>>;
 
-export type Translations = typeof zhCN;
+export type Translations = Omit<typeof zhCN, "nav"> & {
+  nav: Omit<typeof zhCN.nav, "mcp"> & { mcp?: string };
+};
 
 export const t = zhCN;
 
-let loadedEn: Translations | null = null;
+let loadedEn: typeof zhCN | null = null;
 let enPromise: Promise<unknown> | null = null;
 
 export function isEnLoaded(): boolean {
@@ -126,7 +133,13 @@ function ensureEnLoaded(): void {
   if (typeof window === "undefined" || loadedEn !== null || enPromise !== null) return;
   enPromise = import("./i18n/en")
     .then((enModule) => {
-      loadedEn = enModule.enUS;
+      loadedEn = {
+        ...enModule.enUS,
+        nav: {
+          ...enModule.enUS.nav,
+          ...enUSNavPatch,
+        },
+      };
       window.dispatchEvent(new Event("xlstatus:locale-change"));
     })
     .catch(() => {
@@ -152,7 +165,7 @@ export function setLocale(locale: Locale): void {
   window.dispatchEvent(new CustomEvent("xlstatus:locale-change", { detail: { locale: normalized } }));
 }
 
-export function getTranslations(locale: Locale = getLocale()): Translations {
+export function getTranslations(locale: Locale = getLocale()): typeof zhCN {
   const normalized = normalizeLocale(locale);
   if (normalized !== "en-US") return translations["zh-CN"];
   if (loadedEn !== null) return loadedEn;

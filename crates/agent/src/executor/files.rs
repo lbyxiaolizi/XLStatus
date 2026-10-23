@@ -9,6 +9,12 @@ use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
+pub const DEFAULT_FILE_READ_MAX_BYTES: u64 = 2 * 1024 * 1024;
+pub const HARD_MAX_FILE_READ_BYTES: u64 = 100 * 1024 * 1024;
+pub const HARD_MAX_FILE_WRITE_BYTES: usize = 100 * 1024 * 1024;
+pub const MAX_DIRECTORY_ENTRIES: usize = 10_000;
+const FILE_PERMISSION_BITS_MASK: u32 = 0o777;
+
 /// File entry information
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -117,12 +123,13 @@ pub async fn read_file(
     length: u64,
     allowed_roots: &[String],
 ) -> Result<Vec<u8>> {
+    let max_read = bounded_read_length(length)?;
     let roots = canonical_allowed_roots(allowed_roots, false).await?;
     let path = resolve_existing_path(path, &roots).await?;
 
     #[cfg(unix)]
     {
-        return read_file_no_symlink_race(&path, offset, length).await;
+        return read_file_no_symlink_race(&path, offset, max_read).await;
     }
 
     #[cfg(not(unix))]
@@ -145,14 +152,8 @@ pub async fn read_file(
         }
 
         let mut buffer = Vec::new();
-        let max_read = if length > 0 {
-            length as usize
-        } else {
-            usize::MAX
-        };
-
         use tokio::io::AsyncReadExt;
-        file.take(max_read as u64)
+        file.take(max_read)
             .read_to_end(&mut buffer)
             .await
             .context("Failed to read file")?;
@@ -170,6 +171,7 @@ pub async fn write_file(
     create_dirs: bool,
     allowed_roots: &[String],
 ) -> Result<u64> {
+    ensure_write_bounds_and_mode(data, mode)?;
     let roots = canonical_allowed_roots(allowed_roots, true).await?;
     let path = validate_absolute_path(path)?;
     let mut write_target = resolve_write_target(path, &roots).await?;
@@ -197,6 +199,34 @@ pub async fn write_file(
     }
 
     Ok(data.len() as u64)
+}
+
+fn bounded_read_length(length: u64) -> Result<u64> {
+    if length == 0 {
+        return Ok(DEFAULT_FILE_READ_MAX_BYTES);
+    }
+    if length > HARD_MAX_FILE_READ_BYTES {
+        bail!(
+            "File read length exceeds maximum allowed size of {} bytes",
+            HARD_MAX_FILE_READ_BYTES
+        );
+    }
+    Ok(length)
+}
+
+fn ensure_write_bounds_and_mode(data: &[u8], mode: Option<u32>) -> Result<()> {
+    if data.len() > HARD_MAX_FILE_WRITE_BYTES {
+        bail!(
+            "File write data exceeds maximum allowed size of {} bytes",
+            HARD_MAX_FILE_WRITE_BYTES
+        );
+    }
+    if let Some(mode) = mode {
+        if mode & !FILE_PERMISSION_BITS_MASK != 0 {
+            bail!("File mode must only contain permission bits (0o777)");
+        }
+    }
+    Ok(())
 }
 
 /// Delete file or directory
@@ -269,14 +299,44 @@ async fn canonical_allowed_roots(
     let mut roots = Vec::with_capacity(allowed_roots.len());
     for root in allowed_roots {
         let root = validate_absolute_path(root)?;
-        if create_missing {
-            fs::create_dir_all(root)
+        if root.parent().is_none() || root.to_str() == Some("/") {
+            bail!("Filesystem root cannot be used as an allowed file root");
+        }
+        if create_missing && !fs::try_exists(root).await.unwrap_or(false) {
+            let mut ancestor = root
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("Allowed root has no parent"))?;
+            while !fs::try_exists(ancestor).await.unwrap_or(false) {
+                ancestor = ancestor
+                    .parent()
+                    .ok_or_else(|| anyhow::anyhow!("Allowed root has no existing parent"))?;
+            }
+            let canonical_ancestor = fs::canonicalize(ancestor)
+                .await
+                .with_context(|| format!("Ancestor {} does not exist", ancestor.display()))?;
+            let relative = root.strip_prefix(ancestor).with_context(|| {
+                format!(
+                    "Allowed root {} is not below ancestor {}",
+                    root.display(),
+                    ancestor.display()
+                )
+            })?;
+            let target_root = canonical_ancestor.join(relative);
+            #[cfg(unix)]
+            create_dir_all_no_symlink(&target_root)
+                .await
+                .with_context(|| format!("Failed to create allowed root {}", root.display()))?;
+            #[cfg(not(unix))]
+            fs::create_dir_all(&target_root)
                 .await
                 .with_context(|| format!("Failed to create allowed root {}", root.display()))?;
         }
         let canonical = fs::canonicalize(root)
             .await
             .with_context(|| format!("Allowed root {} does not exist", root.display()))?;
+        if canonical.parent().is_none() || canonical.to_str() == Some("/") {
+            bail!("Filesystem root cannot be used as an allowed file root");
+        }
         roots.push(canonical);
     }
     Ok(roots)
@@ -492,7 +552,7 @@ fn list_files_no_symlink_race_blocking(path: &Path) -> Result<Vec<FileEntry>> {
 }
 
 #[cfg(unix)]
-fn read_file_no_symlink_race_blocking(path: &Path, offset: u64, length: u64) -> Result<Vec<u8>> {
+fn read_file_no_symlink_race_blocking(path: &Path, offset: u64, max_read: u64) -> Result<Vec<u8>> {
     let parts = absolute_normal_components(path)?;
     let (file_name, parent_parts) = parts
         .split_last()
@@ -500,10 +560,6 @@ fn read_file_no_symlink_race_blocking(path: &Path, offset: u64, length: u64) -> 
 
     let parent_fd = open_dir_parts_no_follow(parent_parts)?;
     let file_fd = open_child_file_read_no_follow(parent_fd.as_raw_fd(), file_name)?;
-    let metadata = file_metadata(file_fd.as_raw_fd()).context("Failed to read metadata")?;
-    if !is_file_mode(metadata.st_mode) {
-        bail!("Path is not a file");
-    }
 
     let mut file = std::fs::File::from(file_fd);
     if offset > 0 {
@@ -512,7 +568,6 @@ fn read_file_no_symlink_race_blocking(path: &Path, offset: u64, length: u64) -> 
     }
 
     let mut buffer = Vec::new();
-    let max_read = if length > 0 { length } else { u64::MAX };
     std::io::Read::read_to_end(&mut std::io::Read::take(file, max_read), &mut buffer)
         .context("Failed to read file")?;
     Ok(buffer)
@@ -618,19 +673,34 @@ fn open_child_file_no_follow(
     parent_fd: std::os::unix::io::RawFd,
     name: &std::ffi::OsStr,
 ) -> Result<OwnedFd> {
+    if let Ok(existing) = child_metadata_no_follow(parent_fd, name) {
+        if !is_file_mode(existing.st_mode) {
+            bail!("Path is not a regular file");
+        }
+    }
     let name = os_str_to_cstring(name)?;
     let fd = unsafe {
         libc::openat(
             parent_fd,
             name.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
             0o666,
         )
     };
     if fd < 0 {
         return Err(std::io::Error::last_os_error()).context("Failed to open file");
     }
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let metadata = file_metadata(owned_fd.as_raw_fd()).context("Failed to read metadata")?;
+    if !is_file_mode(metadata.st_mode) {
+        bail!("Path is not a regular file");
+    }
+    clear_nonblock_flag(owned_fd.as_raw_fd())?;
+    let trunc_res = unsafe { libc::ftruncate(owned_fd.as_raw_fd(), 0) };
+    if trunc_res < 0 {
+        return Err(std::io::Error::last_os_error()).context("Failed to truncate file");
+    }
+    Ok(owned_fd)
 }
 
 #[cfg(unix)]
@@ -638,18 +708,41 @@ fn open_child_file_read_no_follow(
     parent_fd: std::os::unix::io::RawFd,
     name: &std::ffi::OsStr,
 ) -> Result<OwnedFd> {
+    let pre_metadata = child_metadata_no_follow(parent_fd, name).context("Failed to stat file")?;
+    if !is_file_mode(pre_metadata.st_mode) {
+        bail!("Path is not a regular file");
+    }
     let name = os_str_to_cstring(name)?;
     let fd = unsafe {
         libc::openat(
             parent_fd,
             name.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
         )
     };
     if fd < 0 {
         return Err(std::io::Error::last_os_error()).context("Failed to open file");
     }
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let metadata = file_metadata(owned_fd.as_raw_fd()).context("Failed to read metadata")?;
+    if !is_file_mode(metadata.st_mode) {
+        bail!("Path is not a regular file");
+    }
+    clear_nonblock_flag(owned_fd.as_raw_fd())?;
+    Ok(owned_fd)
+}
+
+#[cfg(unix)]
+fn clear_nonblock_flag(fd: RawFd) -> Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error()).context("Failed to read file status flags");
+    }
+    let res = unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
+    if res < 0 {
+        return Err(std::io::Error::last_os_error()).context("Failed to clear nonblocking flag");
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -774,6 +867,7 @@ fn read_dir_names(fd: RawFd) -> Result<Vec<std::ffi::OsString>> {
     }
 
     let mut entries = Vec::new();
+    let mut overflow = false;
     loop {
         let entry = unsafe { libc::readdir(dir) };
         if entry.is_null() {
@@ -782,6 +876,10 @@ fn read_dir_names(fd: RawFd) -> Result<Vec<std::ffi::OsString>> {
         let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
         let bytes = name.to_bytes();
         if bytes != b"." && bytes != b".." {
+            if entries.len() >= MAX_DIRECTORY_ENTRIES {
+                overflow = true;
+                break;
+            }
             entries.push(std::ffi::OsString::from_vec(bytes.to_vec()));
         }
     }
@@ -789,6 +887,12 @@ fn read_dir_names(fd: RawFd) -> Result<Vec<std::ffi::OsString>> {
     let close_result = unsafe { libc::closedir(dir) };
     if close_result < 0 {
         return Err(std::io::Error::last_os_error()).context("Failed to close directory stream");
+    }
+    if overflow {
+        bail!(
+            "Directory contains more than {} entries",
+            MAX_DIRECTORY_ENTRIES
+        );
     }
     Ok(entries)
 }
@@ -827,8 +931,12 @@ fn metadata_mode(_metadata: &std::fs::Metadata) -> u32 {
 
 #[cfg(unix)]
 async fn set_file_mode(file: &fs::File, _path: &Path, mode: u32) -> Result<()> {
+    if mode & !FILE_PERMISSION_BITS_MASK != 0 {
+        bail!("File mode must only contain permission bits (0o777)");
+    }
     let fd = file.as_raw_fd();
-    let result = unsafe { libc::fchmod(fd, mode as libc::mode_t) };
+    let sanitized_mode = (mode & FILE_PERMISSION_BITS_MASK) as libc::mode_t;
+    let result = unsafe { libc::fchmod(fd, sanitized_mode) };
     if result < 0 {
         return Err(std::io::Error::last_os_error()).context("Failed to set permissions");
     }
@@ -1092,5 +1200,54 @@ mod tests {
         assert!(!dir_path.exists());
         assert!(outside_file.exists());
         assert_eq!(std::fs::read(&outside_file).unwrap(), b"secret");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_read_and_write_reject_fifo_without_blocking() {
+        let allowed = TempDir::new().unwrap();
+        let fifo_path = allowed.path().join("pipe.fifo");
+        let fifo_cstr = std::ffi::CString::new(fifo_path.to_str().unwrap()).unwrap();
+        let rc = unsafe { libc::mkfifo(fifo_cstr.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo should succeed");
+
+        let roots = vec![allowed.path().to_str().unwrap().to_string()];
+        let fifo_str = fifo_path.to_str().unwrap();
+
+        let read_res = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            read_file(fifo_str, 0, 64, &roots),
+        )
+        .await
+        .expect("reading a FIFO must not block");
+        assert!(read_res.is_err());
+
+        let write_res = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            write_file(fifo_str, b"data", None, false, &roots),
+        )
+        .await
+        .expect("writing to a FIFO must not block");
+        assert!(write_res.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_file_read_write_bounds_and_mode_validation() {
+        assert_eq!(bounded_read_length(0).unwrap(), DEFAULT_FILE_READ_MAX_BYTES);
+        assert_eq!(
+            bounded_read_length(HARD_MAX_FILE_READ_BYTES).unwrap(),
+            HARD_MAX_FILE_READ_BYTES
+        );
+        assert!(bounded_read_length(HARD_MAX_FILE_READ_BYTES + 1).is_err());
+
+        assert!(ensure_write_bounds_and_mode(b"ok", Some(0o600)).is_ok());
+        assert!(ensure_write_bounds_and_mode(b"setuid", Some(0o4755)).is_err());
+        assert!(ensure_write_bounds_and_mode(b"setgid", Some(0o2755)).is_err());
+        assert!(ensure_write_bounds_and_mode(b"sticky", Some(0o1755)).is_err());
+
+        let root_err = canonical_allowed_roots(&["/".to_string()], false)
+            .await
+            .unwrap_err();
+        assert!(root_err.to_string().contains("Filesystem root"));
     }
 }

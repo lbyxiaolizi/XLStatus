@@ -11,6 +11,8 @@ use std::time::Duration;
 use xlstatus_shared::ddns::*;
 
 const DDNS_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const DDNS_MAX_RESPONSE_BYTES: usize = 64 * 1024;
+const DDNS_MAX_ERROR_MESSAGE_BYTES: usize = 512;
 const CLOUDFLARE_API_BASE: &str = "https://api.cloudflare.com/client/v4";
 const HE_DDNS_UPDATE_URL: &str = "https://dyn.dns.he.net/nic/update";
 const TENCENT_DNSPOD_API_HOST: &str = "dnspod.tencentcloudapi.com";
@@ -52,10 +54,14 @@ impl DdnsProviderTrait for CloudflareProvider {
             .await
             .context("Failed to list DNS records")?;
 
-        let list_json: serde_json::Value = list_response
-            .json()
-            .await
-            .context("Failed to parse list response")?;
+        let list_text = read_bounded_ddns_response_text(
+            list_response,
+            DDNS_MAX_RESPONSE_BYTES,
+            "Cloudflare list response",
+        )
+        .await?;
+        let list_json: serde_json::Value =
+            serde_json::from_str(&list_text).context("Failed to parse list response")?;
 
         let records = list_json["result"].as_array().context("No result array")?;
 
@@ -87,8 +93,17 @@ impl DdnsProviderTrait for CloudflareProvider {
             .context("Failed to update DNS record")?;
 
         if !update_response.status().is_success() {
-            let error_text = update_response.text().await.unwrap_or_default();
-            anyhow::bail!("Cloudflare API error: {}", error_text);
+            let error_text = read_bounded_ddns_response_text(
+                update_response,
+                DDNS_MAX_RESPONSE_BYTES,
+                "Cloudflare error response",
+            )
+            .await
+            .unwrap_or_default();
+            anyhow::bail!(
+                "Cloudflare API error: {}",
+                sanitize_ddns_error_message(&error_text)
+            );
         }
 
         Ok(())
@@ -123,13 +138,27 @@ impl DdnsProviderTrait for HeProvider {
             .context("Failed to update HE DDNS")?;
 
         if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("HE DDNS error: {}", error_text);
+            let error_text = read_bounded_ddns_response_text(
+                response,
+                DDNS_MAX_RESPONSE_BYTES,
+                "HE DDNS error response",
+            )
+            .await
+            .unwrap_or_default();
+            anyhow::bail!(
+                "HE DDNS error: {}",
+                sanitize_ddns_error_message(&error_text)
+            );
         }
 
-        let body = response.text().await?;
+        let body =
+            read_bounded_ddns_response_text(response, DDNS_MAX_RESPONSE_BYTES, "HE DDNS response")
+                .await?;
         if !body.starts_with("good") && !body.starts_with("nochg") {
-            anyhow::bail!("HE DDNS update failed: {}", body);
+            anyhow::bail!(
+                "HE DDNS update failed: {}",
+                sanitize_ddns_error_message(&body)
+            );
         }
 
         Ok(())
@@ -217,9 +246,19 @@ impl DdnsProviderTrait for TencentCloudProvider {
             .context("Failed to update Tencent Cloud DNS record")?;
 
         let status = response.status();
-        let text = response.text().await.unwrap_or_default();
+        let text = read_bounded_ddns_response_text(
+            response,
+            DDNS_MAX_RESPONSE_BYTES,
+            "Tencent Cloud DDNS response",
+        )
+        .await
+        .unwrap_or_default();
         if !status.is_success() {
-            anyhow::bail!("Tencent Cloud API HTTP {}: {}", status, text);
+            anyhow::bail!(
+                "Tencent Cloud API HTTP {}: {}",
+                status,
+                sanitize_ddns_error_message(&text)
+            );
         }
         let parsed: serde_json::Value = serde_json::from_str(&text)
             .with_context(|| format!("Failed to parse Tencent Cloud response: {}", text))?;
@@ -344,20 +383,33 @@ impl DdnsProviderTrait for WebhookProvider {
 
         // Add body for POST/PUT
         if let Some(ref body_template) = self.config.body_template {
+            let safe_ip = escape_json_template_value(ip);
+            let safe_hostname = escape_json_template_value(hostname);
             let body = body_template
-                .replace("{{ip}}", ip)
-                .replace("{{hostname}}", hostname);
+                .replace("{{ip}}", &safe_ip)
+                .replace("{{hostname}}", &safe_hostname);
             request = request.body(body);
         }
 
-        let response = request
-            .send()
-            .await
-            .context("Failed to send webhook request")?;
+        let response = request.send().await.map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to send webhook request: {}",
+                sanitize_ddns_error_message(&e.to_string())
+            )
+        })?;
 
         if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Webhook error: {}", error_text);
+            let error_text = read_bounded_ddns_response_text(
+                response,
+                DDNS_MAX_RESPONSE_BYTES,
+                "DDNS webhook response",
+            )
+            .await
+            .unwrap_or_default();
+            anyhow::bail!(
+                "Webhook error: {}",
+                sanitize_ddns_error_message(&error_text)
+            );
         }
 
         Ok(())
@@ -366,6 +418,56 @@ impl DdnsProviderTrait for WebhookProvider {
     fn name(&self) -> &'static str {
         "Webhook"
     }
+}
+
+pub(crate) async fn read_bounded_ddns_response_text(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+    label: &str,
+) -> Result<String> {
+    if let Some(content_length) = response.content_length() {
+        if content_length > max_bytes as u64 {
+            anyhow::bail!("{label} exceeds maximum size of {max_bytes} bytes");
+        }
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .with_context(|| format!("failed to read {label}"))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > max_bytes {
+            anyhow::bail!("{label} exceeds maximum size of {max_bytes} bytes");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+pub(crate) fn sanitize_ddns_error_message(error: &str) -> String {
+    let redacted = crate::api::v1::notifications::sanitize_notification_error(error, "");
+    let cleaned: String = redacted
+        .chars()
+        .filter(|ch| !ch.is_control() || matches!(*ch, ' ' | '\t'))
+        .take(DDNS_MAX_ERROR_MESSAGE_BYTES)
+        .collect();
+    cleaned
+}
+
+fn escape_json_template_value(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            c if c.is_control() => {}
+            c => escaped.push(c),
+        }
+    }
+    escaped
 }
 
 /// Dummy DDNS provider for testing
@@ -546,5 +648,18 @@ mod tests {
             update.as_str(),
             "https://api.cloudflare.com/client/v4/zones/zone%2Fid/dns_records/record%2Fid"
         );
+    }
+
+    #[test]
+    fn ddns_error_sanitization_redacts_webhook_urls_and_escapes_json_templates() {
+        let raw_err =
+            "error sending request for url (https://hooks.example.com/ddns/SECRET_TOKEN?api_key=123)";
+        let sanitized = sanitize_ddns_error_message(raw_err);
+        assert!(!sanitized.contains("SECRET_TOKEN"));
+        assert!(!sanitized.contains("api_key=123"));
+        assert!(sanitized.contains("https://hooks.example.com/[redacted]"));
+
+        let escaped = escape_json_template_value("host.example.com\",\"injected\":\"1");
+        assert_eq!(escaped, "host.example.com\\\",\\\"injected\\\":\\\"1");
     }
 }

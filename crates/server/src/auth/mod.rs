@@ -47,3 +47,14 @@ pub fn generate_temporary_transfer_token() -> (String, String) {
     let hash = hash_token(&token);
     (token, hash)
 }
+
+/// Constant-time byte slice comparison to prevent timing side-channel leaks.
+pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right.iter())
+        .fold(0_u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
+}

@@ -87,7 +87,7 @@ export function PatTokensCard() {
     <>
       <div ref={cardRef} className="grid gap-6 lg:grid-cols-2">
         <BrutalCard accent>
-          <h2 className="mb-4 text-xl font-black uppercase">{copy.settingsPage.createPat}</h2>
+          <h2 className="mb-4 text-lg font-semibold tracking-tight text-[var(--text-main)]">{copy.settingsPage.createPat}</h2>
           <SectionFeedback error={error} />
           <form
             onSubmit={(event) => {
@@ -103,27 +103,27 @@ export function PatTokensCard() {
             <button className={buttonClass("primary")} disabled={busy}>{copy.settingsPage.createToken}</button>
           </form>
           {createdToken ? (
-            <div className="mt-5 border-2 border-black bg-black p-3 font-mono text-xs text-green-300">
+            <div className="mt-5 rounded-xl border border-zinc-800 bg-zinc-950 p-3.5 font-mono text-xs text-emerald-400">
               {createdToken}
             </div>
           ) : null}
         </BrutalCard>
 
         <BrutalCard>
-          <h2 className="mb-4 text-xl font-black uppercase">{copy.settingsPage.existingTokens}</h2>
+          <h2 className="mb-4 text-lg font-semibold tracking-tight text-[var(--text-main)]">{copy.settingsPage.existingTokens}</h2>
           <div className="grid gap-3">
             {tokensLoading && tokens.length === 0 ? (
               <SettingsListSkeleton rows={2} />
             ) : tokens.length === 0 ? (
-              <p className="text-sm font-bold text-[var(--text-muted)]">{copy.settingsPage.noTokens}</p>
+              <p className="text-sm font-medium text-[var(--text-muted)]">{copy.settingsPage.noTokens}</p>
             ) : (
               tokens.map((token) => {
                 const serverIds = token.server_ids ?? [];
                 return (
-                  <div key={token.id} className="border-2 border-black bg-[var(--accent-bg)] p-3 text-sm font-bold">
+                  <div key={token.id} className="rounded-xl border border-[var(--border-color)] bg-[var(--bg-subtle)] p-4 text-sm">
                     <div className="flex flex-wrap items-start justify-between gap-3">
                       <div className="min-w-0">
-                        <div className="break-words text-base font-black">{token.name || copy.settingsPage.unnamedToken}</div>
+                        <div className="break-words text-base font-semibold text-[var(--text-main)]">{token.name || copy.settingsPage.unnamedToken}</div>
                         <div className="mt-1 break-all font-mono text-[11px] text-[var(--text-muted)]">{token.id}</div>
                       </div>
                       <div className="flex flex-wrap gap-2">

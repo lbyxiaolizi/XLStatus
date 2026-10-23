@@ -88,17 +88,18 @@ export function useServerRealtime(scope: string | null, revision: number): Serve
         let next = previous;
         for (const item of events) {
           const event = item.event;
-          if (event.kind !== "host_state" || typeof event.agent_id !== "string") continue;
-          const current = next[event.agent_id];
+          const agentId = event["agent_id"];
+          if (event["kind"] !== "host_state" || typeof agentId !== "string") continue;
+          const current = next[agentId];
           const normalized = normalizeLiveState(
-            event.payload,
-            event.received_at,
+            event["payload"],
+            event["received_at"],
             current,
             item.snapshot,
           );
           if (normalized === current) continue;
           if (next === previous) next = { ...previous };
-          next[event.agent_id] = normalized;
+          next[agentId] = normalized;
         }
         if (next === previous && currentScope?.scope === activeScope) return currentScope;
         return { scope: activeScope, values: next };
@@ -145,11 +146,12 @@ export function useServerRealtime(scope: string | null, revision: number): Serve
         if (cancelled) return;
         try {
           const message = JSON.parse(event.data as string) as Record<string, unknown>;
-          const snapshot = message.type === "snapshot";
-          const events = snapshot && Array.isArray(message.events)
-            ? message.events
-            : message.type === "event"
-              ? [message.event]
+          const snapshot = message["type"] === "snapshot";
+          const rawEvents = message["events"];
+          const events = snapshot && Array.isArray(rawEvents)
+            ? rawEvents
+            : message["type"] === "event"
+              ? [message["event"]]
               : [];
           for (const raw of events) {
             if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
@@ -220,20 +222,20 @@ function normalizeLiveState(
   if (previous && Number.isFinite(previousAt) && parsedReceivedAt <= previousAt) return previous;
 
   const state = asRecord(payload);
-  const netInTotal = optionalNumber(state.network_in_total) ?? netIoTotal(state, "bytes_recv");
-  const netOutTotal = optionalNumber(state.network_out_total) ?? netIoTotal(state, "bytes_sent");
+  const netInTotal = optionalNumber(state["network_in_total"]) ?? netIoTotal(state, "bytes_recv");
+  const netOutTotal = optionalNumber(state["network_out_total"]) ?? netIoTotal(state, "bytes_sent");
   return {
-    cpu_percent: optionalNumber(state.cpu_percent),
-    memory_used: optionalNumber(state.memory_used),
-    memory_total: optionalNumber(state.memory_total),
-    load_1: optionalNumber(state.load_1),
-    net_rx_bps: optionalNumber(state.net_rx_bps)
+    cpu_percent: optionalNumber(state["cpu_percent"]),
+    memory_used: optionalNumber(state["memory_used"]),
+    memory_total: optionalNumber(state["memory_total"]),
+    load_1: optionalNumber(state["load_1"]),
+    net_rx_bps: optionalNumber(state["net_rx_bps"])
       ?? rateFromTotalDelta(netInTotal, previous?.network_in_total, receivedAt, previous?.received_at),
-    net_tx_bps: optionalNumber(state.net_tx_bps)
+    net_tx_bps: optionalNumber(state["net_tx_bps"])
       ?? rateFromTotalDelta(netOutTotal, previous?.network_out_total, receivedAt, previous?.received_at),
     network_in_total: netInTotal,
     network_out_total: netOutTotal,
-    uptime_seconds: optionalNumber(state.uptime_seconds),
+    uptime_seconds: optionalNumber(state["uptime_seconds"]),
     received_at: receivedAt,
     confirmed_at: snapshot ? previous?.confirmed_at : Date.now(),
   };
@@ -246,13 +248,15 @@ function asRecord(value: unknown): Record<string, unknown> {
 }
 
 function netIoTotal(state: Record<string, unknown>, field: "bytes_recv" | "bytes_sent"): number | undefined {
-  const netIo = Array.isArray(state.net_io)
-    ? state.net_io
-    : Array.isArray(state.network_interfaces)
-      ? state.network_interfaces
+  const rawNetIo = state["net_io"];
+  const rawNetInterfaces = state["network_interfaces"];
+  const netIo = Array.isArray(rawNetIo)
+    ? rawNetIo
+    : Array.isArray(rawNetInterfaces)
+      ? rawNetInterfaces
       : [];
   if (netIo.length === 0) return undefined;
-  return netIo.reduce(
+  return netIo.reduce<number>(
     (sum, item) => sum + (optionalNumber(asRecord(item)[field]) ?? 0),
     0,
   );

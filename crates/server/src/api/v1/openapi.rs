@@ -423,6 +423,18 @@ const ROUTES: &[RouteSpec] = &[
         protected: true,
     },
     RouteSpec {
+        method: "get",
+        path: "/api/v1/servers/{id}/config",
+        summary: "Read server configuration",
+        protected: true,
+    },
+    RouteSpec {
+        method: "post",
+        path: "/api/v1/servers/{id}/config",
+        summary: "Update server configuration",
+        protected: true,
+    },
+    RouteSpec {
         method: "post",
         path: "/api/v1/servers/{id}/files",
         summary: "List server files",
@@ -789,6 +801,18 @@ const ROUTES: &[RouteSpec] = &[
         protected: true,
     },
     RouteSpec {
+        method: "get",
+        path: "/api/v1/mcp/catalog",
+        summary: "Read MCP catalog",
+        protected: true,
+    },
+    RouteSpec {
+        method: "post",
+        path: "/api/v1/mcp/studio",
+        summary: "Execute MCP studio action",
+        protected: true,
+    },
+    RouteSpec {
         method: "post",
         path: "/api/v1/mcp/execute",
         summary: "Execute MCP tool",
@@ -805,6 +829,12 @@ const ROUTES: &[RouteSpec] = &[
         path: "/mcp",
         summary: "MCP JSON-RPC endpoint",
         protected: true,
+    },
+    RouteSpec {
+        method: "get",
+        path: "/api/v1/openapi.json",
+        summary: "Read OpenAPI specification",
+        protected: false,
     },
     RouteSpec {
         method: "get",
@@ -1110,5 +1140,35 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("same-host control endpoints"));
+    }
+
+    #[test]
+    fn openapi_document_includes_all_registered_routes_and_hides_secrets() {
+        let doc = openapi_document();
+        let paths = doc["paths"].as_object().unwrap();
+
+        assert!(paths["/api/v1/openapi.json"]["get"]
+            .get("security")
+            .is_none());
+        assert!(paths["/api/v1/servers/{id}/config"]["get"]
+            .get("security")
+            .is_some());
+        assert!(paths["/api/v1/servers/{id}/config"]["post"]
+            .get("security")
+            .is_some());
+        assert!(paths["/api/v1/mcp/catalog"]["get"]
+            .get("security")
+            .is_some());
+        assert!(paths["/api/v1/mcp/studio"]["post"]
+            .get("security")
+            .is_some());
+
+        let serialized = doc.to_string().to_ascii_lowercase();
+        for forbidden in ["jwt_secret", "private_key", "password_hash", "sqlite://"] {
+            assert!(
+                !serialized.contains(forbidden),
+                "OpenAPI document must not expose runtime secret or DSN marker: {forbidden}"
+            );
+        }
     }
 }

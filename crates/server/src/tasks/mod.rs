@@ -6,6 +6,7 @@ use cron::Schedule;
 use futures::{stream, StreamExt};
 use once_cell::sync::Lazy;
 use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -29,7 +30,14 @@ pub(crate) const TASK_API_MAX_BODY_BYTES: usize = 256 * 1024;
 pub(crate) const TASK_MAX_NAME_BYTES: usize = 128;
 pub(crate) const TASK_MAX_SCHEDULE_BYTES: usize = 128;
 pub(crate) const TASK_MAX_COMMAND_BYTES: usize = 8192;
+pub(crate) const TASK_MAX_TARGET_BYTES: usize = 2048;
+pub(crate) const TASK_MAX_HOST_BYTES: usize = 253;
 pub(crate) const TASK_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
+pub(crate) const TASK_MAX_TIMEOUT_SECS: u64 = 3600;
+pub(crate) const TASK_MAX_PING_COUNT: u64 = 100;
+pub(crate) const TASK_MAX_HTTP_HEADERS: usize = 32;
+pub(crate) const TASK_MAX_HTTP_HEADER_NAME_BYTES: usize = 128;
+pub(crate) const TASK_MAX_HTTP_HEADER_VALUE_BYTES: usize = 1024;
 pub(crate) const TASK_MAX_SELECTOR_BYTES: usize = 16 * 1024;
 pub(crate) const TASK_MAX_SELECTOR_IDS: usize = 64;
 pub(crate) const TASK_MAX_SELECTOR_TAGS: usize = 32;
@@ -129,6 +137,9 @@ pub(crate) fn parse_task_schedule(schedule: &str) -> Result<Schedule> {
 
 pub(crate) fn validate_task_definition(task: &Task) -> Result<()> {
     validate_sized_text(&task.name, 1, TASK_MAX_NAME_BYTES, "task.name")?;
+    if task.name.trim().is_empty() {
+        anyhow::bail!("task.name must not be empty");
+    }
     if let Some(schedule) = task.schedule.as_deref() {
         validate_sized_text(schedule, 1, TASK_MAX_SCHEDULE_BYTES, "task.schedule")?;
         parse_task_schedule(schedule).context("task.schedule is invalid")?;
@@ -146,6 +157,7 @@ pub(crate) fn validate_task_definition(task: &Task) -> Result<()> {
     if let Some(payload) = task.payload_json.as_deref() {
         validate_sized_text(payload, 0, TASK_MAX_PAYLOAD_BYTES, "task.payload_json")?;
     }
+    validate_task_target_and_payload(task)?;
     validate_sized_text(
         &task.server_selector_json,
         1,
@@ -156,6 +168,344 @@ pub(crate) fn validate_task_definition(task: &Task) -> Result<()> {
         .context("task.server_selector_json is invalid")?;
     validate_task_selector_shape(&selector)?;
     Ok(())
+}
+
+fn validate_task_target_and_payload(task: &Task) -> Result<()> {
+    let payload_obj = match task
+        .payload_json
+        .as_deref()
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+    {
+        Some(raw) => {
+            let value: serde_json::Value =
+                serde_json::from_str(raw).context("task.payload_json is not valid JSON")?;
+            let Some(obj) = value.as_object() else {
+                anyhow::bail!("task.payload_json must be a JSON object");
+            };
+            validate_payload_common_fields(obj)?;
+            Some(obj.clone())
+        }
+        None => None,
+    };
+
+    let command_text = task
+        .command
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+
+    match task.task_type {
+        TaskType::Shell => {
+            let Some(cmd) = command_text else {
+                anyhow::bail!("task.command must not be empty for shell task");
+            };
+            if cmd.trim().is_empty() {
+                anyhow::bail!("task.command must not be empty for shell task");
+            }
+        }
+        TaskType::HttpGet => {
+            let mut has_target = false;
+            if let Some(url) = command_text {
+                validate_http_get_task_url(url)?;
+                has_target = true;
+            }
+            if let Some(obj) = &payload_obj {
+                if let Some(url_val) = obj.get("url") {
+                    let Some(url) = url_val.as_str() else {
+                        anyhow::bail!("http_get payload url must be a string");
+                    };
+                    validate_http_get_task_url(url)?;
+                    has_target = true;
+                }
+                if let Some(headers_val) = obj.get("headers") {
+                    validate_http_get_task_headers(headers_val)?;
+                }
+            }
+            if !has_target {
+                anyhow::bail!("http_get task requires a valid target URL");
+            }
+        }
+        TaskType::IcmpPing => {
+            let mut has_target = false;
+            if let Some(host) = command_text {
+                validate_task_network_host(host, "icmp_ping")?;
+                has_target = true;
+            }
+            if let Some(obj) = &payload_obj {
+                if let Some(host_val) = obj.get("host") {
+                    let Some(host) = host_val.as_str() else {
+                        anyhow::bail!("icmp_ping payload host must be a string");
+                    };
+                    validate_task_network_host(host, "icmp_ping")?;
+                    has_target = true;
+                }
+                if let Some(count_val) = obj.get("count") {
+                    let Some(count) = count_val.as_u64() else {
+                        anyhow::bail!("icmp_ping payload count must be a positive integer");
+                    };
+                    if count == 0 || count > TASK_MAX_PING_COUNT {
+                        anyhow::bail!(
+                            "icmp_ping payload count must be between 1 and {TASK_MAX_PING_COUNT}"
+                        );
+                    }
+                }
+            }
+            if !has_target {
+                anyhow::bail!("icmp_ping task requires a valid target host");
+            }
+        }
+        TaskType::TcpPing => {
+            let mut has_target = false;
+            if let Some(target) = command_text {
+                let (host, port) = parse_tcp_ping_host_port(target)?;
+                validate_task_network_host(&host, "tcp_ping")?;
+                if port == 0 {
+                    anyhow::bail!("tcp_ping port must be between 1 and 65535");
+                }
+                has_target = true;
+            }
+            if let Some(obj) = &payload_obj {
+                let has_host = obj.contains_key("host");
+                let has_port = obj.contains_key("port");
+                if has_host || has_port {
+                    let Some(host) = obj.get("host").and_then(|v| v.as_str()) else {
+                        anyhow::bail!("tcp_ping payload host must be a string");
+                    };
+                    let Some(port) = obj.get("port").and_then(|v| v.as_u64()) else {
+                        anyhow::bail!("tcp_ping payload port must be an integer");
+                    };
+                    if port == 0 || port > u16::MAX as u64 {
+                        anyhow::bail!("tcp_ping payload port must be between 1 and 65535");
+                    }
+                    validate_task_network_host(host, "tcp_ping")?;
+                    has_target = true;
+                }
+            }
+            if !has_target {
+                anyhow::bail!("tcp_ping task requires a valid host:port target");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_payload_common_fields(obj: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
+    for key in ["timeout_secs", "timeout_seconds"] {
+        if let Some(val) = obj.get(key) {
+            let Some(secs) = val.as_u64() else {
+                anyhow::bail!("task.payload_json {key} must be a positive integer");
+            };
+            if secs == 0 || secs > TASK_MAX_TIMEOUT_SECS {
+                anyhow::bail!(
+                    "task.payload_json {key} must be between 1 and {TASK_MAX_TIMEOUT_SECS}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_http_get_task_url(url: &str) -> Result<()> {
+    validate_sized_text(url, 1, TASK_MAX_TARGET_BYTES, "http_get url")?;
+    if url.trim() != url || url.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
+        anyhow::bail!("http_get url contains invalid characters");
+    }
+    let parsed = reqwest::Url::parse(url).context("http_get url is invalid")?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        scheme => anyhow::bail!("http_get url scheme '{scheme}' is not allowed"),
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        anyhow::bail!("http_get url must not include credentials");
+    }
+    let host = parsed
+        .host_str()
+        .context("http_get url must include a host")?;
+    let port = parsed
+        .port_or_known_default()
+        .context("http_get url must include a valid port")?;
+    if port == 0 {
+        anyhow::bail!("http_get url port must be between 1 and 65535");
+    }
+    validate_task_network_host(host, "http_get")
+}
+
+fn validate_http_get_task_headers(headers_val: &serde_json::Value) -> Result<()> {
+    let Some(map) = headers_val.as_object() else {
+        anyhow::bail!("http_get payload headers must be a JSON object");
+    };
+    if map.len() > TASK_MAX_HTTP_HEADERS {
+        anyhow::bail!("http_get payload headers exceeds {TASK_MAX_HTTP_HEADERS} entries");
+    }
+    for (name, value) in map {
+        validate_sized_text(
+            name,
+            1,
+            TASK_MAX_HTTP_HEADER_NAME_BYTES,
+            "http_get header name",
+        )?;
+        let Some(value_str) = value.as_str() else {
+            anyhow::bail!("http_get header value must be a string");
+        };
+        validate_sized_text(
+            value_str,
+            0,
+            TASK_MAX_HTTP_HEADER_VALUE_BYTES,
+            "http_get header value",
+        )?;
+        if name.chars().any(|ch| ch.is_control() || ch.is_whitespace())
+            || value_str.chars().any(char::is_control)
+        {
+            anyhow::bail!("http_get header contains invalid control characters");
+        }
+    }
+    Ok(())
+}
+
+fn parse_tcp_ping_host_port(target: &str) -> Result<(String, u16)> {
+    validate_sized_text(target, 1, TASK_MAX_TARGET_BYTES, "tcp_ping target")?;
+    if target.trim() != target
+        || target
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace())
+    {
+        anyhow::bail!("tcp_ping target contains invalid characters");
+    }
+    let (host, port_str) = if let Some(rest) = target.strip_prefix('[') {
+        let Some((ipv6_host, suffix)) = rest.split_once("]:") else {
+            anyhow::bail!("tcp_ping IPv6 target must use [host]:port format");
+        };
+        (format!("[{ipv6_host}]"), suffix)
+    } else {
+        let Some((host_part, port_part)) = target.rsplit_once(':') else {
+            anyhow::bail!("tcp_ping target must use host:port format");
+        };
+        if host_part.contains(':') {
+            anyhow::bail!("tcp_ping IPv6 target must use [host]:port format");
+        }
+        (host_part.to_string(), port_part)
+    };
+    let port: u16 = port_str
+        .parse()
+        .context("tcp_ping target port is invalid")?;
+    if port == 0 {
+        anyhow::bail!("tcp_ping port must be between 1 and 65535");
+    }
+    Ok((host, port))
+}
+
+fn validate_task_network_host(host: &str, purpose: &str) -> Result<()> {
+    if host.is_empty() || host.trim() != host {
+        anyhow::bail!(
+            "{purpose} host is required and must not contain leading/trailing whitespace"
+        );
+    }
+    validate_sized_text(host, 1, TASK_MAX_HOST_BYTES, &format!("{purpose} host"))?;
+    crate::services::probe::ensure_safe_probe_host(host, purpose)?;
+
+    let unbracketed = if host.starts_with('[') || host.ends_with(']') {
+        let Some(inner) = host.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else {
+            anyhow::bail!("{purpose} host has mismatched IPv6 brackets");
+        };
+        let ipv6: Ipv6Addr = inner
+            .parse()
+            .with_context(|| format!("{purpose} bracketed host must be a valid IPv6 literal"))?;
+        if !crate::security::allow_private_outbound() && is_blocked_task_ip(IpAddr::V6(ipv6)) {
+            anyhow::bail!("{purpose} target resolves to disallowed private address {ipv6}");
+        }
+        return Ok(());
+    } else {
+        host
+    };
+
+    if let Ok(ip) = unbracketed.parse::<IpAddr>() {
+        if !crate::security::allow_private_outbound() && is_blocked_task_ip(ip) {
+            anyhow::bail!("{purpose} target resolves to disallowed private address {ip}");
+        }
+        return Ok(());
+    }
+
+    if unbracketed.contains(':') {
+        anyhow::bail!("{purpose} host contains invalid characters");
+    }
+    if !is_valid_task_hostname(unbracketed) {
+        anyhow::bail!("{purpose} host is not a valid hostname or IP literal");
+    }
+    if !crate::security::allow_private_outbound() && is_disallowed_task_hostname(unbracketed) {
+        anyhow::bail!("{purpose} target resolves to disallowed local or internal host");
+    }
+    Ok(())
+}
+
+fn is_valid_task_hostname(host: &str) -> bool {
+    if host.is_empty() || host.len() > TASK_MAX_HOST_BYTES {
+        return false;
+    }
+    if host.starts_with('.') || host.ends_with('.') {
+        return false;
+    }
+    for label in host.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_disallowed_task_hostname(host: &str) -> bool {
+    let lower = host.to_ascii_lowercase();
+    lower == "localhost"
+        || lower.ends_with(".localhost")
+        || lower == "metadata.google.internal"
+        || lower.ends_with(".internal")
+        || lower.ends_with(".local")
+}
+
+fn is_blocked_task_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => is_blocked_task_ipv4(ip),
+        IpAddr::V6(ip) => is_blocked_task_ipv6(ip),
+    }
+}
+
+fn is_blocked_task_ipv4(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_multicast()
+        || ip.is_unspecified()
+        || ip.is_documentation()
+        || o[0] == 0
+        || o[0] >= 224
+        || (o[0] == 100 && (64..=127).contains(&o[1]))
+        || (o[0] == 169 && o[1] == 254)
+        || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+        || (o[0] == 198 && (18..=19).contains(&o[1]))
+        || o == [255, 255, 255, 255]
+}
+
+fn is_blocked_task_ipv6(ip: Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    let first = segments[0];
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || (first & 0xfe00) == 0xfc00
+        || (first & 0xffc0) == 0xfe80
+        || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        || ip
+            .to_ipv4_mapped()
+            .map(is_blocked_task_ipv4)
+            .unwrap_or(false)
 }
 
 fn validate_sized_text(value: &str, min_bytes: usize, max_bytes: usize, field: &str) -> Result<()> {
@@ -561,13 +911,17 @@ async fn run_triggered_task(
     source_agent_id: Option<&str>,
     owner_user_id: Option<&str>,
 ) -> Result<()> {
-    let task = TaskRepository::get_by_id(&db, task_id)
+    let task_id = crate::api::v1::tasks::require_task_uuid_text(task_id, "task_id")
+        .map_err(|_| anyhow!("invalid triggered task_id"))?;
+    let owner_user_id = owner_user_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .context("Trigger owner_user_id is required")?;
+    let task = TaskRepository::get_by_id(&db, &task_id)
         .await?
         .context("Task not found")?;
-    if let Some(owner_user_id) = owner_user_id {
-        if task.owner_user_id != owner_user_id {
-            anyhow::bail!("Task owner does not match trigger owner");
-        }
+    if task.owner_user_id != owner_user_id {
+        anyhow::bail!("Task owner does not match trigger owner");
     }
     if !task.enabled {
         info!(
@@ -1139,6 +1493,131 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("owner does not match"));
+    }
+
+    #[tokio::test]
+    async fn triggered_task_rejects_missing_or_empty_owner() {
+        let db = test_db().await;
+        let owner = "00000000-0000-0000-0000-000000000001";
+        let task_id = "00000000-0000-0000-0000-000000000301";
+        seed_user(&db, owner, "owner").await;
+        seed_task(&db, task_id, owner, "owner-task").await;
+
+        for missing_owner in [None, Some(""), Some("   ")] {
+            let err = run_triggered_task(
+                db.clone(),
+                crate::grpc::SessionRegistry::new(),
+                crate::current_task_response_registry(),
+                task_id,
+                "alert:dirty",
+                None,
+                missing_owner,
+            )
+            .await
+            .unwrap_err();
+            assert!(err
+                .to_string()
+                .contains("Trigger owner_user_id is required"));
+        }
+    }
+
+    #[test]
+    fn http_get_task_validates_url_scheme_credentials_and_private_targets() {
+        let mut valid = sample_task();
+        valid.task_type = TaskType::HttpGet;
+        valid.command = Some("https://example.com/health".to_string());
+        valid.payload_json = Some(r#"{"timeout_secs":30}"#.to_string());
+        assert!(validate_task_definition(&valid).is_ok());
+
+        let mut payload_only = sample_task();
+        payload_only.task_type = TaskType::HttpGet;
+        payload_only.command = None;
+        payload_only.payload_json =
+            Some(r#"{"url":"https://example.com/health","timeout_secs":15}"#.to_string());
+        assert!(validate_task_definition(&payload_only).is_ok());
+
+        for bad_url in [
+            "file:///etc/passwd",
+            "ftp://example.com/file",
+            "https://user:pass@example.com/health",
+            "http://127.0.0.1:8080/admin",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.0.0.1/internal",
+            "http://[::1]:8080/internal",
+            "http://localhost:8080/internal",
+            "https://example.com/path with spaces",
+        ] {
+            let mut bad = sample_task();
+            bad.task_type = TaskType::HttpGet;
+            bad.command = Some(bad_url.to_string());
+            assert!(
+                validate_task_definition(&bad).is_err(),
+                "expected http_get URL {bad_url:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn icmp_ping_task_rejects_option_injection_whitespace_and_private_hosts() {
+        let mut valid = sample_task();
+        valid.task_type = TaskType::IcmpPing;
+        valid.command = Some("1.1.1.1".to_string());
+        valid.payload_json = Some(r#"{"count":4,"timeout_secs":10}"#.to_string());
+        assert!(validate_task_definition(&valid).is_ok());
+
+        for bad_host in [
+            "-W 999999",
+            "-f",
+            "--flood",
+            "example.com;id",
+            "example.com/path",
+            "host with space",
+            "127.0.0.1",
+            "169.254.169.254",
+            "::1",
+            "localhost",
+            &format!("{}.example.com", "a".repeat(250)),
+        ] {
+            let mut bad = sample_task();
+            bad.task_type = TaskType::IcmpPing;
+            bad.command = Some(bad_host.to_string());
+            assert!(
+                validate_task_definition(&bad).is_err(),
+                "expected icmp_ping host {bad_host:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn tcp_ping_task_validates_host_port_and_blocks_private_targets() {
+        let mut valid = sample_task();
+        valid.task_type = TaskType::TcpPing;
+        valid.command = Some("example.com:443".to_string());
+        assert!(validate_task_definition(&valid).is_ok());
+
+        let mut valid_ipv6 = sample_task();
+        valid_ipv6.task_type = TaskType::TcpPing;
+        valid_ipv6.command = Some("[2606:4700:4700::1111]:443".to_string());
+        assert!(validate_task_definition(&valid_ipv6).is_ok());
+
+        for bad_target in [
+            "example.com",
+            "example.com:0",
+            "example.com:70000",
+            "-flag:80",
+            "127.0.0.1:22",
+            "10.0.0.1:6379",
+            "[::1]:8080",
+            "localhost:5432",
+        ] {
+            let mut bad = sample_task();
+            bad.task_type = TaskType::TcpPing;
+            bad.command = Some(bad_target.to_string());
+            assert!(
+                validate_task_definition(&bad).is_err(),
+                "expected tcp_ping target {bad_target:?} to be rejected"
+            );
+        }
     }
 
     #[test]

@@ -10,7 +10,9 @@ use crate::api::v1::services::{
 };
 use crate::db::Db;
 use crate::grpc::{ensure_task_result_text_within, SessionRegistry, TaskResponseRegistry};
-use crate::services::probe::{probe_http, probe_icmp, probe_tcp, ProbeType, ServiceProbe};
+use crate::services::probe::{
+    ensure_safe_probe_host, probe_http, probe_icmp, probe_tcp, ProbeType, ServiceProbe,
+};
 use crate::tasks::spawn_triggered_tasks;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -825,6 +827,7 @@ struct AgentProbeOutput {
 
 fn build_agent_probe_task(task_id: &str, s: &ServiceConfig) -> Result<ServerTask> {
     let probe_type = ProbeType::from_str(&s.kind).context("invalid kind")?;
+    validate_probe_target_shape(&probe_type, &s.target)?;
     let timeout_seconds = bounded_timeout_seconds(s.timeout_seconds) as u32;
     let task_type = match &probe_type {
         ProbeType::Http => TaskType::HttpGet,
@@ -944,10 +947,11 @@ fn parse_tcp_target(target: &str) -> Result<(&str, u16)> {
     let (host, port) = target
         .rsplit_once(':')
         .context("tcp target must be host:port")?;
-    if host.trim().is_empty() {
-        anyhow::bail!("tcp host is required");
-    }
+    ensure_safe_probe_host(host, "tcp")?;
     let port = port.parse::<u16>().context("invalid port")?;
+    if port == 0 {
+        anyhow::bail!("tcp port must be greater than zero");
+    }
     Ok((host, port))
 }
 
@@ -1097,7 +1101,7 @@ fn validate_probe_target_shape(probe_type: &ProbeType, target: &str) -> Result<(
             Ok(())
         }
         ProbeType::Tcp => parse_tcp_target(target).map(|_| ()),
-        ProbeType::Icmp => Ok(()),
+        ProbeType::Icmp => ensure_safe_probe_host(target, "ICMP monitor"),
     }
 }
 

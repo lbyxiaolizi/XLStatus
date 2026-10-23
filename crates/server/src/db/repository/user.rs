@@ -3,7 +3,7 @@
 
 use crate::db::{models::*, DatabaseBackend};
 use crate::secrets::{decrypt_optional_secret, encrypt_secret};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
@@ -11,6 +11,10 @@ use argon2::{
 use chrono::{DateTime, Utc};
 use xlstatus_shared::UserId;
 use xlstatus_shared::UserRole;
+
+const USER_LIST_MAX_LIMIT: i64 = 500;
+const USER_PASSWORD_MAX_BYTES: usize = 1024;
+const USER_USERNAME_MAX_BYTES: usize = 255;
 
 pub struct UserRepository {
     db: DatabaseBackend,
@@ -22,6 +26,7 @@ impl UserRepository {
     }
 
     pub async fn create(&self, input: CreateUserInput) -> Result<User> {
+        validate_username(&input.username)?;
         let id = UserId::new();
         let password_hash = self.hash_password(&input.password)?;
         let now = Utc::now();
@@ -73,6 +78,8 @@ impl UserRepository {
     }
 
     pub async fn list(&self, limit: i64, offset: i64) -> Result<(Vec<User>, i64)> {
+        let limit = limit.clamp(1, USER_LIST_MAX_LIMIT);
+        let offset = offset.max(0);
         match &self.db {
             DatabaseBackend::Sqlite(pool) => {
                 let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
@@ -93,7 +100,15 @@ impl UserRepository {
                     .await?;
 
                 Ok((
-                    rows.into_iter().map(sqlite_user_from_row).collect(),
+                    rows.into_iter()
+                        .filter_map(|row| match sqlite_user_from_row(row) {
+                            Ok(user) => Some(user),
+                            Err(err) => {
+                                tracing::warn!("skipping invalid user row: {err}");
+                                None
+                            }
+                        })
+                        .collect(),
                     total.0,
                 ))
             }
@@ -126,7 +141,15 @@ impl UserRepository {
                 .await?;
 
                 Ok((
-                    rows.into_iter().map(postgres_user_from_row).collect(),
+                    rows.into_iter()
+                        .filter_map(|row| match postgres_user_from_row(row) {
+                            Ok(user) => Some(user),
+                            Err(err) => {
+                                tracing::warn!("skipping invalid user row: {err}");
+                                None
+                            }
+                        })
+                        .collect(),
                     total.0,
                 ))
             }
@@ -171,6 +194,10 @@ impl UserRepository {
             }
         }
         self.find_by_id(user_id).await
+    }
+
+    pub async fn update_password(&self, user_id: UserId, password: &str) -> Result<Option<User>> {
+        self.reset_password(user_id, password).await
     }
 
     pub async fn reset_password(&self, user_id: UserId, password: &str) -> Result<Option<User>> {
@@ -333,7 +360,16 @@ impl UserRepository {
                 .fetch_optional(pool)
                 .await?;
 
-                Ok(row.map(sqlite_user_from_row))
+                match row {
+                    Some(row) => match sqlite_user_from_row(row) {
+                        Ok(user) => Ok(Some(user)),
+                        Err(err) => {
+                            tracing::warn!(username = %username, "treating invalid user row as not found: {err}");
+                            Ok(None)
+                        }
+                    },
+                    None => Ok(None),
+                }
             }
             DatabaseBackend::Postgres(pool) => {
                 let row = sqlx::query_as::<_, (uuid::Uuid, String, String, String, i32, DateTime<Utc>, DateTime<Utc>)>(
@@ -343,7 +379,16 @@ impl UserRepository {
                 .fetch_optional(pool)
                 .await?;
 
-                Ok(row.map(postgres_user_from_row))
+                match row {
+                    Some(row) => match postgres_user_from_row(row) {
+                        Ok(user) => Ok(Some(user)),
+                        Err(err) => {
+                            tracing::warn!(username = %username, "treating invalid user row as not found: {err}");
+                            Ok(None)
+                        }
+                    },
+                    None => Ok(None),
+                }
             }
         }
     }
@@ -358,7 +403,16 @@ impl UserRepository {
                 .fetch_optional(pool)
                 .await?;
 
-                Ok(row.map(sqlite_user_from_row))
+                match row {
+                    Some(row) => match sqlite_user_from_row(row) {
+                        Ok(user) => Ok(Some(user)),
+                        Err(err) => {
+                            tracing::warn!(user_id = %user_id.0, "treating invalid user row as not found: {err}");
+                            Ok(None)
+                        }
+                    },
+                    None => Ok(None),
+                }
             }
             DatabaseBackend::Postgres(pool) => {
                 let row = sqlx::query_as::<_, (uuid::Uuid, String, String, String, i32, DateTime<Utc>, DateTime<Utc>)>(
@@ -368,12 +422,24 @@ impl UserRepository {
                 .fetch_optional(pool)
                 .await?;
 
-                Ok(row.map(postgres_user_from_row))
+                match row {
+                    Some(row) => match postgres_user_from_row(row) {
+                        Ok(user) => Ok(Some(user)),
+                        Err(err) => {
+                            tracing::warn!(user_id = %user_id.0, "treating invalid user row as not found: {err}");
+                            Ok(None)
+                        }
+                    },
+                    None => Ok(None),
+                }
             }
         }
     }
 
     pub fn verify_password(&self, user: &User, password: &str) -> Result<bool> {
+        if validate_user_password(password).is_err() {
+            return Ok(false);
+        }
         let parsed_hash = PasswordHash::new(&user.password_hash)
             .map_err(|e| anyhow::anyhow!("Failed to parse password hash: {}", e))?;
         Ok(Argon2::default()
@@ -382,6 +448,7 @@ impl UserRepository {
     }
 
     fn hash_password(&self, password: &str) -> Result<String> {
+        validate_user_password(password)?;
         let salt = SaltString::generate(&mut OsRng);
         let argon2 = Argon2::default();
         let password_hash = argon2
@@ -390,6 +457,32 @@ impl UserRepository {
             .to_string();
         Ok(password_hash)
     }
+}
+
+fn validate_username(username: &str) -> Result<()> {
+    if username.trim().is_empty() {
+        anyhow::bail!("username must not be empty");
+    }
+    if username.len() > USER_USERNAME_MAX_BYTES {
+        anyhow::bail!("username must be at most {USER_USERNAME_MAX_BYTES} bytes");
+    }
+    if username.contains('\0') {
+        anyhow::bail!("username must not contain NUL bytes");
+    }
+    Ok(())
+}
+
+fn validate_user_password(password: &str) -> Result<()> {
+    if password.is_empty() {
+        anyhow::bail!("password must not be empty");
+    }
+    if password.len() > USER_PASSWORD_MAX_BYTES {
+        anyhow::bail!("password must be at most {USER_PASSWORD_MAX_BYTES} bytes");
+    }
+    if password.contains('\0') {
+        anyhow::bail!("password must not contain NUL bytes");
+    }
+    Ok(())
 }
 
 fn sqlite_user_from_row(
@@ -402,20 +495,22 @@ fn sqlite_user_from_row(
         String,
         String,
     ),
-) -> User {
-    User {
-        id: UserId(uuid::Uuid::parse_str(&id).unwrap()),
+) -> Result<User> {
+    Ok(User {
+        id: UserId(uuid::Uuid::parse_str(&id).context("invalid user id UUID")?),
         username,
         password_hash,
-        role: role.parse().unwrap(),
+        role: role
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid user role: {e}"))?,
         token_version,
         created_at: DateTime::parse_from_rfc3339(&created_at)
-            .unwrap()
+            .context("invalid user created_at timestamp")?
             .with_timezone(&Utc),
         updated_at: DateTime::parse_from_rfc3339(&updated_at)
-            .unwrap()
+            .context("invalid user updated_at timestamp")?
             .with_timezone(&Utc),
-    }
+    })
 }
 
 fn postgres_user_from_row(
@@ -428,16 +523,18 @@ fn postgres_user_from_row(
         DateTime<Utc>,
         DateTime<Utc>,
     ),
-) -> User {
-    User {
+) -> Result<User> {
+    Ok(User {
         id: UserId(id),
         username,
         password_hash,
-        role: role.parse().unwrap(),
+        role: role
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid user role: {e}"))?,
         token_version,
         created_at,
         updated_at,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -605,5 +702,65 @@ mod tests {
             }
             DatabaseBackend::Postgres(_) => unreachable!(),
         }
+    }
+
+    #[tokio::test]
+    async fn password_validation_and_user_list_pagination_clamping() {
+        let db = test_db().await;
+        let users = UserRepository::new(db);
+
+        assert!(users
+            .create(CreateUserInput {
+                username: "bad-empty-pass".to_string(),
+                password: "".to_string(),
+                role: UserRole::Member,
+            })
+            .await
+            .is_err());
+
+        assert!(users
+            .create(CreateUserInput {
+                username: "bad-nul-pass".to_string(),
+                password: "secret\0password".to_string(),
+                role: UserRole::Member,
+            })
+            .await
+            .is_err());
+
+        assert!(users
+            .create(CreateUserInput {
+                username: "bad-huge-pass".to_string(),
+                password: "a".repeat(USER_PASSWORD_MAX_BYTES + 1),
+                role: UserRole::Member,
+            })
+            .await
+            .is_err());
+
+        let user = users
+            .create(CreateUserInput {
+                username: "valid-user".to_string(),
+                password: "StrongPassword123!".to_string(),
+                role: UserRole::Member,
+            })
+            .await
+            .unwrap();
+
+        assert!(users.reset_password(user.id, "").await.is_err());
+        assert!(users.reset_password(user.id, "bad\0pass").await.is_err());
+        assert!(users
+            .update_password(user.id, &"x".repeat(USER_PASSWORD_MAX_BYTES + 1))
+            .await
+            .is_err());
+
+        assert!(!users.verify_password(&user, "").unwrap());
+        assert!(!users.verify_password(&user, "bad\0pass").unwrap());
+        assert!(!users
+            .verify_password(&user, &"x".repeat(USER_PASSWORD_MAX_BYTES + 1))
+            .unwrap());
+        assert!(users.verify_password(&user, "StrongPassword123!").unwrap());
+
+        let (listed, total) = users.list(-1, -10).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(total, 1);
     }
 }

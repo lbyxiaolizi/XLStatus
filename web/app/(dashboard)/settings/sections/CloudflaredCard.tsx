@@ -77,7 +77,7 @@ export function CloudflaredCard() {
       <BrutalCard>
         <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
           <div>
-            <h2 className="text-xl font-black uppercase">{copy.settingsPage.cloudflareTunnel}</h2>
+            <h2 className="text-lg font-semibold tracking-tight text-[var(--text-main)]">{copy.settingsPage.cloudflareTunnel}</h2>
           </div>
           <button type="button" className={buttonClass("secondary")} onClick={() => void loadCloudflaredStatus()} disabled={cloudflaredLoading}>
             {cloudflaredLoading ? copy.settingsPage.loading : copy.settingsPage.refresh}
@@ -88,9 +88,9 @@ export function CloudflaredCard() {
           <div className="grid gap-3 md:grid-cols-3">
             <MaintenanceCapability label={copy.settingsPage.runningStatus} enabled={cloudflaredStatus ? Boolean(cloudflaredStatus.running) : undefined} copy={copy} />
             <MaintenanceCapability label={copy.settingsPage.tokenLabel} enabled={cloudflaredStatus ? Boolean(cloudflaredStatus.token_configured) : undefined} copy={copy} />
-            <div className="border-2 border-black bg-[var(--accent-bg)] p-3 shadow-[var(--shadow-brutal-sm)]">
-              <div className="text-[11px] font-black uppercase text-[var(--text-muted)]">PID</div>
-              <div className="mt-2 text-sm font-black">{cloudflaredStatus?.pid ?? "N/A"}</div>
+            <div className="rounded-xl border border-[var(--border-color)] bg-[var(--bg-subtle)] p-3.5">
+              <div className="text-xs font-medium text-[var(--text-muted)]">PID</div>
+              <div className="mt-2 font-mono text-sm font-semibold text-[var(--text-main)]">{cloudflaredStatus?.pid ?? "N/A"}</div>
             </div>
           </div>
           <div className="flex flex-wrap gap-2 lg:justify-end">
@@ -120,7 +120,7 @@ export function CloudflaredCard() {
           <InlineError message={cloudflaredStatus.last_error} />
         ) : null}
         {cloudflaredStatus?.logs?.length ? (
-          <pre className="mt-3 max-h-48 overflow-auto border-2 border-black bg-black p-3 text-xs font-bold text-green-300 shadow-[var(--shadow-brutal-sm)]">
+          <pre className="mt-3 max-h-48 overflow-auto rounded-xl border border-zinc-800 bg-zinc-950 p-3.5 font-mono text-xs text-emerald-400">
             {cloudflaredStatus.logs.slice(-20).join("\n")}
           </pre>
         ) : null}

@@ -1,6 +1,6 @@
 use crate::api::types::*;
 use crate::auth::middleware::{derive_csrf_token, AuthUser, CSRF_COOKIE_NAME, SESSION_COOKIE_NAME};
-use crate::auth::totp::{generate_totp_secret, otpauth_uri, verify_totp_code};
+use crate::auth::totp::{generate_totp_secret, otpauth_uri, verify_totp_code_step};
 use crate::auth::{generate_session_token, hash_token};
 use crate::config::Config;
 use crate::db::{
@@ -41,6 +41,7 @@ const AUTH_MAX_WAF_IP_FIELD_BYTES: usize = 4096;
 const AUTH_MAX_WAF_REASON_BYTES: usize = 255;
 const AUTH_MAX_WAF_BAN_MINUTES: i64 = 43_200;
 const AUTH_UUID_TEXT_LEN: usize = 36;
+const TOTP_REPLAY_HORIZON_MINUTES: i64 = 3;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -104,6 +105,7 @@ pub async fn login(
 
     // Find user by username
     let Some(user) = user_repo.find_by_username(&username).await? else {
+        verify_dummy_login_password(&user_repo, &password);
         register_login_failure(&state.db, &client_ip, &username, "unknown user").await?;
         return Err(AppError::Unauthorized("Invalid credentials".to_string()));
     };
@@ -125,9 +127,19 @@ pub async fn login(
         let Some(secret) = totp_secret.as_deref() else {
             return Err(AppError::Unauthorized("Invalid credentials".to_string()));
         };
-        if !verify_totp_code(secret, totp_code, Utc::now()) {
+        if let Err(err) =
+            verify_and_consume_user_totp(&state.db, user.id, secret, totp_code, Utc::now()).await
+        {
             register_login_failure(&state.db, &client_ip, &username, "invalid totp").await?;
-            return Err(AppError::Unauthorized("Invalid TOTP code".to_string()));
+            return Err(match err {
+                TotpVerificationError::RateLimited => {
+                    AppError::TooManyRequests("Too many failed TOTP attempts".to_string())
+                }
+                TotpVerificationError::InvalidCode => {
+                    AppError::Unauthorized("Invalid TOTP code".to_string())
+                }
+                TotpVerificationError::Database(e) => AppError::Database(e),
+            });
         }
     }
 
@@ -318,10 +330,14 @@ pub async fn update_user(
                 ));
             }
         }
+        let role_changed = existing.role != next_role;
         user_repo
             .update_role(target_id, next_role)
             .await?
             .ok_or(AppError::NotFound("user not found".to_string()))?;
+        if role_changed {
+            revoke_user_credentials(&state.db, target_id).await?;
+        }
     }
 
     if let Some(password) = req.password {
@@ -364,6 +380,7 @@ pub async fn delete_user(
             "cannot delete the last admin user".to_string(),
         ));
     }
+    revoke_user_credentials(&state.db, target_id).await?;
     if !user_repo.delete(target_id).await? {
         return Err(AppError::NotFound("user not found".to_string()));
     }
@@ -420,8 +437,16 @@ pub async fn setup_totp(
             .ok_or(AppError::BadRequest(
                 "Current TOTP code is required".to_string(),
             ))?;
-        if !verify_totp_code(&existing_secret, &code, Utc::now()) {
-            return Err(AppError::BadRequest("Invalid TOTP code".to_string()));
+        if let Err(err) = verify_and_consume_user_totp(
+            &state.db,
+            auth_user.user.id,
+            &existing_secret,
+            &code,
+            Utc::now(),
+        )
+        .await
+        {
+            return Err(map_totp_endpoint_error(err));
         }
     }
     let secret = generate_totp_secret();
@@ -451,8 +476,10 @@ pub async fn enable_totp(
         .map(normalize_totp_code)
         .transpose()?
         .ok_or(AppError::BadRequest("TOTP code is required".to_string()))?;
-    if !verify_totp_code(&secret, &code, Utc::now()) {
-        return Err(AppError::BadRequest("Invalid TOTP code".to_string()));
+    if let Err(err) =
+        verify_and_consume_user_totp(&state.db, auth_user.user.id, &secret, &code, Utc::now()).await
+    {
+        return Err(map_totp_endpoint_error(err));
     }
     user_repo.set_totp_enabled(auth_user.user.id, true).await?;
     Ok(Json(ApiResponse::success(TotpStatusResponse {
@@ -476,8 +503,11 @@ pub async fn disable_totp(
             .map(normalize_totp_code)
             .transpose()?
             .ok_or(AppError::BadRequest("TOTP code is required".to_string()))?;
-        if !verify_totp_code(&secret, &code, Utc::now()) {
-            return Err(AppError::BadRequest("Invalid TOTP code".to_string()));
+        if let Err(err) =
+            verify_and_consume_user_totp(&state.db, auth_user.user.id, &secret, &code, Utc::now())
+                .await
+        {
+            return Err(map_totp_endpoint_error(err));
         }
     }
     user_repo.disable_totp(auth_user.user.id).await?;
@@ -904,10 +934,210 @@ pub(crate) async fn require_sensitive_totp(
     let secret = secret.ok_or(AppError::Forbidden("TOTP secret is missing".into()))?;
     let code = sensitive_totp_code_from_headers(headers)
         .ok_or(AppError::Forbidden("TOTP code is required".into()))?;
-    if !verify_totp_code(&secret, &code, Utc::now()) {
-        return Err(AppError::Forbidden("Invalid TOTP code".into()));
+    match verify_and_consume_user_totp(db, user_id, &secret, &code, Utc::now()).await {
+        Ok(()) => Ok(()),
+        Err(TotpVerificationError::RateLimited) => Err(AppError::TooManyRequests(
+            "Too many failed TOTP attempts".into(),
+        )),
+        Err(TotpVerificationError::InvalidCode) => {
+            Err(AppError::Forbidden("Invalid TOTP code".into()))
+        }
+        Err(TotpVerificationError::Database(e)) => Err(AppError::Database(e)),
     }
+}
+
+#[derive(Debug)]
+enum TotpVerificationError {
+    RateLimited,
+    InvalidCode,
+    Database(anyhow::Error),
+}
+
+impl From<AppError> for TotpVerificationError {
+    fn from(err: AppError) -> Self {
+        match err {
+            AppError::Database(e) => TotpVerificationError::Database(e),
+            _ => TotpVerificationError::InvalidCode,
+        }
+    }
+}
+
+impl From<sqlx::Error> for TotpVerificationError {
+    fn from(err: sqlx::Error) -> Self {
+        TotpVerificationError::Database(anyhow::anyhow!(err))
+    }
+}
+
+fn map_totp_endpoint_error(err: TotpVerificationError) -> AppError {
+    match err {
+        TotpVerificationError::RateLimited => {
+            AppError::TooManyRequests("Too many failed TOTP attempts".to_string())
+        }
+        TotpVerificationError::InvalidCode => AppError::BadRequest("Invalid TOTP code".to_string()),
+        TotpVerificationError::Database(e) => AppError::Database(e),
+    }
+}
+
+fn totp_verification_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+async fn verify_and_consume_user_totp(
+    db: &DatabaseBackend,
+    user_id: UserId,
+    secret: &str,
+    code: &str,
+    now: DateTime<Utc>,
+) -> Result<(), TotpVerificationError> {
+    let _guard = totp_verification_lock().lock().await;
+    let user_key = user_id.0.to_string();
+    let since = now - Duration::minutes(LOGIN_FAILURE_WINDOW_MINUTES);
+    let failures = count_recent_user_totp_failures(db, &user_key, since).await?;
+    if failures >= LOGIN_FAILURE_THRESHOLD {
+        record_waf_event(
+            db,
+            "totp",
+            Some(&user_key),
+            "totp_blocked",
+            Some("too many failed totp attempts"),
+        )
+        .await?;
+        return Err(TotpVerificationError::RateLimited);
+    }
+
+    let Some(matched_step) = verify_totp_code_step(secret, code, now) else {
+        record_waf_event(
+            db,
+            "totp",
+            Some(&user_key),
+            "totp_failed",
+            Some("invalid totp"),
+        )
+        .await?;
+        return Err(TotpVerificationError::InvalidCode);
+    };
+
+    let secret_fingerprint = &hash_token(secret)[..16];
+    let step_prefix = format!("step:{secret_fingerprint}:");
+    let replay_since = now - Duration::minutes(TOTP_REPLAY_HORIZON_MINUTES);
+    if is_totp_step_replayed(db, &user_key, &step_prefix, matched_step, replay_since).await? {
+        record_waf_event(
+            db,
+            "totp",
+            Some(&user_key),
+            "totp_failed",
+            Some("replayed totp"),
+        )
+        .await?;
+        return Err(TotpVerificationError::InvalidCode);
+    }
+
+    record_waf_event(
+        db,
+        "totp",
+        Some(&user_key),
+        "totp_used",
+        Some(&format!("{step_prefix}{matched_step}")),
+    )
+    .await?;
     Ok(())
+}
+
+async fn count_recent_user_totp_failures(
+    db: &DatabaseBackend,
+    user_key: &str,
+    since: DateTime<Utc>,
+) -> Result<i64, TotpVerificationError> {
+    match db {
+        DatabaseBackend::Sqlite(pool) => {
+            let row: (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM waf_events WHERE username = ? AND outcome = 'totp_failed' AND created_at >= ?",
+            )
+            .bind(user_key)
+            .bind(since.to_rfc3339())
+            .fetch_one(pool)
+            .await?;
+            Ok(row.0)
+        }
+        DatabaseBackend::Postgres(pool) => {
+            let row: (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM waf_events WHERE username = $1 AND outcome = 'totp_failed' AND created_at >= $2",
+            )
+            .bind(user_key)
+            .bind(since)
+            .fetch_one(pool)
+            .await?;
+            Ok(row.0)
+        }
+    }
+}
+
+async fn is_totp_step_replayed(
+    db: &DatabaseBackend,
+    user_key: &str,
+    step_prefix: &str,
+    matched_step: i64,
+    since: DateTime<Utc>,
+) -> Result<bool, TotpVerificationError> {
+    let reasons: Vec<(Option<String>,)> = match db {
+        DatabaseBackend::Sqlite(pool) => {
+            sqlx::query_as(
+                "SELECT reason FROM waf_events WHERE username = ? AND outcome = 'totp_used' AND created_at >= ?",
+            )
+            .bind(user_key)
+            .bind(since.to_rfc3339())
+            .fetch_all(pool)
+            .await?
+        }
+        DatabaseBackend::Postgres(pool) => {
+            sqlx::query_as(
+                "SELECT reason FROM waf_events WHERE username = $1 AND outcome = 'totp_used' AND created_at >= $2",
+            )
+            .bind(user_key)
+            .bind(since)
+            .fetch_all(pool)
+            .await?
+        }
+    };
+
+    Ok(reasons.into_iter().any(|(reason,)| {
+        reason
+            .as_deref()
+            .and_then(|r| r.strip_prefix(step_prefix))
+            .and_then(|step_str| step_str.parse::<i64>().ok())
+            .map(|used_step| used_step >= matched_step)
+            .unwrap_or(false)
+    }))
+}
+
+fn dummy_login_user() -> &'static crate::db::User {
+    static DUMMY: std::sync::OnceLock<crate::db::User> = std::sync::OnceLock::new();
+    DUMMY.get_or_init(|| {
+        use argon2::{
+            password_hash::{rand_core::OsRng, PasswordHasher, SaltString},
+            Argon2,
+        };
+        let salt = SaltString::generate(&mut OsRng);
+        let password_hash = Argon2::default()
+            .hash_password(b"xlstatus-dummy-password-timing-shield", &salt)
+            .expect("dummy password hash")
+            .to_string();
+        let now = Utc::now();
+        crate::db::User {
+            id: UserId(uuid::Uuid::nil()),
+            username: "dummy".to_string(),
+            password_hash,
+            role: UserRole::Member,
+            token_version: 0,
+            created_at: now,
+            updated_at: now,
+        }
+    })
+}
+
+fn verify_dummy_login_password(user_repo: &UserRepository, password: &str) {
+    let _ = user_repo.verify_password(dummy_login_user(), password);
 }
 
 fn sensitive_totp_code_from_headers(headers: &HeaderMap) -> Option<String> {
@@ -1113,14 +1343,16 @@ fn truncate_utf8_to_bytes(value: &str, max_bytes: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_auth_resource_uuid, normalize_new_password, normalize_optional_totp_code,
-        normalize_role, normalize_username, normalize_waf_minutes, normalize_waf_reason,
-        parse_manual_ban_ips, parse_user_id, require_admin_cookie_session, revoke_user_credentials,
-        sensitive_totp_code_from_headers, AppError, AUTH_API_MAX_BODY_BYTES,
-        AUTH_LOGIN_MAX_BODY_BYTES, AUTH_MAX_PASSWORD_BYTES, AUTH_MAX_ROLE_BYTES,
-        AUTH_MAX_USERNAME_BYTES, AUTH_MAX_WAF_BAN_IPS, AUTH_MAX_WAF_BAN_MINUTES,
-        AUTH_MAX_WAF_IP_FIELD_BYTES, AUTH_MAX_WAF_REASON_BYTES, AUTH_MIN_PASSWORD_BYTES,
-        AUTH_TOTP_CODE_BYTES, AUTH_TOTP_MAX_BODY_BYTES, AUTH_UUID_TEXT_LEN, SENSITIVE_TOTP_HEADER,
+        dummy_login_user, normalize_auth_resource_uuid, normalize_new_password,
+        normalize_optional_totp_code, normalize_role, normalize_username, normalize_waf_minutes,
+        normalize_waf_reason, parse_manual_ban_ips, parse_user_id, require_admin_cookie_session,
+        require_sensitive_totp, revoke_user_credentials, sensitive_totp_code_from_headers,
+        verify_and_consume_user_totp, verify_dummy_login_password, AppError, TotpVerificationError,
+        AUTH_API_MAX_BODY_BYTES, AUTH_LOGIN_MAX_BODY_BYTES, AUTH_MAX_PASSWORD_BYTES,
+        AUTH_MAX_ROLE_BYTES, AUTH_MAX_USERNAME_BYTES, AUTH_MAX_WAF_BAN_IPS,
+        AUTH_MAX_WAF_BAN_MINUTES, AUTH_MAX_WAF_IP_FIELD_BYTES, AUTH_MAX_WAF_REASON_BYTES,
+        AUTH_MIN_PASSWORD_BYTES, AUTH_TOTP_CODE_BYTES, AUTH_TOTP_MAX_BODY_BYTES,
+        AUTH_UUID_TEXT_LEN, LOGIN_FAILURE_THRESHOLD, SENSITIVE_TOTP_HEADER,
     };
     use crate::api::types::{ApiResponse, LoginResponse, UserInfo};
     use crate::auth::middleware::{AuthKind, AuthUser};
@@ -1372,6 +1604,66 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn totp_rejects_replay_within_same_time_step() {
+        use chrono::TimeZone;
+        let db = test_db().await;
+        let user_id = UserId(uuid::Uuid::now_v7());
+        let secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+        let now = Utc.timestamp_opt(59, 0).single().unwrap();
+
+        // First verification at step 1 succeeds
+        verify_and_consume_user_totp(&db, user_id, secret, "287082", now)
+            .await
+            .expect("initial TOTP verification should succeed");
+
+        // Replaying the exact same TOTP code within the same window must fail
+        let replay = verify_and_consume_user_totp(&db, user_id, secret, "287082", now)
+            .await
+            .unwrap_err();
+        assert!(matches!(replay, TotpVerificationError::InvalidCode));
+    }
+
+    #[tokio::test]
+    async fn sensitive_totp_locks_out_after_repeated_failures() {
+        let db = test_db().await;
+        let users = UserRepository::new(db.clone());
+        let user = users
+            .create(CreateUserInput {
+                username: "totp-lockout".into(),
+                password: "password123".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        let secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+        users.set_totp_secret(user.id, secret, true).await.unwrap();
+
+        let mut bad_headers = HeaderMap::new();
+        bad_headers.insert(SENSITIVE_TOTP_HEADER, HeaderValue::from_static("000000"));
+
+        for _ in 0..LOGIN_FAILURE_THRESHOLD {
+            let err = require_sensitive_totp(&db, user.id, &bad_headers)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, AppError::Forbidden(_)));
+        }
+
+        let locked_err = require_sensitive_totp(&db, user.id, &bad_headers)
+            .await
+            .unwrap_err();
+        assert!(matches!(locked_err, AppError::TooManyRequests(_)));
+    }
+
+    #[tokio::test]
+    async fn dummy_login_password_verification_runs_argon2_hash_check() {
+        let db = test_db().await;
+        let users = UserRepository::new(db);
+        let dummy = dummy_login_user();
+        assert!(dummy.password_hash.starts_with("$argon2"));
+        verify_dummy_login_password(&users, "wrong-password");
     }
 
     fn auth_user(auth_kind: AuthKind) -> AuthUser {

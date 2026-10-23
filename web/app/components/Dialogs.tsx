@@ -1,51 +1,32 @@
 "use client";
 
-// In-app dialog primitives replacing the native window.confirm / window.prompt
-// calls scattered across the dashboard. The native dialogs freeze the JS
-// thread, can't be styled or validated inline, and are blocked in some
-// embedded/mobile webviews — the main source of the "awkward interaction"
-// complaint.
-//
-// Usage (per page, no provider needed):
-//   const dialogs = useDialogs();
-//   ...
-//   if (!(await dialogs.confirm({ message: "删除该服务器？", danger: true }))) return;
-//   const name = await dialogs.prompt({ label: "组名" });   // string | null
-//   const code = await dialogs.totp();                      // string | null
-//   ...
-//   return ( <> ...page... {dialogs.element} </> );
-//
-// Each call resolves and closes immediately; in-flight "busy" state belongs on
-// the page's own action button, not the dialog.
-
 import { ReactNode, useCallback, useId, useRef, useState } from "react";
 import { buttonClass, inputClass, textareaClass, useDialogFocusTrap } from "./M7Primitives";
 import { getTranslations } from "@/lib/i18n";
 
 export interface ConfirmOptions {
-  title?: string;
+  title?: string | undefined;
   message: ReactNode;
-  confirmLabel?: string;
-  cancelLabel?: string;
-  danger?: boolean;
+  confirmLabel?: string | undefined;
+  cancelLabel?: string | undefined;
+  danger?: boolean | undefined;
 }
 
 export interface PromptOptions {
-  title?: string;
-  message?: ReactNode;
-  label?: string;
-  placeholder?: string;
-  initialValue?: string;
-  confirmLabel?: string;
-  cancelLabel?: string;
-  multiline?: boolean;
-  // Return an error string to block submission, or null/undefined to allow.
-  validate?: (value: string) => string | null | undefined;
+  title?: string | undefined;
+  message?: ReactNode | undefined;
+  label?: string | undefined;
+  placeholder?: string | undefined;
+  initialValue?: string | undefined;
+  confirmLabel?: string | undefined;
+  cancelLabel?: string | undefined;
+  multiline?: boolean | undefined;
+  validate?: ((value: string) => string | null | undefined) | undefined;
 }
 
 export interface TotpOptions {
-  title?: string;
-  message?: ReactNode;
+  title?: string | undefined;
+  message?: ReactNode | undefined;
 }
 
 type DialogRequest =
@@ -73,13 +54,13 @@ function Backdrop({
 }: {
   children: ReactNode;
   titleId: string;
-  descriptionId?: string;
+  descriptionId?: string | undefined;
   onClose: () => void;
 }) {
   const dialogRef = useDialogFocusTrap(onClose);
 
   return (
-    <div className="fixed inset-0 z-[60] flex items-start justify-center overflow-y-auto bg-black/50 px-4 py-4 sm:py-16">
+    <div className="fixed inset-0 z-[60] flex items-start justify-center overflow-y-auto bg-black/55 backdrop-blur-xs px-4 py-6 sm:py-16">
       <div
         ref={dialogRef}
         role="dialog"
@@ -87,7 +68,7 @@ function Backdrop({
         aria-labelledby={titleId}
         aria-describedby={descriptionId}
         tabIndex={-1}
-        className="w-full max-w-md border-4 border-black bg-[var(--bg-card)] shadow-[10px_10px_0_0_#000] outline-none"
+        className="w-full max-w-md overflow-hidden rounded-2xl border border-[var(--border-color)] bg-[var(--bg-card)] shadow-[var(--shadow-lg)] outline-none"
       >
         {children}
       </div>
@@ -97,8 +78,8 @@ function Backdrop({
 
 function DialogHeader({ id, title }: { id: string; title: string }) {
   return (
-    <div className="border-b-4 border-black bg-[var(--accent-bg)] px-5 py-4">
-      <h2 id={id} className="break-words text-lg font-black uppercase text-[var(--text-main)]">{title}</h2>
+    <div className="border-b border-[var(--border-color)] bg-[var(--bg-subtle)] px-5 py-3.5">
+      <h2 id={id} className="break-words text-base font-semibold tracking-tight text-[var(--text-main)]">{title}</h2>
     </div>
   );
 }
@@ -126,7 +107,6 @@ export function useDialogs(): Dialogs {
   }, []);
 
   const open = useCallback((dialog: DialogRequest, initial = "") => {
-    // If a dialog is somehow already open, cancel it first.
     const previousResolve = resolveRef.current;
     const previousKind = activeKindRef.current;
     resolveRef.current = null;
@@ -169,7 +149,7 @@ export function useDialogs(): Dialogs {
         <Backdrop key={active.id} titleId={titleId} descriptionId={descriptionId} onClose={dismiss}>
           <DialogHeader id={titleId} title={opts.title ?? copy.dialogs.pleaseConfirm} />
           <div className="space-y-5 px-5 py-5">
-            <div id={descriptionId} className="text-sm font-bold text-[var(--text-main)]">{opts.message}</div>
+            <div id={descriptionId} className="text-sm text-[var(--text-main)]">{opts.message}</div>
             <div className="flex flex-wrap justify-end gap-2">
               <button
                 type="button"
@@ -209,17 +189,17 @@ export function useDialogs(): Dialogs {
         >
           <DialogHeader id={titleId} title={opts.title ?? opts.label ?? copy.dialogs.pleaseInput} />
           <form
-            className="space-y-5 px-5 py-5"
+            className="space-y-4 px-5 py-5"
             onSubmit={(event) => {
               event.preventDefault();
               submit();
             }}
           >
             {opts.message ? (
-              <div id={descriptionId} className="text-sm font-bold text-[var(--text-main)]">{opts.message}</div>
+              <div id={descriptionId} className="text-sm text-[var(--text-main)]">{opts.message}</div>
             ) : null}
             {opts.label ? (
-              <label htmlFor={fieldId} className="block text-xs font-black uppercase tracking-wide text-[var(--text-main)]">
+              <label htmlFor={fieldId} className="block text-xs font-medium text-[var(--text-main)]">
                 {opts.label}
               </label>
             ) : null}
@@ -256,7 +236,7 @@ export function useDialogs(): Dialogs {
               />
             )}
             {fieldError ? (
-              <span id={errorId} role="alert" className="block text-xs font-bold text-[var(--accent-color)]">{fieldError}</span>
+              <span id={errorId} role="alert" className="block text-xs font-medium text-[var(--status-danger-text)]">{fieldError}</span>
             ) : null}
             <div className="flex flex-wrap justify-end gap-2">
               <button type="button" className={buttonClass("secondary")} onClick={() => settle(null)}>
@@ -283,18 +263,18 @@ export function useDialogs(): Dialogs {
         <Backdrop key={active.id} titleId={titleId} descriptionId={descriptionId} onClose={dismiss}>
           <DialogHeader id={titleId} title={opts.title ?? copy.dialogs.twoFactor} />
           <form
-            className="space-y-5 px-5 py-5"
+            className="space-y-4 px-5 py-5"
             onSubmit={(event) => {
               event.preventDefault();
               submit();
             }}
           >
-            <label id={descriptionId} htmlFor={fieldId} className="text-sm font-bold text-[var(--text-main)]">
+            <label id={descriptionId} htmlFor={fieldId} className="block text-sm text-[var(--text-main)]">
               {opts.message ?? copy.dialogs.totpPrompt}
             </label>
             <input
               id={fieldId}
-              className={`${inputClass} text-center text-2xl tracking-[0.5em]`}
+              className={`${inputClass} text-center font-mono text-2xl tracking-[0.45em]`}
               value={code}
               inputMode="numeric"
               autoComplete="one-time-code"
@@ -309,7 +289,7 @@ export function useDialogs(): Dialogs {
               data-dialog-initial-focus
             />
             {fieldError ? (
-              <span id={errorId} role="alert" className="block text-xs font-bold text-[var(--accent-color)]">{fieldError}</span>
+              <span id={errorId} role="alert" className="block text-xs font-medium text-[var(--status-danger-text)]">{fieldError}</span>
             ) : null}
             <div className="flex flex-wrap justify-end gap-2">
               <button type="button" className={buttonClass("secondary")} onClick={() => settle(null)}>

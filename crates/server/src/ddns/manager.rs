@@ -11,7 +11,10 @@ use tokio::sync::RwLock;
 use tokio::time::{interval, Duration};
 use tracing::{error, info, warn};
 
-use super::provider::{create_provider, DdnsProviderTrait};
+use super::provider::{
+    create_provider, read_bounded_ddns_response_text, sanitize_ddns_error_message,
+    DdnsProviderTrait, DDNS_MAX_RESPONSE_BYTES,
+};
 use xlstatus_shared::ddns::*;
 
 /// Agent IP state
@@ -219,7 +222,7 @@ impl DdnsManager {
         let res = provider.update_ip(&cfg.domain, new_ip).await;
         let (success, err_msg) = match res {
             Ok(_) => (true, None),
-            Err(e) => (false, Some(e.to_string())),
+            Err(e) => (false, Some(sanitize_ddns_error_message(&e.to_string()))),
         };
         if let Err(e) = DdnsConfigRepository::record_history(
             &self.db,
@@ -466,17 +469,25 @@ async fn resolver_contains_ip(resolver_url: &str, domain: &str, ip: &str) -> Res
         .append_pair("name", domain)
         .append_pair("type", record_type);
     let validated = validate_outbound_url_resolved(url.as_str(), "DDNS resolver").await?;
-    let raw = secure_reqwest_client_builder(&validated)
+    let response = secure_reqwest_client_builder(&validated)
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .context("failed to build DDNS resolver client")?
         .get(validated.url.clone())
         .send()
         .await
-        .context("DDNS resolver request failed")?
-        .json::<serde_json::Value>()
-        .await
-        .context("DDNS resolver response is invalid")?;
+        .context("DDNS resolver request failed")?;
+    if !response.status().is_success() {
+        anyhow::bail!("DDNS resolver returned HTTP {}", response.status());
+    }
+    let body = read_bounded_ddns_response_text(
+        response,
+        DDNS_MAX_RESPONSE_BYTES,
+        "DDNS resolver response",
+    )
+    .await?;
+    let raw: serde_json::Value =
+        serde_json::from_str(&body).context("DDNS resolver response is invalid")?;
     let answers = raw
         .get("Answer")
         .and_then(|value| value.as_array())

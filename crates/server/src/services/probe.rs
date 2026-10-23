@@ -18,6 +18,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
+pub const SERVICE_HTTP_PROBE_MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const SERVICE_PING_OUTPUT_MAX_BYTES: usize = 4096;
 const SERVICE_PING_PROCESS_TIMEOUT_GRACE_SECONDS: u64 = 2;
 
@@ -54,6 +55,7 @@ impl ProbeType {
 }
 
 pub async fn probe_http(url: &str, timeout_secs: u64) -> Result<ServiceProbe> {
+    let timeout_secs = timeout_secs.clamp(1, 30);
     let start = Instant::now();
     let validated = validate_outbound_url_resolved(url, "HTTP monitor").await?;
     let parsed = validated.url.clone();
@@ -68,13 +70,14 @@ pub async fn probe_http(url: &str, timeout_secs: u64) -> Result<ServiceProbe> {
     } else {
         None
     };
-    let client = secure_reqwest_client_builder(&validated)
-        .timeout(Duration::from_secs(timeout_secs))
-        .build()?;
+    let client = build_http_probe_client(&validated, timeout_secs)?;
 
     match client.get(parsed.clone()).send().await {
         Ok(response) => {
             let status = response.status();
+            let _ =
+                read_bounded_probe_response_body(response, SERVICE_HTTP_PROBE_MAX_RESPONSE_BYTES)
+                    .await;
             let latency_ms = start.elapsed().as_millis() as i32;
             let (cert_fingerprint, cert_not_after) = cert_fields(cert);
 
@@ -103,7 +106,7 @@ pub async fn probe_http(url: &str, timeout_secs: u64) -> Result<ServiceProbe> {
                 success: false,
                 latency_ms: Some(latency_ms),
                 status_code: None,
-                error: Some(e.to_string()),
+                error: Some(bounded_ping_output_text(e.to_string().as_bytes())),
                 cert_fingerprint,
                 cert_not_after,
                 checked_at: Utc::now(),
@@ -112,17 +115,66 @@ pub async fn probe_http(url: &str, timeout_secs: u64) -> Result<ServiceProbe> {
     }
 }
 
+fn build_http_probe_client(
+    validated: &ValidatedOutboundUrl,
+    timeout_secs: u64,
+) -> Result<reqwest::Client> {
+    let mut builder = secure_reqwest_client_builder(validated)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(&validated.host, &validated.addrs)
+        .timeout(Duration::from_secs(timeout_secs));
+    let normalized_host = validated
+        .host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.');
+    if normalized_host != validated.host
+        && !normalized_host.is_empty()
+        && normalized_host.parse::<std::net::IpAddr>().is_err()
+    {
+        builder = builder.resolve_to_addrs(normalized_host, &validated.addrs);
+    }
+    builder.build().context("failed to build HTTP probe client")
+}
+
+async fn read_bounded_probe_response_body(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Vec<u8> {
+    if let Some(content_length) = response.content_length() {
+        if content_length > max_bytes as u64 {
+            return Vec::new();
+        }
+    }
+    let mut body = Vec::new();
+    while let Ok(Some(chunk)) = response.chunk().await {
+        let remaining = max_bytes.saturating_sub(body.len());
+        if remaining == 0 {
+            break;
+        }
+        if chunk.len() >= remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            break;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    body
+}
+
 pub async fn probe_tcp(host: &str, port: u16, timeout_secs: u64) -> Result<ServiceProbe> {
+    let timeout_secs = timeout_secs.clamp(1, 30);
+    ensure_safe_probe_host(host, "TCP monitor")?;
     let start = Instant::now();
+    let deadline = start + Duration::from_secs(timeout_secs);
     let addrs = resolve_outbound_host(host, port, "TCP monitor").await?;
 
     for addr in addrs {
-        match tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
-            tokio::net::TcpStream::connect(addr),
-        )
-        .await
-        {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, tokio::net::TcpStream::connect(addr)).await {
             Ok(Ok(_stream)) => {
                 let latency_ms = start.elapsed().as_millis() as i32;
                 return Ok(ServiceProbe {
@@ -159,6 +211,7 @@ pub async fn probe_tcp(host: &str, port: u16, timeout_secs: u64) -> Result<Servi
 /// ICMP ping probe (requires system ping command)
 #[allow(dead_code)]
 pub async fn probe_icmp(host: &str, timeout_secs: u64) -> Result<ServiceProbe> {
+    ensure_safe_probe_host(host, "ICMP monitor")?;
     let start = Instant::now();
     let addrs = resolve_outbound_host(host, 0, "ICMP monitor").await?;
     let target = addrs
@@ -166,6 +219,7 @@ pub async fn probe_icmp(host: &str, timeout_secs: u64) -> Result<ServiceProbe> {
         .context("ICMP monitor host did not resolve to any address")?
         .ip()
         .to_string();
+    ensure_safe_probe_host(&target, "ICMP resolved target")?;
 
     let ping_timeout = Duration::from_secs(
         timeout_secs.saturating_add(SERVICE_PING_PROCESS_TIMEOUT_GRACE_SECONDS),
@@ -276,7 +330,11 @@ async fn probe_tls_certificate(
     timeout_secs: u64,
 ) -> Result<CertificateStatus> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let host = validated.host.clone();
+    let host = validated
+        .host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
     let mut last_error = None;
 
     let config = rustls::ClientConfig::builder()
@@ -397,6 +455,27 @@ impl ServerCertVerifier for NoCertificateVerification {
     }
 }
 
+pub(crate) fn ensure_safe_probe_host(host: &str, purpose: &str) -> Result<()> {
+    let trimmed = host.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("{purpose} host is required");
+    }
+    if trimmed.starts_with('-') {
+        anyhow::bail!("{purpose} host must not start with '-'");
+    }
+    if trimmed.chars().any(|ch| {
+        ch.is_control()
+            || ch.is_whitespace()
+            || matches!(
+                ch,
+                '/' | '\\' | '?' | '#' | '@' | ';' | '|' | '&' | '$' | '`' | '"' | '\''
+            )
+    }) {
+        anyhow::bail!("{purpose} host contains invalid characters");
+    }
+    Ok(())
+}
+
 #[allow(dead_code)]
 fn parse_ping_latency(output: &str) -> Option<i32> {
     // Try to extract average latency from ping output
@@ -454,5 +533,60 @@ mod tests {
 
         let empty = ping_failure_message(b"", b"");
         assert_eq!(empty, "Ping failed");
+    }
+
+    #[test]
+    fn safe_probe_host_rejects_option_injection_and_metacharacters() {
+        assert!(ensure_safe_probe_host("example.com", "ICMP").is_ok());
+        assert!(ensure_safe_probe_host("203.0.113.10", "ICMP").is_ok());
+        assert!(ensure_safe_probe_host("[2606:4700:4700::1111]", "ICMP").is_ok());
+        assert!(ensure_safe_probe_host("-f", "ICMP").is_err());
+        assert!(ensure_safe_probe_host("--flood", "ICMP").is_err());
+        assert!(ensure_safe_probe_host("example.com;id", "ICMP").is_err());
+        assert!(ensure_safe_probe_host("example.com/path", "ICMP").is_err());
+        assert!(ensure_safe_probe_host("host with space", "ICMP").is_err());
+    }
+
+    #[tokio::test]
+    async fn http_probe_response_body_is_bounded_and_pins_resolved_addr() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        assert_eq!(SERVICE_HTTP_PROBE_MAX_RESPONSE_BYTES, 64 * 1024);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut req_buf = [0u8; 1024];
+            let _ = socket.read(&mut req_buf).await;
+            let header = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n";
+            let _ = socket.write_all(header.as_bytes()).await;
+            let chunk = vec![b'x'; 16 * 1024];
+            for _ in 0..8 {
+                if socket.write_all(&chunk).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let url = format!("http://probe.invalid:{}/status", addr.port());
+        let validated = ValidatedOutboundUrl {
+            url: reqwest::Url::parse(&url).unwrap(),
+            host: "probe.invalid".into(),
+            addrs: vec![addr],
+        };
+        let client = build_http_probe_client(&validated, 5).unwrap();
+        let response = client
+            .get(validated.url.clone())
+            .send()
+            .await
+            .expect("pinned HTTP probe client must connect to resolved SocketAddr");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        let body =
+            read_bounded_probe_response_body(response, SERVICE_HTTP_PROBE_MAX_RESPONSE_BYTES).await;
+        assert_eq!(body.len(), SERVICE_HTTP_PROBE_MAX_RESPONSE_BYTES);
+        let _ = server_task.await;
     }
 }

@@ -23,7 +23,8 @@ use crate::auth::middleware::{AuthKind, AuthSession};
 use crate::auth::rbac::has_scope;
 use crate::db::{Agent, AgentRepository, DatabaseBackend, UserRepository};
 
-pub use crate::realtime::ws::ws_servers;
+#[path = "ws.rs"]
+pub mod ws;
 use axum::{
     extract::{connect_info::ConnectInfo, DefaultBodyLimit, Path, Query, State},
     http::HeaderMap,
@@ -37,6 +38,7 @@ use sqlx::{QueryBuilder, Row};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use uuid::Uuid;
+pub use ws::ws_servers;
 use xlstatus_shared::{AgentId, UserId};
 use xlstatus_tsdb::{MetricSeries, QueryRange};
 
@@ -659,6 +661,13 @@ pub async fn batch_update_servers(
     if !has_scope(&auth, "server:write") {
         return Err(AppError::Forbidden("missing scope: server:write".into()));
     }
+    if matches!(req.action, ServerBatchAction::Delete)
+        && matches!(auth.auth_kind, AuthKind::PersonalAccessToken)
+    {
+        return Err(AppError::Forbidden(
+            "server deletion requires a cookie session".into(),
+        ));
+    }
     if matches!(
         req.action,
         ServerBatchAction::Delete | ServerBatchAction::TransferOwner
@@ -735,7 +744,7 @@ pub async fn batch_update_servers(
     let mut results = Vec::new();
     for id in server_ids {
         let result = match apply_batch_action(
-            &state.db,
+            &state,
             &agent_repo,
             &auth,
             &actor_ip,
@@ -821,6 +830,14 @@ pub async fn retry_server_owner_transfer(
 
     let agent_id = parse_agent_id(&transfer.server_id)?;
     let target_owner = parse_user_id(&transfer.to_user_id)?;
+    let user_repo = UserRepository::new(state.db.clone());
+    if user_repo.find_by_id(target_owner).await?.is_none() {
+        mark_server_owner_transfer_failed(&state.db, &id, "target user not found").await?;
+        let updated = load_server_owner_transfer(&state.db, &id)
+            .await?
+            .ok_or(AppError::NotFound("server transfer not found".into()))?;
+        return Ok(Json(ApiResponse::success(updated)));
+    }
     let agent_repo = AgentRepository::new(state.db.clone());
     let row = match agent_repo.find_by_id_with_state(agent_id).await? {
         Some(row) => row,
@@ -1553,6 +1570,9 @@ async fn ensure_group_server_active(
         .await?
         .ok_or(AppError::NotFound("agent not found".into()))?;
     ensure_agent_visible(auth, &agent)?;
+    if agent.owner_user_id != auth.user_id {
+        return Err(AppError::Forbidden("agent is owned by another user".into()));
+    }
     if agent.revoked_at.is_some() {
         return Err(AppError::BadRequest("agent has been revoked".into()));
     }
@@ -1567,11 +1587,16 @@ fn normalize_group_name(value: &str) -> Result<String, AppError> {
     if value.len() > 80 {
         return Err(AppError::BadRequest("group name is too long".into()));
     }
+    if value.chars().any(char::is_control) {
+        return Err(AppError::BadRequest(
+            "group name must not contain control characters".into(),
+        ));
+    }
     Ok(value.to_string())
 }
 
 async fn apply_batch_action(
-    db: &DatabaseBackend,
+    state: &AppState,
     agent_repo: &AgentRepository,
     auth: &AuthSession,
     actor_ip: &str,
@@ -1582,6 +1607,7 @@ async fn apply_batch_action(
     target_owner: Option<UserId>,
     target_group_id: Option<&str>,
 ) -> Result<(), String> {
+    let db = &state.db;
     let agent_id = parse_agent_id(id).map_err(error_message)?;
     let row = agent_repo
         .find_by_id_with_state(agent_id)
@@ -1595,10 +1621,10 @@ async fn apply_batch_action(
             if !auth.role.is_admin() && row.agent.owner_user_id != auth.user_id {
                 return Err("agent is owned by another user".into());
             }
-            delete_agent(db, agent_id).await.map_err(error_message)
+            delete_agent(state, agent_id).await.map_err(error_message)
         }
         ServerBatchAction::MoveGroup => {
-            if !auth.role.is_admin() && row.agent.owner_user_id != auth.user_id {
+            if row.agent.owner_user_id != auth.user_id {
                 return Err("agent is owned by another user".into());
             }
             if row.agent.revoked_at.is_some() {
@@ -2570,24 +2596,52 @@ fn warn_if_audit_failed(result: Result<(), AppError>) {
     }
 }
 
-async fn delete_agent(db: &DatabaseBackend, id: AgentId) -> Result<(), AppError> {
+async fn delete_agent(state: &AppState, id: AgentId) -> Result<(), AppError> {
+    let db = &state.db;
     let affected = match db {
-        DatabaseBackend::Sqlite(pool) => sqlx::query("DELETE FROM agents WHERE id = ?")
-            .bind(id.0.to_string())
-            .execute(pool)
-            .await
-            .map_err(db_err)?
-            .rows_affected(),
-        DatabaseBackend::Postgres(pool) => sqlx::query("DELETE FROM agents WHERE id = $1")
-            .bind(id.0)
-            .execute(pool)
-            .await
-            .map_err(db_err)?
-            .rows_affected(),
+        DatabaseBackend::Sqlite(pool) => {
+            sqlx::query("DELETE FROM server_group_members WHERE agent_id = ?")
+                .bind(id.0.to_string())
+                .execute(pool)
+                .await
+                .map_err(db_err)?;
+            sqlx::query("DELETE FROM agents WHERE id = ?")
+                .bind(id.0.to_string())
+                .execute(pool)
+                .await
+                .map_err(db_err)?
+                .rows_affected()
+        }
+        DatabaseBackend::Postgres(pool) => {
+            sqlx::query("DELETE FROM server_group_members WHERE agent_id = $1")
+                .bind(id.0)
+                .execute(pool)
+                .await
+                .map_err(db_err)?;
+            sqlx::query("DELETE FROM agents WHERE id = $1")
+                .bind(id.0)
+                .execute(pool)
+                .await
+                .map_err(db_err)?
+                .rows_affected()
+        }
     };
     if affected == 0 {
         return Err(AppError::NotFound("agent not found".into()));
     }
+    crate::api::v1::agent_jwt::purge_agent_jwt_challenges(&state.agent_jwt_challenges, id).await;
+    let msg = xlstatus_proto_gen::xlstatus::v1::ServerMessage {
+        payload: Some(
+            xlstatus_proto_gen::xlstatus::v1::server_message::Payload::ForceDisconnect(
+                xlstatus_proto_gen::xlstatus::v1::ForceDisconnect {
+                    reason: "agent deleted".to_string(),
+                },
+            ),
+        ),
+    };
+    let _ = state.session_registry.send(&id, msg).await;
+    state.session_registry.disconnect(&id).await;
+    state.io_registry.disconnect_agent(&id).await;
     Ok(())
 }
 
@@ -2927,7 +2981,10 @@ fn json_label(value: &serde_json::Value) -> Option<String> {
     match value {
         serde_json::Value::String(value) => {
             let trimmed = value.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
+            (!trimmed.is_empty()
+                && trimmed.len() <= SERVER_LABEL_MAX_BYTES
+                && !trimmed.chars().any(char::is_control))
+            .then(|| trimmed.to_string())
         }
         serde_json::Value::Number(value) => Some(value.to_string()),
         serde_json::Value::Bool(value) => Some(value.to_string()),
@@ -2942,6 +2999,11 @@ fn normalize_server_name(value: &str, field: &str) -> Result<String, AppError> {
     }
     if value.len() > SERVER_NAME_MAX_BYTES {
         return Err(AppError::BadRequest(format!("{field} is too long")));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(AppError::BadRequest(format!(
+            "{field} must not contain control characters"
+        )));
     }
     Ok(value.to_string())
 }
@@ -2959,6 +3021,11 @@ fn normalize_optional_label(
     }
     if value.len() > SERVER_LABEL_MAX_BYTES {
         return Err(AppError::BadRequest(format!("{field} is too long")));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(AppError::BadRequest(format!(
+            "{field} must not contain control characters"
+        )));
     }
     Ok(Some(value.to_string()))
 }
@@ -3067,9 +3134,6 @@ fn dashboard_metadata(
 ) -> DashboardMetadata {
     let mut out = parse_dashboard_metadata_json::<DashboardMetadata>(stored).unwrap_or_default();
 
-    if out.public_note.is_none() {
-        out.public_note = metadata_string(fallback_sources, &["public_note", "public_description"]);
-    }
     if out.provider.is_none() {
         out.provider = metadata_string(
             fallback_sources,
@@ -3092,13 +3156,15 @@ fn dashboard_metadata(
         out.city = metadata_string(fallback_sources, &["city", "geo_city"]);
     }
     if out.latitude.is_none() {
-        out.latitude = metadata_f64(fallback_sources, &["latitude", "lat", "geo_latitude"]);
+        out.latitude = metadata_f64(fallback_sources, &["latitude", "lat", "geo_latitude"])
+            .filter(|value| (-90.0..=90.0).contains(value));
     }
     if out.longitude.is_none() {
         out.longitude = metadata_f64(
             fallback_sources,
             &["longitude", "lon", "lng", "geo_longitude"],
-        );
+        )
+        .filter(|value| (-180.0..=180.0).contains(value));
     }
     if out.plan.is_none() {
         out.plan = metadata_string(
@@ -3131,7 +3197,8 @@ fn dashboard_metadata(
                 "bandwidth_quota_bytes",
                 "monthly_traffic_bytes",
             ],
-        );
+        )
+        .filter(|value| *value >= 0);
     }
     if out.traffic_quota_type.is_none() {
         out.traffic_quota_type = metadata_string(
@@ -3209,6 +3276,11 @@ fn normalize_tag_input(tags: Vec<String>) -> Result<Vec<String>, AppError> {
         if cleaned.len() > SERVER_TAG_INPUT_MAX_BYTES {
             return Err(AppError::BadRequest("tag is too long".into()));
         }
+        if cleaned.chars().any(char::is_control) {
+            return Err(AppError::BadRequest(
+                "tag must not contain control characters".into(),
+            ));
+        }
     }
     Ok(normalize_tags(tags))
 }
@@ -3217,7 +3289,10 @@ fn normalize_tags(tags: Vec<String>) -> Vec<String> {
     let mut out = Vec::new();
     for tag in tags {
         let cleaned = tag.trim();
-        if cleaned.is_empty() || out.iter().any(|existing| existing == cleaned) {
+        if cleaned.is_empty()
+            || cleaned.chars().any(char::is_control)
+            || out.iter().any(|existing| existing == cleaned)
+        {
             continue;
         }
         out.push(cleaned.chars().take(24).collect());
@@ -4471,5 +4546,100 @@ mod tests {
         };
 
         assert_eq!(network_rate_from_series(&series, "bytes_recv"), Some(500));
+    }
+
+    #[tokio::test]
+    async fn batch_delete_rejects_pat_and_cleans_up_group_members() {
+        let db = test_db().await;
+        let owner = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let server = Uuid::parse_str("00000000-0000-0000-0000-000000000101").unwrap();
+        let group = Uuid::parse_str("00000000-0000-0000-0000-000000000201").unwrap();
+        seed_user(&db, owner, "owner", "admin").await;
+        seed_agent(&db, server, owner, "server", "2026-01-01T00:00:00Z").await;
+        seed_server_group(&db, group, owner, "owner-group").await;
+        seed_server_group_member(&db, group, server).await;
+
+        let mut pat_auth = auth_session(AuthKind::PersonalAccessToken, UserRole::Admin);
+        pat_auth.user_id = UserId(owner);
+        pat_auth.server_ids = Some(vec![server.to_string()]);
+        pat_auth.pat_id = Some("pat".into());
+
+        let err = batch_update_servers(
+            State(test_state(db.clone())),
+            pat_auth,
+            ConnectInfo("127.0.0.1:12345".parse().unwrap()),
+            HeaderMap::new(),
+            Json(BatchUpdateServersRequest {
+                server_ids: vec![server.to_string()],
+                action: ServerBatchAction::Delete,
+                tags: vec![],
+                dashboard_visible: None,
+                owner_user_id: None,
+                group_id: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::Forbidden(_)));
+
+        let mut cookie_auth = auth_session(AuthKind::Session, UserRole::Admin);
+        cookie_auth.user_id = UserId(owner);
+        let Json(resp) = batch_update_servers(
+            State(test_state(db.clone())),
+            cookie_auth.clone(),
+            ConnectInfo("127.0.0.1:12345".parse().unwrap()),
+            HeaderMap::new(),
+            Json(BatchUpdateServersRequest {
+                server_ids: vec![server.to_string()],
+                action: ServerBatchAction::Delete,
+                tags: vec![],
+                dashboard_visible: None,
+                owner_user_id: None,
+                group_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.data.unwrap().updated, 1);
+
+        let DatabaseBackend::Sqlite(pool) = &db else {
+            unreachable!();
+        };
+        let remaining_members: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM server_group_members WHERE agent_id = ?")
+                .bind(server.to_string())
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining_members, 0);
+    }
+
+    #[test]
+    fn dashboard_metadata_ignores_untrusted_agent_public_note_and_invalid_fallbacks() {
+        let untrusted_info = json!({
+            "public_note": "spoofed public note",
+            "public_description": "spoofed description",
+            "latitude": 999.0,
+            "longitude": -999.0,
+            "traffic_quota_bytes": -100,
+            "provider": "bad\nprovider",
+            "tags": ["good", "bad\x07tag"]
+        });
+        let metadata = dashboard_metadata(None, &[Some(&untrusted_info)]);
+
+        assert_eq!(metadata.public_note, None);
+        assert_eq!(metadata.latitude, None);
+        assert_eq!(metadata.longitude, None);
+        assert_eq!(metadata.traffic_quota_bytes, None);
+        assert_eq!(metadata.provider, None);
+        assert_eq!(metadata.tags, vec!["good".to_string()]);
+    }
+
+    #[test]
+    fn server_names_labels_groups_and_tags_reject_control_characters() {
+        assert!(normalize_server_name("srv\n1", "name").is_err());
+        assert!(normalize_group_name("grp\r1").is_err());
+        assert!(normalize_optional_label(Some("note\x1b[31m".into()), "remark").is_err());
+        assert!(normalize_tag_input(vec!["prod\0".into()]).is_err());
     }
 }

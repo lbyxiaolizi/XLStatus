@@ -13,6 +13,60 @@ const SHELL_DEFAULT_TIMEOUT_SECONDS: u32 = 30;
 const SHELL_MAX_TIMEOUT_SECONDS: u32 = 60;
 const SHELL_DEFAULT_OUTPUT_MAX_BYTES: u64 = 64 * 1024;
 const SHELL_MAX_OUTPUT_BYTES: u64 = 64 * 1024;
+const SHELL_MAX_COMMAND_BYTES: usize = 64 * 1024;
+const SHELL_MAX_WORKING_DIR_BYTES: usize = 4096;
+pub const SHELL_MAX_ENV_VARS: usize = 64;
+pub const SHELL_MAX_ENV_KEY_BYTES: usize = 256;
+pub const SHELL_MAX_ENV_VALUE_BYTES: usize = 4096;
+
+pub(crate) const SENSITIVE_AGENT_ENV_VARS: &[&str] = &[
+    "XLSTATUS_ENROLL_TOKEN",
+    "XLSTATUS_AGENT_JWT",
+    "XLSTATUS_PRIVATE_KEY",
+    "XLSTATUS_TOKEN",
+    "ENROLLMENT_TOKEN",
+];
+
+const BLOCKED_SHELL_ENV_VARS: &[&str] = &[
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "LD_DEBUG",
+    "LD_DEBUG_OUTPUT",
+    "LD_DYNAMIC_WEAK",
+    "LD_ORIGIN_PATH",
+    "LD_PROFILE",
+    "LD_USE_LOAD_BIAS",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "DYLD_FALLBACK_FRAMEWORK_PATH",
+    "DYLD_FORCE_FLAT_NAMESPACE",
+    "DYLD_IMAGE_SUFFIX",
+    "DYLD_PRINT_TO_FILE",
+    "BASH_ENV",
+    "ENV",
+    "PROMPT_COMMAND",
+    "SHELLOPTS",
+    "BASHOPTS",
+    "PS4",
+    "IFS",
+    "CDPATH",
+    "GLOBIGNORE",
+    "FPATH",
+    "ZDOTDIR",
+    "GCONV_PATH",
+    "HOSTALIASES",
+    "LOCALDOMAIN",
+    "RES_OPTIONS",
+    "PERL5OPT",
+    "PERL5LIB",
+    "PYTHONSTARTUP",
+    "PYTHONPATH",
+    "RUBYOPT",
+    "NODE_OPTIONS",
+];
 
 /// Shell command execution result
 #[derive(Debug)]
@@ -25,6 +79,138 @@ pub struct ShellResult {
     pub execution_time_ms: u64,
 }
 
+pub(crate) fn is_sensitive_inherited_env_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    if SENSITIVE_AGENT_ENV_VARS.contains(&upper.as_str()) {
+        return true;
+    }
+    if upper.starts_with("XLSTATUS_")
+        && (upper.contains("TOKEN")
+            || upper.contains("SECRET")
+            || upper.contains("KEY")
+            || upper.contains("JWT")
+            || upper.contains("PASS"))
+    {
+        return true;
+    }
+    if upper.starts_with("LD_") || upper.starts_with("DYLD_") || upper.starts_with("BASH_FUNC_") {
+        return true;
+    }
+    matches!(
+        upper.as_str(),
+        "BASH_ENV" | "ENV" | "PROMPT_COMMAND" | "SHELLOPTS" | "BASHOPTS" | "PS4"
+    )
+}
+
+pub(crate) fn sanitize_tokio_command_env(cmd: &mut Command) {
+    for &key in SENSITIVE_AGENT_ENV_VARS {
+        cmd.env_remove(key);
+    }
+    for (key, _) in std::env::vars_os() {
+        let key_lossy = key.to_string_lossy();
+        if is_sensitive_inherited_env_key(&key_lossy) {
+            cmd.env_remove(&key);
+        }
+    }
+}
+
+pub fn is_valid_env_key_identifier(key: &str) -> bool {
+    let bytes = key.as_bytes();
+    let Some((&first, rest)) = bytes.split_first() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return false;
+    }
+    rest.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+pub fn is_blocked_shell_env_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    is_sensitive_inherited_env_key(&upper) || BLOCKED_SHELL_ENV_VARS.contains(&upper.as_str())
+}
+
+pub fn validate_shell_env(env: &[(String, String)]) -> Result<()> {
+    if env.len() > SHELL_MAX_ENV_VARS {
+        bail!(
+            "Command environment variable count {} exceeds maximum of {}",
+            env.len(),
+            SHELL_MAX_ENV_VARS
+        );
+    }
+
+    for (key, value) in env {
+        if key.is_empty() || key.len() > SHELL_MAX_ENV_KEY_BYTES {
+            bail!(
+                "Invalid environment variable key length {} (must be 1..={} bytes)",
+                key.len(),
+                SHELL_MAX_ENV_KEY_BYTES
+            );
+        }
+        if !is_valid_env_key_identifier(key) {
+            bail!(
+                "Invalid environment variable key '{}': must match [A-Za-z_][A-Za-z0-9_]*",
+                key
+            );
+        }
+        if is_blocked_shell_env_key(key) {
+            bail!(
+                "Environment variable '{}' is blocked by agent security policy",
+                key
+            );
+        }
+        if value.len() > SHELL_MAX_ENV_VALUE_BYTES {
+            bail!(
+                "Environment variable '{}' value exceeds maximum of {} bytes",
+                key,
+                SHELL_MAX_ENV_VALUE_BYTES
+            );
+        }
+        if value.contains('\0') || value.chars().any(char::is_control) {
+            bail!(
+                "Environment variable '{}' value contains disallowed control characters",
+                key
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_shell_command_inputs(
+    command: &str,
+    working_dir: Option<&str>,
+    env: &[(String, String)],
+) -> Result<()> {
+    if command.trim().is_empty() {
+        bail!("Command must not be empty");
+    }
+    if command.len() > SHELL_MAX_COMMAND_BYTES {
+        bail!(
+            "Command length {} exceeds maximum of {} bytes",
+            command.len(),
+            SHELL_MAX_COMMAND_BYTES
+        );
+    }
+    if command.contains('\0') {
+        bail!("Command must not contain NUL bytes");
+    }
+
+    if let Some(dir) = working_dir {
+        if dir.is_empty() || dir.len() > SHELL_MAX_WORKING_DIR_BYTES {
+            bail!(
+                "Working directory length must be between 1 and {} bytes",
+                SHELL_MAX_WORKING_DIR_BYTES
+            );
+        }
+        if dir.contains('\0') || dir.chars().any(char::is_control) {
+            bail!("Working directory contains disallowed control characters");
+        }
+    }
+
+    validate_shell_env(env)
+}
+
 /// Execute a shell command with timeout and output limits
 pub async fn execute_shell_command(
     command: &str,
@@ -33,6 +219,8 @@ pub async fn execute_shell_command(
     timeout_seconds: u32,
     max_output_bytes: u64,
 ) -> Result<ShellResult> {
+    validate_shell_command_inputs(command, working_dir, env)?;
+
     let start = Instant::now();
     let timeout_seconds = bounded_timeout_seconds(timeout_seconds);
     let max_output_bytes = bounded_output_max_bytes(max_output_bytes);
@@ -50,6 +238,8 @@ pub async fn execute_shell_command(
         c.args(["-c", command]);
         c
     };
+
+    sanitize_tokio_command_env(&mut cmd);
 
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
@@ -432,5 +622,93 @@ mod tests {
         assert_eq!(bounded_timeout_seconds(u32::MAX), SHELL_MAX_TIMEOUT_SECONDS);
         assert_eq!(bounded_output_max_bytes(0), SHELL_DEFAULT_OUTPUT_MAX_BYTES);
         assert_eq!(bounded_output_max_bytes(u64::MAX), SHELL_MAX_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn test_validate_shell_env_blocks_dangerous_and_malformed_vars() {
+        for blocked in [
+            "LD_PRELOAD",
+            "ld_preload",
+            "LD_LIBRARY_PATH",
+            "LD_AUDIT",
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+            "BASH_ENV",
+            "ENV",
+            "PROMPT_COMMAND",
+            "SHELLOPTS",
+            "BASHOPTS",
+            "PS4",
+            "IFS",
+            "CDPATH",
+            "XLSTATUS_ENROLL_TOKEN",
+            "XLSTATUS_AGENT_JWT",
+            "XLSTATUS_PRIVATE_KEY",
+            "XLSTATUS_TOKEN",
+        ] {
+            let env = vec![(blocked.to_string(), "value".to_string())];
+            assert!(
+                validate_shell_env(&env).is_err(),
+                "expected {blocked} to be rejected"
+            );
+        }
+
+        // Invalid key identifiers
+        for bad_key in ["", "1BAD", "BAD=KEY", "BAD KEY", "BAD\0KEY", "BAD-KEY"] {
+            let env = vec![(bad_key.to_string(), "value".to_string())];
+            assert!(
+                validate_shell_env(&env).is_err(),
+                "expected key '{bad_key}' to be rejected"
+            );
+        }
+
+        // Oversized key / value / count
+        let oversized_key = vec![("A".repeat(SHELL_MAX_ENV_KEY_BYTES + 1), "v".to_string())];
+        assert!(validate_shell_env(&oversized_key).is_err());
+
+        let oversized_val = vec![(
+            "VALID_KEY".to_string(),
+            "v".repeat(SHELL_MAX_ENV_VALUE_BYTES + 1),
+        )];
+        assert!(validate_shell_env(&oversized_val).is_err());
+
+        let control_val = vec![("VALID_KEY".to_string(), "line1\nline2".to_string())];
+        assert!(validate_shell_env(&control_val).is_err());
+
+        let nul_val = vec![("VALID_KEY".to_string(), "val\0ue".to_string())];
+        assert!(validate_shell_env(&nul_val).is_err());
+
+        let too_many: Vec<(String, String)> = (0..=SHELL_MAX_ENV_VARS)
+            .map(|i| (format!("VAR_{i}"), "ok".to_string()))
+            .collect();
+        assert!(validate_shell_env(&too_many).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_shell_strips_inherited_xlstatus_secrets() {
+        std::env::set_var("XLSTATUS_ENROLL_TOKEN", "xle_super_secret_enroll_token");
+        std::env::set_var("XLSTATUS_AGENT_JWT", "eyJ_super_secret_agent_jwt");
+        std::env::set_var("XLSTATUS_PRIVATE_KEY", "deadbeef_private_key");
+        std::env::set_var("XLSTATUS_TOKEN", "secret_bootstrap_token");
+
+        let result = execute_shell_command(
+            if cfg!(target_os = "windows") {
+                "set"
+            } else {
+                "env"
+            },
+            None,
+            &[],
+            5,
+            64 * 1024,
+        )
+        .await
+        .unwrap();
+
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        assert!(!stdout.contains("xle_super_secret_enroll_token"));
+        assert!(!stdout.contains("eyJ_super_secret_agent_jwt"));
+        assert!(!stdout.contains("deadbeef_private_key"));
+        assert!(!stdout.contains("secret_bootstrap_token"));
     }
 }

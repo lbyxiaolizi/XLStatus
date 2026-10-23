@@ -1083,10 +1083,14 @@ async fn notify_agent_ip_change(
     let sender = NotificationSender::new();
     for channel in channels {
         if let Err(err) = sender.send(&channel, &message).await {
+            let sanitized = crate::api::v1::notifications::sanitize_notification_error(
+                &err.to_string(),
+                &channel.url,
+            );
             tracing::warn!(
                 "IP change notification channel {} failed: {}",
                 channel.id,
-                err
+                sanitized
             );
         }
     }

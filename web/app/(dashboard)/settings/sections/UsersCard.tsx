@@ -119,7 +119,7 @@ export function UsersCard() {
       <BrutalCard>
         <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
           <div>
-            <h2 className="text-xl font-black uppercase">{copy.settingsPage.userManagement}</h2>
+            <h2 className="text-lg font-semibold tracking-tight text-[var(--text-main)]">{copy.settingsPage.userManagement}</h2>
           </div>
           <button type="button" className={buttonClass("secondary")} onClick={() => void loadUsers()} disabled={usersLoading}>
             {usersLoading ? copy.settingsPage.loading : copy.settingsPage.refresh}
@@ -151,17 +151,17 @@ export function UsersCard() {
           {usersLoading && users.length === 0 ? (
             <SettingsListSkeleton />
           ) : users.length === 0 ? (
-            <p className="text-sm font-bold text-[var(--text-muted)]">{copy.settingsPage.noUsers}</p>
+            <p className="text-sm font-medium text-[var(--text-muted)]">{copy.settingsPage.noUsers}</p>
           ) : (
             users.map((user) => (
-              <div key={user.id} className="grid gap-3 border-2 border-black bg-[var(--accent-bg)] p-3 shadow-[var(--shadow-brutal-sm)] xl:grid-cols-[minmax(0,1fr)_10rem_minmax(15rem,0.8fr)_auto] xl:items-center">
+              <div key={user.id} className="grid gap-3 rounded-xl border border-[var(--border-color)] bg-[var(--bg-subtle)] p-3.5 xl:grid-cols-[minmax(0,1fr)_10rem_minmax(15rem,0.8fr)_auto] xl:items-center">
                 <div className="min-w-0">
                   <div className="flex flex-wrap items-center gap-2">
-                    <span className="break-words text-sm font-black">{user.username}</span>
+                    <span className="break-words text-sm font-semibold text-[var(--text-main)]">{user.username}</span>
                     <StatusBadge tone={user.role === "admin" ? "yellow" : "gray"}>{user.role}</StatusBadge>
                   </div>
-                  <div className="mt-1 break-all font-mono text-[11px] font-bold text-[var(--text-muted)]">{user.id}</div>
-                  <div className="mt-1 text-xs font-bold text-[var(--text-muted)]">{copy.settingsPage.createdAt.replace("{date}", String(formatDate(user.created_at)))}</div>
+                  <div className="mt-1 break-all font-mono text-[11px] text-[var(--text-muted)]">{user.id}</div>
+                  <div className="mt-1 text-xs text-[var(--text-muted)]">{copy.settingsPage.createdAt.replace("{date}", String(formatDate(user.created_at)))}</div>
                 </div>
                 <select className={inputClass} value={user.role} onChange={(e) => void run(() => updateUserRole(user, e.target.value))} disabled={busy}>
                   <option value="member">member</option>

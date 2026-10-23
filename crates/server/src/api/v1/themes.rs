@@ -497,6 +497,11 @@ fn normalize_name(value: &str, field: &str) -> Result<String, AppError> {
     if value.len() > THEME_MAX_NAME_BYTES {
         return Err(AppError::BadRequest(format!("{field} is too long")));
     }
+    if value.chars().any(|ch| ch.is_control()) {
+        return Err(AppError::BadRequest(format!(
+            "{field} must not contain control characters"
+        )));
+    }
     Ok(value.to_string())
 }
 
@@ -514,6 +519,11 @@ fn normalize_optional_text(
     }
     if value.len() > max_len {
         return Err(AppError::BadRequest(format!("{field} is too long")));
+    }
+    if value.chars().any(|ch| ch.is_control()) {
+        return Err(AppError::BadRequest(format!(
+            "{field} must not contain control characters"
+        )));
     }
     Ok(Some(value.to_string()))
 }
@@ -569,8 +579,7 @@ fn is_safe_theme_color_value(value: &str) -> bool {
                 && !args.contains(['(', ')'])
                 && args.chars().all(|ch| {
                     ch.is_ascii_digit()
-                        || ch.is_ascii_whitespace()
-                        || matches!(ch, ',' | '.' | '%' | '/' | '+' | '-')
+                        || matches!(ch, ' ' | '\t' | ',' | '.' | '%' | '/' | '+' | '-')
                 });
         }
     }
@@ -1027,6 +1036,14 @@ mod tests {
         let auth = auth_session(AuthKind::PersonalAccessToken);
         let err = require_admin_cookie_session(&auth).unwrap_err();
         assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[test]
+    fn theme_color_and_text_reject_newlines_and_control_characters() {
+        assert!(!is_safe_theme_color_value("rgb(255,\n0, 0)"));
+        assert!(!is_safe_theme_color_value("rgba(255,\r0, 0, 1)"));
+        assert!(normalize_name("Theme\nName", "name").is_err());
+        assert!(normalize_optional_text(Some("Desc\0".into()), 100, "description").is_err());
     }
 
     #[test]

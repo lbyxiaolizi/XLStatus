@@ -105,7 +105,7 @@ export function SessionsCard() {
       <BrutalCard>
         <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
           <div>
-            <h2 className="text-xl font-black uppercase">{copy.settingsPage.activeSessions}</h2>
+            <h2 className="text-lg font-semibold tracking-tight text-[var(--text-main)]">{copy.settingsPage.activeSessions}</h2>
           </div>
           <button type="button" className={buttonClass("secondary")} onClick={() => void loadSessions()} disabled={sessionsLoading}>
             {sessionsLoading ? copy.settingsPage.loading : copy.settingsPage.refresh}
@@ -116,22 +116,22 @@ export function SessionsCard() {
           {sessionsLoading && sessions.length === 0 ? (
             <SettingsListSkeleton />
           ) : sessions.length === 0 ? (
-            <p className="text-sm font-bold text-[var(--text-muted)]">{copy.settingsPage.noActiveSessions}</p>
+            <p className="text-sm font-medium text-[var(--text-muted)]">{copy.settingsPage.noActiveSessions}</p>
           ) : (
             sessions.map((session) => (
-              <div key={session.id} className="grid gap-3 border-2 border-black bg-[var(--accent-bg)] p-3 shadow-[var(--shadow-brutal-sm)] xl:grid-cols-[minmax(0,1fr)_14rem_auto] xl:items-center">
+              <div key={session.id} className="grid gap-3 rounded-xl border border-[var(--border-color)] bg-[var(--bg-subtle)] p-3.5 xl:grid-cols-[minmax(0,1fr)_14rem_auto] xl:items-center">
                 <div className="min-w-0">
                   <div className="flex flex-wrap items-center gap-2">
-                    <span className="break-words text-sm font-black">{session.username}</span>
+                    <span className="break-words text-sm font-semibold text-[var(--text-main)]">{session.username}</span>
                     <StatusBadge tone={session.role === "admin" ? "yellow" : "gray"}>{session.role}</StatusBadge>
                     {session.is_current ? <StatusBadge tone="green">{copy.settingsPage.current}</StatusBadge> : null}
                   </div>
-                  <div className="mt-1 break-all font-mono text-[11px] font-bold text-[var(--text-muted)]">{session.id}</div>
-                  <div className="mt-1 break-all text-xs font-bold text-[var(--text-muted)]">
+                  <div className="mt-1 break-all font-mono text-[11px] text-[var(--text-muted)]">{session.id}</div>
+                  <div className="mt-1 break-all text-xs text-[var(--text-muted)]">
                     {session.ip || "IP N/A"} / {session.user_agent || "UA N/A"}
                   </div>
                 </div>
-                <div className="text-xs font-bold text-[var(--text-muted)]">
+                <div className="text-xs text-[var(--text-muted)]">
                   <div>{copy.settingsPage.createdLabel.replace("{date}", String(formatDate(session.created_at)))}</div>
                   <div>{copy.settingsPage.expiresLabel.replace("{date}", String(formatDate(session.expires_at)))}</div>
                 </div>

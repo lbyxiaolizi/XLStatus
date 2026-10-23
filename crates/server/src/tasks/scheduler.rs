@@ -175,9 +175,14 @@ impl TaskScheduler {
 
     /// Manually trigger a task execution
     pub async fn trigger_task(&self, task_id: &str) -> Result<()> {
-        let task = TaskRepository::get_by_id(&self.db, task_id)
+        let task_id = crate::api::v1::tasks::require_task_uuid_text(task_id, "task_id")
+            .map_err(|_| anyhow::anyhow!("Invalid task_id"))?;
+        let task = TaskRepository::get_by_id(&self.db, &task_id)
             .await?
             .context("Task not found")?;
+        if !task.enabled {
+            anyhow::bail!("Task is disabled");
+        }
 
         info!("Manually triggering task: {} ({})", task.id, task.name);
         self.execute_task(&task).await
@@ -439,6 +444,36 @@ mod tests {
             .expect("scheduler should finish after both replies")
             .expect("scheduler task should not panic")
             .expect("scheduler run should succeed");
+    }
+
+    #[tokio::test]
+    async fn trigger_task_rejects_invalid_uuid_and_disabled_task() {
+        let db = test_db().await;
+        let owner_id = "00000000-0000-0000-0000-000000000001";
+        let agent_id_text = "00000000-0000-0000-0000-000000000201";
+        let task_ids = seed_scheduled_tasks(&db, owner_id, agent_id_text, 1).await;
+        let task_id = task_ids.first().unwrap().clone();
+
+        let Db::Sqlite(pool) = &db else {
+            unreachable!();
+        };
+        sqlx::query("UPDATE tasks SET enabled = 0 WHERE id = ?")
+            .bind(&task_id)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        let scheduler = TaskScheduler::new(
+            db,
+            SessionRegistry::new(),
+            Arc::new(TaskResponseRegistry::new()),
+        );
+
+        let bad_id_err = scheduler.trigger_task("not-a-uuid").await.unwrap_err();
+        assert!(bad_id_err.to_string().contains("Invalid task_id"));
+
+        let disabled_err = scheduler.trigger_task(&task_id).await.unwrap_err();
+        assert!(disabled_err.to_string().contains("Task is disabled"));
     }
 
     async fn test_db() -> Db {

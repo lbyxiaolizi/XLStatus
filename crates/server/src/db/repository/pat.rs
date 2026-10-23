@@ -108,6 +108,7 @@ impl PATRepository {
                     FROM personal_access_tokens
                     WHERE user_id = ? AND revoked_at IS NULL
                     ORDER BY created_at DESC
+                    LIMIT 500
                     "#,
                 )
                 .bind(user_id.0.to_string())
@@ -164,6 +165,7 @@ impl PATRepository {
                     FROM personal_access_tokens
                     WHERE user_id = $1 AND revoked_at IS NULL
                     ORDER BY created_at DESC
+                    LIMIT 500
                     "#,
                 )
                 .bind(user_id.0)
@@ -448,7 +450,7 @@ impl PATRepository {
         match &self.db {
             DatabaseBackend::Sqlite(pool) => {
                 sqlx::query(
-                    "UPDATE personal_access_tokens SET last_used_at = ?, last_used_ip = ? WHERE id = ?",
+                    "UPDATE personal_access_tokens SET last_used_at = ?, last_used_ip = ? WHERE id = ? AND revoked_at IS NULL",
                 )
                 .bind(now.to_rfc3339())
                 .bind(ip)
@@ -459,7 +461,7 @@ impl PATRepository {
             DatabaseBackend::Postgres(pool) => {
                 let id = parse_pat_uuid(id, "id")?;
                 sqlx::query(
-                    "UPDATE personal_access_tokens SET last_used_at = $1, last_used_ip = $2 WHERE id = $3",
+                    "UPDATE personal_access_tokens SET last_used_at = $1, last_used_ip = $2 WHERE id = $3 AND revoked_at IS NULL",
                 )
                 .bind(now)
                 .bind(ip)
@@ -807,6 +809,41 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(repo.list_by_user(user.id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mark_used_does_not_update_revoked_pat() {
+        let db = test_db().await;
+        let user = UserRepository::new(db.clone())
+            .create(CreateUserInput {
+                username: "owner-revoke-pat".into(),
+                password: "secret".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        let repo = PATRepository::new(db);
+        let pat = repo
+            .create(
+                CreatePATInput {
+                    user_id: user.id,
+                    name: "ci".into(),
+                    scopes: vec!["notification:read".into()],
+                    server_ids: None,
+                    expires_at: Some(Utc::now() + chrono::Duration::days(1)),
+                },
+                hash_token("xlp_revoked_usage"),
+            )
+            .await
+            .unwrap();
+
+        assert!(repo.revoke(&pat.id, user.id).await.unwrap());
+        repo.mark_used(&pat.id, Some("203.0.113.5")).await.unwrap();
+
+        let stored = repo.find_by_id(&pat.id).await.unwrap().unwrap();
+        assert!(stored.revoked_at.is_some());
+        assert!(stored.last_used_at.is_none());
+        assert!(stored.last_used_ip.is_none());
     }
 
     async fn insert_raw_pat(

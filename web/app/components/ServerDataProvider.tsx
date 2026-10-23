@@ -22,63 +22,63 @@ import { getCookie } from "@/app/lib/format";
 import { apiClient, getApiBaseUrl } from "@/lib/api";
 
 export interface ServerLocation {
-  source?: string | null;
-  provider?: string | null;
-  country?: string | null;
-  region?: string | null;
-  city?: string | null;
-  latitude?: number | null;
-  longitude?: number | null;
-  timezone?: string | null;
+  source?: string | null | undefined;
+  provider?: string | null | undefined;
+  country?: string | null | undefined;
+  region?: string | null | undefined;
+  city?: string | null | undefined;
+  latitude?: number | null | undefined;
+  longitude?: number | null | undefined;
+  timezone?: string | null | undefined;
 }
 
 export interface Server {
   id: string;
   name: string;
-  remark?: string | null;
-  note?: string | null;
-  expires_at?: string | null;
-  expired_at?: string | null;
-  renewal_price?: string | number | null;
-  price?: string | number | null;
-  provider?: string | null;
-  region?: string | null;
-  country?: string | null;
-  city?: string | null;
-  latitude?: number | null;
-  longitude?: number | null;
-  location?: ServerLocation | null;
-  plan?: string | null;
-  tags?: string[];
-  accent_color?: string | null;
-  dashboard_visible?: boolean | null;
-  display_order?: number | null;
+  remark?: string | null | undefined;
+  note?: string | null | undefined;
+  expires_at?: string | null | undefined;
+  expired_at?: string | null | undefined;
+  renewal_price?: string | number | null | undefined;
+  price?: string | number | null | undefined;
+  provider?: string | null | undefined;
+  region?: string | null | undefined;
+  country?: string | null | undefined;
+  city?: string | null | undefined;
+  latitude?: number | null | undefined;
+  longitude?: number | null | undefined;
+  location?: ServerLocation | null | undefined;
+  plan?: string | null | undefined;
+  tags?: string[] | undefined;
+  accent_color?: string | null | undefined;
+  dashboard_visible?: boolean | null | undefined;
+  display_order?: number | null | undefined;
   status: string;
-  cpu_percent?: number;
-  memory_used?: number;
-  memory_total?: number;
-  load_1?: number;
-  net_rx_bps?: number | null;
-  net_tx_bps?: number | null;
-  network_in_total?: number | null;
-  network_out_total?: number | null;
-  uptime_seconds?: number | null;
-  last_seen_at?: string;
-  last_event_at?: string;
+  cpu_percent?: number | undefined;
+  memory_used?: number | undefined;
+  memory_total?: number | undefined;
+  load_1?: number | undefined;
+  net_rx_bps?: number | null | undefined;
+  net_tx_bps?: number | null | undefined;
+  network_in_total?: number | null | undefined;
+  network_out_total?: number | null | undefined;
+  uptime_seconds?: number | null | undefined;
+  last_seen_at?: string | undefined;
+  last_event_at?: string | undefined;
 }
 
 export interface LiveState {
-  cpu_percent?: number;
-  memory_used?: number;
-  memory_total?: number;
-  load_1?: number;
-  net_rx_bps?: number;
-  net_tx_bps?: number;
-  network_in_total?: number;
-  network_out_total?: number;
-  uptime_seconds?: number;
+  cpu_percent?: number | undefined;
+  memory_used?: number | undefined;
+  memory_total?: number | undefined;
+  load_1?: number | undefined;
+  net_rx_bps?: number | undefined;
+  net_tx_bps?: number | undefined;
+  network_in_total?: number | undefined;
+  network_out_total?: number | undefined;
+  uptime_seconds?: number | undefined;
   received_at: string;
-  confirmed_at?: number;
+  confirmed_at?: number | undefined;
 }
 
 export type ServerConnectionState = "connecting" | "open" | "closed" | "error";
@@ -283,13 +283,14 @@ export function useOptionalServerData(): ServerDataContextValue | null {
 function isServer(value: unknown): value is Server {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const row = value as Record<string, unknown>;
-  const tagsValid = row.tags === undefined
-    || row.tags === null
-    || (Array.isArray(row.tags) && row.tags.every((tag) => typeof tag === "string"));
+  const tags = row["tags"];
+  const tagsValid = tags === undefined
+    || tags === null
+    || (Array.isArray(tags) && tags.every((tag) => typeof tag === "string"));
   return tagsValid
-    && typeof row.id === "string"
-    && typeof row.name === "string"
-    && typeof row.status === "string";
+    && typeof row["id"] === "string"
+    && typeof row["name"] === "string"
+    && typeof row["status"] === "string";
 }
 
 function sessionFingerprint(value: string): string {

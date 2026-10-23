@@ -14,6 +14,7 @@ import {
 import { showToast } from "@/app/components/Toasts";
 import { apiClient, type SystemSettingsResponse } from "@/lib/api";
 import { useI18n } from "@/lib/use-i18n";
+import { sanitizeAssetUrl, sanitizeCssVariableValue } from "@/app/lib/security";
 import { useBusy } from "@/app/lib/use-busy";
 import { useLoadOnVisible } from "@/app/lib/use-load-on-visible";
 import { SectionFeedback, nullableText } from "./shared";
@@ -93,15 +94,39 @@ export function PublicSiteCard() {
       setError(copy.settingsPage.enterPublicSiteName);
       return;
     }
+    const rawLogoUrl = nullableText(publicBranding.logoUrl);
+    const safeLogoUrl = rawLogoUrl ? sanitizeAssetUrl(rawLogoUrl) : null;
+    if (rawLogoUrl && !safeLogoUrl) {
+      setError("Invalid logo URL: only http://, https://, or relative / paths are allowed.");
+      return;
+    }
+    const rawFaviconUrl = nullableText(publicBranding.faviconUrl);
+    const safeFaviconUrl = rawFaviconUrl ? sanitizeAssetUrl(rawFaviconUrl) : null;
+    if (rawFaviconUrl && !safeFaviconUrl) {
+      setError("Invalid favicon URL: only http://, https://, or relative / paths are allowed.");
+      return;
+    }
+    const rawBackgroundUrl = nullableText(publicBranding.backgroundUrl);
+    const safeBackgroundUrl = rawBackgroundUrl ? sanitizeAssetUrl(rawBackgroundUrl) : null;
+    if (rawBackgroundUrl && !safeBackgroundUrl) {
+      setError("Invalid background URL: only http://, https://, or relative / paths are allowed.");
+      return;
+    }
+    const rawThemeColor = nullableText(publicBranding.themeColor);
+    const safeThemeColor = rawThemeColor ? sanitizeCssVariableValue(rawThemeColor) : null;
+    if (rawThemeColor && !safeThemeColor) {
+      setError("Invalid theme color value.");
+      return;
+    }
     const totpCode = await sensitiveTotpCode();
     if (totpCode === null) return;
     setSettingsLoading(true);
     const response = await apiClient.updateSettings({
       public_site_name: siteName,
-      public_logo_url: nullableText(publicBranding.logoUrl),
-      public_favicon_url: nullableText(publicBranding.faviconUrl),
-      public_theme_color: nullableText(publicBranding.themeColor),
-      public_background_url: nullableText(publicBranding.backgroundUrl),
+      public_logo_url: safeLogoUrl,
+      public_favicon_url: safeFaviconUrl,
+      public_theme_color: safeThemeColor,
+      public_background_url: safeBackgroundUrl,
       public_custom_head: null,
       public_custom_body: null,
     }, totpCode);
@@ -120,7 +145,7 @@ export function PublicSiteCard() {
       <BrutalCard>
         <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
           <div>
-            <h2 className="text-xl font-black uppercase">{copy.settingsPage.publicStatusPage}</h2>
+            <h2 className="text-lg font-semibold tracking-tight text-[var(--text-main)]">{copy.settingsPage.publicStatusPage}</h2>
           </div>
           <button type="button" className={buttonClass("secondary")} onClick={() => void loadSystemSettings(true)} disabled={settingsLoading}>
             {settingsLoading ? copy.settingsPage.loading : copy.settingsPage.refresh}
@@ -132,11 +157,11 @@ export function PublicSiteCard() {
             <StatusBadge tone={systemSettings ? (systemSettings.public_site_enabled ? "green" : "red") : "gray"}>
               {systemSettings ? (systemSettings.public_site_enabled ? copy.settingsPage.public : copy.settingsPage.private) : copy.common.notAvailable}
             </StatusBadge>
-            <span className="text-sm font-bold text-[var(--text-muted)]">
+            <span className="text-sm font-medium text-[var(--text-muted)]">
               {copy.settingsPage.publicSiteToggleHint}
             </span>
           </div>
-          <label className="inline-flex cursor-pointer items-center gap-2 border-2 border-black bg-[var(--accent-bg)] px-3 py-2 text-sm font-black shadow-[var(--shadow-brutal-sm)]">
+          <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-[var(--border-color)] bg-[var(--bg-subtle)] px-3 py-2 text-xs font-medium text-[var(--text-main)]">
             <input
               type="checkbox"
               checked={systemSettings?.public_site_enabled === true}
@@ -146,16 +171,16 @@ export function PublicSiteCard() {
             {copy.settingsPage.anonymousAccess}
           </label>
         </div>
-        <div className="mt-3 flex flex-wrap items-center justify-between gap-3 border-t-2 border-black pt-3">
+        <div className="mt-3 flex flex-wrap items-center justify-between gap-3 border-t border-[var(--border-color)] pt-3">
           <div className="flex flex-wrap items-center gap-2">
             <StatusBadge tone={systemSettings?.public_server_details_enabled ? "green" : "gray"}>
               {systemSettings ? (systemSettings.public_server_details_enabled ? copy.settingsPage.showDetails : copy.settingsPage.hideDetails) : copy.common.notAvailable}
             </StatusBadge>
-            <span className="text-sm font-bold text-[var(--text-muted)]">
+            <span className="text-sm font-medium text-[var(--text-muted)]">
               {copy.settingsPage.publicDetailsToggleHint}
             </span>
           </div>
-          <label className="inline-flex cursor-pointer items-center gap-2 border-2 border-black bg-[var(--accent-bg)] px-3 py-2 text-sm font-black shadow-[var(--shadow-brutal-sm)]">
+          <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-[var(--border-color)] bg-[var(--bg-subtle)] px-3 py-2 text-xs font-medium text-[var(--text-main)]">
             <input
               type="checkbox"
               checked={systemSettings?.public_server_details_enabled === true}
@@ -165,7 +190,7 @@ export function PublicSiteCard() {
             {copy.settingsPage.serverDetails}
           </label>
         </div>
-        <div className="mt-4 grid gap-3 border-t-2 border-black pt-4 lg:grid-cols-2">
+        <div className="mt-4 grid gap-3 border-t border-[var(--border-color)] pt-4 lg:grid-cols-2">
           <Field label={copy.settingsPage.siteName}>
             <input
               className={inputClass}

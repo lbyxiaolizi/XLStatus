@@ -24,6 +24,8 @@ pub struct AlertRuleRow {
     pub updated_at: DateTime<Utc>,
 }
 
+const ALERT_LIST_MAX_LIMIT: i64 = 500;
+
 pub struct AlertRepository {
     db: Db,
 }
@@ -101,211 +103,16 @@ impl AlertRepository {
     }
 
     pub async fn list(&self) -> Result<Vec<AlertRuleRow>> {
-        let mut out = Vec::new();
-        match &self.db {
-            DatabaseBackend::Sqlite(pool) => {
-                let rows: Vec<(
-                    String,
-                    String,
-                    String,
-                    i64,
-                    String,
-                    String,
-                    Option<String>,
-                    Option<String>,
-                    Option<String>,
-                    String,
-                    String,
-                )> = sqlx::query_as(
-                    "SELECT id, owner_user_id, name, enabled, trigger_mode, rules_json, notification_group_id, fail_task_ids_json, recover_task_ids_json, created_at, updated_at FROM alert_rules ORDER BY created_at DESC",
-                )
-                .fetch_all(pool)
-                .await?;
-                for (
-                    id,
-                    owner_user_id,
-                    name,
-                    enabled,
-                    trigger_mode,
-                    rules_json,
-                    notification_group_id,
-                    fail_task_ids_json,
-                    recover_task_ids_json,
-                    created_at,
-                    updated_at,
-                ) in rows
-                {
-                    out.push(build_alert_rule_row(
-                        id,
-                        owner_user_id,
-                        name,
-                        enabled != 0,
-                        trigger_mode,
-                        rules_json,
-                        notification_group_id,
-                        fail_task_ids_json,
-                        recover_task_ids_json,
-                        created_at,
-                        updated_at,
-                    )?);
-                }
-            }
-            DatabaseBackend::Postgres(pool) => {
-                let rows: Vec<(
-                    String,
-                    String,
-                    String,
-                    bool,
-                    String,
-                    String,
-                    Option<String>,
-                    Option<String>,
-                    Option<String>,
-                    String,
-                    String,
-                )> = sqlx::query_as(
-                    "SELECT id::text, owner_user_id::text, name, enabled, trigger_mode, rules_json, notification_group_id::text, fail_task_ids_json, recover_task_ids_json, created_at::text, updated_at::text FROM alert_rules ORDER BY created_at DESC",
-                )
-                .fetch_all(pool)
-                .await?;
-                for (
-                    id,
-                    owner_user_id,
-                    name,
-                    enabled,
-                    trigger_mode,
-                    rules_json,
-                    notification_group_id,
-                    fail_task_ids_json,
-                    recover_task_ids_json,
-                    created_at,
-                    updated_at,
-                ) in rows
-                {
-                    out.push(build_alert_rule_row(
-                        id,
-                        owner_user_id,
-                        name,
-                        enabled,
-                        trigger_mode,
-                        rules_json,
-                        notification_group_id,
-                        fail_task_ids_json,
-                        recover_task_ids_json,
-                        created_at,
-                        updated_at,
-                    )?);
-                }
-            }
-        }
-        Ok(out)
+        self.list_page(ALERT_LIST_MAX_LIMIT, 0).await
     }
 
     pub async fn list_by_owner(&self, owner_user_id: &str) -> Result<Vec<AlertRuleRow>> {
-        let mut out = Vec::new();
-        match &self.db {
-            DatabaseBackend::Sqlite(pool) => {
-                let rows: Vec<(
-                    String,
-                    String,
-                    String,
-                    i64,
-                    String,
-                    String,
-                    Option<String>,
-                    Option<String>,
-                    Option<String>,
-                    String,
-                    String,
-                )> = sqlx::query_as(
-                    "SELECT id, owner_user_id, name, enabled, trigger_mode, rules_json, notification_group_id, fail_task_ids_json, recover_task_ids_json, created_at, updated_at FROM alert_rules WHERE owner_user_id = ? ORDER BY created_at DESC",
-                )
-                .bind(owner_user_id)
-                .fetch_all(pool)
-                .await?;
-                for (
-                    id,
-                    owner_user_id,
-                    name,
-                    enabled,
-                    trigger_mode,
-                    rules_json,
-                    notification_group_id,
-                    fail_task_ids_json,
-                    recover_task_ids_json,
-                    created_at,
-                    updated_at,
-                ) in rows
-                {
-                    out.push(build_alert_rule_row(
-                        id,
-                        owner_user_id,
-                        name,
-                        enabled != 0,
-                        trigger_mode,
-                        rules_json,
-                        notification_group_id,
-                        fail_task_ids_json,
-                        recover_task_ids_json,
-                        created_at,
-                        updated_at,
-                    )?);
-                }
-            }
-            DatabaseBackend::Postgres(pool) => {
-                let rows: Vec<(
-                    String,
-                    String,
-                    String,
-                    bool,
-                    String,
-                    String,
-                    Option<String>,
-                    Option<String>,
-                    Option<String>,
-                    String,
-                    String,
-                )> = sqlx::query_as(
-                    "SELECT id::text, owner_user_id::text, name, enabled, trigger_mode, rules_json, notification_group_id::text, fail_task_ids_json, recover_task_ids_json, created_at::text, updated_at::text FROM alert_rules WHERE owner_user_id::text = $1 ORDER BY created_at DESC",
-                )
-                .bind(owner_user_id)
-                .fetch_all(pool)
-                .await?;
-                for (
-                    id,
-                    owner_user_id,
-                    name,
-                    enabled,
-                    trigger_mode,
-                    rules_json,
-                    notification_group_id,
-                    fail_task_ids_json,
-                    recover_task_ids_json,
-                    created_at,
-                    updated_at,
-                ) in rows
-                {
-                    out.push(build_alert_rule_row(
-                        id,
-                        owner_user_id,
-                        name,
-                        enabled,
-                        trigger_mode,
-                        rules_json,
-                        notification_group_id,
-                        fail_task_ids_json,
-                        recover_task_ids_json,
-                        created_at,
-                        updated_at,
-                    )?);
-                }
-            }
-        }
-        Ok(out)
+        self.list_by_owner_page(owner_user_id, ALERT_LIST_MAX_LIMIT, 0)
+            .await
     }
 
     pub async fn list_page(&self, limit: i64, offset: i64) -> Result<Vec<AlertRuleRow>> {
-        let limit = limit.max(0);
+        let limit = limit.clamp(1, ALERT_LIST_MAX_LIMIT);
         let offset = offset.max(0);
         let mut out = Vec::new();
         match &self.db {
@@ -417,7 +224,7 @@ impl AlertRepository {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<AlertRuleRow>> {
-        let limit = limit.max(0);
+        let limit = limit.clamp(1, ALERT_LIST_MAX_LIMIT);
         let offset = offset.max(0);
         let mut out = Vec::new();
         match &self.db {
@@ -753,6 +560,7 @@ impl AlertEventRepository {
     }
 
     pub async fn list_recent(&self, limit: i64) -> Result<Vec<AlertEventRow>> {
+        let limit = limit.clamp(1, ALERT_LIST_MAX_LIMIT);
         let mut out = Vec::new();
         match &self.db {
             DatabaseBackend::Sqlite(pool) => {
@@ -802,6 +610,7 @@ impl AlertEventRepository {
         owner_user_id: &str,
         limit: i64,
     ) -> Result<Vec<AlertEventRow>> {
+        let limit = limit.clamp(1, ALERT_LIST_MAX_LIMIT);
         let mut out = Vec::new();
         match &self.db {
             DatabaseBackend::Sqlite(pool) => {
@@ -888,6 +697,7 @@ impl AlertEventRepository {
         if server_ids.is_empty() {
             return Ok(Vec::new());
         }
+        let limit = limit.clamp(1, ALERT_LIST_MAX_LIMIT);
         let mut out = Vec::new();
         match &self.db {
             DatabaseBackend::Sqlite(pool) => {
@@ -978,6 +788,7 @@ impl AlertEventRepository {
         if server_ids.is_empty() {
             return Ok(Vec::new());
         }
+        let limit = limit.clamp(1, ALERT_LIST_MAX_LIMIT);
         let mut out = Vec::new();
         match &self.db {
             DatabaseBackend::Sqlite(pool) => {
@@ -1157,6 +968,101 @@ mod tests {
         let found = AlertRepository::new(db).find_by_id(wanted).await.unwrap();
 
         assert_eq!(found.unwrap().id, wanted);
+    }
+
+    #[tokio::test]
+    async fn alert_repositories_clamp_negative_and_oversized_pagination() {
+        let db = DatabaseBackend::connect("sqlite::memory:", true)
+            .await
+            .unwrap();
+        db.run_migrations().await.unwrap();
+        let owner = "00000000-0000-0000-0000-000000000001";
+        let agent_id = "00000000-0000-0000-0000-000000000101";
+        seed_user(&db, owner, "owner").await;
+
+        let rule_repo = AlertRepository::new(db.clone());
+        let r1 = rule_repo
+            .create(
+                owner,
+                "r1",
+                TriggerMode::Once,
+                &[AlertCondition::ServerOffline {
+                    agent_id: agent_id.into(),
+                    offline_seconds: 60,
+                }],
+                None,
+                &[],
+                &[],
+            )
+            .await
+            .unwrap();
+        let _r2 = rule_repo
+            .create(
+                owner,
+                "r2",
+                TriggerMode::Once,
+                &[AlertCondition::ServerOffline {
+                    agent_id: agent_id.into(),
+                    offline_seconds: 60,
+                }],
+                None,
+                &[],
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(rule_repo.list_page(-1, -10).await.unwrap().len(), 1);
+        assert_eq!(
+            rule_repo
+                .list_by_owner_page(owner, -1, -10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let DatabaseBackend::Sqlite(pool) = &db else {
+            unreachable!();
+        };
+        for idx in 0..3 {
+            sqlx::query(
+                "INSERT INTO alert_events (id, rule_id, agent_id, kind, payload_json, fired_at) VALUES (?, ?, ?, 'fired', '{}', '2026-01-01T00:00:00Z')",
+            )
+            .bind(format!("00000000-0000-0000-0000-00000000090{idx}"))
+            .bind(&r1.id)
+            .bind(agent_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        let event_repo = AlertEventRepository::new(db);
+        assert_eq!(event_repo.list_recent(-1).await.unwrap().len(), 1);
+        assert_eq!(
+            event_repo
+                .list_recent_for_owner(owner, -1)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            event_repo
+                .list_recent_for_server_ids(&[agent_id.to_string()], -1)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            event_repo
+                .list_recent_for_owner_server_ids(owner, &[agent_id.to_string()], -1)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     async fn seed_user(db: &DatabaseBackend, id: &str, username: &str) {

@@ -21,6 +21,13 @@ use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
 
+pub const MAX_SAMPLE_PAYLOAD_BYTES: usize = 64 * 1024;
+pub const MAX_SAMPLE_JSON_DEPTH: usize = 16;
+pub const MAX_BATCH_SAMPLES: usize = 256_000;
+pub const MAX_SAMPLES_PER_AGENT: usize = 50_000;
+pub const MAX_RETENTION_DAYS: i64 = 3650;
+pub const MAX_FUTURE_SKEW_SECONDS: i64 = 86_400;
+
 #[derive(Debug, Error)]
 pub enum MetricError {
     #[error("invalid timestamp: {0}")]
@@ -200,6 +207,97 @@ impl Default for InMemoryMetricStore {
     }
 }
 
+fn normalize_retention(retention: Duration) -> Duration {
+    retention.clamp(
+        Duration::milliseconds(1),
+        Duration::days(MAX_RETENTION_DAYS),
+    )
+}
+
+fn cutoff_for_retention(now: DateTime<Utc>, retention: Duration) -> DateTime<Utc> {
+    let clamped = retention.max(Duration::zero());
+    now.checked_sub_signed(clamped)
+        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+        .max(DateTime::<Utc>::UNIX_EPOCH)
+}
+
+fn validate_sample_payload(value: &serde_json::Value) -> Result<usize, MetricError> {
+    fn add_bytes(accumulated: &mut usize, n: usize) -> Result<(), MetricError> {
+        *accumulated = accumulated.saturating_add(n);
+        if *accumulated > MAX_SAMPLE_PAYLOAD_BYTES {
+            Err(MetricError::Backend(format!(
+                "sample payload size exceeds maximum of {} bytes",
+                MAX_SAMPLE_PAYLOAD_BYTES
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn walk(
+        value: &serde_json::Value,
+        depth: usize,
+        accumulated: &mut usize,
+    ) -> Result<(), MetricError> {
+        if depth > MAX_SAMPLE_JSON_DEPTH {
+            return Err(MetricError::Backend(format!(
+                "sample payload JSON depth exceeds maximum of {}",
+                MAX_SAMPLE_JSON_DEPTH
+            )));
+        }
+
+        match value {
+            serde_json::Value::Null => add_bytes(accumulated, 4),
+            serde_json::Value::Bool(b) => add_bytes(accumulated, if *b { 4 } else { 5 }),
+            serde_json::Value::Number(num) => {
+                if let Some(f) = num.as_f64() {
+                    if !f.is_finite() {
+                        return Err(MetricError::Backend(
+                            "sample payload contains non-finite number".into(),
+                        ));
+                    }
+                }
+                add_bytes(accumulated, 24)
+            }
+            serde_json::Value::String(s) => add_bytes(accumulated, s.len().saturating_add(2)),
+            serde_json::Value::Array(items) => {
+                add_bytes(accumulated, 2)?;
+                for item in items {
+                    add_bytes(accumulated, 1)?;
+                    walk(item, depth + 1, accumulated)?;
+                }
+                Ok(())
+            }
+            serde_json::Value::Object(map) => {
+                add_bytes(accumulated, 2)?;
+                for (k, v) in map {
+                    add_bytes(accumulated, k.len().saturating_add(4))?;
+                    walk(v, depth + 1, accumulated)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    let mut total = 0usize;
+    walk(value, 0, &mut total)?;
+    Ok(total)
+}
+
+fn validate_sample(sample: &MetricSample, now: DateTime<Utc>) -> Result<(), MetricError> {
+    if sample.sample_at.timestamp() < 0 {
+        return Err(MetricError::InvalidTimestamp(sample.sample_at.to_rfc3339()));
+    }
+    let max_allowed = now
+        .checked_add_signed(Duration::seconds(MAX_FUTURE_SKEW_SECONDS))
+        .unwrap_or(DateTime::<Utc>::MAX_UTC);
+    if sample.sample_at > max_allowed {
+        return Err(MetricError::InvalidTimestamp(sample.sample_at.to_rfc3339()));
+    }
+    validate_sample_payload(&sample.fields_json)?;
+    Ok(())
+}
+
 impl InMemoryMetricStore {
     pub fn new() -> Self {
         Self::with_retention(QueryRange::Day30.to_chrono_duration())
@@ -209,7 +307,7 @@ impl InMemoryMetricStore {
         Self {
             inner: RwLock::new(InMemoryState {
                 series: HashMap::new(),
-                retention,
+                retention: normalize_retention(retention),
             }),
         }
     }
@@ -222,6 +320,12 @@ impl InMemoryMetricStore {
         // the size of the dropped prefix.
         let before = entries.len();
         *entries = entries.split_off(&cutoff);
+        if entries.len() > MAX_SAMPLES_PER_AGENT {
+            let excess = entries.len() - MAX_SAMPLES_PER_AGENT;
+            for _ in 0..excess {
+                let _ = entries.pop_first();
+            }
+        }
         before.saturating_sub(entries.len())
     }
 
@@ -242,9 +346,9 @@ impl InMemoryMetricStore {
     }
 
     fn compact_all(state: &mut InMemoryState, cutoff: DateTime<Utc>) -> usize {
-        let mut dropped = 0;
+        let mut dropped: usize = 0;
         state.series.retain(|_, entries| {
-            dropped += Self::compact_series(entries, cutoff);
+            dropped = dropped.saturating_add(Self::compact_series(entries, cutoff));
             !entries.is_empty()
         });
         dropped
@@ -254,7 +358,7 @@ impl InMemoryMetricStore {
     /// series. Writes use the narrower per-agent helper instead.
     pub fn compact(&self) -> usize {
         let mut state = self.inner.write();
-        let cutoff = Utc::now() - state.retention;
+        let cutoff = cutoff_for_retention(Utc::now(), state.retention);
         Self::compact_all(&mut state, cutoff)
     }
 
@@ -263,9 +367,10 @@ impl InMemoryMetricStore {
     }
 
     pub fn set_retention(&self, retention: Duration) -> usize {
+        let retention = normalize_retention(retention);
         let mut state = self.inner.write();
         state.retention = retention;
-        let cutoff = Utc::now() - retention;
+        let cutoff = cutoff_for_retention(Utc::now(), retention);
         Self::compact_all(&mut state, cutoff)
     }
 
@@ -281,7 +386,7 @@ impl InMemoryMetricStore {
 
     pub fn export_samples(&self) -> Vec<MetricSample> {
         let state = self.inner.read();
-        let cutoff = Utc::now() - state.retention;
+        let cutoff = cutoff_for_retention(Utc::now(), state.retention);
         let mut samples = Vec::new();
         for (agent_id, entries) in &state.series {
             samples.extend(
@@ -305,14 +410,13 @@ impl MetricBackend for InMemoryMetricStore {
     }
 
     fn write(&self, sample: MetricSample) -> Result<(), MetricError> {
-        if sample.sample_at.timestamp() < 0 {
-            return Err(MetricError::InvalidTimestamp(sample.sample_at.to_rfc3339()));
-        }
+        let now = Utc::now();
+        validate_sample(&sample, now)?;
         let agent_id = sample.agent_id.clone();
         let ts = sample.sample_at;
         let payload = sample.fields_json.clone();
         let mut state = self.inner.write();
-        let cutoff = Utc::now() - state.retention;
+        let cutoff = cutoff_for_retention(now, state.retention);
         state
             .series
             .entry(agent_id.clone())
@@ -323,15 +427,21 @@ impl MetricBackend for InMemoryMetricStore {
     }
 
     fn write_batch(&self, samples: Vec<MetricSample>) -> Result<usize, MetricError> {
+        if samples.len() > MAX_BATCH_SAMPLES {
+            return Err(MetricError::Backend(format!(
+                "batch size {} exceeds maximum of {}",
+                samples.len(),
+                MAX_BATCH_SAMPLES
+            )));
+        }
+        let now = Utc::now();
         for sample in &samples {
-            if sample.sample_at.timestamp() < 0 {
-                return Err(MetricError::InvalidTimestamp(sample.sample_at.to_rfc3339()));
-            }
+            validate_sample(sample, now)?;
         }
 
         let count = samples.len();
         let mut state = self.inner.write();
-        let cutoff = Utc::now() - state.retention;
+        let cutoff = cutoff_for_retention(now, state.retention);
         let mut affected_agents = HashSet::with_capacity(count);
         for sample in samples {
             affected_agents.insert(sample.agent_id.clone());
@@ -350,7 +460,9 @@ impl MetricBackend for InMemoryMetricStore {
     fn query(&self, agent_id: AgentId, range: QueryRange) -> Result<MetricSeries, MetricError> {
         let state = self.inner.read();
         let now = Utc::now();
-        let cutoff = std::cmp::max(now - range.to_chrono_duration(), now - state.retention);
+        let range_cutoff = cutoff_for_retention(now, range.to_chrono_duration());
+        let retention_cutoff = cutoff_for_retention(now, state.retention);
+        let cutoff = std::cmp::max(range_cutoff, retention_cutoff);
         let samples = state
             .series
             .get(&agent_id)
@@ -370,7 +482,7 @@ impl MetricBackend for InMemoryMetricStore {
 
     fn latest(&self, agent_id: AgentId) -> Result<Option<MetricSample>, MetricError> {
         let state = self.inner.read();
-        let cutoff = Utc::now() - state.retention;
+        let cutoff = cutoff_for_retention(Utc::now(), state.retention);
         Ok(state
             .series
             .get(&agent_id)
@@ -385,7 +497,7 @@ impl MetricBackend for InMemoryMetricStore {
 
     fn list_agents(&self) -> Result<Vec<AgentId>, MetricError> {
         let state = self.inner.read();
-        let cutoff = Utc::now() - state.retention;
+        let cutoff = cutoff_for_retention(Utc::now(), state.retention);
         Ok(state
             .series
             .iter()
@@ -415,6 +527,12 @@ impl MetricBackend for InMemoryMetricStore {
             return Err(MetricError::Backend(
                 "retention must be greater than zero".into(),
             ));
+        }
+        if retention > Duration::days(MAX_RETENTION_DAYS) {
+            return Err(MetricError::Backend(format!(
+                "retention must not exceed {} days",
+                MAX_RETENTION_DAYS
+            )));
         }
         InMemoryMetricStore::set_retention(self, retention);
         Ok(())
@@ -863,5 +981,90 @@ mod tests {
         assert_eq!(store.backend_name(), "recording");
         assert_eq!(store.health().samples, Some(1));
         assert_eq!(store.list_agents().unwrap(), vec![agent]);
+    }
+
+    #[test]
+    fn rejects_oversized_and_deeply_nested_sample_payloads() {
+        let store = InMemoryMetricStore::new();
+        let agent = id(21);
+        let now = Utc::now();
+
+        let oversized_str = "x".repeat(MAX_SAMPLE_PAYLOAD_BYTES + 128);
+        let err = store
+            .write(MetricSample {
+                agent_id: agent.clone(),
+                sample_at: now,
+                fields_json: json!({ "blob": oversized_str }),
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum"));
+
+        let mut nested = json!(1);
+        for _ in 0..=MAX_SAMPLE_JSON_DEPTH {
+            nested = json!([nested]);
+        }
+        let err = store
+            .write(MetricSample {
+                agent_id: agent,
+                sample_at: now,
+                fields_json: nested,
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("depth exceeds maximum"));
+    }
+
+    #[test]
+    fn rejects_pre_epoch_and_far_future_timestamps() {
+        let store = InMemoryMetricStore::new();
+        let agent = id(22);
+        let now = Utc::now();
+
+        let pre_epoch = DateTime::<Utc>::from_timestamp(-10, 0).unwrap();
+        assert!(matches!(
+            store.write(MetricSample {
+                agent_id: agent.clone(),
+                sample_at: pre_epoch,
+                fields_json: json!({ "cpu": 1.0 }),
+            }),
+            Err(MetricError::InvalidTimestamp(_))
+        ));
+
+        let far_future = now + Duration::days(30);
+        assert!(matches!(
+            store.write(MetricSample {
+                agent_id: agent,
+                sample_at: far_future,
+                fields_json: json!({ "cpu": 1.0 }),
+            }),
+            Err(MetricError::InvalidTimestamp(_))
+        ));
+    }
+
+    #[test]
+    fn extreme_retention_values_do_not_overflow_or_panic() {
+        let store = InMemoryMetricStore::with_retention(Duration::MAX);
+        let agent = id(23);
+        let now = Utc::now();
+
+        store
+            .write(MetricSample {
+                agent_id: agent.clone(),
+                sample_at: now,
+                fields_json: json!({ "cpu": 10.0 }),
+            })
+            .unwrap();
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.compact(), 0);
+
+        // Negative/zero retention via InMemoryMetricStore::set_retention is safely clamped
+        store.set_retention(Duration::MIN);
+        assert!(store.retention() >= Duration::milliseconds(1));
+
+        // MetricBackend::set_retention rejects non-positive or > MAX_RETENTION_DAYS
+        let facade = MetricStore::in_memory();
+        assert!(facade.set_retention(Duration::zero()).is_err());
+        assert!(facade
+            .set_retention(Duration::days(MAX_RETENTION_DAYS + 1))
+            .is_err());
     }
 }

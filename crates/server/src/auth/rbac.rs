@@ -45,12 +45,15 @@ pub const KNOWN_SCOPES: &[&str] = &[
 ];
 
 pub const NON_ADMIN_PAT_DENIED_SCOPES: &[&str] = &[
+    "inventory:delete",
     "server:write",
     "server:delete",
     "server:exec",
     "task:write",
     "task:delete",
     "task:exec",
+    "ddns:write",
+    "ddns:delete",
     "nat:write",
     "nat:delete",
     "transfer:write",
@@ -249,7 +252,14 @@ pub fn validate_server_ids(server_ids: Option<&[String]>) -> Result<(), String> 
                 "server id in allowlist must be at most {PAT_RUNTIME_MAX_SERVER_ID_BYTES} bytes"
             ));
         }
-        uuid::Uuid::parse_str(id).map_err(|_| format!("invalid server id in allowlist: {}", id))?;
+        let parsed = uuid::Uuid::parse_str(id)
+            .map_err(|_| format!("invalid server id in allowlist: {}", id))?;
+        if parsed.to_string() != *id {
+            return Err(format!(
+                "server id in allowlist must be a canonical UUID: {}",
+                id
+            ));
+        }
     }
 
     Ok(())
@@ -554,6 +564,35 @@ mod tests {
     fn validate_server_ids_rejects_oversized_id_text() {
         let v = vec!["a".repeat(PAT_RUNTIME_MAX_SERVER_ID_BYTES + 1)];
         assert!(validate_server_ids(Some(&v)).is_err());
+    }
+
+    #[test]
+    fn validate_server_ids_rejects_non_canonical_uuid_text() {
+        let upper = vec!["00000000-0000-0000-0000-00000000000A".to_string()];
+        assert!(validate_server_ids(Some(&upper)).is_err());
+        let simple = vec!["00000000000000000000000000000001".to_string()];
+        assert!(validate_server_ids(Some(&simple)).is_err());
+    }
+
+    #[test]
+    fn validate_pat_scopes_rejects_inventory_and_ddns_mutations_for_non_admin() {
+        for denied in [
+            "inventory:delete",
+            "inventory:*",
+            "ddns:write",
+            "ddns:delete",
+            "ddns:*",
+        ] {
+            let scopes = vec![denied.to_string()];
+            assert!(
+                validate_pat_scopes(&scopes, false).is_err(),
+                "expected {denied} to be rejected for non-admin"
+            );
+            assert!(
+                validate_pat_scopes(&scopes, true).is_ok(),
+                "expected {denied} to be accepted for admin"
+            );
+        }
     }
 
     // ---- can_access_server / can_access_servers ----

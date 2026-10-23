@@ -10,6 +10,26 @@ use std::{
 #[cfg(not(target_os = "freebsd"))]
 use sysinfo::{Components, Disks, Networks, System};
 
+const MAX_COLLECTED_DISKS: usize = 256;
+const MAX_COLLECTED_INTERFACES: usize = 256;
+const MAX_COLLECTED_TEMPERATURES: usize = 128;
+
+fn sanitize_f32_percent(val: f32) -> f32 {
+    if val.is_finite() {
+        val.clamp(0.0, 100.0)
+    } else {
+        0.0
+    }
+}
+
+fn sanitize_load(val: f64) -> f64 {
+    if val.is_finite() && val >= 0.0 {
+        val
+    } else {
+        0.0
+    }
+}
+
 /// HostInfo: stable per-host info, sent once on enroll and on demand.
 #[derive(Debug, Clone, Serialize)]
 pub struct HostInfo {
@@ -114,6 +134,7 @@ fn collect_host_disks() -> Vec<HostDisk> {
         })
         .collect();
     list.sort_by(|a, b| a.mount_point.cmp(&b.mount_point));
+    list.truncate(MAX_COLLECTED_DISKS);
     list
 }
 
@@ -123,7 +144,7 @@ pub fn collect_host_state() -> HostState {
     sys.refresh_all();
 
     let load = System::load_average();
-    let cpu_percent = sys.global_cpu_usage();
+    let cpu_percent = sanitize_f32_percent(sys.global_cpu_usage());
 
     // Per-CPU average already encoded in global_cpu_usage on sysinfo 0.32+.
 
@@ -145,6 +166,7 @@ pub fn collect_host_state() -> HostState {
         .collect();
     // Sort for stable output.
     disk_list.sort_by(|a, b| a.mount_point.cmp(&b.mount_point));
+    disk_list.truncate(MAX_COLLECTED_DISKS);
 
     // Network: cumulative bytes per NIC.
     let networks = Networks::new_with_refreshed_list();
@@ -157,6 +179,7 @@ pub fn collect_host_state() -> HostState {
         })
         .collect();
     net_list.sort_by(|a, b| a.name.cmp(&b.name));
+    net_list.truncate(MAX_COLLECTED_INTERFACES);
 
     let (in_total, out_total) = net_list.iter().fold((0u64, 0u64), |(ri, ro), n| {
         (ri.saturating_add(n.rx_bytes), ro.saturating_add(n.tx_bytes))
@@ -164,7 +187,12 @@ pub fn collect_host_state() -> HostState {
 
     // Temperatures (best-effort; sysinfo Components covers hwmon on Linux).
     let components = Components::new_with_refreshed_list();
-    let temperatures: Vec<f32> = components.iter().map(|c| c.temperature()).collect();
+    let temperatures: Vec<f32> = components
+        .iter()
+        .map(|c| c.temperature())
+        .filter(|t| t.is_finite())
+        .take(MAX_COLLECTED_TEMPERATURES)
+        .collect();
 
     // Process count
     let process_count = sys.processes().len() as u64;
@@ -184,9 +212,9 @@ pub fn collect_host_state() -> HostState {
         memory_total: total_mem,
         swap_used: used_swap,
         swap_total: total_swap,
-        load1: load.one,
-        load5: load.five,
-        load15: load.fifteen,
+        load1: sanitize_load(load.one),
+        load5: sanitize_load(load.five),
+        load15: sanitize_load(load.fifteen),
         uptime_seconds,
         tcp_connections: tcp_conn,
         udp_connections: udp_conn,

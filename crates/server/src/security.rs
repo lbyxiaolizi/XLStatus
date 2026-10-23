@@ -86,8 +86,22 @@ async fn resolve_outbound_host_with_policy(
     purpose: &str,
     allow_private: bool,
 ) -> Result<Vec<SocketAddr>> {
+    let trimmed_host = host.trim();
+    if trimmed_host.is_empty() || trimmed_host.chars().any(char::is_control) {
+        anyhow::bail!("{purpose} host is invalid");
+    }
+    let unbracketed = trimmed_host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(trimmed_host);
+    if unbracketed.is_empty() || unbracketed.contains('%') {
+        anyhow::bail!("{purpose} host '{host}' is invalid");
+    }
     if allow_private {
-        let resolved: Vec<_> = lookup_host((host, port))
+        if let Ok(ip) = unbracketed.parse::<IpAddr>() {
+            return Ok(vec![SocketAddr::new(ip, port)]);
+        }
+        let resolved: Vec<_> = lookup_host((unbracketed, port))
             .await
             .with_context(|| format!("failed to resolve {purpose} host '{host}'"))
             .map(|addrs| addrs.collect())?;
@@ -97,12 +111,16 @@ async fn resolve_outbound_host_with_policy(
         return Ok(resolved);
     }
 
-    if let Ok(ip) = host.parse::<IpAddr>() {
+    if let Ok(ip) = unbracketed.parse::<IpAddr>() {
         ensure_public_ip(ip, purpose)?;
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
+    let normalized_domain = unbracketed.trim_end_matches('.').to_ascii_lowercase();
+    if normalized_domain == "localhost" || normalized_domain.ends_with(".localhost") {
+        anyhow::bail!("{purpose} target resolves to disallowed private address {host}");
+    }
 
-    let mut addrs = lookup_host((host, port))
+    let mut addrs = lookup_host((unbracketed, port))
         .await
         .with_context(|| format!("failed to resolve {purpose} host '{host}'"))?;
     let mut resolved = Vec::new();
@@ -154,14 +172,27 @@ pub fn validate_websocket_origin(
     headers: &HeaderMap,
     allowed_origins: &[String],
 ) -> std::result::Result<(), String> {
-    let Some(origin) = headers
-        .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
+    let mut origins = headers.get_all(header::ORIGIN).iter();
+    let Some(first_origin) = origins.next() else {
         return Ok(());
     };
+    if origins.next().is_some() {
+        return Err("WebSocket Origin is not allowed".to_string());
+    }
+    if first_origin.as_bytes().len() > HTTP_FORWARDED_HEADER_MAX_BYTES {
+        return Err("WebSocket Origin is not allowed".to_string());
+    }
+    let Some(origin) = first_origin
+        .to_str()
+        .ok()
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
+    else {
+        return Err("WebSocket Origin is not allowed".to_string());
+    };
+    if origin.eq_ignore_ascii_case("null") {
+        return Err("WebSocket Origin is not allowed".to_string());
+    }
 
     if allowed_origins
         .iter()
@@ -170,14 +201,20 @@ pub fn validate_websocket_origin(
         return Ok(());
     }
 
-    let host = headers
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    if let Some(host) = host {
-        if origin_host_matches_request_host(origin, host) {
-            return Ok(());
+    let mut hosts = headers.get_all(header::HOST).iter();
+    if let Some(first_host) = hosts.next() {
+        if hosts.next().is_none() && first_host.as_bytes().len() <= HTTP_FORWARDED_HEADER_MAX_BYTES
+        {
+            if let Some(host) = first_host
+                .to_str()
+                .ok()
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
+            {
+                if origin_host_matches_request_host(origin, host) {
+                    return Ok(());
+                }
+            }
         }
     }
 
@@ -232,10 +269,20 @@ where
     let peer_is_trusted = peer_ip.map(trusted_proxy_ip).unwrap_or(false);
     if peer_is_trusted {
         let forwarded = get_header("x-forwarded-for")
+            .and_then(|value| bounded_forwarded_header_str(&value))
             .and_then(|value| value.split(',').next().map(str::trim).map(str::to_string))
-            .or_else(|| get_header("x-real-ip"))
-            .or_else(|| get_header("cf-connecting-ip"));
-        if let Some(ip) = sanitize_ip_label(forwarded) {
+            .and_then(|value| sanitize_ip_label(Some(value)))
+            .or_else(|| {
+                get_header("x-real-ip")
+                    .and_then(|value| bounded_forwarded_header_str(&value))
+                    .and_then(|value| sanitize_ip_label(Some(value)))
+            })
+            .or_else(|| {
+                get_header("cf-connecting-ip")
+                    .and_then(|value| bounded_forwarded_header_str(&value))
+                    .and_then(|value| sanitize_ip_label(Some(value)))
+            });
+        if let Some(ip) = forwarded {
             return ip;
         }
     }
@@ -248,16 +295,19 @@ fn trust_proxy_headers() -> bool {
         .unwrap_or(false)
 }
 
+fn bounded_forwarded_header_str(value: &str) -> Option<String> {
+    if value.len() > HTTP_FORWARDED_HEADER_MAX_BYTES || value.chars().any(char::is_control) {
+        return None;
+    }
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 fn bounded_http_forwarded_header_value(value: &HeaderValue) -> Option<String> {
     if value.as_bytes().len() > HTTP_FORWARDED_HEADER_MAX_BYTES {
         return None;
     }
-    value
-        .to_str()
-        .ok()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
+    value.to_str().ok().and_then(bounded_forwarded_header_str)
 }
 
 fn forwarded_proto_header_value(headers: &HeaderMap) -> Option<String> {
@@ -319,11 +369,19 @@ fn origin_host_matches_request_host(origin: &str, request_host: &str) -> bool {
 }
 
 fn normalized_origin(origin: &str) -> Option<String> {
+    if origin.chars().any(char::is_control) {
+        return None;
+    }
     let parsed = reqwest::Url::parse(origin).ok()?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return None;
     }
-    if parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() {
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
         return None;
     }
     let host = normalized_host_port(origin, Some(parsed.scheme()))?;
@@ -346,7 +404,18 @@ struct RequestHost {
 }
 
 fn parse_origin_host(origin: &str) -> Option<OriginHost> {
+    if origin.chars().any(char::is_control) {
+        return None;
+    }
     let parsed = reqwest::Url::parse(origin).ok()?;
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return None;
+    }
     let default_port = match parsed.scheme() {
         "http" => 80,
         "https" => 443,
@@ -360,7 +429,18 @@ fn parse_origin_host(origin: &str) -> Option<OriginHost> {
 }
 
 fn parse_request_host(request_host: &str) -> Option<RequestHost> {
+    if request_host.chars().any(char::is_control) {
+        return None;
+    }
     let parsed = reqwest::Url::parse(&format!("http://{request_host}")).ok()?;
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return None;
+    }
     Some(RequestHost {
         host: parsed.host_str()?.to_ascii_lowercase(),
         port: parsed.port(),
@@ -415,8 +495,9 @@ fn trusted_proxy_ip(ip: IpAddr) -> bool {
 }
 
 fn trusted_proxy_entry_matches(entry: &str, ip: IpAddr) -> bool {
+    let canonical_ip = ip.to_canonical();
     if let Ok(exact) = entry.parse::<IpAddr>() {
-        return exact == ip;
+        return exact == ip || exact.to_canonical() == canonical_ip;
     }
     let Some((network, prefix)) = entry.split_once('/') else {
         return false;
@@ -427,7 +508,7 @@ fn trusted_proxy_entry_matches(entry: &str, ip: IpAddr) -> bool {
     let Ok(prefix) = prefix.parse::<u8>() else {
         return false;
     };
-    ip_in_cidr(ip, network, prefix)
+    ip_in_cidr(ip, network, prefix) || ip_in_cidr(canonical_ip, network, prefix)
 }
 
 fn ip_in_cidr(ip: IpAddr, network: IpAddr, prefix: u8) -> bool {
@@ -467,13 +548,39 @@ fn is_blocked_ipv4(ip: Ipv4Addr) -> bool {
         || ip.is_multicast()
         || ip.is_unspecified()
         || ip.is_documentation()
+        || ip.is_broadcast()
         || o[0] == 0
         || o[0] >= 224
         || (o[0] == 100 && (64..=127).contains(&o[1]))
         || (o[0] == 169 && o[1] == 254)
         || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+        || (o[0] == 192 && o[1] == 88 && o[2] == 99)
         || (o[0] == 198 && (18..=19).contains(&o[1]))
         || o == [255, 255, 255, 255]
+}
+
+fn ipv4_from_segments(hi: u16, lo: u16) -> Ipv4Addr {
+    Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8)
+}
+
+fn embedded_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(mapped) = ip.to_ipv4_mapped() {
+        return Some(mapped);
+    }
+    let s = ip.segments();
+    // IPv4-compatible (::w.x.y.z) and IPv4-translated (::ffff:0:w.x.y.z)
+    if s[..6] == [0, 0, 0, 0, 0, 0] || s[..6] == [0, 0, 0, 0, 0xffff, 0] {
+        return Some(ipv4_from_segments(s[6], s[7]));
+    }
+    // NAT64 well-known prefix (64:ff9b::/96) and local-use prefix (64:ff9b:1::/48)
+    if s[..6] == [0x0064, 0xff9b, 0, 0, 0, 0] || (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 1) {
+        return Some(ipv4_from_segments(s[6], s[7]));
+    }
+    // 6to4 prefix (2002::/16) embeds IPv4 in segments 1 and 2
+    if s[0] == 0x2002 {
+        return Some(ipv4_from_segments(s[1], s[2]));
+    }
+    None
 }
 
 fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
@@ -482,10 +589,25 @@ fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
     ip.is_loopback()
         || ip.is_unspecified()
         || ip.is_multicast()
+        // Unique local (fc00::/7)
         || (first & 0xfe00) == 0xfc00
+        // Link-local (fe80::/10) and deprecated site-local (fec0::/10)
         || (first & 0xffc0) == 0xfe80
+        || (first & 0xffc0) == 0xfec0
+        // Documentation (2001:db8::/32 and 3fff::/20)
         || (segments[0] == 0x2001 && segments[1] == 0x0db8)
-        || ip.to_ipv4_mapped().map(is_blocked_ipv4).unwrap_or(false)
+        || (segments[0] & 0xfff0) == 0x3ff0
+        // IETF protocol assignments (2001::/23, including Teredo 2001::/32 & benchmarking 2001:2::/48)
+        || (segments[0] == 0x2001 && segments[1] < 0x0200)
+        // Discard-only address block (100::/64)
+        || (segments[0] == 0x0100 && segments[1..4] == [0, 0, 0])
+        // Deprecated IPv4-compatible (::/96) & IPv4-translated (::ffff:0:0/96)
+        || segments[..6] == [0, 0, 0, 0, 0, 0]
+        || segments[..6] == [0, 0, 0, 0, 0xffff, 0]
+        // NAT64 well-known prefix (64:ff9b::/96) and local-use prefix (64:ff9b:1::/48)
+        || segments[..6] == [0x0064, 0xff9b, 0, 0, 0, 0]
+        || (segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2] == 0x0001)
+        || embedded_ipv4(ip).map(is_blocked_ipv4).unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -516,6 +638,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_private_ip_literal_in_outbound_url() {
+        let _env = OutboundEnvGuard::clear();
         let err = validate_outbound_url_resolved("http://127.0.0.1:8080/status", "test")
             .await
             .unwrap_err();
@@ -553,6 +676,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolved_url_pins_ip_literal_address() {
+        let _env = OutboundEnvGuard::clear();
         let validated = validate_outbound_url_resolved("https://1.1.1.1/dns-query", "test")
             .await
             .unwrap();
@@ -749,6 +873,19 @@ mod tests {
     }
 
     impl OutboundEnvGuard {
+        fn clear() -> Self {
+            let lock = OUTBOUND_ENV_LOCK.lock().unwrap();
+            let allow_private_outbound = std::env::var("XLSTATUS_ALLOW_PRIVATE_OUTBOUND").ok();
+            let allow_private_webhooks = std::env::var("XLSTATUS_ALLOW_PRIVATE_WEBHOOKS").ok();
+            std::env::remove_var("XLSTATUS_ALLOW_PRIVATE_OUTBOUND");
+            std::env::remove_var("XLSTATUS_ALLOW_PRIVATE_WEBHOOKS");
+            Self {
+                allow_private_outbound,
+                allow_private_webhooks,
+                _lock: lock,
+            }
+        }
+
         fn set_webhook_only() -> Self {
             let lock = OUTBOUND_ENV_LOCK.lock().unwrap();
             let allow_private_outbound = std::env::var("XLSTATUS_ALLOW_PRIVATE_OUTBOUND").ok();
@@ -835,5 +972,129 @@ mod tests {
         headers.insert(header::HOST, "status.example.com".parse().unwrap());
 
         assert!(validate_websocket_origin(&headers, &["*".to_string()]).is_err());
+    }
+
+    #[test]
+    fn blocks_special_ipv6_transition_and_nat64_ranges() {
+        // IPv4-mapped IPv6
+        assert!(is_blocked_ip("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(is_blocked_ip("::ffff:10.0.0.1".parse().unwrap()));
+        assert!(is_blocked_ip("::ffff:169.254.169.254".parse().unwrap()));
+        assert!(!is_blocked_ip("::ffff:1.1.1.1".parse().unwrap()));
+
+        // IPv4-compatible IPv6 (::/96) and IPv4-translated (::ffff:0:0/96)
+        assert!(is_blocked_ip("::127.0.0.1".parse().unwrap()));
+        assert!(is_blocked_ip("::10.0.0.1".parse().unwrap()));
+        assert!(is_blocked_ip("::ffff:0:127.0.0.1".parse().unwrap()));
+        assert!(is_blocked_ip("::ffff:0:169.254.169.254".parse().unwrap()));
+
+        // NAT64 well-known (64:ff9b::/96) and local-use (64:ff9b:1::/48)
+        assert!(is_blocked_ip("64:ff9b::127.0.0.1".parse().unwrap()));
+        assert!(is_blocked_ip("64:ff9b::10.0.0.1".parse().unwrap()));
+        assert!(is_blocked_ip("64:ff9b::169.254.169.254".parse().unwrap()));
+        assert!(is_blocked_ip("64:ff9b:1::10.0.0.1".parse().unwrap()));
+        assert!(is_blocked_ip("64:ff9b:1::127.0.0.1".parse().unwrap()));
+
+        // 6to4 (2002::/16), Teredo / IETF (2001::/23), site-local (fec0::/10), discard (100::/64)
+        assert!(is_blocked_ip("2002:7f00:1::1".parse().unwrap()));
+        assert!(is_blocked_ip("2002:a00:1::1".parse().unwrap()));
+        assert!(is_blocked_ip("2001::1".parse().unwrap()));
+        assert!(is_blocked_ip("2001:2::1".parse().unwrap()));
+        assert!(is_blocked_ip("fec0::1".parse().unwrap()));
+        assert!(is_blocked_ip("100::1".parse().unwrap()));
+        assert!(is_blocked_ip("3fff::1".parse().unwrap()));
+
+        // Special IPv4 ranges
+        assert!(is_blocked_ip("192.0.0.1".parse().unwrap()));
+        assert!(is_blocked_ip("192.88.99.1".parse().unwrap()));
+        assert!(is_blocked_ip("198.18.0.1".parse().unwrap()));
+        assert!(is_blocked_ip("198.19.255.254".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn outbound_url_handles_bracketed_ipv6_and_localhost_literals() {
+        let _env = OutboundEnvGuard::clear();
+        for blocked_url in [
+            "http://[::1]:8080/status",
+            "http://[::ffff:127.0.0.1]:8080/status",
+            "http://[64:ff9b::169.254.169.254]:8080/latest/meta-data",
+            "http://[64:ff9b:1::10.0.0.1]:8080/status",
+            "http://localhost:8080/status",
+            "http://internal.localhost:8080/status",
+        ] {
+            let err = validate_outbound_url_resolved(blocked_url, "test")
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("disallowed private address"),
+                "expected disallowed private address for {blocked_url}, got: {err}"
+            );
+        }
+
+        let validated =
+            validate_outbound_url_resolved("https://[2606:4700:4700::1111]/dns-query", "test")
+                .await
+                .unwrap();
+        assert_eq!(validated.addrs.len(), 1);
+        assert_eq!(
+            validated.addrs[0].ip(),
+            "2606:4700:4700::1111".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(validated.addrs[0].port(), 443);
+    }
+
+    #[test]
+    fn websocket_origin_rejects_null_empty_duplicate_and_malformed_origins() {
+        let mut null_headers = HeaderMap::new();
+        null_headers.insert(header::ORIGIN, "null".parse().unwrap());
+        null_headers.insert(header::HOST, "status.example.com".parse().unwrap());
+        assert!(validate_websocket_origin(&null_headers, &[]).is_err());
+
+        let mut blank_headers = HeaderMap::new();
+        blank_headers.insert(header::ORIGIN, "   ".parse().unwrap());
+        blank_headers.insert(header::HOST, "status.example.com".parse().unwrap());
+        assert!(validate_websocket_origin(&blank_headers, &[]).is_err());
+
+        let mut duplicate_headers = HeaderMap::new();
+        duplicate_headers.append(
+            header::ORIGIN,
+            "https://status.example.com".parse().unwrap(),
+        );
+        duplicate_headers.append(
+            header::ORIGIN,
+            "https://status.example.com".parse().unwrap(),
+        );
+        duplicate_headers.insert(header::HOST, "status.example.com".parse().unwrap());
+        assert!(validate_websocket_origin(&duplicate_headers, &[]).is_err());
+
+        let mut path_origin = HeaderMap::new();
+        path_origin.insert(
+            header::ORIGIN,
+            "https://status.example.com/subpath".parse().unwrap(),
+        );
+        path_origin.insert(header::HOST, "status.example.com".parse().unwrap());
+        assert!(validate_websocket_origin(&path_origin, &[]).is_err());
+
+        let mut userinfo_origin = HeaderMap::new();
+        userinfo_origin.insert(
+            header::ORIGIN,
+            "https://user@status.example.com".parse().unwrap(),
+        );
+        userinfo_origin.insert(header::HOST, "status.example.com".parse().unwrap());
+        assert!(validate_websocket_origin(&userinfo_origin, &[]).is_err());
+    }
+
+    #[test]
+    fn forwarded_ip_falls_back_when_primary_header_is_invalid_and_matches_dual_stack_peers() {
+        let _env = TrustedProxyEnvGuard::set();
+        let peer_addr: SocketAddr = "[::ffff:10.0.0.5]:443".parse().unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "unknown, 10.0.0.5".parse().unwrap());
+        headers.insert("x-real-ip", "198.51.100.42".parse().unwrap());
+        assert_eq!(
+            client_ip_from_headers_and_peer(&headers, Some(peer_addr)),
+            "198.51.100.42"
+        );
     }
 }

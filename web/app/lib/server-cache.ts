@@ -36,13 +36,14 @@ function storageKey(scope: string): string {
 function isServerRow(value: unknown): value is CachedServerRow {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const row = value as Record<string, unknown>;
-  const tagsValid = row.tags === undefined
-    || row.tags === null
-    || (Array.isArray(row.tags) && row.tags.every((tag) => typeof tag === "string"));
+  const tags = row["tags"];
+  const tagsValid = tags === undefined
+    || tags === null
+    || (Array.isArray(tags) && tags.every((tag) => typeof tag === "string"));
   return tagsValid
-    && typeof row.id === "string"
-    && typeof row.name === "string"
-    && typeof row.status === "string";
+    && typeof row["id"] === "string"
+    && typeof row["name"] === "string"
+    && typeof row["status"] === "string";
 }
 
 function isFresh(cachedAt: number): boolean {

@@ -5,7 +5,10 @@ use crate::api::v1::auth::{
     active_waf_ban, cookie_secure_attr, record_waf_event, register_oauth_failure,
     require_sensitive_totp, AppError, AppState,
 };
-use crate::auth::middleware::{derive_csrf_token, AuthUser, CSRF_COOKIE_NAME, SESSION_COOKIE_NAME};
+use crate::auth::middleware::{
+    derive_csrf_token, session_cookie_token_is_valid, AuthUser, CSRF_COOKIE_NAME,
+    SESSION_COOKIE_NAME,
+};
 use crate::auth::{generate_session_token, hash_token, SessionRepository};
 use crate::config::OidcProviderConfig;
 use crate::db::{CreateSessionInput, DatabaseBackend, UserRepository};
@@ -1263,7 +1266,11 @@ async fn cookie_session_user_id(
     let Some(cookie) = cookie_jar.get(SESSION_COOKIE_NAME) else {
         return Ok(None);
     };
-    let token_hash = hash_token(cookie.value());
+    let token = cookie.value();
+    if !session_cookie_token_is_valid(token) {
+        return Ok(None);
+    }
+    let token_hash = hash_token(token);
     let session_repo = SessionRepository::new(state.db.clone());
     let Some(session) = session_repo.find_by_token_hash(&token_hash).await? else {
         return Ok(None);

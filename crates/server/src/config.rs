@@ -1,7 +1,13 @@
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::fs;
+use std::net::SocketAddr;
 use std::path::Path;
+
+pub const MIN_SESSION_TTL_HOURS: i64 = 1;
+pub const MAX_SESSION_TTL_HOURS: i64 = 24 * 365;
+const MIN_SECRET_DISTINCT_BYTES: usize = 4;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -12,7 +18,7 @@ pub struct Config {
     pub oauth2: OAuth2Config,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct ServerConfig {
     #[serde(default = "default_http_bind")]
     pub http_bind: String,
@@ -36,7 +42,24 @@ pub struct ServerConfig {
     pub cors_allowed_origins: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+impl fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServerConfig")
+            .field("http_bind", &self.http_bind)
+            .field("grpc_bind", &self.grpc_bind)
+            .field("grpc_tls_cert_path", &self.grpc_tls_cert_path)
+            .field(
+                "grpc_tls_key_path",
+                &self.grpc_tls_key_path.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("grpc_tls_client_ca_path", &self.grpc_tls_client_ca_path)
+            .field("grpc_reflection_enabled", &self.grpc_reflection_enabled)
+            .field("cors_allowed_origins", &self.cors_allowed_origins)
+            .finish()
+    }
+}
+
+#[derive(Clone, Deserialize)]
 pub struct DatabaseConfig {
     pub url: String,
 
@@ -44,7 +67,16 @@ pub struct DatabaseConfig {
     pub create_if_missing: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+impl fmt::Debug for DatabaseConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DatabaseConfig")
+            .field("url", &"[REDACTED]")
+            .field("create_if_missing", &self.create_if_missing)
+            .finish()
+    }
+}
+
+#[derive(Clone, Deserialize)]
 pub struct SecurityConfig {
     #[serde(default = "default_session_secret")]
     pub session_secret: String,
@@ -59,6 +91,20 @@ pub struct SecurityConfig {
     pub secret_encryption_key: Option<String>,
 }
 
+impl fmt::Debug for SecurityConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SecurityConfig")
+            .field("session_secret", &"[REDACTED]")
+            .field("session_ttl_hours", &self.session_ttl_hours)
+            .field("cookie_secure", &self.cookie_secure)
+            .field(
+                "secret_encryption_key",
+                &self.secret_encryption_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct OAuth2Config {
     #[serde(default = "default_oauth2_frontend_redirect_url")]
@@ -68,7 +114,7 @@ pub struct OAuth2Config {
     pub providers: Vec<OidcProviderConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct OidcProviderConfig {
     pub id: String,
     #[serde(default)]
@@ -98,10 +144,40 @@ pub struct OidcProviderConfig {
     pub username_field: String,
 }
 
+impl fmt::Debug for OidcProviderConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OidcProviderConfig")
+            .field("id", &self.id)
+            .field("display_name", &self.display_name)
+            .field("auth_url", &self.auth_url)
+            .field("token_url", &self.token_url)
+            .field("userinfo_url", &self.userinfo_url)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"[REDACTED]")
+            .field("redirect_url", &self.redirect_url)
+            .field("scopes", &self.scopes)
+            .field("token_auth_method", &self.token_auth_method)
+            .field("userinfo_auth_method", &self.userinfo_auth_method)
+            .field("extra_auth_params", &"[REDACTED]")
+            .field("subject_field", &self.subject_field)
+            .field("email_field", &self.email_field)
+            .field("name_field", &self.name_field)
+            .field("username_field", &self.username_field)
+            .finish()
+    }
+}
+
 impl Config {
     pub fn load() -> anyhow::Result<Self> {
         // Try environment variable first
         if let Ok(database_url) = std::env::var("DATABASE_URL") {
+            let session_ttl_hours = match std::env::var("SESSION_TTL_HOURS") {
+                Ok(raw) if !raw.trim().is_empty() => raw
+                    .trim()
+                    .parse::<i64>()
+                    .map_err(|_| anyhow::anyhow!("SESSION_TTL_HOURS must be a valid integer"))?,
+                _ => default_session_ttl_hours(),
+            };
             let config = Self {
                 server: ServerConfig {
                     http_bind: std::env::var("HTTP_BIND").unwrap_or_else(|_| default_http_bind()),
@@ -134,10 +210,7 @@ impl Config {
                 security: SecurityConfig {
                     session_secret: std::env::var("SESSION_SECRET")
                         .unwrap_or_else(|_| default_session_secret()),
-                    session_ttl_hours: std::env::var("SESSION_TTL_HOURS")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or_else(default_session_ttl_hours),
+                    session_ttl_hours,
                     cookie_secure: std::env::var("SECURITY_COOKIE_SECURE")
                         .ok()
                         .map(|value| parse_bool_env(&value))
@@ -169,6 +242,63 @@ impl Config {
     }
 
     fn validate_deployment_security(&self) -> anyhow::Result<()> {
+        if self.database.url.trim().is_empty() {
+            anyhow::bail!("DATABASE_URL/database.url must not be empty");
+        }
+
+        let http_addr: SocketAddr = self.server.http_bind.trim().parse().map_err(|_| {
+            anyhow::anyhow!("HTTP_BIND/server.http_bind must be a valid socket address")
+        })?;
+        if http_addr.port() == 0 {
+            anyhow::bail!("HTTP_BIND/server.http_bind port must be between 1 and 65535");
+        }
+
+        let grpc_addr: SocketAddr = self.server.grpc_bind.trim().parse().map_err(|_| {
+            anyhow::anyhow!("GRPC_BIND/server.grpc_bind must be a valid socket address")
+        })?;
+        if grpc_addr.port() == 0 {
+            anyhow::bail!("GRPC_BIND/server.grpc_bind port must be between 1 and 65535");
+        }
+        if http_addr == grpc_addr {
+            anyhow::bail!(
+                "HTTP_BIND/server.http_bind and GRPC_BIND/server.grpc_bind must not use the same address and port"
+            );
+        }
+
+        let has_tls_cert = self
+            .server
+            .grpc_tls_cert_path
+            .as_deref()
+            .is_some_and(|p| !p.trim().is_empty());
+        let has_tls_key = self
+            .server
+            .grpc_tls_key_path
+            .as_deref()
+            .is_some_and(|p| !p.trim().is_empty());
+        let has_tls_ca = self
+            .server
+            .grpc_tls_client_ca_path
+            .as_deref()
+            .is_some_and(|p| !p.trim().is_empty());
+        if has_tls_cert != has_tls_key {
+            anyhow::bail!(
+                "GRPC_TLS_CERT_PATH/server.grpc_tls_cert_path and GRPC_TLS_KEY_PATH/server.grpc_tls_key_path must both be set when gRPC TLS is enabled"
+            );
+        }
+        if has_tls_ca && !has_tls_cert {
+            anyhow::bail!(
+                "GRPC_TLS_CLIENT_CA_PATH/server.grpc_tls_client_ca_path requires gRPC TLS cert and key paths"
+            );
+        }
+
+        if !(MIN_SESSION_TTL_HOURS..=MAX_SESSION_TTL_HOURS)
+            .contains(&self.security.session_ttl_hours)
+        {
+            anyhow::bail!(
+                "SESSION_TTL_HOURS/security.session_ttl_hours must be between {MIN_SESSION_TTL_HOURS} and {MAX_SESSION_TTL_HOURS} hours"
+            );
+        }
+
         let secret = self.security.session_secret.trim();
         let weak_defaults = [
             "CHANGE_ME_IN_PRODUCTION",
@@ -186,6 +316,10 @@ impl Config {
         if secret.len() < 32 {
             anyhow::bail!("SESSION_SECRET/security.session_secret must be at least 32 characters");
         }
+        if distinct_byte_count(secret.as_bytes()) < MIN_SECRET_DISTINCT_BYTES {
+            anyhow::bail!("SESSION_SECRET/security.session_secret has insufficient entropy");
+        }
+
         let secret_encryption_key = self.secret_encryption_key_material().trim();
         if weak_defaults.contains(&secret_encryption_key) {
             anyhow::bail!(
@@ -195,6 +329,11 @@ impl Config {
         if secret_encryption_key.len() < 32 {
             anyhow::bail!(
                 "SECRET_ENCRYPTION_KEY/security.secret_encryption_key must be at least 32 characters"
+            );
+        }
+        if distinct_byte_count(secret_encryption_key.as_bytes()) < MIN_SECRET_DISTINCT_BYTES {
+            anyhow::bail!(
+                "SECRET_ENCRYPTION_KEY/security.secret_encryption_key has insufficient entropy"
             );
         }
         Ok(())
@@ -207,6 +346,10 @@ impl Config {
             .filter(|value| !value.trim().is_empty())
             .unwrap_or(&self.security.session_secret)
     }
+}
+
+fn distinct_byte_count(bytes: &[u8]) -> usize {
+    bytes.iter().copied().collect::<HashSet<u8>>().len()
 }
 
 impl Default for Config {
@@ -511,5 +654,75 @@ mod tests {
         assert_eq!(error, "Failed to parse configuration file");
         assert!(!error.contains(secret));
         assert!(!error.contains("postgresql://"));
+    }
+
+    #[test]
+    fn config_debug_redacts_secrets_and_database_url() {
+        let mut config = Config::default();
+        config.database.url = "postgresql://admin:db-secret-pass@db.example/xlstatus".to_string();
+        config.security.session_secret = "super-sensitive-session-secret-value-2026".to_string();
+        config.security.secret_encryption_key =
+            Some("super-sensitive-encryption-key-value-2026".to_string());
+        config.server.grpc_tls_key_path = Some("/etc/xlstatus/private-tls.key".to_string());
+        config.oauth2.providers.push(super::OidcProviderConfig {
+            id: "oidc".to_string(),
+            display_name: Some("OIDC".to_string()),
+            auth_url: "https://idp.example/auth".to_string(),
+            token_url: "https://idp.example/token".to_string(),
+            userinfo_url: "https://idp.example/userinfo".to_string(),
+            client_id: "client".to_string(),
+            client_secret: "oidc-super-secret-client-secret".to_string(),
+            redirect_url: "https://status.example/callback".to_string(),
+            scopes: vec!["openid".to_string()],
+            token_auth_method: "client_secret_post".to_string(),
+            userinfo_auth_method: "bearer".to_string(),
+            extra_auth_params: std::collections::HashMap::from([(
+                "secret_param".to_string(),
+                "extra-secret-param-value".to_string(),
+            )]),
+            subject_field: "sub".to_string(),
+            email_field: "email".to_string(),
+            name_field: "name".to_string(),
+            username_field: "preferred_username".to_string(),
+        });
+
+        let debug_output = format!("{config:?}");
+        assert!(debug_output.contains("[REDACTED]"));
+        assert!(!debug_output.contains("db-secret-pass"));
+        assert!(!debug_output.contains("super-sensitive-session-secret-value-2026"));
+        assert!(!debug_output.contains("super-sensitive-encryption-key-value-2026"));
+        assert!(!debug_output.contains("/etc/xlstatus/private-tls.key"));
+        assert!(!debug_output.contains("oidc-super-secret-client-secret"));
+        assert!(!debug_output.contains("extra-secret-param-value"));
+    }
+
+    #[test]
+    fn deployment_security_validates_ttl_ports_tls_and_entropy() {
+        let mut config = Config::default();
+        config.security.session_secret = "test-secret-key-for-development-only-2026".to_string();
+        assert!(config.validate_deployment_security().is_ok());
+
+        let mut bad_ttl = config.clone();
+        bad_ttl.security.session_ttl_hours = 0;
+        assert!(bad_ttl.validate_deployment_security().is_err());
+
+        bad_ttl.security.session_ttl_hours = super::MAX_SESSION_TTL_HOURS + 1;
+        assert!(bad_ttl.validate_deployment_security().is_err());
+
+        let mut bad_port = config.clone();
+        bad_port.server.http_bind = "127.0.0.1:0".to_string();
+        assert!(bad_port.validate_deployment_security().is_err());
+
+        let mut colliding_bind = config.clone();
+        colliding_bind.server.grpc_bind = colliding_bind.server.http_bind.clone();
+        assert!(colliding_bind.validate_deployment_security().is_err());
+
+        let mut mismatched_tls = config.clone();
+        mismatched_tls.server.grpc_tls_cert_path = Some("/tmp/cert.pem".to_string());
+        assert!(mismatched_tls.validate_deployment_security().is_err());
+
+        let mut low_entropy = config.clone();
+        low_entropy.security.session_secret = "a".repeat(32);
+        assert!(low_entropy.validate_deployment_security().is_err());
     }
 }

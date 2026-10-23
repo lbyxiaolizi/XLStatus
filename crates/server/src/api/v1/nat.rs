@@ -378,6 +378,9 @@ pub async fn update_nat_mapping(
     }
     if req.enabled == Some(true) || (mapping.enabled && req.enabled != Some(false)) {
         require_active_nat_agent_or_403(&db, &auth_user, &mapping.agent_id).await?;
+        validate_nat_local_target_or_403(&mapping.local_host)?;
+        validate_local_port_or_403(mapping.local_port)?;
+        validate_public_port_or_403(mapping.public_port)?;
     }
     if let Some(enabled) = req.enabled {
         mapping.enabled = enabled;
@@ -802,12 +805,25 @@ fn normalize_required_nat_text(
     max_bytes: usize,
     field: &str,
 ) -> Result<String, String> {
+    if value.chars().any(|ch| ch.is_control()) {
+        return Err(format!(
+            "{field} must not contain whitespace or control characters"
+        ));
+    }
     let value = value.trim().to_string();
     if value.is_empty() {
         return Err(format!("{field} is required"));
     }
     if value.len() > max_bytes {
         return Err(format!("{field} must be at most {max_bytes} bytes"));
+    }
+    if value
+        .chars()
+        .any(|ch| ch.is_control() || ch.is_whitespace())
+    {
+        return Err(format!(
+            "{field} must not contain whitespace or control characters"
+        ));
     }
     Ok(value)
 }
@@ -817,9 +833,13 @@ fn normalize_optional_nat_text(
     max_bytes: usize,
     field: &str,
 ) -> Result<Option<String>, String> {
-    let Some(value) = value.map(|value| value.trim().to_string()) else {
+    let Some(raw) = value else {
         return Ok(None);
     };
+    if raw.chars().any(|ch| ch.is_control()) {
+        return Err(format!("{field} must not contain control characters"));
+    }
+    let value = raw.trim().to_string();
     if value.is_empty() {
         return Ok(None);
     }
@@ -1137,6 +1157,24 @@ mod tests {
         .is_err());
         assert!(normalize_optional_nat_text(
             Some("a".repeat(NAT_MAX_DESCRIPTION_BYTES + 1)),
+            NAT_MAX_DESCRIPTION_BYTES,
+            "description"
+        )
+        .is_err());
+        assert!(normalize_required_nat_text(
+            "127.0.0.1\n".into(),
+            NAT_MAX_LOCAL_HOST_BYTES,
+            "local_host"
+        )
+        .is_err());
+        assert!(normalize_required_nat_text(
+            "127.0.0.1 8080".into(),
+            NAT_MAX_LOCAL_HOST_BYTES,
+            "local_host"
+        )
+        .is_err());
+        assert!(normalize_optional_nat_text(
+            Some("desc\0".into()),
             NAT_MAX_DESCRIPTION_BYTES,
             "description"
         )

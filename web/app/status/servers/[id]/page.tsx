@@ -29,6 +29,7 @@ import {
 } from "@/app/components/charts";
 import { apiClient } from "@/lib/api";
 import { durationLabel, formatRate } from "@/app/lib/format";
+import { sanitizeCssVariableValue } from "@/app/lib/security";
 import type { Translations } from "@/lib/i18n";
 import { useI18n } from "@/lib/use-i18n";
 
@@ -39,32 +40,32 @@ interface PageProps {
 interface PublicServerDetail {
   id: string;
   name: string;
-  remark?: string | null;
-  public_note?: string | null;
-  accent_color?: string | null;
+  remark?: string | null | undefined;
+  public_note?: string | null | undefined;
+  accent_color?: string | null | undefined;
   status: string;
-  last_seen_at?: string | null;
-  resources?: PublicServerResources | null;
-  metrics?: PublicServerMetrics | null;
+  last_seen_at?: string | null | undefined;
+  resources?: PublicServerResources | null | undefined;
+  metrics?: PublicServerMetrics | null | undefined;
 }
 
 interface PublicServerResources {
-  cpu_percent?: number | null;
-  memory_used?: number | null;
-  memory_total?: number | null;
-  memory_percent?: number | null;
-  disk_used?: number | null;
-  disk_total?: number | null;
-  disk_percent?: number | null;
-  load_1?: number | null;
-  net_rx_bps?: number | null;
-  net_tx_bps?: number | null;
-  network_in_total?: number | null;
-  network_out_total?: number | null;
-  uptime_seconds?: number | null;
-  tcp_connections?: number | null;
-  udp_connections?: number | null;
-  process_count?: number | null;
+  cpu_percent?: number | null | undefined;
+  memory_used?: number | null | undefined;
+  memory_total?: number | null | undefined;
+  memory_percent?: number | null | undefined;
+  disk_used?: number | null | undefined;
+  disk_total?: number | null | undefined;
+  disk_percent?: number | null | undefined;
+  load_1?: number | null | undefined;
+  net_rx_bps?: number | null | undefined;
+  net_tx_bps?: number | null | undefined;
+  network_in_total?: number | null | undefined;
+  network_out_total?: number | null | undefined;
+  uptime_seconds?: number | null | undefined;
+  tcp_connections?: number | null | undefined;
+  udp_connections?: number | null | undefined;
+  process_count?: number | null | undefined;
 }
 
 interface PublicServerMetrics {
@@ -74,42 +75,40 @@ interface PublicServerMetrics {
 
 interface PublicMetricSample {
   sample_at: string;
-  cpu_percent?: number | null;
-  memory_percent?: number | null;
-  disk_percent?: number | null;
-  load_1?: number | null;
-  net_rx_bps?: number | null;
-  net_tx_bps?: number | null;
-  network_in_total?: number | null;
-  network_out_total?: number | null;
-  tcp_connections?: number | null;
-  udp_connections?: number | null;
-  process_count?: number | null;
+  cpu_percent?: number | null | undefined;
+  memory_percent?: number | null | undefined;
+  disk_percent?: number | null | undefined;
+  load_1?: number | null | undefined;
+  net_rx_bps?: number | null | undefined;
+  net_tx_bps?: number | null | undefined;
+  network_in_total?: number | null | undefined;
+  network_out_total?: number | null | undefined;
+  tcp_connections?: number | null | undefined;
+  udp_connections?: number | null | undefined;
+  process_count?: number | null | undefined;
 }
 
 interface PublicServiceResult {
-  server_id?: string | null;
+  server_id?: string | null | undefined;
   status: string;
-  delay_ms?: number | null;
+  delay_ms?: number | null | undefined;
   created_at: string;
 }
 
 interface PublicService {
   id: string;
   name: string;
-  service_type?: string;
-  kind?: string;
-  type?: string;
-  server_id?: string | null;
-  server_ids?: string[];
-  last_status?: string | null;
-  last_check_at?: string | null;
-  history?: PublicServiceResult[];
+  service_type?: string | undefined;
+  kind?: string | undefined;
+  type?: string | undefined;
+  server_id?: string | null | undefined;
+  server_ids?: string[] | undefined;
+  last_status?: string | null | undefined;
+  last_check_at?: string | null | undefined;
+  history?: PublicServiceResult[] | undefined;
 }
 
 export default function PublicServerDetailPage({ params }: PageProps) {
-  // React 19 unwraps the route params promise during render, so the first paint
-  // already knows the id instead of waiting for an effect round-trip.
   const resolved = params instanceof Promise ? use(params) : params;
   const serverId = resolved.id;
   const { t: copy } = useI18n();
@@ -161,14 +160,14 @@ export default function PublicServerDetailPage({ params }: PageProps) {
 
   useEffect(() => {
     const controller = new AbortController();
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount is the standard client data-load pattern
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount
     void loadServer(controller.signal);
     return () => controller.abort();
   }, [loadServer]);
 
   useEffect(() => {
     const controller = new AbortController();
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount is the standard client data-load pattern
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount
     void loadServices(controller.signal);
     return () => controller.abort();
   }, [loadServices]);
@@ -208,9 +207,9 @@ export default function PublicServerDetailPage({ params }: PageProps) {
             {server.metrics?.samples?.length ? <PublicMetricsCharts metrics={server.metrics} /> : null}
             <section>
               <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
-                <h2 className="text-xl font-black uppercase">{copy.statusDetailPage.relatedServicesHeading}</h2>
+                <h2 className="text-base font-semibold tracking-tight text-[var(--text-main)]">{copy.statusDetailPage.relatedServicesHeading}</h2>
                 {servicesLoading ? (
-                  <span className="border-2 border-black bg-[var(--accent-bg)] px-2 py-1 text-xs font-black shadow-[var(--shadow-brutal-sm)]">
+                  <span className="rounded-full border border-[var(--border-color)] bg-[var(--bg-subtle)] px-2.5 py-0.5 text-xs font-medium text-[var(--text-muted)]">
                     {copy.statusDetailPage.loading}
                   </span>
                 ) : null}
@@ -236,17 +235,18 @@ export default function PublicServerDetailPage({ params }: PageProps) {
 function ServerSummary({ server }: { server: PublicServerDetail }) {
   const { t: copy } = useI18n();
   const note = server.public_note || server.remark || copy.statusDetailPage.publicServerNote;
+  const safeAccentColor = sanitizeCssVariableValue(server.accent_color);
 
   return (
     <section
-      className="border-2 border-black bg-[var(--accent-bg)] p-4 shadow-[var(--shadow-brutal)]"
-      style={{ borderTopColor: server.accent_color || "var(--border-color)", borderTopWidth: "8px" }}
+      className="rounded-xl border border-[var(--border-color)] bg-[var(--bg-card)] p-5 shadow-[var(--shadow-xs)]"
+      style={safeAccentColor ? { borderTopColor: safeAccentColor, borderTopWidth: "3px" } : undefined}
     >
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
-          <h2 className="break-words text-2xl font-black uppercase">{server.name}</h2>
-          <p className="mt-1 break-all font-mono text-xs font-bold text-[var(--text-muted)]">{server.id}</p>
-          <p className="mt-3 max-w-3xl break-words text-sm font-bold text-[var(--text-muted)]">{note}</p>
+          <h2 className="break-words text-lg font-semibold tracking-tight text-[var(--text-main)]">{server.name}</h2>
+          <p className="mt-0.5 break-all font-mono text-xs text-[var(--text-muted)]">{server.id}</p>
+          <p className="mt-2 max-w-3xl break-words text-sm text-[var(--text-muted)]">{note}</p>
         </div>
         <StatusBadge tone={serverTone(server.status)}>{statusLabel(server.status, copy)}</StatusBadge>
       </div>
@@ -279,14 +279,12 @@ function PublicResources({ resources }: { resources: PublicServerResources }) {
 function PublicMetricsCharts({ metrics }: { metrics: PublicServerMetrics }) {
   const { t: copy } = useI18n();
   const charts = useMemo(() => buildMetricCharts(metrics.samples), [metrics.samples]);
-  // Keep the series arrays referentially stable so the memoized chart can bail
-  // out when a re-render does not change the samples.
   const resourceSeries = useMemo(
     () =>
       [
         { id: "cpu", label: copy.statusDetailPage.seriesCpu, color: "var(--accent-color)", points: charts.cpu },
-        { id: "memory", label: copy.statusDetailPage.seriesMemory, color: "var(--btn-bg)", points: charts.memory },
-        { id: "disk", label: copy.statusDetailPage.seriesDisk, color: "#f97316", points: charts.disk },
+        { id: "memory", label: copy.statusDetailPage.seriesMemory, color: "#6366f1", points: charts.memory },
+        { id: "disk", label: copy.statusDetailPage.seriesDisk, color: "#f59e0b", points: charts.disk },
       ].filter((series) => series.points.length > 0),
     [charts, copy],
   );
@@ -294,7 +292,7 @@ function PublicMetricsCharts({ metrics }: { metrics: PublicServerMetrics }) {
     () =>
       [
         { id: "rx", label: copy.statusDetailPage.seriesDownload, color: "var(--accent-color)", points: charts.rx },
-        { id: "tx", label: copy.statusDetailPage.seriesUpload, color: "var(--btn-bg)", points: charts.tx },
+        { id: "tx", label: copy.statusDetailPage.seriesUpload, color: "#6366f1", points: charts.tx },
       ].filter((series) => series.points.length > 0),
     [charts, copy],
   );
@@ -304,8 +302,8 @@ function PublicMetricsCharts({ metrics }: { metrics: PublicServerMetrics }) {
   return (
     <section>
       <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
-        <h2 className="text-xl font-black uppercase">{copy.statusDetailPage.chartsHeading}</h2>
-        <span className="border-2 border-black bg-[var(--accent-bg)] px-2 py-1 text-xs font-black shadow-[var(--shadow-brutal-sm)]">
+        <h2 className="text-base font-semibold tracking-tight text-[var(--text-main)]">{copy.statusDetailPage.chartsHeading}</h2>
+        <span className="rounded-full border border-[var(--border-color)] bg-[var(--bg-subtle)] px-2.5 py-0.5 font-mono text-xs font-medium text-[var(--text-muted)]">
           {metrics.range || "1d"}
         </span>
       </div>
@@ -331,18 +329,18 @@ function MetricChartCard({
   title: string;
   value: string;
   series: ChartSeries[];
-  maxValue?: number;
-  formatValue: (value?: number | null) => string;
+  maxValue?: number | undefined;
+  formatValue: (value: number) => string;
 }) {
   const { t: copy } = useI18n();
   return (
-    <section className="border-2 border-black bg-[var(--bg-card)] p-4 shadow-[var(--shadow-brutal)]">
+    <section className="rounded-xl border border-[var(--border-color)] bg-[var(--bg-card)] p-5 shadow-[var(--shadow-xs)]">
       <div className="mb-3 flex items-start justify-between gap-3">
         <div>
-          <h3 className="text-xl font-black uppercase">{title}</h3>
-          <p className="mt-1 text-sm font-black text-[var(--text-muted)]">{value}</p>
+          <h3 className="text-sm font-semibold tracking-tight text-[var(--text-main)]">{title}</h3>
+          <p className="mt-0.5 font-mono text-xs text-[var(--text-muted)]">{value}</p>
         </div>
-        <span className="border-2 border-black bg-[var(--accent-bg)] px-2 py-1 text-xs font-black shadow-[var(--shadow-brutal-sm)]">
+        <span className="rounded-full border border-emerald-500/25 bg-[var(--status-ok-bg)] px-2 py-0.5 font-mono text-[10px] font-medium text-[var(--status-ok-text)]">
           LIVE
         </span>
       </div>
@@ -355,10 +353,10 @@ function MetricChartCard({
         interactive={false}
         variant="detail"
       />
-      <div className="mt-3 flex flex-wrap gap-2">
+      <div className="mt-3 flex flex-wrap gap-1.5">
         {series.map((item) => (
-          <span key={item.id ?? item.label} className="inline-flex items-center gap-2 border-2 border-black bg-[var(--accent-bg)] px-2 py-1 text-xs font-black">
-            <span className="h-2.5 w-2.5 border-2 border-black" style={{ background: item.color }} />
+          <span key={item.id ?? item.label} className="inline-flex items-center gap-1.5 rounded-md border border-[var(--border-color)] bg-[var(--bg-subtle)] px-2 py-0.5 text-xs font-medium text-[var(--text-muted)]">
+            <span className="h-2 w-2 rounded-full" style={{ background: item.color }} />
             {item.label}
           </span>
         ))}
@@ -380,8 +378,8 @@ function PublicServiceCard({ service }: { service: PublicService }) {
     <BrutalCard>
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <h3 className="break-words text-xl font-black">{service.name}</h3>
-          <p className="mt-1 text-xs font-bold text-[var(--text-muted)]">{serviceKind(service, copy)}</p>
+          <h3 className="break-words text-base font-semibold text-[var(--text-main)]">{service.name}</h3>
+          <p className="mt-0.5 font-mono text-xs text-[var(--text-muted)]">{serviceKind(service, copy)}</p>
         </div>
         <StatusBadge tone={serviceTone(service.last_status ?? undefined)}>{statusLabel(service.last_status ?? undefined, copy)}</StatusBadge>
       </div>
@@ -398,17 +396,17 @@ function PublicServiceCard({ service }: { service: PublicService }) {
 function PublicServiceHistory({ days }: { days: PublicServiceDay[] }) {
   const { t: copy } = useI18n();
   return (
-    <div className="mt-4 border-t-2 border-black pt-3">
+    <div className="mt-4 border-t border-[var(--border-color)] pt-3">
       <div className="grid grid-cols-[repeat(30,minmax(0,1fr))] gap-1">
         {days.map((day) => (
           <span
             key={day.key}
             title={`${day.label} ${formatPercent(day.uptime)} ${day.avgDelay === undefined ? "" : formatMs(Math.round(day.avgDelay))}`}
-            className={`h-7 border-2 border-black ${publicServiceDayClass(day)}`}
+            className={`h-6 rounded-xs ${publicServiceDayClass(day)}`}
           />
         ))}
       </div>
-      <div className="mt-2 flex justify-between text-xs font-black text-[var(--text-muted)]">
+      <div className="mt-2 flex justify-between text-[11px] text-[var(--text-muted)]">
         <span>{copy.statusDetailPage.daysAgo30}</span>
         <span>{copy.statusDetailPage.today}</span>
       </div>
@@ -418,9 +416,9 @@ function PublicServiceHistory({ days }: { days: PublicServiceDay[] }) {
 
 function InfoTile({ label, value }: { label: string; value: string }) {
   return (
-    <div className="border-2 border-black bg-[var(--bg-card)] p-3 shadow-[var(--shadow-brutal-sm)]">
-      <div className="text-xs font-black uppercase text-[var(--text-muted)]">{label}</div>
-      <div className="mt-1 break-words text-sm font-black">{value}</div>
+    <div className="rounded-xl border border-[var(--border-color)] bg-[var(--bg-subtle)] p-3.5">
+      <div className="text-[11px] font-medium text-[var(--text-muted)]">{label}</div>
+      <div className="mt-1 break-words font-mono text-sm font-semibold text-[var(--text-main)]">{value}</div>
     </div>
   );
 }

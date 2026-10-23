@@ -31,28 +31,28 @@ interface NotificationChannel {
   url: string;
   request_method: string;
   request_type: string;
-  headers?: Record<string, string>;
-  headers_json?: string | null;
-  body_template?: string;
-  verify_tls?: boolean;
-  format_metric_units?: boolean;
-  created_at?: string;
-  updated_at?: string;
+  headers?: Record<string, string> | undefined;
+  headers_json?: string | null | undefined;
+  body_template?: string | undefined;
+  verify_tls?: boolean | undefined;
+  format_metric_units?: boolean | undefined;
+  created_at?: string | undefined;
+  updated_at?: string | undefined;
 }
 
 interface NotificationGroupMember {
   id: string;
   name: string;
-  request_type?: string;
-  url?: string;
+  request_type?: string | undefined;
+  url?: string | undefined;
 }
 
 interface NotificationGroup {
   id: string;
   name: string;
-  members?: NotificationGroupMember[];
-  created_at?: string;
-  updated_at?: string;
+  members?: NotificationGroupMember[] | undefined;
+  created_at?: string | undefined;
+  updated_at?: string | undefined;
 }
 
 interface NotificationProvider {
@@ -64,8 +64,8 @@ interface NotificationProvider {
 }
 
 type ModalState =
-  | { type: "notification"; item?: NotificationChannel }
-  | { type: "group"; item?: NotificationGroup }
+  | { type: "notification"; item?: NotificationChannel | undefined }
+  | { type: "group"; item?: NotificationGroup | undefined }
   | null;
 
 const defaultBodyTemplate =
@@ -141,8 +141,6 @@ export default function NotificationsPage() {
     body_template: "",
   });
   const [groupForm, setGroupForm] = useState(emptyGroupForm);
-  // One guard per surface: the open modal, the channel table, the group cards.
-  // Only one modal is open at a time, so both forms can share formBusy.
   const [formBusy, runForm] = useBusy();
   const [channelBusy, runChannel] = useBusy();
   const [groupBusy, runGroup] = useBusy();
@@ -161,19 +159,19 @@ export default function NotificationsPage() {
     let nextError: string | null = null;
 
     if (notificationResponse.success && notificationResponse.data) {
-      setNotifications((notificationResponse.data.notifications as NotificationChannel[]) ?? []);
+      setNotifications((notificationResponse.data["notifications"] as NotificationChannel[]) ?? []);
     } else {
       nextError = responseError(notificationResponse);
     }
 
     if (groupResponse.success && groupResponse.data) {
-      setGroups((groupResponse.data.groups as NotificationGroup[]) ?? []);
+      setGroups((groupResponse.data["groups"] as NotificationGroup[]) ?? []);
     } else if (!nextError) {
       nextError = responseError(groupResponse);
     }
 
     if (providerResponse.success && providerResponse.data) {
-      const nextProviders = (providerResponse.data.providers as NotificationProvider[]) ?? [];
+      const nextProviders = (providerResponse.data["providers"] as NotificationProvider[]) ?? [];
       if (nextProviders.length) setProviders(nextProviders);
     }
 
@@ -277,21 +275,32 @@ export default function NotificationsPage() {
       format_metric_units: notificationForm.format_metric_units,
     };
     if (!editingItem || notificationForm.url !== notificationOriginals.url || !isRedactedValue(notificationForm.url)) {
-      payload.url = notificationForm.url.trim();
+      payload["url"] = notificationForm.url.trim();
     }
-    if (!editingItem || notificationForm.headers_json !== notificationOriginals.headers_json || !isRedactedValue(notificationForm.headers_json)) {
-      payload.headers_json = notificationForm.headers_json.trim() || null;
+    if (
+      !editingItem ||
+      notificationForm.headers_json !== notificationOriginals.headers_json ||
+      !isRedactedValue(notificationForm.headers_json)
+    ) {
+      payload["headers_json"] = notificationForm.headers_json.trim() || null;
     }
-    if (!editingItem || notificationForm.body_template !== notificationOriginals.body_template || !isRedactedValue(notificationForm.body_template)) {
-      payload.body_template = notificationForm.body_template;
+    if (
+      !editingItem ||
+      notificationForm.body_template !== notificationOriginals.body_template ||
+      !isRedactedValue(notificationForm.body_template)
+    ) {
+      payload["body_template"] = notificationForm.body_template;
     }
-    const response =
-      editingItem
-        ? await apiClient.updateNotification(editingItem.id, payload, totpCode)
-        : await apiClient.createNotification(payload, totpCode);
+    const response = editingItem
+      ? await apiClient.updateNotification(editingItem.id, payload, totpCode)
+      : await apiClient.createNotification(payload, totpCode);
 
     if (response.success) {
-      showToast(modal?.type === "notification" && modal.item ? copy.notificationsPage.channelUpdated : copy.notificationsPage.channelCreated);
+      showToast(
+        modal?.type === "notification" && modal.item
+          ? copy.notificationsPage.channelUpdated
+          : copy.notificationsPage.channelCreated,
+      );
       setModal(null);
       await load();
     } else {
@@ -310,7 +319,11 @@ export default function NotificationsPage() {
         : await apiClient.createNotificationGroup(payload, totpCode);
 
     if (response.success) {
-      showToast(modal?.type === "group" && modal.item ? copy.notificationsPage.groupUpdated : copy.notificationsPage.groupCreated);
+      showToast(
+        modal?.type === "group" && modal.item
+          ? copy.notificationsPage.groupUpdated
+          : copy.notificationsPage.groupCreated,
+      );
       setModal(null);
       await load();
     } else {
@@ -331,7 +344,14 @@ export default function NotificationsPage() {
   }
 
   async function deleteNotification(item: NotificationChannel) {
-    if (!(await dialogs.confirm({ message: copy.notificationsPage.deleteChannelConfirm.replace("{name}", String(item.name)), danger: true }))) return;
+    if (
+      !(await dialogs.confirm({
+        message: copy.notificationsPage.deleteChannelConfirm.replace("{name}", String(item.name)),
+        danger: true,
+      }))
+    ) {
+      return;
+    }
     setError(null);
     const totpCode = await sensitiveTotpCode();
     if (totpCode === null) return;
@@ -345,7 +365,14 @@ export default function NotificationsPage() {
   }
 
   async function deleteGroup(item: NotificationGroup) {
-    if (!(await dialogs.confirm({ message: copy.notificationsPage.deleteGroupConfirm.replace("{name}", String(item.name)), danger: true }))) return;
+    if (
+      !(await dialogs.confirm({
+        message: copy.notificationsPage.deleteGroupConfirm.replace("{name}", String(item.name)),
+        danger: true,
+      }))
+    ) {
+      return;
+    }
     setError(null);
     const totpCode = await sensitiveTotpCode();
     if (totpCode === null) return;
@@ -367,7 +394,9 @@ export default function NotificationsPage() {
     const response = await apiClient.addNotificationGroupMember(group.id, notificationId, totpCode);
     if (response.success) {
       const notification = notificationById.get(notificationId);
-      showToast(copy.notificationsPage.memberAdded.replace("{name}", String(notification?.name || notificationId)));
+      showToast(
+        copy.notificationsPage.memberAdded.replace("{name}", String(notification?.name || notificationId)),
+      );
       setSelectedMembers((current) => ({ ...current, [group.id]: "" }));
       await load();
     } else {
@@ -417,13 +446,15 @@ export default function NotificationsPage() {
         <div className="grid gap-6 xl:grid-cols-[minmax(0,1.1fr)_minmax(340px,0.9fr)]">
           <section>
             <div className="mb-3 flex items-center justify-between gap-3">
-              <h2 className="text-xl font-black uppercase">{copy.notificationsPage.channels}</h2>
+              <h2 className="text-base font-semibold tracking-tight text-[var(--text-main)]">
+                {copy.notificationsPage.channels}
+              </h2>
               <StatusBadge tone="blue">{notifications.length}</StatusBadge>
             </div>
             {notifications.length === 0 ? (
               <EmptyState title={copy.notificationsPage.noChannels} />
             ) : (
-              <div className="overflow-x-auto border-2 border-black bg-[var(--bg-card)] shadow-[var(--shadow-brutal)]">
+              <div className="overflow-x-auto rounded-xl border border-[var(--border-color)] bg-[var(--bg-card)] shadow-[var(--shadow-xs)]">
                 <table className="w-full min-w-[760px]">
                   <thead>
                     <tr>
@@ -435,34 +466,52 @@ export default function NotificationsPage() {
                       <th className={thClass}>{copy.notificationsPage.colActions}</th>
                     </tr>
                   </thead>
-                  <tbody>
+                  <tbody className="divide-y divide-[var(--border-color)]">
                     {notifications.map((item) => (
-                      <tr key={item.id}>
+                      <tr key={item.id} className="transition-colors hover:bg-[var(--bg-subtle)]">
                         <td className={tdClass}>{item.name}</td>
                         <td className={tdClass}>
-                          <div className="flex flex-wrap gap-2">
+                          <div className="flex flex-wrap gap-1.5">
                             <StatusBadge tone="gray">{item.request_method || "POST"}</StatusBadge>
                             <StatusBadge tone="blue">{item.request_type || "json"}</StatusBadge>
                           </div>
                         </td>
-                        <td className={`${tdClass} max-w-[280px] break-all text-xs`}>
+                        <td className={`${tdClass} max-w-[280px] break-all font-mono text-xs text-[var(--text-muted)]`}>
                           {item.url}
                         </td>
                         <td className={tdClass}>
                           <StatusBadge tone={item.verify_tls === false ? "yellow" : "green"}>
-                            {item.verify_tls === false ? copy.notificationsPage.tlsSkip : copy.notificationsPage.tlsVerify}
+                            {item.verify_tls === false
+                              ? copy.notificationsPage.tlsSkip
+                              : copy.notificationsPage.tlsVerify}
                           </StatusBadge>
                         </td>
-                        <td className={tdClass}>{formatDate(item.updated_at || item.created_at)}</td>
+                        <td className={`${tdClass} font-mono text-xs text-[var(--text-muted)]`}>
+                          {formatDate(item.updated_at || item.created_at)}
+                        </td>
                         <td className={`${tdClass} min-w-[220px]`}>
                           <div className="flex flex-wrap gap-2">
-                            <button type="button" className={buttonClass("secondary")} disabled={channelBusy} onClick={() => void runChannel(() => testNotification(item))}>
+                            <button
+                              type="button"
+                              className={buttonClass("secondary")}
+                              disabled={channelBusy}
+                              onClick={() => void runChannel(() => testNotification(item))}
+                            >
                               {copy.notificationsPage.test}
                             </button>
-                            <button type="button" className={buttonClass("secondary")} onClick={() => openEditNotification(item)}>
+                            <button
+                              type="button"
+                              className={buttonClass("secondary")}
+                              onClick={() => openEditNotification(item)}
+                            >
                               {copy.notificationsPage.edit}
                             </button>
-                            <button type="button" className={buttonClass("danger")} disabled={channelBusy} onClick={() => void runChannel(() => deleteNotification(item))}>
+                            <button
+                              type="button"
+                              className={buttonClass("danger")}
+                              disabled={channelBusy}
+                              onClick={() => void runChannel(() => deleteNotification(item))}
+                            >
                               {copy.notificationsPage.delete}
                             </button>
                           </div>
@@ -477,7 +526,9 @@ export default function NotificationsPage() {
 
           <section>
             <div className="mb-3 flex items-center justify-between gap-3">
-              <h2 className="text-xl font-black uppercase">{copy.notificationsPage.groups}</h2>
+              <h2 className="text-base font-semibold tracking-tight text-[var(--text-main)]">
+                {copy.notificationsPage.groups}
+              </h2>
               <StatusBadge tone="pink">{groups.length}</StatusBadge>
             </div>
             {groups.length === 0 ? (
@@ -489,19 +540,34 @@ export default function NotificationsPage() {
                   const memberIds = new Set(members.map((member) => member.id));
                   const candidates = notifications.filter((item) => !memberIds.has(item.id));
                   return (
-                    <article key={group.id} className="border-2 border-black bg-[var(--bg-card)] p-4 shadow-[var(--shadow-brutal)]">
+                    <article
+                      key={group.id}
+                      className="rounded-xl border border-[var(--border-color)] bg-[var(--bg-card)] p-4 shadow-[var(--shadow-xs)]"
+                    >
                       <div className="flex flex-wrap items-start justify-between gap-3">
                         <div className="min-w-0">
-                          <h3 className="break-words text-lg font-black text-[var(--text-main)]">{group.name}</h3>
-                          <p className="mt-1 text-xs font-black uppercase text-[var(--text-muted)]">
-                            {members.length} {copy.notificationsPage.channelCountSuffix} / {formatDate(group.updated_at || group.created_at)}
+                          <h3 className="break-words text-base font-semibold text-[var(--text-main)]">
+                            {group.name}
+                          </h3>
+                          <p className="mt-1 font-mono text-xs text-[var(--text-muted)]">
+                            {members.length} {copy.notificationsPage.channelCountSuffix} /{" "}
+                            {formatDate(group.updated_at || group.created_at)}
                           </p>
                         </div>
                         <div className="flex flex-wrap gap-2">
-                          <button type="button" className={buttonClass("secondary")} onClick={() => openEditGroup(group)}>
+                          <button
+                            type="button"
+                            className={buttonClass("secondary")}
+                            onClick={() => openEditGroup(group)}
+                          >
                             {copy.notificationsPage.edit}
                           </button>
-                          <button type="button" className={buttonClass("danger")} disabled={groupBusy} onClick={() => void runGroup(() => deleteGroup(group))}>
+                          <button
+                            type="button"
+                            className={buttonClass("danger")}
+                            disabled={groupBusy}
+                            onClick={() => void runGroup(() => deleteGroup(group))}
+                          >
                             {copy.notificationsPage.delete}
                           </button>
                         </div>
@@ -509,17 +575,29 @@ export default function NotificationsPage() {
 
                       <div className="mt-4 grid gap-2">
                         {members.length === 0 ? (
-                          <div className="border-2 border-black bg-[var(--accent-bg)] px-3 py-3 text-sm font-black">
+                          <div className="rounded-lg border border-dashed border-[var(--border-color)] bg-[var(--bg-subtle)] px-3 py-2.5 text-xs text-[var(--text-muted)]">
                             {copy.notificationsPage.noMembers}
                           </div>
                         ) : (
                           members.map((member) => (
-                            <div key={member.id} className="grid gap-2 border-2 border-black px-3 py-2 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
+                            <div
+                              key={member.id}
+                              className="grid gap-2 rounded-lg border border-[var(--border-color)] bg-[var(--bg-subtle)] px-3 py-2 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center"
+                            >
                               <div className="min-w-0">
-                                <p className="break-words text-sm font-black">{member.name}</p>
-                                <p className="break-all text-xs font-bold text-[var(--text-muted)]">{member.url || member.id}</p>
+                                <p className="break-words text-sm font-medium text-[var(--text-main)]">
+                                  {member.name}
+                                </p>
+                                <p className="break-all font-mono text-xs text-[var(--text-muted)]">
+                                  {member.url || member.id}
+                                </p>
                               </div>
-                              <button type="button" className={buttonClass("secondary")} disabled={groupBusy} onClick={() => void runGroup(() => removeMember(group, member))}>
+                              <button
+                                type="button"
+                                className={buttonClass("secondary")}
+                                disabled={groupBusy}
+                                onClick={() => void runGroup(() => removeMember(group, member))}
+                              >
                                 {copy.notificationsPage.removeMember}
                               </button>
                             </div>
@@ -563,11 +641,25 @@ export default function NotificationsPage() {
         </div>
 
         {modal?.type === "notification" ? (
-          <Modal title={modal.item ? copy.notificationsPage.editChannel : copy.notificationsPage.createChannel} onClose={() => setModal(null)}>
-            <form onSubmit={(event) => { event.preventDefault(); void runForm(() => submitNotification()); }} className="space-y-4">
+          <Modal
+            title={modal.item ? copy.notificationsPage.editChannel : copy.notificationsPage.createChannel}
+            onClose={() => setModal(null)}
+          >
+            <form
+              onSubmit={(event) => {
+                event.preventDefault();
+                void runForm(() => submitNotification());
+              }}
+              className="space-y-4"
+            >
               <div className="grid gap-4 sm:grid-cols-2">
                 <Field label={copy.notificationsPage.fieldName}>
-                  <input className={inputClass} value={notificationForm.name} onChange={(event) => setNotificationForm((form) => ({ ...form, name: event.target.value }))} required />
+                  <input
+                    className={inputClass}
+                    value={notificationForm.name}
+                    onChange={(event) => setNotificationForm((form) => ({ ...form, name: event.target.value }))}
+                    required
+                  />
                 </Field>
                 <Field label={copy.notificationsPage.fieldProvider}>
                   <select className={selectClass} onChange={(event) => applyProvider(event.target.value)} defaultValue="">
@@ -581,11 +673,20 @@ export default function NotificationsPage() {
                 </Field>
               </div>
               <Field label={copy.notificationsPage.fieldUrl}>
-                <input className={inputClass} value={notificationForm.url} onChange={(event) => setNotificationForm((form) => ({ ...form, url: event.target.value }))} required />
+                <input
+                  className={inputClass}
+                  value={notificationForm.url}
+                  onChange={(event) => setNotificationForm((form) => ({ ...form, url: event.target.value }))}
+                  required
+                />
               </Field>
               <div className="grid gap-4 sm:grid-cols-2">
                 <Field label={copy.notificationsPage.fieldMethod}>
-                  <select className={selectClass} value={notificationForm.request_method} onChange={(event) => setNotificationForm((form) => ({ ...form, request_method: event.target.value }))}>
+                  <select
+                    className={selectClass}
+                    value={notificationForm.request_method}
+                    onChange={(event) => setNotificationForm((form) => ({ ...form, request_method: event.target.value }))}
+                  >
                     <option value="POST">POST</option>
                     <option value="GET">GET</option>
                     <option value="PUT">PUT</option>
@@ -593,7 +694,11 @@ export default function NotificationsPage() {
                   </select>
                 </Field>
                 <Field label={copy.notificationsPage.fieldType}>
-                  <select className={selectClass} value={notificationForm.request_type} onChange={(event) => setNotificationForm((form) => ({ ...form, request_type: event.target.value }))}>
+                  <select
+                    className={selectClass}
+                    value={notificationForm.request_type}
+                    onChange={(event) => setNotificationForm((form) => ({ ...form, request_type: event.target.value }))}
+                  >
                     <option value="json">json</option>
                     <option value="form">form</option>
                     <option value="custom">custom</option>
@@ -601,18 +706,38 @@ export default function NotificationsPage() {
                 </Field>
               </div>
               <Field label={copy.notificationsPage.fieldHeadersJson}>
-                <textarea className={`${textareaClass} min-h-24`} value={notificationForm.headers_json} onChange={(event) => setNotificationForm((form) => ({ ...form, headers_json: event.target.value }))} spellCheck={false} />
+                <textarea
+                  className={`${textareaClass} min-h-24`}
+                  value={notificationForm.headers_json}
+                  onChange={(event) => setNotificationForm((form) => ({ ...form, headers_json: event.target.value }))}
+                  spellCheck={false}
+                />
               </Field>
               <Field label={copy.notificationsPage.fieldBodyTemplate}>
-                <textarea className={`${textareaClass} min-h-32`} value={notificationForm.body_template} onChange={(event) => setNotificationForm((form) => ({ ...form, body_template: event.target.value }))} spellCheck={false} />
+                <textarea
+                  className={`${textareaClass} min-h-32`}
+                  value={notificationForm.body_template}
+                  onChange={(event) => setNotificationForm((form) => ({ ...form, body_template: event.target.value }))}
+                  spellCheck={false}
+                />
               </Field>
               <div className="grid gap-3 sm:grid-cols-2">
-                <label className="flex items-center gap-3 border-2 border-black bg-[var(--bg-card)] px-3 py-3 text-sm font-black shadow-[var(--shadow-brutal-sm)]">
-                  <input type="checkbox" checked={notificationForm.verify_tls} onChange={(event) => setNotificationForm((form) => ({ ...form, verify_tls: event.target.checked }))} />
+                <label className="flex items-center gap-3 rounded-lg border border-[var(--border-color)] bg-[var(--bg-subtle)] px-3 py-2.5 text-sm font-medium text-[var(--text-main)]">
+                  <input
+                    type="checkbox"
+                    checked={notificationForm.verify_tls}
+                    onChange={(event) => setNotificationForm((form) => ({ ...form, verify_tls: event.target.checked }))}
+                  />
                   {copy.notificationsPage.verifyTlsCert}
                 </label>
-                <label className="flex items-center gap-3 border-2 border-black bg-[var(--bg-card)] px-3 py-3 text-sm font-black shadow-[var(--shadow-brutal-sm)]">
-                  <input type="checkbox" checked={notificationForm.format_metric_units} onChange={(event) => setNotificationForm((form) => ({ ...form, format_metric_units: event.target.checked }))} />
+                <label className="flex items-center gap-3 rounded-lg border border-[var(--border-color)] bg-[var(--bg-subtle)] px-3 py-2.5 text-sm font-medium text-[var(--text-main)]">
+                  <input
+                    type="checkbox"
+                    checked={notificationForm.format_metric_units}
+                    onChange={(event) =>
+                      setNotificationForm((form) => ({ ...form, format_metric_units: event.target.checked }))
+                    }
+                  />
                   {copy.notificationsPage.formatMetricUnits}
                 </label>
               </div>
@@ -624,10 +749,24 @@ export default function NotificationsPage() {
         ) : null}
 
         {modal?.type === "group" ? (
-          <Modal title={modal.item ? copy.notificationsPage.editGroup : copy.notificationsPage.createGroup} onClose={() => setModal(null)}>
-            <form onSubmit={(event) => { event.preventDefault(); void runForm(() => submitGroup()); }} className="space-y-4">
+          <Modal
+            title={modal.item ? copy.notificationsPage.editGroup : copy.notificationsPage.createGroup}
+            onClose={() => setModal(null)}
+          >
+            <form
+              onSubmit={(event) => {
+                event.preventDefault();
+                void runForm(() => submitGroup());
+              }}
+              className="space-y-4"
+            >
               <Field label={copy.notificationsPage.fieldName}>
-                <input className={inputClass} value={groupForm.name} onChange={(event) => setGroupForm({ name: event.target.value })} required />
+                <input
+                  className={inputClass}
+                  value={groupForm.name}
+                  onChange={(event) => setGroupForm({ name: event.target.value })}
+                  required
+                />
               </Field>
               <button type="submit" disabled={formBusy} className={buttonClass("primary")}>
                 {copy.notificationsPage.saveGroup}
@@ -641,7 +780,7 @@ export default function NotificationsPage() {
   );
 }
 
-function formatHeaders(headers?: Record<string, string>): string {
+function formatHeaders(headers?: Record<string, string> | undefined): string {
   if (!headers || Object.keys(headers).length === 0) return "";
   return JSON.stringify(headers, null, 2);
 }

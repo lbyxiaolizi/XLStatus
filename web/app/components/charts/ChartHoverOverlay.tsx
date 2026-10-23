@@ -8,8 +8,6 @@ export interface ChartHoverEntry {
   text: string;
 }
 
-// Crosshair + tooltip layer. Kept separate from the chart bodies so a pointer
-// move only re-renders this subtree while the memoized series paths stay put.
 export const ChartHoverOverlay = memo(function ChartHoverOverlay({
   x,
   timeLabel,
@@ -35,15 +33,15 @@ export const ChartHoverOverlay = memo(function ChartHoverOverlay({
 
   return (
     <g>
-      <line x1={x} x2={x} y1={top} y2={top + plotHeight} stroke="var(--border-color)" strokeDasharray="6 5" strokeWidth="2" />
-      <rect x={tooltipX} y={tooltipY} width={tooltipWidth} height={tooltipHeight} fill="var(--bg-card)" stroke="var(--border-color)" strokeWidth="2" />
-      <text x={tooltipX + 10} y={tooltipY + 18} fill="var(--text-main)" fontSize="12" fontWeight="900">
+      <line x1={x} x2={x} y1={top} y2={top + plotHeight} stroke="var(--text-muted)" strokeDasharray="4 4" strokeWidth="1" />
+      <rect x={tooltipX} y={tooltipY} width={tooltipWidth} height={tooltipHeight} rx="8" fill="var(--bg-card)" stroke="var(--border-color)" strokeWidth="1" />
+      <text x={tooltipX + 10} y={tooltipY + 18} fill="var(--text-muted)" fontSize="11" fontWeight="600">
         {timeLabel}
       </text>
       {entries.map((entry, index) => (
         <g key={`${entry.label}-${index}`} transform={`translate(${tooltipX + 10}, ${tooltipY + 36 + index * 20})`}>
-          <rect width="9" height="9" y="-8" fill={entry.color} stroke="var(--border-color)" strokeWidth="1.5" />
-          <text x="16" y="0" fill="var(--text-main)" fontSize="12" fontWeight="900">
+          <circle cx="4" cy="-4" r="3.5" fill={entry.color} />
+          <text x="14" y="0" fill="var(--text-main)" fontSize="11" fontWeight="600">
             {entry.text}
           </text>
         </g>

@@ -1,4 +1,9 @@
 import type { ThemeDefinition } from "@/lib/api";
+import {
+  isValidCssVariableName,
+  sanitizeCssVariableValue,
+  sanitizeThemeVariables,
+} from "./security";
 
 export const DASHBOARD_THEME_CACHE_KEY = "xlstatus:dashboard-theme:v1";
 export const DASHBOARD_THEME_EVENT = "xlstatus:dashboard-theme-change";
@@ -80,8 +85,8 @@ export function applyDashboardTheme(theme: ThemeDefinition | null): void {
   if (typeof document === "undefined") return;
   const root = document.documentElement;
   const body = document.body;
-  root.dataset.xlstatusDashboardThemeId = theme?.id ?? "";
-  const previousKeys = (root.dataset.xlstatusDashboardThemeVars || "")
+  root.dataset["xlstatusDashboardThemeId"] = theme?.id ?? "";
+  const previousKeys = (root.dataset["xlstatusDashboardThemeVars"] || "")
     .split(",")
     .map((key) => key.trim())
     .filter(Boolean);
@@ -89,20 +94,24 @@ export function applyDashboardTheme(theme: ThemeDefinition | null): void {
     root.style.removeProperty(key);
     body?.style.removeProperty(key);
   }
-  root.dataset.xlstatusDashboardThemeVars = "";
+  root.dataset["xlstatusDashboardThemeVars"] = "";
 
   document.getElementById("xlstatus-dashboard-theme-style")?.remove();
   if (!theme) return;
 
-  const activeVariables = themeVariablesForMode(theme, root.classList.contains("dark-mode"));
+  const activeVariables = sanitizeThemeVariables(
+    themeVariablesForMode(theme, root.classList.contains("dark-mode")),
+  );
   const nextKeys: string[] = [];
   for (const [key, value] of Object.entries(activeVariables)) {
-    if (!key.startsWith("--") || !value) continue;
-    root.style.setProperty(key, value);
-    body?.style.setProperty(key, value);
+    if (!isValidCssVariableName(key)) continue;
+    const safeValue = sanitizeCssVariableValue(value);
+    if (!safeValue) continue;
+    root.style.setProperty(key, safeValue);
+    body?.style.setProperty(key, safeValue);
     nextKeys.push(key);
   }
-  root.dataset.xlstatusDashboardThemeVars = nextKeys.join(",");
+  root.dataset["xlstatusDashboardThemeVars"] = nextKeys.join(",");
 }
 
 function themeVariablesForMode(theme: ThemeDefinition, isDark: boolean): Record<string, string> {

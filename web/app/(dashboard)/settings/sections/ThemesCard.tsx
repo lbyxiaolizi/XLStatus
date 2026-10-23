@@ -19,6 +19,7 @@ import {
   cacheDashboardTheme,
   DASHBOARD_THEME_CACHE_KEY,
 } from "@/app/lib/dashboard-theme";
+import { sanitizeCssVariableValue } from "@/app/lib/security";
 import { readStoredUser } from "@/app/lib/client-store";
 import { useBusy } from "@/app/lib/use-busy";
 import { useLoadOnVisible } from "@/app/lib/use-load-on-visible";
@@ -182,7 +183,7 @@ export function ThemesCard() {
       <BrutalCard>
         <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
           <div>
-            <h2 className="text-xl font-black uppercase">{copy.settingsPage.themeTemplates}</h2>
+            <h2 className="text-lg font-semibold tracking-tight text-[var(--text-main)]">{copy.settingsPage.themeTemplates}</h2>
           </div>
           <button type="button" className={buttonClass("secondary")} onClick={() => void loadThemes(true)} disabled={themeLoading}>
             {themeLoading ? copy.settingsPage.loading : copy.settingsPage.refresh}
@@ -197,34 +198,34 @@ export function ThemesCard() {
             {(!themesLoaded || themeLoading) && themes.length === 0 ? (
               <div className="grid gap-3" aria-busy="true">
                 {Array.from({ length: 3 }).map((_, index) => (
-                  <div key={index} className="h-36 animate-pulse border-2 border-black bg-[var(--accent-bg)] shadow-[var(--shadow-brutal-sm)]" />
+                  <div key={index} className="h-36 animate-pulse rounded-xl border border-[var(--border-color)] bg-[var(--bg-subtle)]" />
                 ))}
               </div>
             ) : themeError && themes.length === 0 ? null : themes.length === 0 ? (
-              <p className="text-sm font-bold text-[var(--text-muted)]">{copy.settingsPage.noThemes}</p>
+              <p className="text-sm font-medium text-[var(--text-muted)]">{copy.settingsPage.noThemes}</p>
             ) : (
               themes.map((theme) => (
-                <div key={theme.id} className="grid gap-3 border-2 border-black bg-[var(--accent-bg)] p-3 shadow-[var(--shadow-brutal-sm)]">
+                <div key={theme.id} className="grid gap-3 rounded-xl border border-[var(--border-color)] bg-[var(--bg-subtle)] p-4">
                   <div className="flex flex-wrap items-start justify-between gap-3">
                     <div className="min-w-0">
                       <div className="flex flex-wrap items-center gap-2">
-                        <h3 className="break-words text-lg font-black uppercase">{theme.name}</h3>
+                        <h3 className="break-words text-base font-semibold tracking-tight text-[var(--text-main)]">{theme.name}</h3>
                         <StatusBadge tone={theme.builtin ? "blue" : "pink"}>{theme.builtin ? copy.settingsPage.builtin : copy.settingsPage.custom}</StatusBadge>
                         <StatusBadge tone="gray">{themeTargetLabel(theme.target, copy)}</StatusBadge>
                         {selectedPublicThemeId === theme.id ? <StatusBadge tone="green">{copy.settingsPage.publicPageBadge}</StatusBadge> : null}
                         {selectedDashboardThemeId === theme.id ? <StatusBadge tone="yellow">{copy.settingsPage.dashboardBadge}</StatusBadge> : null}
                       </div>
-                      <p className="mt-1 break-all font-mono text-[11px] font-bold text-[var(--text-muted)]">{theme.id}</p>
+                      <p className="mt-1 break-all font-mono text-[11px] text-[var(--text-muted)]">{theme.id}</p>
                       {theme.description ? (
-                        <p className="mt-1 text-sm font-bold text-[var(--text-muted)]">{theme.description}</p>
+                        <p className="mt-1 text-sm text-[var(--text-muted)]">{theme.description}</p>
                       ) : null}
                     </div>
-                    <div className="flex shrink-0 flex-wrap gap-1">
+                    <div className="flex shrink-0 flex-wrap gap-1.5">
                       {themeSwatches(theme).map(([key, value]) => (
                         <span
                           key={key}
                           title={`${key}: ${value}`}
-                          className="h-7 w-7 border-2 border-black shadow-[var(--shadow-brutal-sm)]"
+                          className="h-6 w-6 rounded-md border border-[var(--border-color)] shadow-[var(--shadow-xs)]"
                           style={{ background: value }}
                         />
                       ))}
@@ -311,7 +312,10 @@ function themeSupportsTarget(theme: ThemeDefinition, target: "public" | "dashboa
 
 function themeSwatches(theme: ThemeDefinition): Array<[string, string]> {
   return Object.entries(theme.variables ?? {})
-    .filter(([, value]) => /^(#|rgb\(|rgba\(|hsl\(|hsla\()/i.test(value.trim()))
+    .map(([key, value]): [string, string | null] => [key, sanitizeCssVariableValue(value)])
+    .filter((entry): entry is [string, string] =>
+      Boolean(entry[1] && /^(#|rgb\(|rgba\(|hsl\(|hsla\()/i.test(entry[1])),
+    )
     .slice(0, 6);
 }
 
