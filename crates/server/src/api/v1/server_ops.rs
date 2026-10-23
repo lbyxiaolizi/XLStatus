@@ -218,8 +218,9 @@ pub async fn read_file(
     Json(req): Json<FileReadRequest>,
 ) -> Result<Json<ApiResponse<FileReadResponse>>, AppError> {
     require_transfer_scope(&auth, "transfer:read")?;
+    let path = validate_file_target_path(&req.path)?;
+    let encoding = normalize_encoding(&req.encoding)?;
     let agent_id = ensure_server_online(&state, &auth, &server_id).await?;
-    let path = validate_abs_path(&req.path)?;
     let length = req.length.clamp(1, FILE_READ_MAX_BYTES);
     let result = dispatch_file_task(
         &state,
@@ -249,7 +250,6 @@ pub async fn read_file(
             "agent returned more than {length} file bytes"
         )));
     }
-    let encoding = normalize_encoding(&req.encoding)?;
     let content = if encoding == "base64" {
         result.stdout.trim().to_string()
     } else {
@@ -273,8 +273,8 @@ pub async fn write_file(
     Json(req): Json<FileWriteRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     require_transfer_write_sensitive_auth(&state.db, &auth, &headers).await?;
-    let agent_id = ensure_server_online(&state, &auth, &server_id).await?;
-    let path = validate_abs_path(&req.path)?;
+    let path = validate_file_target_path(&req.path)?;
+    let mode = validate_file_write_mode(req.mode)?;
     let encoding = normalize_encoding(&req.encoding)?;
     let data = if encoding == "base64" {
         decode_base64(req.content.trim())
@@ -283,6 +283,7 @@ pub async fn write_file(
         req.content.into_bytes()
     };
     ensure_file_write_size(&data)?;
+    let agent_id = ensure_server_online(&state, &auth, &server_id).await?;
     let bytes_len = data.len();
     let result = dispatch_file_task(
         &state,
@@ -293,7 +294,7 @@ pub async fn write_file(
             spec: Some(Spec::FileWrite(FileWriteTask {
                 path: path.clone(),
                 data,
-                mode: req.mode.unwrap_or(0),
+                mode,
                 create_dirs: req.create_dirs,
             })),
         },
@@ -321,13 +322,13 @@ pub async fn delete_file(
     Json(req): Json<FileDeleteRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     require_transfer_write_sensitive_auth(&state.db, &auth, &headers).await?;
-    let agent_id = ensure_server_online(&state, &auth, &server_id).await?;
     let path = validate_abs_path(&req.path)?;
-    if path == "/" {
+    if is_filesystem_root_path(&path) {
         return Err(AppError::BadRequest(
             "refusing to delete filesystem root".into(),
         ));
     }
+    let agent_id = ensure_server_online(&state, &auth, &server_id).await?;
     let result = dispatch_file_task(
         &state,
         agent_id,
@@ -492,8 +493,8 @@ async fn build_temp_url(
         "transfer:write"
     };
     require_transfer_scope(&auth, scope)?;
+    let path = validate_file_target_path(&req.path)?;
     let agent_id = ensure_server_active(&state, &auth, &server_id).await?;
-    let path = validate_abs_path(&req.path)?;
     let expires_in = temporary_url_expires_in(req.expires_in);
     let expires_at = temporary_url_expires_at(expires_in);
     let (token, token_hash) = generate_temporary_transfer_token();
@@ -679,7 +680,44 @@ fn validate_abs_path(path: &str) -> Result<String, AppError> {
     if trimmed.contains('\0') {
         return Err(AppError::BadRequest("path contains NUL byte".into()));
     }
+    if trimmed.chars().any(char::is_control) {
+        return Err(AppError::BadRequest(
+            "path must not contain control characters".into(),
+        ));
+    }
+    if trimmed.split('/').any(|segment| segment == "..") {
+        return Err(AppError::BadRequest(
+            "path must not contain '..' traversal segments".into(),
+        ));
+    }
     Ok(trimmed.to_string())
+}
+
+fn is_filesystem_root_path(path: &str) -> bool {
+    !path
+        .split('/')
+        .any(|segment| !segment.is_empty() && segment != ".")
+}
+
+fn validate_file_target_path(path: &str) -> Result<String, AppError> {
+    let validated = validate_abs_path(path)?;
+    if is_filesystem_root_path(&validated) {
+        return Err(AppError::BadRequest(
+            "file path must not refer to filesystem root".into(),
+        ));
+    }
+    Ok(validated)
+}
+
+fn validate_file_write_mode(mode: Option<u32>) -> Result<u32, AppError> {
+    let mode = mode.unwrap_or(0);
+    if mode > 0o777 {
+        return Err(AppError::BadRequest(
+            "file mode must be within 0o000..=0o777 (setuid/setgid/sticky bits are not allowed)"
+                .into(),
+        ));
+    }
+    Ok(mode)
 }
 
 fn ensure_file_write_size(data: &[u8]) -> Result<(), AppError> {
@@ -728,13 +766,14 @@ fn remote_config_patch_contains_sensitive_fields(
         ));
     };
     let mut sensitive = false;
-    for key in object.keys() {
+    for (key, value) in object {
         if REMOTE_CONFIG_FORBIDDEN_FIELDS.contains(&key.as_str()) {
             return Err(AppError::BadRequest(format!(
                 "remote config field {key} cannot be changed from the dashboard"
             )));
         }
         if REMOTE_CONFIG_SENSITIVE_FIELDS.contains(&key.as_str()) {
+            validate_remote_config_field_value(key, value)?;
             sensitive = true;
             continue;
         }
@@ -743,8 +782,133 @@ fn remote_config_patch_contains_sensitive_fields(
                 "unknown remote config field: {key}"
             )));
         }
+        validate_remote_config_field_value(key, value)?;
     }
     Ok(sensitive)
+}
+
+fn validate_remote_config_field_value(
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<(), AppError> {
+    match key {
+        "name" => {
+            let Some(name) = value.as_str() else {
+                return Err(AppError::BadRequest(
+                    "config field 'name' must be a string".into(),
+                ));
+            };
+            let trimmed = name.trim();
+            if trimmed.is_empty() || trimmed.len() > 255 || trimmed.chars().any(char::is_control) {
+                return Err(AppError::BadRequest(
+                    "config field 'name' must be 1..=255 printable characters".into(),
+                ));
+            }
+        }
+        "report_interval_seconds" | "ip_report_interval_seconds" => {
+            let Some(secs) = value.as_u64() else {
+                return Err(AppError::BadRequest(format!(
+                    "config field '{key}' must be a positive integer"
+                )));
+            };
+            if !(1..=86_400).contains(&secs) {
+                return Err(AppError::BadRequest(format!(
+                    "config field '{key}' must be between 1 and 86400 seconds"
+                )));
+            }
+        }
+        "disable_auto_update"
+        | "disable_force_update"
+        | "disable_command_execute"
+        | "disable_nat"
+        | "disable_send_query" => {
+            if !value.is_boolean() {
+                return Err(AppError::BadRequest(format!(
+                    "config field '{key}' must be a boolean"
+                )));
+            }
+        }
+        "server" | "grpc_server" => {
+            let Some(raw) = value.as_str() else {
+                return Err(AppError::BadRequest(format!(
+                    "config field '{key}' must be a URL string"
+                )));
+            };
+            let trimmed = raw.trim();
+            if trimmed.is_empty() || trimmed.len() > FORCE_UPDATE_MAX_URL_BYTES {
+                return Err(AppError::BadRequest(format!(
+                    "config field '{key}' must be 1..={FORCE_UPDATE_MAX_URL_BYTES} bytes"
+                )));
+            }
+            let parsed = reqwest::Url::parse(trimmed).map_err(|e| {
+                AppError::BadRequest(format!("config field '{key}' is not a valid URL: {e}"))
+            })?;
+            if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+                return Err(AppError::BadRequest(format!(
+                    "config field '{key}' must use http or https with a valid host"
+                )));
+            }
+            if !parsed.username().is_empty()
+                || parsed.password().is_some()
+                || parsed.query().is_some()
+                || parsed.fragment().is_some()
+            {
+                return Err(AppError::BadRequest(format!(
+                    "config field '{key}' must not contain credentials, query, or fragment"
+                )));
+            }
+        }
+        "grpc_tls_ca_path" | "grpc_tls_client_cert_path" | "grpc_tls_client_key_path" => {
+            if !value.is_null() {
+                let Some(path) = value.as_str() else {
+                    return Err(AppError::BadRequest(format!(
+                        "config field '{key}' must be a string or null"
+                    )));
+                };
+                if path.len() > SERVER_OPS_MAX_PATH_BYTES || path.chars().any(char::is_control) {
+                    return Err(AppError::BadRequest(format!(
+                        "config field '{key}' is invalid"
+                    )));
+                }
+            }
+        }
+        "grpc_tls_domain_name" => {
+            if !value.is_null() {
+                let Some(domain) = value.as_str() else {
+                    return Err(AppError::BadRequest(
+                        "config field 'grpc_tls_domain_name' must be a string or null".into(),
+                    ));
+                };
+                if domain.len() > 253 || domain.chars().any(char::is_control) {
+                    return Err(AppError::BadRequest(
+                        "config field 'grpc_tls_domain_name' is invalid".into(),
+                    ));
+                }
+            }
+        }
+        "file_allowed_roots" => {
+            let Some(roots) = value.as_array() else {
+                return Err(AppError::BadRequest(
+                    "config field 'file_allowed_roots' must be an array of paths".into(),
+                ));
+            };
+            if roots.len() > 64 {
+                return Err(AppError::BadRequest(
+                    "config field 'file_allowed_roots' exceeds 64 entries".into(),
+                ));
+            }
+            for item in roots {
+                let Some(root_path) = item.as_str() else {
+                    return Err(AppError::BadRequest(
+                        "config field 'file_allowed_roots' entries must be strings".into(),
+                    ));
+                };
+                validate_abs_path(root_path)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn require_admin_cookie_session(auth: &AuthSession) -> Result<(), AppError> {
@@ -820,6 +984,8 @@ fn validate_force_update_version(version: &str) -> Result<String, AppError> {
         ));
     }
     if trimmed.len() > 80
+        || !trimmed.as_bytes()[0].is_ascii_alphanumeric()
+        || trimmed.contains("..")
         || !trimmed
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
@@ -901,17 +1067,24 @@ fn validate_default_force_update_download_url(
     }
     let path = url.path();
     let expected_prefix = format!("{FORCE_UPDATE_REPO_PATH_PREFIX}{version}/");
-    if !path.starts_with(&expected_prefix) {
+    let Some(filename) = path.strip_prefix(&expected_prefix) else {
         return Err(AppError::BadRequest(
             "download_url must point to the requested XLStatus release version".into(),
         ));
+    };
+    if filename.is_empty() {
+        return Err(AppError::BadRequest(
+            "download_url missing release asset name".into(),
+        ));
     }
-    let filename = path
-        .rsplit('/')
-        .next()
-        .filter(|part| !part.is_empty())
-        .ok_or_else(|| AppError::BadRequest("download_url missing release asset name".into()))?;
-    if filename.contains('/') || filename.contains('\\') || !filename.starts_with("xlstatus-agent-")
+    if filename.contains('/')
+        || filename.contains('\\')
+        || filename.contains('%')
+        || filename.contains("..")
+        || !filename.starts_with("xlstatus-agent-")
+        || !filename
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
     {
         return Err(AppError::BadRequest(
             "download_url must point to an XLStatus Agent release asset".into(),
@@ -1621,6 +1794,92 @@ mod tests {
         let data = response.0.data.expect("config response data");
 
         assert_eq!(data.get("last_info"), Some(&serde_json::Value::Null));
+    }
+
+    #[test]
+    fn file_paths_reject_traversal_control_chars_and_root_targets() {
+        assert!(validate_abs_path("/var/log/syslog").is_ok());
+        assert!(validate_abs_path("/").is_ok());
+        assert!(validate_abs_path("/var/log/../../etc/shadow").is_err());
+        assert!(validate_abs_path("/var/log/\n/app.log").is_err());
+
+        for root in ["/", "//", "///", "/.", "/./."] {
+            assert!(
+                is_filesystem_root_path(root),
+                "{root} must be treated as root"
+            );
+            assert!(
+                validate_file_target_path(root).is_err(),
+                "{root} must be rejected as a file target"
+            );
+        }
+        assert!(validate_file_target_path("/var/log/app.log").is_ok());
+    }
+
+    #[test]
+    fn file_write_mode_rejects_suid_sgid_sticky_and_high_bits() {
+        assert_eq!(validate_file_write_mode(None).unwrap(), 0);
+        assert_eq!(validate_file_write_mode(Some(0o644)).unwrap(), 0o644);
+        assert_eq!(validate_file_write_mode(Some(0o755)).unwrap(), 0o755);
+
+        for forbidden_mode in [0o4755, 0o2755, 0o1777, 0o10000, u32::MAX] {
+            let err = validate_file_write_mode(Some(forbidden_mode)).unwrap_err();
+            assert!(
+                app_error_message(&err).contains("0o000..=0o777"),
+                "mode {forbidden_mode:#o} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_config_patch_validates_field_types_and_url_safety() {
+        assert!(
+            remote_config_patch_contains_sensitive_fields(&serde_json::json!({
+                "report_interval_seconds": 0
+            }))
+            .is_err()
+        );
+        assert!(
+            remote_config_patch_contains_sensitive_fields(&serde_json::json!({
+                "server": "https://user:pass@status.example.com"
+            }))
+            .is_err()
+        );
+        assert!(
+            remote_config_patch_contains_sensitive_fields(&serde_json::json!({
+                "file_allowed_roots": ["/var/lib/../../etc"]
+            }))
+            .is_err()
+        );
+        assert!(
+            remote_config_patch_contains_sensitive_fields(&serde_json::json!({
+                "server": "https://status.example.com:8443",
+                "file_allowed_roots": ["/var/lib/xlstatus"]
+            }))
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn force_update_rejects_dot_version_and_path_traversal_assets() {
+        for bad_version in [".", "..", "../v0.1", "v0.1..2", "-v0.1"] {
+            assert!(
+                validate_force_update_version(bad_version).is_err(),
+                "version {bad_version:?} must be rejected"
+            );
+        }
+
+        for bad_url in [
+            "https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1/subdir/xlstatus-agent-linux-amd64",
+            "https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1/%2e%2e/xlstatus-agent-linux-amd64",
+            "https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.1/xlstatus-agent-linux-amd64%00.sh",
+        ] {
+            assert!(
+                validate_force_update_request_with_custom_source(force_update_req(bad_url), false)
+                    .is_err(),
+                "url {bad_url} must be rejected"
+            );
+        }
     }
 
     async fn test_state() -> AppState {

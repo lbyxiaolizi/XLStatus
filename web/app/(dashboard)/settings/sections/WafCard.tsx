@@ -106,14 +106,14 @@ export function WafCard() {
       <BrutalCard>
         <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
           <div>
-            <h2 className="text-xl font-black uppercase">{copy.settingsPage.wafBans}</h2>
+            <h2 className="text-lg font-semibold tracking-tight text-[var(--text-main)]">{copy.settingsPage.wafBans}</h2>
           </div>
           <button type="button" className={buttonClass("secondary")} onClick={() => void loadWafBans()} disabled={wafLoading}>
             {wafLoading ? copy.settingsPage.loading : copy.settingsPage.refresh}
           </button>
         </div>
         <SectionFeedback error={error} />
-        <div className="mb-4 grid gap-3 border-b-2 border-black pb-4 xl:grid-cols-[minmax(0,1fr)_minmax(0,0.8fr)_9rem_auto] xl:items-end">
+        <div className="mb-4 grid gap-3 border-b border-[var(--border-color)] pb-4 xl:grid-cols-[minmax(0,1fr)_minmax(0,0.8fr)_9rem_auto] xl:items-end">
           <Field label={copy.settingsPage.ipList}>
             <input
               className={inputClass}
@@ -147,19 +147,19 @@ export function WafCard() {
           {wafLoading && wafBans.length === 0 ? (
             <SettingsListSkeleton />
           ) : wafBans.length === 0 ? (
-            <p className="text-sm font-bold text-[var(--text-muted)]">{copy.settingsPage.noActiveBans}</p>
+            <p className="text-sm font-medium text-[var(--text-muted)]">{copy.settingsPage.noActiveBans}</p>
           ) : (
             wafBans.map((ban) => (
-              <div key={ban.id} className="grid gap-3 border-2 border-black bg-[var(--accent-bg)] p-3 shadow-[var(--shadow-brutal-sm)] xl:grid-cols-[minmax(0,1fr)_12rem_auto] xl:items-center">
+              <div key={ban.id} className="grid gap-3 rounded-xl border border-[var(--border-color)] bg-[var(--bg-subtle)] p-3.5 xl:grid-cols-[minmax(0,1fr)_12rem_auto] xl:items-center">
                 <div className="min-w-0">
                   <div className="flex flex-wrap items-center gap-2">
-                    <span className="break-all text-sm font-black">{ban.ip}</span>
+                    <span className="break-all font-mono text-sm font-semibold text-[var(--text-main)]">{ban.ip}</span>
                     <StatusBadge tone="red">{copy.settingsPage.failedCount.replace("{count}", String(ban.failed_count))}</StatusBadge>
                   </div>
-                  <div className="mt-1 break-words text-xs font-bold text-[var(--text-muted)]">{ban.reason}</div>
-                  <div className="mt-1 break-all font-mono text-[11px] font-bold text-[var(--text-muted)]">{ban.id}</div>
+                  <div className="mt-1 break-words text-xs text-[var(--text-muted)]">{ban.reason}</div>
+                  <div className="mt-1 break-all font-mono text-[11px] text-[var(--text-muted)]">{ban.id}</div>
                 </div>
-                <div className="text-xs font-bold text-[var(--text-muted)]">
+                <div className="text-xs text-[var(--text-muted)]">
                   <div>{copy.settingsPage.unbanLabel.replace("{date}", String(formatDate(ban.banned_until)))}</div>
                   <div>{copy.settingsPage.updatedLabel.replace("{date}", String(formatDate(ban.updated_at || ban.created_at)))}</div>
                 </div>

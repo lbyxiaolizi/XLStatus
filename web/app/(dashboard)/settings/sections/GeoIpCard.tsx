@@ -178,7 +178,7 @@ export function GeoIpCard() {
         <BrutalCard>
           <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
             <div>
-              <h2 className="text-xl font-black uppercase">{copy.settingsPage.geoIp}</h2>
+              <h2 className="text-lg font-semibold tracking-tight text-[var(--text-main)]">{copy.settingsPage.geoIp}</h2>
               <div className="mt-2 flex flex-wrap gap-2">
                 <StatusBadge tone="blue">{systemSettings ? copy.settingsPage.defaultProvider.replace("{provider}", String(systemSettings.geoip_provider || "empty")) : copy.common.notAvailable}</StatusBadge>
                 <StatusBadge tone={systemSettings?.geoip_ipinfo_token_configured ? "green" : "gray"}>
@@ -221,8 +221,8 @@ export function GeoIpCard() {
               <Field label="ipinfo token">
                 <input className={inputClass} value={geoIp.token} onChange={(event) => setGeoIp({ ...geoIp, token: event.target.value })} placeholder="optional" />
               </Field>
-              <div className="grid gap-3 border-t-2 border-black pt-3 sm:grid-cols-2">
-                <label className="flex items-center gap-2 text-sm font-black">
+              <div className="grid gap-3 border-t border-[var(--border-color)] pt-3 sm:grid-cols-2">
+                <label className="flex items-center gap-2 text-sm font-medium text-[var(--text-main)]">
                   <input type="checkbox" checked={geoIpIpChange.enabled} onChange={(event) => setGeoIpIpChange((current) => ({ ...current, enabled: event.target.checked }))} />
                   {copy.settingsPage.ipChangeNotification}
                 </label>
@@ -249,7 +249,7 @@ export function GeoIpCard() {
               <button type="button" className={buttonClass("primary")} onClick={() => void run(testGeoIp)} disabled={geoIpLoading || busy}>
                 {geoIpLoading ? copy.settingsPage.querying : copy.settingsPage.testGeoIp}
               </button>
-              <div className="border-t-2 border-black pt-3">
+              <div className="border-t border-[var(--border-color)] pt-3">
                 <div className="grid gap-3">
                   <Field label={copy.settingsPage.mmdbUrl}>
                     <input className={inputClass} value={geoIpMmdbUrl} onChange={(event) => setGeoIpMmdbUrl(event.target.value)} placeholder="https://example.com/GeoLite2-City.mmdb" />
@@ -260,21 +260,21 @@ export function GeoIpCard() {
                   <Field label={copy.settingsPage.mmdbFile}>
                     <input className={inputClass} type="file" accept=".mmdb" onChange={(event) => setGeoIpMmdbFile(event.target.files?.[0] ?? null)} />
                   </Field>
-                  {geoIpMmdbFile ? <div className="break-all text-xs font-black text-[var(--text-muted)]">{geoIpMmdbFile.name}</div> : null}
+                  {geoIpMmdbFile ? <div className="break-all text-xs font-medium text-[var(--text-muted)]">{geoIpMmdbFile.name}</div> : null}
                   <button type="button" className={buttonClass("secondary")} onClick={() => void run(uploadGeoIpDatabase)} disabled={geoIpLoading || busy || !geoIpMmdbFile}>
                     {copy.settingsPage.uploadMmdb}
                   </button>
                 </div>
               </div>
             </div>
-            <div className="min-w-0 border-2 border-black bg-[var(--accent-bg)] p-3 shadow-[var(--shadow-brutal-sm)]">
+            <div className="min-w-0 rounded-xl border border-[var(--border-color)] bg-[var(--bg-subtle)] p-4">
               {geoIpResult ? (
                 <div className="grid gap-3">
                   <div className="flex flex-wrap gap-2">
                     <StatusBadge tone="blue">{geoIpResult.provider}</StatusBadge>
                     <StatusBadge tone="gray">{geoIpResult.ip}</StatusBadge>
                   </div>
-                  <div className="grid gap-2 text-sm font-bold md:grid-cols-2">
+                  <div className="grid gap-2 text-sm md:grid-cols-2">
                     <div>{copy.settingsPage.countryLabel.replace("{value}", String(geoIpResult.country || "N/A"))}</div>
                     <div>{copy.settingsPage.regionLabel.replace("{value}", String(geoIpResult.region || "N/A"))}</div>
                     <div>{copy.settingsPage.cityLabel.replace("{value}", String(geoIpResult.city || "N/A"))}</div>
@@ -284,15 +284,15 @@ export function GeoIpCard() {
                     <div className="break-words md:col-span-2">{copy.settingsPage.ispLabel.replace("{value}", String(geoIpResult.isp || "N/A"))}</div>
                     <div className="break-words md:col-span-2">{copy.settingsPage.organizationLabel.replace("{value}", String(geoIpResult.organization || "N/A"))}</div>
                   </div>
-                  <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-all bg-black p-3 font-mono text-xs text-green-300">
+                  <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-all rounded-xl border border-zinc-800 bg-zinc-950 p-3.5 font-mono text-xs text-emerald-400">
                     {JSON.stringify(geoIpResult.raw ?? geoIpResult, null, 2)}
                   </pre>
                 </div>
               ) : (
-                <p className="text-sm font-bold text-[var(--text-muted)]">{copy.settingsPage.noGeoIpQuery}</p>
+                <p className="text-sm font-medium text-[var(--text-muted)]">{copy.settingsPage.noGeoIpQuery}</p>
               )}
               {geoIpMmdbStatus ? (
-                <div className="mt-4 border-t-2 border-black pt-3 text-sm font-bold">
+                <div className="mt-4 border-t border-[var(--border-color)] pt-3 text-sm">
                   <div className="grid gap-2 md:grid-cols-2">
                     <div>{copy.settingsPage.mmdbStatusLabel.replace("{value}", geoIpMmdbStatus.configured ? copy.settingsPage.configured : copy.settingsPage.notConfigured)}</div>
                     <div>{copy.settingsPage.typeLabel.replace("{value}", String(geoIpMmdbStatus.database_type || "N/A"))}</div>
@@ -301,7 +301,7 @@ export function GeoIpCard() {
                     <div>{copy.settingsPage.sizeLabel.replace("{value}", String(geoIpMmdbStatus.size_bytes ?? "N/A"))}</div>
                     <div>{copy.settingsPage.ipVersionLabel.replace("{value}", String(geoIpMmdbStatus.ip_version || "N/A"))}</div>
                     <div className="break-all md:col-span-2">{copy.settingsPage.pathLabel.replace("{value}", String(geoIpMmdbStatus.path))}</div>
-                    {geoIpMmdbStatus.error ? <div className="break-all text-[var(--btn-bg)] md:col-span-2">{copy.settingsPage.errorLabel.replace("{value}", String(geoIpMmdbStatus.error))}</div> : null}
+                    {geoIpMmdbStatus.error ? <div className="break-all text-rose-500 md:col-span-2">{copy.settingsPage.errorLabel.replace("{value}", String(geoIpMmdbStatus.error))}</div> : null}
                   </div>
                 </div>
               ) : null}
@@ -313,7 +313,7 @@ export function GeoIpCard() {
       <BrutalCard className="mb-6">
         <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
           <div>
-            <h2 className="text-xl font-black uppercase">{copy.settingsPage.ddns}</h2>
+            <h2 className="text-lg font-semibold tracking-tight text-[var(--text-main)]">{copy.settingsPage.ddns}</h2>
             <div className="mt-2 flex flex-wrap gap-2">
               <StatusBadge tone={ddnsResolverUrl.trim() ? "green" : "gray"}>
                 {systemSettings ? (ddnsResolverUrl.trim() ? copy.settingsPage.resolverConfigured : copy.settingsPage.resolverSystem) : copy.common.notAvailable}

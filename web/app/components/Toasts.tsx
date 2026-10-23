@@ -1,14 +1,5 @@
 "use client";
 
-// Transient success/notice feedback. Inline notices previously stayed on
-// screen until the next action replaced them, and feedback for an action in
-// one settings card was invisible while looking at another. Toasts stack
-// bottom-right, dismiss themselves, and are announced politely.
-//
-// Rule of thumb for adopters: pure confirmations ("saved", "deleted") become
-// toasts; anything the user must read or copy (generated tokens, temp URLs)
-// stays inline where it cannot vanish mid-read.
-
 import { useSyncExternalStore } from "react";
 
 export interface ToastItem {
@@ -57,19 +48,19 @@ function getServerSnapshot(): ToastItem[] {
 }
 
 const toneClasses: Record<ToastItem["tone"], string> = {
-  green: "bg-[var(--accent-color)] text-[var(--btn-text)]",
-  yellow: "bg-[var(--accent-bg)] text-[var(--text-main)]",
+  green: "border-emerald-500/30 bg-[var(--bg-card)] text-[var(--text-main)]",
+  yellow: "border-amber-500/30 bg-[var(--bg-card)] text-[var(--text-main)]",
+};
+
+const dotClasses: Record<ToastItem["tone"], string> = {
+  green: "bg-emerald-500",
+  yellow: "bg-amber-500",
 };
 
 export function Toaster() {
   const items = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
 
   return (
-    // The live region stays mounted even when empty: screen readers only
-    // announce changes inside an existing region, not regions that appear
-    // already holding content. Above dialogs (z-60) so confirmations issued
-    // from a modal remain visible; pointer-events scoped to the cards so the
-    // empty region never blocks clicks.
     <div
       role="status"
       aria-live="polite"
@@ -78,14 +69,17 @@ export function Toaster() {
       {items.map((toast) => (
         <div
           key={toast.id}
-          className={`pointer-events-auto flex items-start justify-between gap-3 border-2 border-black px-3 py-2 text-sm font-black shadow-[var(--shadow-brutal)] ${toneClasses[toast.tone]}`}
+          className={`pointer-events-auto flex items-start justify-between gap-3 rounded-xl border px-3.5 py-2.5 text-xs font-medium shadow-[var(--shadow-md)] backdrop-blur-md ${toneClasses[toast.tone]}`}
         >
-          <span className="min-w-0 break-words">{toast.message}</span>
+          <div className="flex min-w-0 items-center gap-2">
+            <span className={`h-2 w-2 shrink-0 rounded-full ${dotClasses[toast.tone]}`} aria-hidden="true" />
+            <span className="min-w-0 break-words">{toast.message}</span>
+          </div>
           <button
             type="button"
             onClick={() => dismissToast(toast.id)}
             aria-label="dismiss"
-            className="shrink-0 border-2 border-black bg-[var(--bg-card)] px-1.5 text-xs font-black text-[var(--text-main)] shadow-[var(--shadow-brutal-sm)]"
+            className="shrink-0 rounded-md border border-[var(--border-color)] bg-[var(--bg-subtle)] px-1.5 py-0.5 text-xs font-medium text-[var(--text-muted)] transition hover:text-[var(--text-main)]"
           >
             ×
           </button>
@@ -94,3 +88,5 @@ export function Toaster() {
     </div>
   );
 }
+
+export const ToastViewport = Toaster;

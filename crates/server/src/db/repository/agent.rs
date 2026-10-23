@@ -9,6 +9,8 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use xlstatus_shared::{AgentId, UserId};
 
+const AGENT_LIST_MAX_LIMIT: i64 = 500;
+
 pub struct EnrollmentTokenRepository {
     db: DatabaseBackend,
 }
@@ -75,12 +77,15 @@ impl EnrollmentTokenRepository {
         token_hash: &str,
         agent_id: AgentId,
     ) -> Result<Option<EnrollmentToken>> {
+        if token_hash.trim().is_empty() {
+            return Ok(None);
+        }
         let now = Utc::now();
 
         match &self.db {
             DatabaseBackend::Sqlite(pool) => {
                 let result = sqlx::query(
-                    "UPDATE enrollment_tokens SET used_at = ?, used_by_agent_id = ? WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?",
+                    "UPDATE enrollment_tokens SET used_at = ?, used_by_agent_id = ? WHERE token_hash = ? AND used_at IS NULL AND julianday(expires_at) > julianday(?)",
                 )
                 .bind(now.to_rfc3339())
                 .bind(agent_id.0.to_string())
@@ -88,7 +93,7 @@ impl EnrollmentTokenRepository {
                 .bind(now.to_rfc3339())
                 .execute(pool)
                 .await?;
-                if result.rows_affected() == 0 {
+                if result.rows_affected() != 1 {
                     return Ok(None);
                 }
 
@@ -167,6 +172,14 @@ impl EnrollmentTokenRepository {
                 ))
             }
         }
+    }
+
+    pub async fn increment_usage(
+        &self,
+        token_hash: &str,
+        agent_id: AgentId,
+    ) -> Result<Option<EnrollmentToken>> {
+        self.find_and_use(token_hash, agent_id).await
     }
 }
 
@@ -298,6 +311,8 @@ impl AgentRepository {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<Agent>> {
+        let limit = limit.clamp(1, AGENT_LIST_MAX_LIMIT);
+        let offset = offset.max(0);
         match &self.db {
             DatabaseBackend::Sqlite(pool) => {
                 let rows = sqlx::query_as::<_, (String, String, String, String, Option<String>, Option<String>, String, String)>(
@@ -550,6 +565,8 @@ impl AgentRepository {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<AgentWithState>, i64)> {
+        let limit = limit.clamp(1, AGENT_LIST_MAX_LIMIT);
+        let offset = offset.max(0);
         let total = self.count_total().await?;
         let rows = match &self.db {
             DatabaseBackend::Sqlite(pool) => {
@@ -620,6 +637,8 @@ impl AgentRepository {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<AgentWithState>, i64)> {
+        let limit = limit.clamp(1, AGENT_LIST_MAX_LIMIT);
+        let offset = offset.max(0);
         let rows = match &self.db {
             DatabaseBackend::Sqlite(pool) => {
                 sqlx::query_as::<_, (String, String, String, String, Option<String>, Option<String>, String, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)>(
@@ -696,6 +715,8 @@ impl AgentRepository {
         if server_ids.is_empty() {
             return Ok((Vec::new(), 0));
         }
+        let limit = limit.clamp(1, AGENT_LIST_MAX_LIMIT);
+        let offset = offset.max(0);
 
         match &self.db {
             DatabaseBackend::Sqlite(pool) => {
@@ -1247,6 +1268,97 @@ mod tests {
         assert_eq!(total, 2);
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].agent.id, valid_agent.id);
+    }
+
+    #[tokio::test]
+    async fn enrollment_token_consumption_is_atomic_under_concurrency() {
+        let db = test_db().await;
+        let user = UserRepository::new(db.clone())
+            .create(CreateUserInput {
+                username: "owner-concurrent".into(),
+                password: "password123".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        let repo = EnrollmentTokenRepository::new(db.clone());
+        let token_hash = "concurrent-token-hash";
+        repo.create(
+            CreateEnrollmentTokenInput {
+                created_by_user_id: user.id,
+                expires_at: Utc::now() + chrono::Duration::hours(1),
+            },
+            token_hash.into(),
+        )
+        .await
+        .unwrap();
+
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let db_clone = db.clone();
+            tasks.push(tokio::spawn(async move {
+                EnrollmentTokenRepository::new(db_clone)
+                    .increment_usage(token_hash, AgentId(uuid::Uuid::now_v7()))
+                    .await
+                    .unwrap()
+            }));
+        }
+
+        let mut successes = 0;
+        for task in tasks {
+            if task.await.unwrap().is_some() {
+                successes += 1;
+            }
+        }
+        assert_eq!(successes, 1);
+    }
+
+    #[tokio::test]
+    async fn agent_list_queries_clamp_negative_and_oversized_pagination() {
+        let db = test_db().await;
+        let user = UserRepository::new(db.clone())
+            .create(CreateUserInput {
+                username: "owner-pagination".into(),
+                password: "password123".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        let repo = AgentRepository::new(db);
+        let mut ids = Vec::new();
+        for idx in 0..3 {
+            let agent = repo
+                .create(CreateAgentInput {
+                    name: format!("agent-{idx}"),
+                    public_key: "public-key".into(),
+                    owner_user_id: user.id,
+                })
+                .await
+                .unwrap();
+            ids.push(agent.id.0.to_string());
+        }
+
+        // Negative limit (-1 in SQLite means unlimited) must be clamped to 1
+        let by_owner = repo.list_by_owner(user.id, -1, -10).await.unwrap();
+        assert_eq!(by_owner.len(), 1);
+
+        let (with_state, total) = repo.list_with_state(-1, -5).await.unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(with_state.len(), 1);
+
+        let (owner_state, owner_total) = repo
+            .list_with_state_by_owner(user.id, -1, -5)
+            .await
+            .unwrap();
+        assert_eq!(owner_total, 3);
+        assert_eq!(owner_state.len(), 1);
+
+        let (by_ids, ids_total) = repo
+            .list_with_state_by_server_ids(Some(user.id), &ids, -1, -5)
+            .await
+            .unwrap();
+        assert_eq!(ids_total, 3);
+        assert_eq!(by_ids.len(), 1);
     }
 
     async fn insert_raw_agent(

@@ -523,13 +523,13 @@ const NAT_MAPPING_SELECT_POSTGRES_ACTIVE_BY_PUBLIC_PORT: &str = r#"
     WHERE m.public_port = $1 AND m.enabled = TRUE AND a.revoked_at IS NULL
 "#;
 const NAT_MAPPING_SELECT_SQLITE_BY_AGENT: &str =
-    nat_mapping_select!("WHERE agent_id = ? ORDER BY created_at DESC");
+    nat_mapping_select!("WHERE agent_id = ? ORDER BY created_at DESC LIMIT 500");
 const NAT_MAPPING_SELECT_POSTGRES_BY_AGENT: &str =
-    nat_mapping_select!("WHERE agent_id = $1 ORDER BY created_at DESC");
+    nat_mapping_select!("WHERE agent_id = $1 ORDER BY created_at DESC LIMIT 500");
 const NAT_MAPPING_SELECT_SQLITE_ENABLED: &str =
-    nat_mapping_select!("WHERE enabled = 1 ORDER BY public_port ASC");
+    nat_mapping_select!("WHERE enabled = 1 ORDER BY public_port ASC LIMIT 500");
 const NAT_MAPPING_SELECT_POSTGRES_ENABLED: &str =
-    nat_mapping_select!("WHERE enabled = TRUE ORDER BY public_port ASC");
+    nat_mapping_select!("WHERE enabled = TRUE ORDER BY public_port ASC LIMIT 500");
 const NAT_MAPPING_SELECT_SQLITE_ENABLED_ACTIVE_AGENTS: &str = r#"
     SELECT m.id, m.agent_id, m.local_host, m.local_port, m.public_port,
            m.protocol, m.enabled, m.description, m.allowed_sources,
@@ -541,6 +541,7 @@ const NAT_MAPPING_SELECT_SQLITE_ENABLED_ACTIVE_AGENTS: &str = r#"
     JOIN agents a ON a.id = m.agent_id
     WHERE m.enabled = 1 AND a.revoked_at IS NULL
     ORDER BY m.public_port ASC
+    LIMIT 500
 "#;
 const NAT_MAPPING_SELECT_POSTGRES_ENABLED_ACTIVE_AGENTS: &str = r#"
     SELECT m.id, m.agent_id, m.local_host, m.local_port, m.public_port,
@@ -553,6 +554,7 @@ const NAT_MAPPING_SELECT_POSTGRES_ENABLED_ACTIVE_AGENTS: &str = r#"
     JOIN agents a ON a.id = m.agent_id
     WHERE m.enabled = TRUE AND a.revoked_at IS NULL
     ORDER BY m.public_port ASC
+    LIMIT 500
 "#;
 
 fn parse_uuid(value: &str, field: &str) -> Result<uuid::Uuid> {

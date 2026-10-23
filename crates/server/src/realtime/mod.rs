@@ -21,6 +21,12 @@ use uuid::Uuid;
 
 const BROADCAST_CAPACITY: usize = 256;
 const LATEST_CACHE_PER_AGENT: usize = 1;
+const LATEST_CACHE_MAX_AGENTS: usize = LATEST_CACHE_PER_AGENT * 1024;
+const MAX_REALTIME_KIND_CHARS: usize = 64;
+const MAX_REALTIME_JSON_DEPTH: usize = 8;
+const MAX_REALTIME_OBJECT_KEYS: usize = 128;
+const MAX_REALTIME_ARRAY_LEN: usize = 256;
+const MAX_REALTIME_STRING_CHARS: usize = 512;
 
 /// One event on the wire. `agent_id` is the source; `payload` is the
 /// same JSON the gRPC layer also persisted to `agents.last_state_json`
@@ -35,12 +41,92 @@ pub struct RealtimeEvent {
 
 impl RealtimeEvent {
     pub fn new(kind: impl Into<String>, agent_id: Uuid, payload: serde_json::Value) -> Self {
+        let kind = sanitize_realtime_kind(&kind.into());
+        let payload = sanitize_realtime_payload(payload, 0);
         Self {
-            kind: kind.into(),
+            kind,
             agent_id,
             received_at: Utc::now(),
             payload,
         }
+    }
+}
+
+fn sanitize_realtime_kind(kind: &str) -> String {
+    let cleaned: String = kind
+        .chars()
+        .filter(|ch| !ch.is_control() && !ch.is_whitespace())
+        .take(MAX_REALTIME_KIND_CHARS)
+        .collect();
+    if cleaned.is_empty() {
+        "unknown".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn is_sensitive_realtime_key(key: &str) -> bool {
+    let lower = key.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "private_key"
+            | "public_key"
+            | "owner_user_id"
+            | "password"
+            | "password_hash"
+            | "secret"
+            | "csrf_token"
+            | "enrollment_token"
+            | "access_token"
+            | "refresh_token"
+            | "api_key"
+            | "bearer"
+            | "authorization"
+            | "cookie"
+            | "session_id"
+            | "totp_secret"
+    ) || lower.ends_with("_secret")
+        || lower.ends_with("_token")
+        || lower.ends_with("_private_key")
+}
+
+fn sanitize_realtime_payload(value: serde_json::Value, depth: usize) -> serde_json::Value {
+    if depth > MAX_REALTIME_JSON_DEPTH {
+        return serde_json::Value::Null;
+    }
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len().min(MAX_REALTIME_OBJECT_KEYS));
+            for (raw_key, val) in map {
+                if out.len() >= MAX_REALTIME_OBJECT_KEYS {
+                    break;
+                }
+                let key: String = raw_key
+                    .chars()
+                    .filter(|ch| !ch.is_control())
+                    .take(128)
+                    .collect();
+                if key.is_empty() || is_sensitive_realtime_key(&key) {
+                    continue;
+                }
+                out.insert(key, sanitize_realtime_payload(val, depth + 1));
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .into_iter()
+                .take(MAX_REALTIME_ARRAY_LEN)
+                .map(|item| sanitize_realtime_payload(item, depth + 1))
+                .collect(),
+        ),
+        serde_json::Value::String(s) => serde_json::Value::String(
+            s.chars()
+                .filter(|ch| !ch.is_control())
+                .take(MAX_REALTIME_STRING_CHARS)
+                .collect(),
+        ),
+        other => other,
     }
 }
 
@@ -69,21 +155,33 @@ impl BroadcastHub {
     /// Publish a HostState or HostInfo event. The hub also remembers
     /// the freshest event per agent so a new dashboard tab can render
     /// current state without waiting for the next tick.
-    pub fn publish(&self, event: RealtimeEvent) {
+    pub fn publish(&self, mut event: RealtimeEvent) {
+        event.kind = sanitize_realtime_kind(&event.kind);
+        event.payload = sanitize_realtime_payload(event.payload, 0);
         {
             let mut latest = self.latest.write();
-            latest.insert(event.agent_id, event.clone());
-            if latest.len() > LATEST_CACHE_PER_AGENT * 1024 {
-                // Defensive bound - we never expect this many agents
-                // in a single process, but we'd rather drop something
-                // than OOM.
-                latest.clear();
+            if latest.len() >= LATEST_CACHE_MAX_AGENTS && !latest.contains_key(&event.agent_id) {
+                // Defensive bound - evict the oldest cached agent entry rather than
+                // wiping the entire snapshot map on overflow.
+                if let Some(oldest_id) = latest
+                    .iter()
+                    .min_by_key(|(_, cached)| cached.received_at)
+                    .map(|(id, _)| *id)
+                {
+                    latest.remove(&oldest_id);
+                }
             }
+            latest.insert(event.agent_id, event.clone());
         }
         // send() returns Err only when there are no receivers; we
         // intentionally swallow that error to keep the publisher path
         // infallible.
         let _ = self.tx.send(event);
+    }
+
+    /// Evict a revoked or deleted agent from the latest snapshot cache.
+    pub fn remove_agent(&self, agent_id: &Uuid) {
+        self.latest.write().remove(agent_id);
     }
 
     /// Subscribe to all events. Returns a receiver that yields the
@@ -144,5 +242,38 @@ mod tests {
         let hub = BroadcastHub::new();
         // publish with zero subscribers must not error or panic.
         hub.publish(RealtimeEvent::new("host_state", uid(4), json!({})));
+    }
+
+    #[tokio::test]
+    async fn realtime_event_strips_sensitive_keys_and_control_characters() {
+        let hub = BroadcastHub::new();
+        let mut rx = hub.subscribe();
+        hub.publish(RealtimeEvent::new(
+            "host_info\u{0007}\n",
+            uid(9),
+            json!({
+                "hostname": "edge-\u{0000}node\u{001b}[31m",
+                "cpu_percent": 15.5,
+                "public_key": "ed25519-secret-key",
+                "private_key": "never-broadcast",
+                "owner_user_id": "00000000-0000-0000-0000-000000000001",
+                "enrollment_token": "tok_secret",
+                "nested": {
+                    "api_token": "secret",
+                    "safe_label": "ok\u{0007}"
+                }
+            }),
+        ));
+
+        let ev = rx.recv().await.unwrap();
+        assert_eq!(ev.kind, "host_info");
+        assert_eq!(ev.payload["hostname"], "edge-node[31m");
+        assert_eq!(ev.payload["cpu_percent"], 15.5);
+        assert!(ev.payload.get("public_key").is_none());
+        assert!(ev.payload.get("private_key").is_none());
+        assert!(ev.payload.get("owner_user_id").is_none());
+        assert!(ev.payload.get("enrollment_token").is_none());
+        assert!(ev.payload["nested"].get("api_token").is_none());
+        assert_eq!(ev.payload["nested"]["safe_label"], "ok");
     }
 }

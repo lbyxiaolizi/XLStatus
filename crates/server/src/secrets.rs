@@ -1,16 +1,28 @@
 //! Application-level encryption for secrets stored in the database.
 
 use crate::db::DatabaseBackend;
-use anyhow::{anyhow, bail, Context, Result};
-use ring::{aead, rand as ring_rand};
-use sha2::{Digest, Sha256};
+use anyhow::{anyhow, bail, Result};
+use ring::{aead, hkdf, rand as ring_rand};
 use sqlx::Row;
+use std::collections::HashSet;
+use std::fmt;
 use std::sync::OnceLock;
 
 const PREFIX: &str = "xlsec:v1:";
 const AAD: &[u8] = b"xlstatus.secrets.v1";
+const HKDF_SALT: &[u8] = b"xlstatus.secrets.salt.v1";
+const HKDF_INFO: &[u8] = b"XLStatus secret encryption key v1";
 const NONCE_LEN: usize = 12;
+const TAG_LEN: usize = 16;
+const NONCE_HEX_LEN: usize = NONCE_LEN * 2;
+const MIN_CIPHERTEXT_HEX_LEN: usize = TAG_LEN * 2;
+pub const MAX_SECRET_PLAINTEXT_BYTES: usize = 16 * 1024;
+const MAX_CIPHERTEXT_HEX_LEN: usize = (MAX_SECRET_PLAINTEXT_BYTES + TAG_LEN) * 2;
+pub const MAX_ENCRYPTED_SECRET_BYTES: usize =
+    PREFIX.len() + NONCE_HEX_LEN + 1 + MAX_CIPHERTEXT_HEX_LEN;
 const SECRET_SETTING_VALUE_JSON_MAX_BYTES: usize = 64 * 1024;
+const MIN_MASTER_KEY_BYTES: usize = 32;
+const MIN_MASTER_KEY_DISTINCT_BYTES: usize = 4;
 
 static SECRET_CRYPTO: OnceLock<SecretCrypto> = OnceLock::new();
 
@@ -32,6 +44,9 @@ pub fn decrypt_secret_if_needed(value: &str) -> Result<String> {
     if is_encrypted_secret(value) {
         active_crypto()?.decrypt(value)
     } else {
+        if value.len() > MAX_SECRET_PLAINTEXT_BYTES {
+            bail!("secret value exceeds maximum allowed size");
+        }
         Ok(value.to_string())
     }
 }
@@ -82,23 +97,73 @@ struct SecretCrypto {
     key: [u8; 32],
 }
 
+impl fmt::Debug for SecretCrypto {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SecretCrypto")
+            .field("key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Drop for SecretCrypto {
+    fn drop(&mut self) {
+        for byte in &mut self.key {
+            // SAFETY: self.key is a valid stack/heap byte array owned by self.
+            unsafe {
+                std::ptr::write_volatile(byte, 0);
+            }
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+struct HkdfKey32;
+
+impl hkdf::KeyType for HkdfKey32 {
+    fn len(&self) -> usize {
+        32
+    }
+}
+
 impl SecretCrypto {
     fn new(master_key: &str) -> Result<Self> {
         let master_key = master_key.trim();
-        if master_key.len() < 32 {
+        if master_key.len() < MIN_MASTER_KEY_BYTES {
             bail!("secret encryption key must be at least 32 characters");
         }
+        let weak_defaults = [
+            "CHANGE_ME_IN_PRODUCTION",
+            "change-me-in-production",
+            "replace-with-a-long-random-secret",
+            "replace-with-a-different-long-random-secret",
+            "replace-with-a-32-byte-random-hex-secret",
+            "replace-with-a-different-32-byte-random-hex-secret",
+        ];
+        if weak_defaults.contains(&master_key) {
+            bail!("secret encryption key uses an insecure default value");
+        }
+        let distinct: HashSet<u8> = master_key.bytes().collect();
+        if distinct.len() < MIN_MASTER_KEY_DISTINCT_BYTES {
+            bail!("secret encryption key has insufficient entropy");
+        }
 
-        let mut hasher = Sha256::new();
-        hasher.update(b"XLStatus secret encryption key v1\0");
-        hasher.update(master_key.as_bytes());
-        let digest = hasher.finalize();
+        let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, HKDF_SALT);
+        let prk = salt.extract(master_key.as_bytes());
+        let info = [HKDF_INFO];
+        let okm = prk
+            .expand(&info, HkdfKey32)
+            .map_err(|_| anyhow!("failed to derive secret encryption key"))?;
         let mut key = [0_u8; 32];
-        key.copy_from_slice(&digest);
+        okm.fill(&mut key)
+            .map_err(|_| anyhow!("failed to derive secret encryption key"))?;
         Ok(Self { key })
     }
 
     fn encrypt(&self, plaintext: &str) -> Result<String> {
+        if plaintext.len() > MAX_SECRET_PLAINTEXT_BYTES {
+            bail!("secret value exceeds maximum allowed size");
+        }
+
         let rng = ring_rand::SystemRandom::new();
         let mut nonce_bytes = [0_u8; NONCE_LEN];
         ring_rand::SecureRandom::fill(&rng, &mut nonce_bytes)
@@ -121,22 +186,32 @@ impl SecretCrypto {
     }
 
     fn decrypt(&self, encrypted: &str) -> Result<String> {
+        if encrypted.len() > MAX_ENCRYPTED_SECRET_BYTES {
+            bail!("encrypted secret exceeds maximum allowed size");
+        }
         let payload = encrypted
             .strip_prefix(PREFIX)
             .ok_or_else(|| anyhow!("secret is not encrypted"))?;
         let (nonce_hex, ciphertext_hex) = payload
             .split_once(':')
             .ok_or_else(|| anyhow!("encrypted secret payload is malformed"))?;
-        let nonce_vec =
-            hex::decode(nonce_hex).context("encrypted secret nonce is not valid hex")?;
-        if nonce_vec.len() != NONCE_LEN {
+        if nonce_hex.len() != NONCE_HEX_LEN {
             bail!("encrypted secret nonce has invalid length");
         }
+        if ciphertext_hex.len() < MIN_CIPHERTEXT_HEX_LEN
+            || ciphertext_hex.len() > MAX_CIPHERTEXT_HEX_LEN
+            || ciphertext_hex.len() % 2 != 0
+        {
+            bail!("encrypted secret ciphertext has invalid length");
+        }
+
+        let nonce_vec = hex::decode(nonce_hex)
+            .map_err(|_| anyhow!("encrypted secret nonce is not valid hex"))?;
         let mut nonce_bytes = [0_u8; NONCE_LEN];
         nonce_bytes.copy_from_slice(&nonce_vec);
 
-        let mut in_out =
-            hex::decode(ciphertext_hex).context("encrypted secret ciphertext is not valid hex")?;
+        let mut in_out = hex::decode(ciphertext_hex)
+            .map_err(|_| anyhow!("encrypted secret ciphertext is not valid hex"))?;
         let key = self.less_safe_key()?;
         let plaintext = key
             .open_in_place(
@@ -145,7 +220,8 @@ impl SecretCrypto {
                 &mut in_out,
             )
             .map_err(|_| anyhow!("failed to decrypt secret"))?;
-        String::from_utf8(plaintext.to_vec()).context("decrypted secret is not valid UTF-8")
+        String::from_utf8(plaintext.to_vec())
+            .map_err(|_| anyhow!("decrypted secret is not valid UTF-8"))
     }
 
     fn less_safe_key(&self) -> Result<aead::LessSafeKey> {
@@ -297,10 +373,16 @@ fn parse_migratable_secret_setting(key: &str, value_json: &str) -> Option<String
         return None;
     }
     match serde_json::from_str::<String>(value_json) {
-        Ok(value) => Some(value),
-        Err(err) => {
+        Ok(value) if value.len() <= MAX_SECRET_PLAINTEXT_BYTES => Some(value),
+        Ok(_) => {
             tracing::warn!(
-                "historical secret setting {key} skipped during plaintext migration: {err}"
+                "historical secret setting {key} skipped during plaintext migration: decoded string exceeds {MAX_SECRET_PLAINTEXT_BYTES} bytes"
+            );
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                "historical secret setting {key} skipped during plaintext migration: value_json is not a valid JSON string"
             );
             None
         }
@@ -362,6 +444,23 @@ struct DdnsSecretColumns {
     webhook_url: Option<String>,
 }
 
+impl fmt::Debug for DdnsSecretColumns {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DdnsSecretColumns")
+            .field("api_token", &self.api_token.as_ref().map(|_| "[REDACTED]"))
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "api_secret",
+                &self.api_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "webhook_url",
+                &self.webhook_url.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
 impl DdnsSecretColumns {
     fn encrypted(&self) -> Result<Self> {
         Ok(Self {
@@ -394,6 +493,46 @@ mod tests {
         let two = SecretCrypto::new("abcdefabcdefabcdefabcdefabcdef12").unwrap();
         let encrypted = one.encrypt("secret-value").unwrap();
         assert!(two.decrypt(&encrypted).is_err());
+    }
+
+    #[test]
+    fn rejects_weak_or_low_entropy_master_keys_and_redacts_debug() {
+        assert!(SecretCrypto::new("short-key").is_err());
+        assert!(SecretCrypto::new(&"a".repeat(32)).is_err());
+        assert!(SecretCrypto::new("replace-with-a-32-byte-random-hex-secret").is_err());
+
+        let crypto = SecretCrypto::new("01234567890123456789012345678901").unwrap();
+        let debug_str = format!("{crypto:?}");
+        assert!(debug_str.contains("[REDACTED]"));
+        assert!(!debug_str.contains("0123456789"));
+
+        let ddns_cols = DdnsSecretColumns {
+            api_token: Some("super-secret-ddns-token".into()),
+            api_key: Some("super-secret-ddns-key".into()),
+            api_secret: Some("super-secret-ddns-secret".into()),
+            webhook_url: Some("https://hooks.example.com/secret".into()),
+        };
+        let ddns_debug = format!("{ddns_cols:?}");
+        assert!(ddns_debug.contains("[REDACTED]"));
+        assert!(!ddns_debug.contains("super-secret"));
+    }
+
+    #[test]
+    fn rejects_oversized_plaintext_and_corrupt_ciphertext_before_allocation() {
+        let crypto = SecretCrypto::new("01234567890123456789012345678901").unwrap();
+        let oversized_plain = "x".repeat(MAX_SECRET_PLAINTEXT_BYTES + 1);
+        assert!(crypto.encrypt(&oversized_plain).is_err());
+        assert!(decrypt_secret_if_needed(&oversized_plain).is_err());
+
+        let oversized_cipher = format!(
+            "{PREFIX}{}:{}",
+            "00".repeat(NONCE_LEN),
+            "aa".repeat(MAX_SECRET_PLAINTEXT_BYTES + TAG_LEN + 1)
+        );
+        assert!(crypto.decrypt(&oversized_cipher).is_err());
+
+        let truncated_cipher = format!("{PREFIX}{}:001122", "00".repeat(NONCE_LEN));
+        assert!(crypto.decrypt(&truncated_cipher).is_err());
     }
 
     #[tokio::test]

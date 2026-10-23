@@ -13,20 +13,20 @@ export type ChartAxis = "left" | "right";
 export type ChartKind = "line" | "area";
 
 export interface ChartSeries {
-  id?: string;
+  id?: string | undefined;
   label: string;
   color: string;
   points: ChartPoint[];
-  axis?: ChartAxis;
-  kind?: ChartKind;
-  opacity?: number;
-  strokeDasharray?: string;
-  strokeWidth?: number;
+  axis?: ChartAxis | undefined;
+  kind?: ChartKind | undefined;
+  opacity?: number | undefined;
+  strokeDasharray?: string | undefined;
+  strokeWidth?: number | undefined;
 }
 
 export interface PublicServiceResult {
   status: string;
-  delay_ms?: number | null;
+  delay_ms?: number | null | undefined;
   created_at: string;
 }
 
@@ -34,7 +34,7 @@ export interface PublicServiceDay {
   key: string;
   label: string;
   uptime: number;
-  avgDelay?: number;
+  avgDelay?: number | undefined;
   total: number;
 }
 

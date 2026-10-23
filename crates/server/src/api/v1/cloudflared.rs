@@ -4,6 +4,7 @@ use crate::api::types::ApiResponse;
 use crate::api::v1::auth::{require_sensitive_totp, AppError, AppState};
 use crate::api::v1::settings::{
     cloudflared_token, cloudflared_token_configured, set_cloudflared_token,
+    validate_cloudflared_token_str,
 };
 use crate::auth::middleware::{AuthKind, AuthSession};
 use axum::{
@@ -101,6 +102,7 @@ pub async fn start_cloudflared(
         .ok_or(AppError::BadRequest(
             "cloudflared token is not configured".into(),
         ))?;
+    validate_cloudflared_token_str(&token)?;
     let mut process = CLOUDFLARED.lock().await;
     refresh_process(&mut process);
     if process.child.is_some() {
@@ -117,10 +119,10 @@ pub async fn start_cloudflared(
         .map_err(|e| AppError::BadRequest(format!("failed to start cloudflared: {e}")))?;
 
     if let Some(stdout) = child.stdout.take() {
-        tokio::spawn(read_cloudflared_logs("stdout", stdout));
+        tokio::spawn(read_cloudflared_logs("stdout", stdout, Some(token.clone())));
     }
     if let Some(stderr) = child.stderr.take() {
-        tokio::spawn(read_cloudflared_logs("stderr", stderr));
+        tokio::spawn(read_cloudflared_logs("stderr", stderr, Some(token)));
     }
     process.started_at = Some(Utc::now().to_rfc3339());
     process.last_error = None;
@@ -204,17 +206,18 @@ fn cloudflared_run_command(token: &str) -> Command {
     command
 }
 
-async fn read_cloudflared_logs<R>(stream_name: &'static str, stream: R)
-where
+async fn read_cloudflared_logs<R>(
+    stream_name: &'static str,
+    stream: R,
+    configured_token: Option<String>,
+) where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut lines = BufReader::new(stream).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         let mut process = CLOUDFLARED.lock().await;
-        push_log(
-            &mut process,
-            &format!("{stream_name}: {}", redact_token(&line)),
-        );
+        let redacted = redact_token_with_secret(&line, configured_token.as_deref());
+        push_log(&mut process, &format!("{stream_name}: {redacted}"));
     }
 }
 
@@ -222,13 +225,69 @@ fn push_log(process: &mut CloudflaredProcess, line: &str) {
     while process.logs.len() >= 200 {
         process.logs.pop_front();
     }
+    let sanitized: String = line
+        .chars()
+        .filter(|ch| !ch.is_control() || *ch == '\t')
+        .take(2048)
+        .collect();
     process
         .logs
-        .push_back(format!("{} {line}", Utc::now().to_rfc3339()));
+        .push_back(format!("{} {sanitized}", Utc::now().to_rfc3339()));
 }
 
+#[cfg(test)]
 fn redact_token(line: &str) -> String {
-    line.replace("token=", "token=<redacted>")
+    redact_token_with_secret(line, None)
+}
+
+fn redact_token_with_secret(line: &str, configured_token: Option<&str>) -> String {
+    let mut redacted = line.to_string();
+    if let Some(secret) = configured_token.map(str::trim).filter(|s| !s.is_empty()) {
+        redacted = redacted.replace(secret, "<redacted>");
+    }
+    for prefix in [
+        "TUNNEL_TOKEN=",
+        "--token=",
+        "--token ",
+        "token=",
+        "\"token\":\"",
+        "\"token\": \"",
+    ] {
+        redacted = redact_after_prefix(&redacted, prefix);
+    }
+    redacted
+}
+
+fn redact_after_prefix(input: &str, prefix: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(idx) = rest.find(prefix) {
+        let split_at = idx + prefix.len();
+        out.push_str(&rest[..split_at]);
+        let after = &rest[split_at..];
+        if let Some(stripped) = after.strip_prefix("<redacted>") {
+            out.push_str("<redacted>");
+            rest = stripped;
+            continue;
+        }
+        let end = if prefix.ends_with('"') {
+            after.find('"').unwrap_or(after.len())
+        } else if let Some(stripped) = after.strip_prefix('"') {
+            stripped.find('"').map(|i| i + 2).unwrap_or(after.len())
+        } else if let Some(stripped) = after.strip_prefix('\'') {
+            stripped.find('\'').map(|i| i + 2).unwrap_or(after.len())
+        } else {
+            after
+                .find(|ch: char| {
+                    ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | ';' | ')' | ']' | '}')
+                })
+                .unwrap_or(after.len())
+        };
+        out.push_str("<redacted>");
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn require_admin(auth: &AuthSession) -> Result<(), AppError> {
@@ -297,6 +356,28 @@ mod tests {
             require_admin_cookie_session(&auth),
             Err(AppError::Forbidden(_))
         ));
+    }
+
+    #[test]
+    fn cloudflared_log_redaction_strips_token_values() {
+        let secret = "eyJhIjoiMTIzNDU2Nzg5MCIsInQiOiJhYmNkZWYifQ==";
+        let line = format!("INF Starting tunnel token={secret} connIndex=0");
+        let redacted = super::redact_token(&line);
+        assert_eq!(redacted, "INF Starting tunnel token=<redacted> connIndex=0");
+        assert!(!redacted.contains(secret));
+
+        let cli_line = format!("cloudflared tunnel run --token {secret} --no-autoupdate");
+        let redacted_cli = super::redact_token(&cli_line);
+        assert_eq!(
+            redacted_cli,
+            "cloudflared tunnel run --token <redacted> --no-autoupdate"
+        );
+        assert!(!redacted_cli.contains(secret));
+
+        let raw_line = format!("fatal: invalid tunnel credentials {secret}");
+        let redacted_raw = super::redact_token_with_secret(&raw_line, Some(secret));
+        assert_eq!(redacted_raw, "fatal: invalid tunnel credentials <redacted>");
+        assert!(!redacted_raw.contains(secret));
     }
 
     fn auth_session(auth_kind: AuthKind) -> AuthSession {

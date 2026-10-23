@@ -13,10 +13,14 @@ use chrono::{DateTime, Utc};
 use sqlx::postgres::PgRow;
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
+use std::fmt;
 use tracing::warn;
 use xlstatus_shared::ddns::*;
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+const DDNS_HISTORY_MAX_LIMIT: i64 = 500;
+const REDACTED_SECRET: &str = "[REDACTED]";
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct DdnsConfigRow {
     pub id: String,
     pub owner_user_id: String,
@@ -36,6 +40,40 @@ pub struct DdnsConfigRow {
     pub enabled: bool,
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl fmt::Debug for DdnsConfigRow {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DdnsConfigRow")
+            .field("id", &self.id)
+            .field("owner_user_id", &self.owner_user_id)
+            .field("agent_id", &self.agent_id)
+            .field("name", &self.name)
+            .field("provider", &self.provider)
+            .field("domain", &self.domain)
+            .field("record_id", &self.record_id)
+            .field("zone_id", &self.zone_id)
+            .field(
+                "api_token",
+                &self.api_token.as_ref().map(|_| REDACTED_SECRET),
+            )
+            .field("api_key", &self.api_key.as_ref().map(|_| REDACTED_SECRET))
+            .field(
+                "api_secret",
+                &self.api_secret.as_ref().map(|_| REDACTED_SECRET),
+            )
+            .field(
+                "webhook_url",
+                &self.webhook_url.as_ref().map(|_| REDACTED_SECRET),
+            )
+            .field("current_ip", &self.current_ip)
+            .field("last_applied_ip", &self.last_applied_ip)
+            .field("last_applied_at", &self.last_applied_at)
+            .field("enabled", &self.enabled)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
 }
 
 pub struct DdnsConfigRepository;
@@ -270,6 +308,7 @@ impl DdnsHistoryRepository {
         config_id: &str,
         limit: i64,
     ) -> Result<Vec<DdnsHistoryEntry>> {
+        let limit = limit.clamp(1, DDNS_HISTORY_MAX_LIMIT);
         let mut entries: Vec<DdnsHistoryEntry> = Vec::new();
         match db {
             crate::db::DatabaseBackend::Sqlite(pool) => {
@@ -312,8 +351,10 @@ macro_rules! ddns_config_select {
     };
 }
 
-const DDNS_CONFIG_SELECT_SQLITE_ENABLED: &str = ddns_config_select!("WHERE enabled = 1");
-const DDNS_CONFIG_SELECT_POSTGRES_ENABLED: &str = ddns_config_select!("WHERE enabled = TRUE");
+const DDNS_CONFIG_SELECT_SQLITE_ENABLED: &str =
+    ddns_config_select!("WHERE enabled = 1 ORDER BY created_at DESC LIMIT 500");
+const DDNS_CONFIG_SELECT_POSTGRES_ENABLED: &str =
+    ddns_config_select!("WHERE enabled = TRUE ORDER BY created_at DESC LIMIT 500");
 const DDNS_CONFIG_SELECT_SQLITE_BY_ID: &str = ddns_config_select!("WHERE id = ?");
 const DDNS_CONFIG_SELECT_POSTGRES_BY_ID: &str = ddns_config_select!("WHERE id = $1");
 
@@ -663,6 +704,67 @@ mod tests {
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].id, valid_id);
         assert_eq!(configs[0].last_applied_ip.as_deref(), Some("198.51.100.10"));
+    }
+
+    #[tokio::test]
+    async fn ddns_config_debug_redacts_secrets_and_history_clamps_limit() {
+        let db = test_db().await;
+        let user = UserRepository::new(db.clone())
+            .create(CreateUserInput {
+                username: "debug-owner".into(),
+                password: "secret".into(),
+                role: UserRole::Admin,
+            })
+            .await
+            .unwrap();
+        let config_id = uuid::Uuid::now_v7().to_string();
+        let row = DdnsConfigRow {
+            id: config_id.clone(),
+            owner_user_id: user.id.0.to_string(),
+            agent_id: None,
+            name: "cf".into(),
+            provider: "cloudflare".into(),
+            domain: "example.com".into(),
+            record_id: None,
+            zone_id: Some("zone".into()),
+            api_token: Some("secret-api-token".into()),
+            api_key: Some("secret-api-key".into()),
+            api_secret: Some("secret-api-secret".into()),
+            webhook_url: Some("https://hook.example.com/secret-url".into()),
+            current_ip: None,
+            last_applied_ip: None,
+            last_applied_at: None,
+            enabled: true,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let dbg = format!("{row:?}");
+        assert!(dbg.contains("[REDACTED]"));
+        assert!(!dbg.contains("secret-api-token"));
+        assert!(!dbg.contains("secret-api-key"));
+        assert!(!dbg.contains("secret-api-secret"));
+        assert!(!dbg.contains("secret-url"));
+
+        DdnsConfigRepository::create(&db, &row).await.unwrap();
+        for idx in 0..3 {
+            DdnsConfigRepository::record_history(
+                &db,
+                &uuid::Uuid::now_v7().to_string(),
+                &config_id,
+                None,
+                &format!("198.51.100.{idx}"),
+                true,
+                None,
+                &chrono::Utc::now().to_rfc3339(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let clamped = DdnsHistoryRepository::list_for_config(&db, &config_id, -1)
+            .await
+            .unwrap();
+        assert_eq!(clamped.len(), 1);
     }
 
     async fn test_db() -> DatabaseBackend {

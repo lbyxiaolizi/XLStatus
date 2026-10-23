@@ -333,7 +333,7 @@ async fn ensure_alert_conditions_visible_to_auth(
             AlertCondition::ServiceDown { service_id, .. }
             | AlertCondition::ServiceLatency { service_id, .. }
             | AlertCondition::CertificateExpiry { service_id, .. } => {
-                ensure_service_id_visible_to_auth(db, auth, service_id).await?;
+                ensure_alert_service_visible_to_auth(db, auth, service_id).await?;
             }
             AlertCondition::ServerExpiry { agent_id, .. }
             | AlertCondition::ServerTrafficQuota { agent_id, .. }
@@ -344,6 +344,68 @@ async fn ensure_alert_conditions_visible_to_auth(
         }
     }
     Ok(())
+}
+
+async fn ensure_alert_service_visible_to_auth(
+    db: &crate::db::Db,
+    auth: &AuthSession,
+    service_id: &str,
+) -> Result<(), AppError> {
+    ensure_service_id_visible_to_auth(db, auth, service_id).await?;
+    let (owner_user_id, cover_mode, exclude_server_ids_json) =
+        fetch_service_scope_metadata(db, service_id).await?;
+    if !auth.role.is_admin() {
+        if let Some(owner_user_id) = owner_user_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if owner_user_id != auth.user_id.0.to_string() {
+                return Err(AppError::Forbidden("service not in scope".into()));
+            }
+        }
+    }
+    if auth.server_ids.is_some() {
+        let has_excludes = exclude_server_ids_json
+            .as_deref()
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty() && *raw != "[]")
+            .is_some();
+        if cover_mode != "specific" || has_excludes {
+            return Err(AppError::Forbidden("service not in scope".into()));
+        }
+    }
+    Ok(())
+}
+
+async fn fetch_service_scope_metadata(
+    db: &crate::db::Db,
+    service_id: &str,
+) -> Result<(Option<String>, String, Option<String>), AppError> {
+    match db {
+        DatabaseBackend::Sqlite(pool) => {
+            sqlx::query_as(
+                "SELECT owner_user_id, COALESCE(cover_mode, 'local'), exclude_server_ids_json FROM services WHERE id = ?",
+            )
+            .bind(service_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|err| AppError::Database(err.into()))?
+            .ok_or_else(|| AppError::NotFound("service not found".into()))
+        }
+        DatabaseBackend::Postgres(pool) => {
+            let service_uuid = uuid::Uuid::parse_str(service_id)
+                .map_err(|err| AppError::BadRequest(format!("invalid service_id: {err}")))?;
+            sqlx::query_as(
+                "SELECT owner_user_id::text, COALESCE(cover_mode, 'local'), exclude_server_ids_json FROM services WHERE id = $1",
+            )
+            .bind(service_uuid)
+            .fetch_optional(pool)
+            .await
+            .map_err(|err| AppError::Database(err.into()))?
+            .ok_or_else(|| AppError::NotFound("service not found".into()))
+        }
+    }
 }
 
 async fn ensure_alert_agent_visible_to_auth(
@@ -417,7 +479,13 @@ async fn alert_rule_visible_to_auth(
     Ok(
         ensure_alert_conditions_visible_to_auth(db, auth, &rule.conditions)
             .await
-            .is_ok(),
+            .is_ok()
+            && ensure_tasks_visible_to_auth(db, auth, &rule.failure_task_ids)
+                .await
+                .is_ok()
+            && ensure_tasks_visible_to_auth(db, auth, &rule.recovery_task_ids)
+                .await
+                .is_ok(),
     )
 }
 
@@ -696,6 +764,93 @@ mod tests {
             &db,
             &pat_alert_session(owner, UserRole::Admin, &[allowed_server]),
             &[blocked_task.to_string()],
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn pat_alert_rule_visibility_rejects_rule_with_out_of_scope_trigger_task() {
+        let db = test_db().await;
+        let owner = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let allowed_server = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000101").unwrap();
+        let blocked_server = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000202").unwrap();
+        let blocked_task = "00000000-0000-0000-0000-000000000301";
+        let rule_id = "00000000-0000-0000-0000-000000000501";
+
+        seed_user(&db, owner, "owner", "admin").await;
+        seed_agent(&db, allowed_server, owner, "allowed").await;
+        seed_agent(&db, blocked_server, owner, "blocked").await;
+        seed_task_with_selector(
+            &db,
+            blocked_task,
+            owner,
+            serde_json::json!({ "server_ids": [blocked_server.to_string()] }),
+        )
+        .await;
+        seed_alert_rule_with_condition(
+            &db,
+            rule_id,
+            owner,
+            "rule-with-blocked-task",
+            server_offline_condition(allowed_server),
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+        let DatabaseBackend::Sqlite(pool) = &db else {
+            unreachable!();
+        };
+        sqlx::query("UPDATE alert_rules SET fail_task_ids_json = ? WHERE id = ?")
+            .bind(serde_json::to_string(&[blocked_task]).unwrap())
+            .bind(rule_id)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        let rule = AlertRepository::new(db.clone())
+            .find_by_id(rule_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let visible = alert_rule_visible_to_auth(
+            &db,
+            &pat_alert_session(owner, UserRole::Admin, &[&allowed_server.to_string()]),
+            &rule,
+        )
+        .await
+        .unwrap();
+
+        assert!(!visible);
+    }
+
+    #[tokio::test]
+    async fn pat_alert_service_condition_rejects_broad_cover_mode_service() {
+        let db = test_db().await;
+        let owner = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let allowed_server = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000101").unwrap();
+        let broad_service = "00000000-0000-0000-0000-000000000301";
+
+        seed_user(&db, owner, "owner", "admin").await;
+        seed_agent(&db, allowed_server, owner, "allowed").await;
+        seed_service(&db, broad_service, allowed_server).await;
+        let DatabaseBackend::Sqlite(pool) = &db else {
+            unreachable!();
+        };
+        sqlx::query("UPDATE services SET cover_mode = 'all' WHERE id = ?")
+            .bind(broad_service)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        let err = ensure_alert_conditions_visible_to_auth(
+            &db,
+            &pat_alert_session(owner, UserRole::Admin, &[&allowed_server.to_string()]),
+            &[AlertCondition::ServiceDown {
+                service_id: broad_service.to_string(),
+                consecutive_failures: 1,
+            }],
         )
         .await
         .unwrap_err();

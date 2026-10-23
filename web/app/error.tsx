@@ -1,10 +1,5 @@
 "use client";
 
-// Route-level error boundary (App Router convention). Before this existed, a
-// render-time throw anywhere in a page — e.g. the old `load_1.toFixed` on a null
-// metric — blanked the whole app. Now it collapses to this recoverable panel
-// while the root layout stays mounted.
-
 import { useEffect } from "react";
 import { getTranslations } from "@/lib/i18n";
 
@@ -22,24 +17,38 @@ export default function RouteError({
   }, [error]);
 
   const buttonBase =
-    "inline-flex min-h-10 items-center justify-center border-2 border-black px-4 py-2 text-sm font-black uppercase tracking-wide shadow-[2px_2px_0_0_#000] transition hover:-translate-x-0.5 hover:-translate-y-0.5";
+    "inline-flex min-h-9 items-center justify-center rounded-lg border px-4 py-2 text-xs font-medium tracking-tight transition";
 
   return (
-    <main className="mx-auto flex w-full max-w-3xl flex-col gap-5 px-4 py-16">
-      <div className="border-4 border-black bg-[var(--bg-card)] p-6 shadow-[10px_10px_0_0_#000]">
-        <p className="inline-block border-2 border-black bg-[var(--accent-bg)] px-3 py-1 text-xs font-black uppercase tracking-wide shadow-[2px_2px_0_0_#000]">
+    <main className="mx-auto flex w-full max-w-2xl flex-col gap-5 px-4 py-16">
+      <div className="rounded-xl border border-[var(--border-color)] bg-[var(--bg-card)] p-6 shadow-[var(--shadow-sm)]">
+        <p className="inline-flex items-center gap-1.5 rounded-md border border-rose-500/30 bg-rose-500/10 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wider text-rose-600 dark:text-rose-400">
+          <span className="h-1.5 w-1.5 rounded-full bg-rose-500" />
           {copy.pageError}
         </p>
-        <h1 className="mt-4 text-2xl font-black uppercase text-[var(--text-main)]">{copy.loadFailed}</h1>
-        <p className="mt-3 text-sm font-bold text-[var(--text-muted)]">
+        <h1 className="mt-4 text-xl font-semibold text-[var(--text-main)]">
+          {copy.loadFailed}
+        </h1>
+        <p className="mt-2 text-sm text-[var(--text-muted)]">
           {error.message || copy.unexpected}
-          {error.digest ? <span className="ml-2 opacity-60">({error.digest})</span> : null}
+          {error.digest ? (
+            <span className="ml-2 font-mono text-xs opacity-60">
+              ({error.digest})
+            </span>
+          ) : null}
         </p>
-        <div className="mt-6 flex flex-wrap gap-3">
-          <button type="button" onClick={reset} className={`${buttonBase} bg-black text-white`}>
+        <div className="mt-6 flex flex-wrap gap-2.5">
+          <button
+            type="button"
+            onClick={reset}
+            className={`${buttonBase} border-transparent bg-[var(--btn-bg)] text-[var(--btn-text)] hover:opacity-90`}
+          >
             {copy.retry}
           </button>
-          <a href="/status" className={`${buttonBase} bg-[var(--bg-card)] text-[var(--text-main)]`}>
+          <a
+            href="/status"
+            className={`${buttonBase} border-[var(--border-color)] bg-[var(--bg-card)] text-[var(--text-main)] hover:bg-[var(--bg-hover)]`}
+          >
             {copy.backToStatus}
           </a>
         </div>

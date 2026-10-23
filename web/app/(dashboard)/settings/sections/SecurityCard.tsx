@@ -21,6 +21,7 @@ import {
   type TotpStatusResponse,
 } from "@/lib/api";
 import { useI18n } from "@/lib/use-i18n";
+import { sanitizeExternalHttpUrl } from "@/app/lib/security";
 import { useBusy } from "@/app/lib/use-busy";
 import { useLoadOnVisible } from "@/app/lib/use-load-on-visible";
 import { SectionFeedback } from "./shared";
@@ -137,8 +138,9 @@ export function SecurityCard() {
     const totpCode = await sensitiveTotpCode();
     if (totpCode === null) return;
     const response = await apiClient.startOAuthBind(providerId, "/settings", totpCode);
-    if (response.success && response.data?.authorization_url) {
-      window.location.href = response.data.authorization_url;
+    const safeAuthUrl = sanitizeExternalHttpUrl(response.data?.authorization_url);
+    if (response.success && safeAuthUrl) {
+      window.location.href = safeAuthUrl;
     } else {
       setError(responseError(response));
     }
@@ -163,7 +165,7 @@ export function SecurityCard() {
       <BrutalCard>
         <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
           <div>
-            <h2 className="text-xl font-black uppercase">{copy.settingsPage.accountSecurity}</h2>
+            <h2 className="text-lg font-semibold tracking-tight text-[var(--text-main)]">{copy.settingsPage.accountSecurity}</h2>
           </div>
           <button type="button" className={buttonClass("secondary")} onClick={() => void loadTotpStatus(true)} disabled={totpLoading}>
             {totpLoading ? copy.settingsPage.loading : copy.settingsPage.refresh}
@@ -193,7 +195,7 @@ export function SecurityCard() {
                 </div>
               </div>
             ) : (
-              <p className="text-sm font-bold text-[var(--text-muted)]">
+              <p className="text-sm font-medium text-[var(--text-muted)]">
                 {copy.settingsPage.totpHint}
               </p>
             )}
@@ -221,19 +223,19 @@ export function SecurityCard() {
               </button>
             </div>
             {oauthProviders.length > 0 || staleOAuthBindings.length > 0 ? (
-              <div className="grid gap-3 border-t-2 border-black pt-3">
+              <div className="grid gap-3 border-t border-[var(--border-color)] pt-3">
                 {oauthProviders.map((provider) => {
                   const binding = oauthBindingMap.get(provider.id);
                   return (
-                    <div key={provider.id} className="grid gap-3 border-2 border-black bg-[var(--bg-card)] p-3">
+                    <div key={provider.id} className="grid gap-3 rounded-xl border border-[var(--border-color)] bg-[var(--bg-subtle)] p-3.5">
                       <div className="flex flex-wrap items-start justify-between gap-2">
                         <div className="min-w-0">
-                          <p className="truncate text-sm font-black uppercase">{provider.display_name}</p>
-                          <p className="break-all text-xs font-bold text-[var(--text-muted)]">
+                          <p className="truncate text-sm font-semibold text-[var(--text-main)]">{provider.display_name}</p>
+                          <p className="break-all text-xs text-[var(--text-muted)]">
                             {binding?.email || binding?.display_name || binding?.subject || provider.scopes.join(" ")}
                           </p>
                           {binding ? (
-                            <p className="text-xs font-bold text-[var(--text-muted)]">
+                            <p className="text-xs text-[var(--text-muted)]">
                               {copy.settingsPage.boundAt.replace("{date}", String(formatDate(binding.created_at)))}
                             </p>
                           ) : null}
@@ -265,14 +267,14 @@ export function SecurityCard() {
                   );
                 })}
                 {staleOAuthBindings.map((binding) => (
-                  <div key={binding.provider} className="grid gap-3 border-2 border-black bg-[var(--bg-card)] p-3">
+                  <div key={binding.provider} className="grid gap-3 rounded-xl border border-[var(--border-color)] bg-[var(--bg-subtle)] p-3.5">
                     <div className="flex flex-wrap items-start justify-between gap-2">
                       <div className="min-w-0">
-                        <p className="truncate text-sm font-black uppercase">{binding.provider_display_name}</p>
-                        <p className="break-all text-xs font-bold text-[var(--text-muted)]">
+                        <p className="truncate text-sm font-semibold text-[var(--text-main)]">{binding.provider_display_name}</p>
+                        <p className="break-all text-xs text-[var(--text-muted)]">
                           {binding.email || binding.display_name || binding.subject}
                         </p>
-                        <p className="text-xs font-bold text-[var(--text-muted)]">
+                        <p className="text-xs text-[var(--text-muted)]">
                           {copy.settingsPage.configRemovedBoundAt.replace("{date}", String(formatDate(binding.created_at)))}
                         </p>
                       </div>

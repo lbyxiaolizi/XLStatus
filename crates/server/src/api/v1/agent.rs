@@ -181,6 +181,9 @@ pub async fn revoke_agent(
             "agent not found or already revoked".into(),
         ));
     }
+    let agent_id = AgentId(agent_id);
+    crate::api::v1::agent_jwt::purge_agent_jwt_challenges(&state.agent_jwt_challenges, agent_id)
+        .await;
     let msg = ServerMessage {
         payload: Some(ServerPayload::ForceDisconnect(
             xlstatus_proto_gen::xlstatus::v1::ForceDisconnect {
@@ -188,20 +191,16 @@ pub async fn revoke_agent(
             },
         )),
     };
-    // Session registry is process-local; not part of AppState today
-    // to keep the type small. Resolve it from a sidecar Arc that
-    // main.rs wires in.
-    let registry = revoke_registry()
-        .ok_or_else(|| AppError::BadRequest("revoke registry not initialized".into()))?;
-    let agent_id = AgentId(agent_id);
-    if let Err(e) = registry.session.send(&agent_id, msg).await {
-        // No live session is fine; the next reconnect attempt will be
-        // rejected at the JWT challenge step. We still return 200 so
-        // the admin's revoke succeeds.
-        tracing::debug!("no live session to force_disconnect: {}", e);
+    let _ = state.session_registry.send(&agent_id, msg.clone()).await;
+    state.session_registry.disconnect(&agent_id).await;
+    state.io_registry.disconnect_agent(&agent_id).await;
+    if let Some(registry) = revoke_registry() {
+        if let Err(e) = registry.session.send(&agent_id, msg).await {
+            tracing::debug!("no live session to force_disconnect: {}", e);
+        }
+        registry.session.disconnect(&agent_id).await;
+        registry.io.disconnect_agent(&agent_id).await;
     }
-    registry.session.disconnect(&agent_id).await;
-    registry.io.disconnect_agent(&agent_id).await;
     if let Some(manager) = crate::current_nat_manager() {
         if let Err(e) = manager.reload().await {
             tracing::warn!("NAT manager reload failed after agent revoke: {}", e);
@@ -538,6 +537,61 @@ mod tests {
         .unwrap();
         assert_eq!(response.0.data.expect("enroll response data").name, "agent");
         assert_eq!(unused_enrollment_token_count(&db).await, 0);
+    }
+
+    #[tokio::test]
+    async fn revoke_agent_purges_jwt_challenges_and_disconnects_sessions() {
+        let db = test_db().await;
+        let user_id = uuid::Uuid::from_bytes([1; 16]);
+        seed_user(&db, user_id).await;
+        let token = seed_enrollment_token(&db, user_id, "xle_", "d").await;
+        let state = test_state(db.clone());
+
+        let enrolled = enroll(
+            State(state.clone()),
+            Json(EnrollRequest {
+                name: "edge-revoke".into(),
+                enrollment_token: token,
+                public_key: "b".repeat(64),
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .data
+        .unwrap();
+        let agent_id = AgentId(uuid::Uuid::parse_str(&enrolled.agent_id).unwrap());
+
+        {
+            let mut challenges = state.agent_jwt_challenges.write().await;
+            challenges.insert(
+                format!("{}:{}", agent_id.0, "a".repeat(64)),
+                Utc::now() + Duration::seconds(60),
+            );
+            challenges.insert(
+                format!("request:{}:{}", agent_id.0, "b".repeat(64)),
+                Utc::now() + Duration::seconds(60),
+            );
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let _guard = state.session_registry.register(agent_id, tx).await;
+
+        let res = revoke_agent(
+            State(state.clone()),
+            auth_user(AuthKind::Session, UserRole::Admin),
+            HeaderMap::new(),
+            Path(enrolled.agent_id.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(res.0.success);
+        assert!(state.agent_jwt_challenges.read().await.is_empty());
+        assert!(!state.session_registry.is_online(&agent_id).await);
+        let msg = rx.recv().await.expect("force disconnect message").unwrap();
+        assert!(matches!(
+            msg.payload,
+            Some(ServerPayload::ForceDisconnect(_))
+        ));
     }
 
     async fn test_db() -> crate::db::DatabaseBackend {

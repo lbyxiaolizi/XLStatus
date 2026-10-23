@@ -16,16 +16,10 @@ import {
   useStoredUser,
   type StoredUser,
 } from "@/app/components/M7Primitives";
-import { sanitizeReturnTo } from "@/app/lib/format";
+import { resolveLoginRedirectParam } from "@/app/lib/security";
 import { useI18n } from "@/lib/use-i18n";
 import type { Translations } from "@/lib/i18n";
 
-// The generic responseError maps 401 to "authentication required" and 403 to
-// "permission denied" — both are wrong on the login screen itself, where 401
-// means bad credentials and 403 means this request was refused (WAF ban, or a
-// stale-cookie CSRF rejection from the auth middleware, which arrives with no
-// body). Every 403 gets login-context copy; the ban copy avoids asserting a
-// cause or duration because manual WAF bans share the same backend message.
 function loginErrorMessage(response: ApiResponse<unknown>, copy: Translations): string {
   const backendError = response.error ?? "";
   if (response.status === 401) {
@@ -53,16 +47,11 @@ export default function LoginPage() {
   const [totpCode, setTotpCode] = useState("");
   const [mfaRequired, setMfaRequired] = useState(false);
   const [oauthProviders, setOauthProviders] = useState<OAuthProvider[]>([]);
-  // Read query params synchronously on first client render (no setTimeout(0)
-  // deferral, which left a tick where returnTo was the stale /dashboard).
   const [returnTo] = useState(() =>
     typeof window === "undefined"
       ? "/dashboard"
-      : sanitizeReturnTo(new URLSearchParams(window.location.search).get("return_to")),
+      : resolveLoginRedirectParam(window.location.search),
   );
-  // Set after mount rather than in the initializer: the notice changes the DOM,
-  // and this page is prerendered, so reading the query during the first render
-  // would make hydration mismatch the static HTML.
   const [sessionExpired, setSessionExpired] = useState(false);
   useEffect(() => {
     if (new URLSearchParams(window.location.search).get("reason") === "expired") {
@@ -73,9 +62,6 @@ export default function LoginPage() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
-  // A user with a live identity has no business on the login form; bounce them
-  // to their destination. A stale identity (expired session) is fine: the first
-  // authenticated request 401s, clears the stored user, and lands back here.
   useEffect(() => {
     if (storedUser) router.replace(returnTo);
   }, [returnTo, router, storedUser]);
@@ -97,8 +83,6 @@ export default function LoginPage() {
   async function handleSubmit(event: FormEvent) {
     event.preventDefault();
     setError(null);
-    // The expired-session context is stale the moment the user acts on the
-    // form; without this it would flash back while the request is in flight.
     setSessionExpired(false);
     setLoading(true);
 
@@ -113,8 +97,6 @@ export default function LoginPage() {
         return;
       }
       if (data.user) {
-        // No router.push here: the storedUser effect above is the single
-        // redirect owner, and it fires as soon as setStoredUser lands.
         setStoredUser(data.user as StoredUser);
         return;
       }
@@ -128,21 +110,22 @@ export default function LoginPage() {
   return (
     <main className="flex min-h-screen items-center justify-center px-4 py-10">
       <div className="w-full max-w-md">
-        <Link href="/status" className="mb-6 inline-block border-2 border-black bg-[var(--bg-card)] px-3 py-2 text-xs font-black uppercase shadow-[var(--shadow-brutal-sm)]">
+        <Link href="/status" className={`${buttonClass("secondary")} mb-6`}>
           {copy.loginPage.backToStatus}
         </Link>
-        <BrutalCard className="p-6 sm:p-8" accent>
-          <div className="mb-8">
-            <p className="mb-2 inline-block border-2 border-black bg-white px-3 py-1 text-xs font-black uppercase shadow-[var(--shadow-brutal-sm)]">
+        <BrutalCard className="p-6 sm:p-8">
+          <div className="mb-6">
+            <p className="mb-2 inline-flex items-center gap-1.5 rounded-full border border-[var(--border-color)] bg-[var(--bg-subtle)] px-2.5 py-0.5 text-[11px] font-medium tracking-wide text-[var(--text-muted)] uppercase">
+              <span className="h-1.5 w-1.5 rounded-full bg-[var(--accent-color)]" aria-hidden="true" />
               {copy.loginPage.adminEntry}
             </p>
-            <h1 className="text-5xl font-black uppercase tracking-tight">XLStatus</h1>
-            <p className="mt-2 text-sm font-bold text-[var(--text-muted)]">
+            <h1 className="text-3xl font-semibold tracking-tight text-[var(--text-main)]">XLStatus</h1>
+            <p className="mt-1.5 text-sm text-[var(--text-muted)]">
               {copy.loginPage.tagline}
             </p>
           </div>
 
-          <form onSubmit={handleSubmit} className="space-y-5">
+          <form onSubmit={handleSubmit} className="space-y-4">
             {sessionExpired && !error ? (
               <InlineNotice tone="yellow">{copy.loginPage.sessionExpired}</InlineNotice>
             ) : null}
@@ -153,9 +136,6 @@ export default function LoginPage() {
                 value={username}
                 onChange={(event) => {
                   setUsername(event.target.value);
-                  // Symmetric with the password field: switching identity
-                  // leaves the MFA step, otherwise the submit button stays
-                  // disabled with no way to re-trigger it.
                   setMfaRequired(false);
                   setTotpCode("");
                 }}
@@ -205,7 +185,7 @@ export default function LoginPage() {
             </button>
           </form>
           {oauthProviders.length > 0 ? (
-            <div className="mt-5 grid gap-2 border-t-2 border-black pt-5">
+            <div className="mt-5 grid gap-2 border-t border-[var(--border-color)] pt-5">
               {oauthProviders.map((provider) => (
                 <a
                   key={provider.id}

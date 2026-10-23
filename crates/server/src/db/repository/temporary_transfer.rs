@@ -11,6 +11,8 @@ pub struct TemporaryTransferTokenRepository {
     db: DatabaseBackend,
 }
 
+const TEMP_TRANSFER_MAX_LIMIT: i64 = 500;
+
 const TEMP_TRANSFER_COLUMNS: &str = r#"
     id, token_hash, server_id, path, op, issued_by_user_id, auth_kind,
     session_id, api_token_id, scope, expires_at, used_at, used_ip,
@@ -129,6 +131,9 @@ impl TemporaryTransferTokenRepository {
         &self,
         token_hash: &str,
     ) -> Result<Option<TemporaryTransferToken>> {
+        if token_hash.trim().is_empty() {
+            return Ok(None);
+        }
         match &self.db {
             DatabaseBackend::Sqlite(pool) => {
                 let sql = format!(
@@ -148,7 +153,7 @@ impl TemporaryTransferTokenRepository {
                     .bind(token_hash)
                     .fetch_optional(pool)
                     .await?;
-                Ok(row.map(postgres_row_to_token))
+                row.map(postgres_row_to_token).transpose()
             }
         }
     }
@@ -167,7 +172,7 @@ impl TemporaryTransferTokenRepository {
                     "SELECT {TEMP_TRANSFER_COLUMNS} FROM temporary_transfer_tokens WHERE id = $1"
                 );
                 let row = sqlx::query(&sql).bind(id).fetch_optional(pool).await?;
-                Ok(row.map(postgres_row_to_token))
+                row.map(postgres_row_to_token).transpose()
             }
         }
     }
@@ -177,6 +182,8 @@ impl TemporaryTransferTokenRepository {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<TemporaryTransferToken>, i64)> {
+        let limit = limit.clamp(1, TEMP_TRANSFER_MAX_LIMIT);
+        let offset = offset.max(0);
         match &self.db {
             DatabaseBackend::Sqlite(pool) => {
                 let total: (i64,) =
@@ -210,10 +217,11 @@ impl TemporaryTransferTokenRepository {
                     .bind(offset)
                     .fetch_all(pool)
                     .await?;
-                Ok((
-                    rows.into_iter().map(postgres_row_to_token).collect(),
-                    total.0,
-                ))
+                let tokens = rows
+                    .into_iter()
+                    .map(postgres_row_to_token)
+                    .collect::<Result<Vec<_>>>()?;
+                Ok((tokens, total.0))
             }
         }
     }
@@ -224,6 +232,8 @@ impl TemporaryTransferTokenRepository {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<TemporaryTransferToken>, i64)> {
+        let limit = limit.clamp(1, TEMP_TRANSFER_MAX_LIMIT);
+        let offset = offset.max(0);
         match &self.db {
             DatabaseBackend::Sqlite(pool) => {
                 let owner = owner_user_id.0.to_string();
@@ -264,10 +274,11 @@ impl TemporaryTransferTokenRepository {
                     .bind(offset)
                     .fetch_all(pool)
                     .await?;
-                Ok((
-                    rows.into_iter().map(postgres_row_to_token).collect(),
-                    total.0,
-                ))
+                let tokens = rows
+                    .into_iter()
+                    .map(postgres_row_to_token)
+                    .collect::<Result<Vec<_>>>()?;
+                Ok((tokens, total.0))
             }
         }
     }
@@ -282,6 +293,8 @@ impl TemporaryTransferTokenRepository {
         if server_ids.is_empty() {
             return Ok((Vec::new(), 0));
         }
+        let limit = limit.clamp(1, TEMP_TRANSFER_MAX_LIMIT);
+        let offset = offset.max(0);
         match &self.db {
             DatabaseBackend::Sqlite(pool) => {
                 let owner = owner_user_id.0.to_string();
@@ -333,10 +346,11 @@ impl TemporaryTransferTokenRepository {
                     .bind(offset)
                     .fetch_all(pool)
                     .await?;
-                Ok((
-                    rows.into_iter().map(postgres_row_to_token).collect(),
-                    total.0,
-                ))
+                let tokens = rows
+                    .into_iter()
+                    .map(postgres_row_to_token)
+                    .collect::<Result<Vec<_>>>()?;
+                Ok((tokens, total.0))
             }
         }
     }
@@ -379,7 +393,7 @@ impl TemporaryTransferTokenRepository {
                 r#"
                     UPDATE temporary_transfer_tokens
                     SET used_at = ?, used_ip = ?, used_status = 'started'
-                    WHERE id = ? AND used_at IS NULL AND revoked_at IS NULL AND expires_at > ?
+                    WHERE id = ? AND used_at IS NULL AND revoked_at IS NULL AND julianday(expires_at) > julianday(?)
                     "#,
             )
             .bind(now.to_rfc3339())
@@ -406,6 +420,10 @@ impl TemporaryTransferTokenRepository {
         Ok(affected == 1)
     }
 
+    pub async fn consume_valid(&self, id: &str, used_ip: Option<&str>) -> Result<bool> {
+        self.mark_used_once(id, used_ip).await
+    }
+
     pub async fn reserve_upload_once(
         &self,
         id: &str,
@@ -420,7 +438,7 @@ impl TemporaryTransferTokenRepository {
                     SET used_at = ?, used_ip = ?, used_status = 'receiving',
                         agent_task_id = ?
                     WHERE id = ? AND op = 'upload' AND used_at IS NULL
-                        AND revoked_at IS NULL AND expires_at > ?
+                        AND revoked_at IS NULL AND julianday(expires_at) > julianday(?)
                     "#,
             )
             .bind(now.to_rfc3339())
@@ -459,7 +477,7 @@ impl TemporaryTransferTokenRepository {
                     UPDATE temporary_transfer_tokens
                     SET used_status = 'started', agent_task_id = NULL
                     WHERE id = ? AND used_status = 'receiving' AND agent_task_id = ?
-                        AND revoked_at IS NULL AND expires_at > ?
+                        AND revoked_at IS NULL AND julianday(expires_at) > julianday(?)
                     "#,
             )
             .bind(id)
@@ -628,27 +646,27 @@ fn sqlite_row_to_token(row: sqlx::sqlite::SqliteRow) -> Result<TemporaryTransfer
     })
 }
 
-fn postgres_row_to_token(row: sqlx::postgres::PgRow) -> TemporaryTransferToken {
-    let id: String = row.get("id");
-    let token_hash: String = row.get("token_hash");
-    let server_id: uuid::Uuid = row.get("server_id");
-    let path: String = row.get("path");
-    let op: String = row.get("op");
-    let issued_by_user_id: uuid::Uuid = row.get("issued_by_user_id");
-    let auth_kind: String = row.get("auth_kind");
-    let session_id: Option<uuid::Uuid> = row.get("session_id");
-    let api_token_id: Option<uuid::Uuid> = row.get("api_token_id");
-    let scope: String = row.get("scope");
-    let expires_at: DateTime<Utc> = row.get("expires_at");
-    let used_at: Option<DateTime<Utc>> = row.get("used_at");
-    let used_ip: Option<String> = row.get("used_ip");
-    let used_status: Option<String> = row.get("used_status");
-    let used_error: Option<String> = row.get("used_error");
-    let agent_task_id: Option<String> = row.get("agent_task_id");
-    let revoked_at: Option<DateTime<Utc>> = row.get("revoked_at");
-    let created_at: DateTime<Utc> = row.get("created_at");
-    let created_ip: Option<String> = row.get("created_ip");
-    TemporaryTransferToken {
+fn postgres_row_to_token(row: sqlx::postgres::PgRow) -> Result<TemporaryTransferToken> {
+    let id: String = row.try_get("id")?;
+    let token_hash: String = row.try_get("token_hash")?;
+    let server_id: uuid::Uuid = row.try_get("server_id")?;
+    let path: String = row.try_get("path")?;
+    let op: String = row.try_get("op")?;
+    let issued_by_user_id: uuid::Uuid = row.try_get("issued_by_user_id")?;
+    let auth_kind: String = row.try_get("auth_kind")?;
+    let session_id: Option<uuid::Uuid> = row.try_get("session_id")?;
+    let api_token_id: Option<uuid::Uuid> = row.try_get("api_token_id")?;
+    let scope: String = row.try_get("scope")?;
+    let expires_at: DateTime<Utc> = row.try_get("expires_at")?;
+    let used_at: Option<DateTime<Utc>> = row.try_get("used_at")?;
+    let used_ip: Option<String> = row.try_get("used_ip")?;
+    let used_status: Option<String> = row.try_get("used_status")?;
+    let used_error: Option<String> = row.try_get("used_error")?;
+    let agent_task_id: Option<String> = row.try_get("agent_task_id")?;
+    let revoked_at: Option<DateTime<Utc>> = row.try_get("revoked_at")?;
+    let created_at: DateTime<Utc> = row.try_get("created_at")?;
+    let created_ip: Option<String> = row.try_get("created_ip")?;
+    Ok(TemporaryTransferToken {
         id,
         token_hash,
         server_id: AgentId(server_id),
@@ -668,7 +686,7 @@ fn postgres_row_to_token(row: sqlx::postgres::PgRow) -> TemporaryTransferToken {
         revoked_at,
         created_at,
         created_ip,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -835,6 +853,52 @@ mod tests {
         assert_eq!(allowed_total, 1);
         assert_eq!(allowed_tokens.len(), 1);
         assert_eq!(allowed_tokens[0].id, allowed.id);
+
+        // Negative limit (-1 in SQLite means unlimited) must be clamped to 1
+        let (clamped_all, _) = repo.list(-1, -5).await.unwrap();
+        assert_eq!(clamped_all.len(), 1);
+        let (clamped_owner, _) = repo.list_for_owner(owner.id, -1, -5).await.unwrap();
+        assert_eq!(clamped_owner.len(), 1);
+        let (clamped_allowed, _) = repo
+            .list_for_owner_server_ids(
+                owner.id,
+                &[
+                    allowed_agent.id.0.to_string(),
+                    blocked_agent.id.0.to_string(),
+                ],
+                -1,
+                -5,
+            )
+            .await
+            .unwrap();
+        assert_eq!(clamped_allowed.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn temporary_transfer_token_consumption_is_atomic_under_concurrency() {
+        let (repo, created, _) = seeded_token("xlt_concurrent").await;
+        let db = repo.db.clone();
+        let token_id = created.id.clone();
+
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let db_clone = db.clone();
+            let id_clone = token_id.clone();
+            tasks.push(tokio::spawn(async move {
+                TemporaryTransferTokenRepository::new(db_clone)
+                    .consume_valid(&id_clone, Some("203.0.113.20"))
+                    .await
+                    .unwrap()
+            }));
+        }
+
+        let mut successes = 0;
+        for task in tasks {
+            if task.await.unwrap() {
+                successes += 1;
+            }
+        }
+        assert_eq!(successes, 1);
     }
 
     async fn seeded_token(

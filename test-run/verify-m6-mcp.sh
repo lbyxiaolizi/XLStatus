@@ -64,7 +64,7 @@ echo ">>> enroll + run agent"
   --token "$ETOK" \
   --name "verify-m6-mcp-agent" \
   --config "$LOG_DIR/agent.yaml" > "$LOG_DIR/enroll.log" 2>&1
-AGENT_ID=$(python3 -c "import json;print(json.load(open('$LOG_DIR/agent.yaml'))['agent_id'])")
+AGENT_ID=$(python3 -c "import json;p='$LOG_DIR/agent.yaml';d=json.load(open(p));d['file_allowed_roots']=['/tmp'];json.dump(d,open(p,'w'),indent=2);print(d['agent_id'])")
 test_process_start "$TEST_PROCESS_REGISTRY" agent "$LOG_DIR/agent.log" \
   "$ROOT/target/debug/xlstatus-agent" run --config "$LOG_DIR/agent.yaml"
 
@@ -78,7 +78,7 @@ done
 echo ">>> create PAT for MCP"
 PAT_RESP=$(curl -s -X POST -b "$JAR" -H "Content-Type: application/json" -H "X-CSRF-Token: $CSRF" \
   "http://127.0.0.1:$HTTP_PORT/api/v1/tokens" \
-  -d "{\"name\":\"m6-mcp\",\"scopes\":[\"server:read\",\"server:exec\",\"transfer:read\",\"transfer:write\"],\"server_ids\":[\"$AGENT_ID\"]}")
+  -d "{\"name\":\"m6-mcp\",\"scopes\":[\"server:read\",\"server:exec\",\"transfer:read\"],\"server_ids\":[\"$AGENT_ID\"]}")
 PAT=$(echo "$PAT_RESP" | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('token',''))")
 [ -n "$PAT" ] || { echo "FAIL: empty PAT"; echo "$PAT_RESP"; exit 1; }
 
@@ -110,7 +110,7 @@ JSON_TOOLS=$(curl -s -X POST -H "Authorization: Bearer $PAT" -H "Content-Type: a
   "http://127.0.0.1:$HTTP_PORT/mcp" \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}')
 echo "  tools/list: $JSON_TOOLS"
-echo "$JSON_TOOLS" | python3 -c "import sys,json;d=json.load(sys.stdin);names=[t['name'] for t in d['result']['tools']];assert 'server.exec' in names and 'fs.write' in names"
+echo "$JSON_TOOLS" | python3 -c "import sys,json;d=json.load(sys.stdin);names=[t['name'] for t in d['result']['tools']];assert 'server.exec' in names and 'cluster.diagnose' in names and 'fs.write' not in names"
 
 echo ">>> server.list"
 LIST=$(call_mcp server.list '{}')
@@ -129,44 +129,32 @@ echo "  jsonrpc exec: $JSON_EXEC"
 echo "$JSON_EXEC" | python3 -c "import sys,json;d=json.load(sys.stdin);r=d['result']['structuredContent'];assert r['status']=='success' and 'jsonrpc-ok' in r['stdout'], r"
 
 TMP="/tmp/xlstatus-m6-mcp-file.txt"
-echo ">>> fs.write/read/list/delete"
-WRITE=$(call_mcp fs.write "{\"server_id\":\"$AGENT_ID\",\"path\":\"$TMP\",\"content\":\"hello-mcp-file\"}")
-echo "  write: $WRITE"
-echo "$WRITE" | python3 -c "import sys,json;d=json.load(sys.stdin);assert d['success'] and d['data']['result']['status']=='success'"
+echo ">>> fs.read/list/download_url + PAT fs.write rejection"
+WRITE_REJECT_STATUS=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer $PAT" -H "Content-Type: application/json" \
+  "http://127.0.0.1:$HTTP_PORT/api/v1/mcp/execute" \
+  -d "{\"tool\":\"fs.write\",\"arguments\":{\"server_id\":\"$AGENT_ID\",\"path\":\"$TMP\",\"content\":\"blocked\"}}")
+[[ "$WRITE_REJECT_STATUS" == "403" ]] || { echo "FAIL: fs.write PAT rejection status $WRITE_REJECT_STATUS"; exit 1; }
+SEED_FILE=$(call_mcp server.exec "{\"server_id\":\"$AGENT_ID\",\"command\":\"printf 'hello-mcp-file' > $TMP\",\"timeout\":10}")
+echo "$SEED_FILE" | python3 -c "import sys,json;d=json.load(sys.stdin);assert d['data']['result']['status']=='success'"
 READ=$(call_mcp fs.read "{\"server_id\":\"$AGENT_ID\",\"path\":\"$TMP\",\"max_size\":1024}")
 echo "  read: $READ"
 echo "$READ" | python3 -c "import sys,json;d=json.load(sys.stdin);assert 'hello-mcp-file' in d['data']['result']['content']"
 LS=$(call_mcp fs.list "{\"server_id\":\"$AGENT_ID\",\"path\":\"/tmp\"}")
 echo "  list: $LS"
-echo "$LS" | python3 -c "import sys,json;d=json.load(sys.stdin);assert d['data']['result']['status']=='success'"
+echo "$LS" | python3 -c "import sys,json;d=json.load(sys.stdin);assert d['data']['success'] and isinstance(d['data']['result']['entries'], list)"
 DL=$(call_mcp fs.download_url "{\"server_id\":\"$AGENT_ID\",\"path\":\"$TMP\"}")
 echo "  download_url: $DL"
 DL_URL=$(echo "$DL" | python3 -c "import sys,json;u=json.load(sys.stdin)['data']['result']['url'];assert u.startswith('/api/v1/transfers/temp/download') and 'example.com' not in u;print(u)")
 DL_BODY=$(curl -s "http://127.0.0.1:$HTTP_PORT$DL_URL")
 [[ "$DL_BODY" == "hello-mcp-file" ]] || { echo "FAIL: temporary download body '$DL_BODY'"; exit 1; }
-RL_RESP=$(call_mcp fs.download_url "{\"server_id\":\"$AGENT_ID\",\"path\":\"$TMP\"}")
-RL_URL=$(echo "$RL_RESP" | python3 -c "import sys,json;print(json.load(sys.stdin)['data']['result']['url'])")
-UL=$(call_mcp fs.upload_url "{\"server_id\":\"$AGENT_ID\",\"path\":\"$TMP\"}")
-echo "  upload_url: $UL"
-UL_URL=$(echo "$UL" | python3 -c "import sys,json;u=json.load(sys.stdin)['data']['result']['url'];assert u.startswith('/api/v1/transfers/temp/upload') and 'example.com' not in u;print(u)")
-UPLOAD_RESP=$(curl -s -X PUT --data-binary 'hello-temp-upload' "http://127.0.0.1:$HTTP_PORT$UL_URL")
-echo "  temp upload: $UPLOAD_RESP"
-echo "$UPLOAD_RESP" | python3 -c "import sys,json;d=json.load(sys.stdin);assert d['success'] and d['data']['bytes_written']==17"
-READ_UP=$(call_mcp fs.read "{\"server_id\":\"$AGENT_ID\",\"path\":\"$TMP\",\"max_size\":1024}")
-echo "  read_uploaded: $READ_UP"
-echo "$READ_UP" | python3 -c "import sys,json;d=json.load(sys.stdin);assert 'hello-temp-upload' in d['data']['result']['content']"
+REPLAY_STATUS=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HTTP_PORT$DL_URL")
+[[ "$REPLAY_STATUS" == "403" ]] || { echo "FAIL: single-use temp token replay status $REPLAY_STATUS"; exit 1; }
 BAD_URL="${DL_URL/token=/token=bad}"
 BAD_STATUS=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HTTP_PORT$BAD_URL")
 [[ "$BAD_STATUS" == "403" ]] || { echo "FAIL: bad temp token status $BAD_STATUS"; exit 1; }
-RL_STATUS=200
-for _ in $(seq 1 12); do
-  RL_STATUS=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HTTP_PORT$RL_URL")
-done
-[[ "$RL_STATUS" == "429" ]] || { echo "FAIL: temp URL rate limit status $RL_STATUS"; exit 1; }
-DEL=$(call_mcp fs.delete "{\"server_id\":\"$AGENT_ID\",\"path\":\"$TMP\"}")
-echo "  delete: $DEL"
-echo "$DEL" | python3 -c "import sys,json;d=json.load(sys.stdin);assert d['data']['result']['status']=='success'"
+CLEAN_FILE=$(call_mcp server.exec "{\"server_id\":\"$AGENT_ID\",\"command\":\"rm -f $TMP\",\"timeout\":10}")
+echo "$CLEAN_FILE" | python3 -c "import sys,json;d=json.load(sys.stdin);assert d['data']['result']['status']=='success'"
 
 echo ""
-echo "M6 MCP PASS (PAT-only MCP, server exec, fs read/write/list/delete, temporary URL transfer + rate limit)"
+echo "M6 MCP PASS (PAT-only MCP, server exec, fs read/list/download_url, write rejection + single-use token)"
 test_process_print_cleanup "$TEST_PROCESS_REGISTRY"

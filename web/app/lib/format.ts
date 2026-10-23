@@ -5,6 +5,7 @@
 // null guard). Keep the single source of truth here and import everywhere.
 
 import { formatBytes } from "@/app/components/M7Primitives";
+import { sanitizeRedirectPath } from "@/app/lib/security";
 
 // Coerce an unknown value to a finite number, or undefined. Accepts numeric
 // strings. Backend Option<f64>/Option<i64> fields arrive as null → undefined.
@@ -68,28 +69,9 @@ export function getCookie(name: string): string | null {
   );
 }
 
-// True if the string contains any ASCII control character (0x00-0x1F or 0x7F).
-function hasControlCharacter(value: string): boolean {
-  for (let i = 0; i < value.length; i += 1) {
-    const code = value.charCodeAt(i);
-    if (code <= 0x1f || code === 0x7f) return true;
-  }
-  return false;
-}
-
 // Validate a `return_to` redirect target. Only same-origin absolute paths are
 // allowed; anything suspicious (protocol-relative, backslashes, control chars,
 // or pointing back at /login) falls back to /dashboard.
-export function sanitizeReturnTo(value: string | null): string {
-  if (
-    !value ||
-    !value.startsWith("/") ||
-    value.startsWith("//") ||
-    value.includes("\\") ||
-    hasControlCharacter(value) ||
-    value.startsWith("/login")
-  ) {
-    return "/dashboard";
-  }
-  return value;
+export function sanitizeReturnTo(value: string | null | undefined): string {
+  return sanitizeRedirectPath(value, "/dashboard");
 }

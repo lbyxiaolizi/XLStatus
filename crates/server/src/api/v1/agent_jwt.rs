@@ -18,6 +18,8 @@ const SIGNATURE_HEX_LEN: usize = 128;
 const CHALLENGE_REQUEST_CLOCK_SKEW_SECONDS: i64 = 120;
 const REQUEST_CHALLENGE_KEY_PREFIX: &str = "request";
 const CHALLENGE_RECORDS_PER_REQUEST: usize = 2;
+const MAX_CHALLENGE_RECORDS_PER_AGENT: usize =
+    MAX_PENDING_CHALLENGES_PER_AGENT * CHALLENGE_RECORDS_PER_REQUEST;
 
 #[derive(Debug, Deserialize)]
 pub struct GetJwtChallengeRequest {
@@ -84,6 +86,9 @@ pub async fn get_agent_jwt_challenge(
         .saturating_add(CHALLENGE_RECORDS_PER_REQUEST)
         > MAX_PENDING_CHALLENGES
         || pending_challenges_for_agent(&challenges, agent_id) >= MAX_PENDING_CHALLENGES_PER_AGENT
+        || challenge_records_for_agent(&challenges, agent_id)
+            .saturating_add(CHALLENGE_RECORDS_PER_REQUEST)
+            > MAX_CHALLENGE_RECORDS_PER_AGENT
     {
         return Err(AppError::Forbidden(
             "too many pending JWT challenges".to_string(),
@@ -203,6 +208,26 @@ fn pending_challenges_for_agent(
         .count()
 }
 
+fn challenge_records_for_agent(
+    challenges: &std::collections::HashMap<String, chrono::DateTime<Utc>>,
+    agent_id: AgentId,
+) -> usize {
+    let challenge_prefix = format!("{}:", agent_id.0);
+    let request_prefix = format!("{REQUEST_CHALLENGE_KEY_PREFIX}:{}:", agent_id.0);
+    challenges
+        .keys()
+        .filter(|key| key.starts_with(&challenge_prefix) || key.starts_with(&request_prefix))
+        .count()
+}
+
+pub(crate) async fn purge_agent_jwt_challenges(store: &AgentJwtChallengeStore, agent_id: AgentId) {
+    let challenge_prefix = format!("{}:", agent_id.0);
+    let request_prefix = format!("{REQUEST_CHALLENGE_KEY_PREFIX}:{}:", agent_id.0);
+    let mut challenges = store.write().await;
+    challenges
+        .retain(|key, _| !key.starts_with(&challenge_prefix) && !key.starts_with(&request_prefix));
+}
+
 fn validate_challenge_request_shape(req: &GetJwtChallengeRequest) -> Result<(), AppError> {
     if !valid_nonce_shape(&req.request_nonce) {
         return Err(AppError::Unauthorized(
@@ -259,6 +284,10 @@ async fn consume_agent_jwt_challenge(
     let mut challenges = store.write().await;
     match challenges.get(challenge_key) {
         Some(expires_at) if *expires_at == expected_expires_at => {
+            if *expires_at < Utc::now() {
+                challenges.remove(challenge_key);
+                return Err(AppError::Unauthorized("JWT challenge expired".to_string()));
+            }
             challenges.remove(challenge_key);
             Ok(())
         }
@@ -504,6 +533,52 @@ mod tests {
             .await
             .unwrap();
         assert!(!store.read().await.contains_key(&key));
+
+        let expired_key = "agent:expired".to_string();
+        let past = Utc::now() - Duration::seconds(1);
+        store.write().await.insert(expired_key.clone(), past);
+        let err = consume_agent_jwt_challenge(&store, &expired_key, past)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Unauthorized(msg) if msg.contains("expired")));
+        assert!(!store.read().await.contains_key(&expired_key));
+    }
+
+    #[tokio::test]
+    async fn jwt_challenge_bounds_consumed_request_nonces_per_agent() {
+        let (state, agent_id, signing_key) = seeded_agent_state().await;
+        let now = Utc::now();
+        {
+            let mut challenges = state.agent_jwt_challenges.write().await;
+            for i in 0..MAX_CHALLENGE_RECORDS_PER_AGENT {
+                challenges.insert(
+                    request_challenge_key(agent_id, &format!("{i:064x}")),
+                    now + Duration::seconds(30),
+                );
+            }
+        }
+        let request_nonce = "f".repeat(NONCE_HEX_LEN);
+        let request_timestamp = now.timestamp();
+        let signature =
+            sign_challenge_request(&signing_key, agent_id, &request_nonce, request_timestamp);
+
+        let err = get_agent_jwt_challenge(
+            State(state.clone()),
+            Json(GetJwtChallengeRequest {
+                agent_id: agent_id.to_string(),
+                request_nonce,
+                request_timestamp,
+                signature,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::Forbidden(message) if message.contains("too many")));
+
+        purge_agent_jwt_challenges(&state.agent_jwt_challenges, agent_id).await;
+        let guard = state.agent_jwt_challenges.read().await;
+        assert_eq!(challenge_records_for_agent(&guard, agent_id), 0);
     }
 
     async fn seeded_agent_state() -> (AppState, AgentId, SigningKey) {

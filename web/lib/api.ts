@@ -1,4 +1,11 @@
 // API client for XLStatus backend
+import {
+  encodePathSegment,
+  redactSensitiveTokens,
+  sanitizeDownloadFilename,
+  sanitizeExternalHttpUrl,
+  sanitizeRedirectPath,
+} from "@/app/lib/security";
 import { getTranslations } from "@/lib/i18n";
 
 const DEFAULT_API_PORT = "8080";
@@ -8,8 +15,11 @@ function trimTrailingSlash(value: string): string {
 }
 
 export function getApiBaseUrl(): string {
-  const configured = process.env.NEXT_PUBLIC_API_URL?.trim();
-  if (configured) return trimTrailingSlash(configured);
+  const configured = process.env["NEXT_PUBLIC_API_URL"]?.trim();
+  if (configured) {
+    const safeConfigured = sanitizeExternalHttpUrl(configured);
+    if (safeConfigured) return trimTrailingSlash(safeConfigured);
+  }
 
   if (typeof window !== "undefined") {
     const currentOrigin = new URL(window.location.origin);
@@ -23,7 +33,11 @@ export function getApiBaseUrl(): string {
 export function buildWebSocketUrl(path: string): string {
   const url = new URL(getApiBaseUrl());
   const protocol = url.protocol === "https:" ? "wss" : "ws";
-  return `${protocol}://${url.host}${path}`;
+  const safePath =
+    path.startsWith("/") && !path.startsWith("//")
+      ? path
+      : `/${path.replace(/^\/+/, "")}`;
+  return `${protocol}://${url.host}${safePath}`;
 }
 
 export const API_BASE_URL = getApiBaseUrl();
@@ -42,7 +56,9 @@ function redirectToLogin(): void {
   window.localStorage.removeItem("session_token");
   window.localStorage.removeItem("user");
 
-  const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  const returnTo = sanitizeRedirectPath(
+    `${window.location.pathname}${window.location.search}${window.location.hash}`,
+  );
   const reason = hadSession ? "&reason=expired" : "";
   window.location.assign(`/login?return_to=${encodeURIComponent(returnTo)}${reason}`);
 }
@@ -53,10 +69,10 @@ function isAuthRedirectExemptPath(pathname: string): boolean {
 
 export interface ApiResponse<T> {
   success: boolean;
-  data?: T;
-  error?: string;
-  status?: number;
-  request_id?: string;
+  data?: T | undefined;
+  error?: string | undefined;
+  status?: number | undefined;
+  request_id?: string | undefined;
 }
 
 export interface ServerListResponse {
@@ -492,26 +508,79 @@ export interface CreateEnrollmentTokenResponse {
   expires_at: string;
 }
 
+export interface McpToolDefinition {
+  name: string;
+  description: string;
+  category?: string | undefined;
+  input_schema: Record<string, unknown>;
+  annotations?: Record<string, unknown> | undefined;
+}
+
+export interface McpResourceDefinition {
+  uri: string;
+  name: string;
+  description: string;
+  mime_type: string;
+}
+
+export interface McpResourceTemplateDefinition {
+  uri_template: string;
+  name: string;
+  description: string;
+  mime_type: string;
+}
+
+export interface McpPromptArgument {
+  name: string;
+  description: string;
+  required: boolean;
+}
+
+export interface McpPromptDefinition {
+  name: string;
+  description: string;
+  arguments: McpPromptArgument[];
+}
+
+export interface McpCatalogResponse {
+  protocol_version: string;
+  server_info: Record<string, unknown>;
+  tools: McpToolDefinition[];
+  resources: McpResourceDefinition[];
+  resource_templates: McpResourceTemplateDefinition[];
+  prompts: McpPromptDefinition[];
+}
+
+export interface McpStudioResponse {
+  kind: string;
+  name: string;
+  duration_ms: number;
+  output: unknown;
+}
+
 export type JsonObject = Record<string, unknown>;
 
-type ApiRequestOptions = RequestInit & {
-  anonymous?: boolean;
-  skipAuthRedirect?: boolean;
-  clientCacheTtlMs?: number;
-  bypassClientCache?: boolean;
+export type RequestOptions = ApiReadOptions;
+
+type ApiRequestOptions = Omit<RequestInit, "signal"> & {
+  signal?: AbortSignal | null | undefined;
+  anonymous?: boolean | undefined;
+  skipAuthRedirect?: boolean | undefined;
+  clientCacheTtlMs?: number | undefined;
+  bypassClientCache?: boolean | undefined;
 };
 
 type ApiReadOptions = {
-  signal?: AbortSignal;
-  bypassClientCache?: boolean;
+  signal?: AbortSignal | undefined;
+  bypassClientCache?: boolean | undefined;
 };
 
 // Newer servers can inline probe history into the service listing. Older ones
 // simply ignore the extra query params and omit the `history` key, so callers
 // must still be able to fall back to per-service history requests.
 export type ListServicesOptions = ApiReadOptions & {
-  includeHistory?: boolean;
-  historyLimit?: number;
+  includeHistory?: boolean | undefined;
+  historyLimit?: number | undefined;
 };
 
 interface ClientCacheEntry {
@@ -556,6 +625,7 @@ class ApiClient {
       skipAuthRedirect,
       clientCacheTtlMs = 0,
       bypassClientCache = false,
+      signal,
       ...fetchOptions
     } = options;
     const csrfToken = getCookie("xlstatus_csrf");
@@ -574,7 +644,7 @@ class ApiClient {
       if (cached && cached.expiresAt > Date.now()) {
         return this.waitForSharedRequest(
           Promise.resolve(cached.response as ApiResponse<T>),
-          fetchOptions.signal,
+          signal,
         );
       }
       if (cached) this.responseCache.delete(cacheKey);
@@ -590,7 +660,11 @@ class ApiClient {
           ...fetchOptions,
           // Cached requests are shared. A component abort only stops its own
           // wait; it must not cancel the request another mounted view is using.
-          ...(cacheable && !bypassClientCache ? { signal: undefined } : {}),
+          ...(cacheable && !bypassClientCache
+            ? { signal: null }
+            : signal !== undefined
+              ? { signal }
+              : {}),
           headers: {
             ...defaultHeaders,
             ...(csrfToken && !anonymous ? { "x-csrf-token": csrfToken } : {}),
@@ -660,7 +734,7 @@ class ApiClient {
 
     if (bypassClientCache) {
       const requestEpoch = this.beginCacheRequest(cacheKey);
-      return this.waitForSharedRequest(executeAndCache(requestEpoch), fetchOptions.signal);
+      return this.waitForSharedRequest(executeAndCache(requestEpoch), signal);
     }
 
     // Generation-scoped keys prevent a post-mutation reload from joining a
@@ -678,7 +752,7 @@ class ApiClient {
       });
     }
 
-    return this.waitForSharedRequest(shared, fetchOptions.signal);
+    return this.waitForSharedRequest(shared, signal);
   }
 
   private invalidateClientCache(): void {
@@ -784,12 +858,13 @@ class ApiClient {
     options: ApiRequestOptions = {},
   ): Promise<ApiResponse<DownloadFileResponse>> {
     const url = `${this.baseUrl}${path}`;
-    const { anonymous, headers, skipAuthRedirect, ...fetchOptions } = options;
+    const { anonymous, headers, skipAuthRedirect, signal, ...fetchOptions } = options;
     const csrfToken = getCookie("xlstatus_csrf");
 
     try {
       const response = await fetch(url, {
         ...fetchOptions,
+        ...(signal !== undefined ? { signal } : {}),
         headers: {
           ...(csrfToken && !anonymous ? { "x-csrf-token": csrfToken } : {}),
           ...headers,
@@ -834,7 +909,7 @@ class ApiClient {
   }
 
   private sensitiveHeaders(totpCode?: string): HeadersInit {
-    const code = totpCode?.trim();
+    const code = totpCode?.replace(/[\u0000-\u001f\u007f]/g, "").trim();
     return code ? { "x-totp-code": code } : {};
   }
 
@@ -876,8 +951,8 @@ class ApiClient {
   }
 
   getOAuthLoginUrl(providerId: string, returnTo = "/dashboard"): string {
-    const query = new URLSearchParams({ return_to: returnTo });
-    return `${this.baseUrl}/api/v1/oauth2/${encodeURIComponent(providerId)}?${query.toString()}`;
+    const query = new URLSearchParams({ return_to: sanitizeRedirectPath(returnTo) });
+    return `${this.baseUrl}/api/v1/oauth2/${encodePathSegment(providerId)}?${query.toString()}`;
   }
 
   async startOAuthBind(
@@ -885,9 +960,9 @@ class ApiClient {
     returnTo = "/settings",
     totpCode?: string,
   ): Promise<ApiResponse<OAuthStartResponse>> {
-    const query = new URLSearchParams({ return_to: returnTo });
+    const query = new URLSearchParams({ return_to: sanitizeRedirectPath(returnTo, "/settings") });
     return this.request<OAuthStartResponse>(
-      `/api/v1/oauth2/${encodeURIComponent(providerId)}/bind?${query.toString()}`,
+      `/api/v1/oauth2/${encodePathSegment(providerId)}/bind?${query.toString()}`,
       {
         method: "POST",
         headers: this.sensitiveHeaders(totpCode),
@@ -899,7 +974,7 @@ class ApiClient {
     providerId: string,
     totpCode?: string,
   ): Promise<ApiResponse<JsonObject>> {
-    return this.request<JsonObject>(`/api/v1/oauth2/${encodeURIComponent(providerId)}/unbind`, {
+    return this.request<JsonObject>(`/api/v1/oauth2/${encodePathSegment(providerId)}/unbind`, {
       method: "POST",
       headers: this.sensitiveHeaders(totpCode),
     });
@@ -924,7 +999,7 @@ class ApiClient {
     user: JsonObject,
     totpCode?: string,
   ): Promise<ApiResponse<JsonObject>> {
-    return this.request<JsonObject>(`/api/v1/users/${encodeURIComponent(id)}`, {
+    return this.request<JsonObject>(`/api/v1/users/${encodePathSegment(id)}`, {
       method: "POST",
       body: JSON.stringify(user),
       headers: this.sensitiveHeaders(totpCode),
@@ -932,7 +1007,7 @@ class ApiClient {
   }
 
   async deleteUser(id: string, totpCode?: string): Promise<ApiResponse<JsonObject>> {
-    return this.request<JsonObject>(`/api/v1/users/${encodeURIComponent(id)}`, {
+    return this.request<JsonObject>(`/api/v1/users/${encodePathSegment(id)}`, {
       method: "DELETE",
       headers: this.sensitiveHeaders(totpCode),
     });
@@ -948,7 +1023,7 @@ class ApiClient {
   }
 
   async deleteSession(id: string, totpCode?: string): Promise<ApiResponse<JsonObject>> {
-    return this.request<JsonObject>(`/api/v1/sessions/${encodeURIComponent(id)}`, {
+    return this.request<JsonObject>(`/api/v1/sessions/${encodePathSegment(id)}`, {
       method: "DELETE",
       headers: this.sensitiveHeaders(totpCode),
     });
@@ -975,7 +1050,7 @@ class ApiClient {
   }
 
   async deleteWafBan(id: string, totpCode?: string): Promise<ApiResponse<JsonObject>> {
-    return this.request<JsonObject>(`/api/v1/waf/bans/${encodeURIComponent(id)}`, {
+    return this.request<JsonObject>(`/api/v1/waf/bans/${encodePathSegment(id)}`, {
       method: "DELETE",
       headers: this.sensitiveHeaders(totpCode),
     });
@@ -1026,15 +1101,28 @@ class ApiClient {
   }
 
   async revokePat(id: string, totpCode?: string): Promise<ApiResponse<JsonObject>> {
-    return this.request<JsonObject>(`/api/v1/tokens/${encodeURIComponent(id)}`, {
+    return this.request<JsonObject>(`/api/v1/tokens/${encodePathSegment(id)}`, {
       method: "DELETE",
       headers: this.sensitiveHeaders(totpCode),
     });
   }
 
   getAgentInstallScriptUrl(params: Record<string, string>, baseUrl = this.baseUrl): string {
-    const query = new URLSearchParams(params);
-    return `${baseUrl.replace(/\/+$/, "")}/api/v1/agents/install.sh?${query.toString()}`;
+    const safeParams: Record<string, string> = {};
+    for (const [key, value] of Object.entries(params)) {
+      if (key === "server_url" || key === "download_url") {
+        const safeUrl = sanitizeExternalHttpUrl(value);
+        if (safeUrl) safeParams[key] = safeUrl;
+      } else {
+        safeParams[key] = value;
+      }
+    }
+    const query = new URLSearchParams(safeParams);
+    const trimmedBase = baseUrl.trim();
+    const safeBase = trimmedBase
+      ? (sanitizeExternalHttpUrl(trimmedBase) ?? this.baseUrl)
+      : this.baseUrl;
+    return `${safeBase.replace(/\/+$/, "")}/api/v1/agents/install.sh?${query.toString()}`;
   }
 
   async createEnrollmentToken(
@@ -1066,7 +1154,7 @@ class ApiClient {
   }
 
   async getServer(id: string, options?: { signal?: AbortSignal }): Promise<ApiResponse<JsonObject>> {
-    return this.request<JsonObject>(`/api/v1/servers/${encodeURIComponent(id)}`, options);
+    return this.request<JsonObject>(`/api/v1/servers/${encodePathSegment(id)}`, options);
   }
 
   async updateServer(
@@ -1075,7 +1163,7 @@ class ApiClient {
     totpCode?: string,
   ): Promise<ApiResponse<JsonObject>> {
     return this.requestWithFallback<JsonObject>(
-      `/api/v1/servers/${encodeURIComponent(id)}`,
+      `/api/v1/servers/${encodePathSegment(id)}`,
       payload,
       ["POST", "PATCH", "PUT"],
       { headers: this.sensitiveHeaders(totpCode) },
@@ -1113,7 +1201,7 @@ class ApiClient {
     totpCode?: string,
   ): Promise<ApiResponse<ServerOwnerTransfer>> {
     return this.request<ServerOwnerTransfer>(
-      `/api/v1/server-transfers/${encodeURIComponent(id)}/retry`,
+      `/api/v1/server-transfers/${encodePathSegment(id)}/retry`,
       {
         method: "POST",
         headers: this.sensitiveHeaders(totpCode),
@@ -1126,7 +1214,7 @@ class ApiClient {
     totpCode?: string,
   ): Promise<ApiResponse<ServerOwnerTransfer>> {
     return this.request<ServerOwnerTransfer>(
-      `/api/v1/server-transfers/${encodeURIComponent(id)}/cancel`,
+      `/api/v1/server-transfers/${encodePathSegment(id)}/cancel`,
       {
         method: "POST",
         headers: this.sensitiveHeaders(totpCode),
@@ -1155,7 +1243,7 @@ class ApiClient {
     totpCode?: string,
   ): Promise<ApiResponse<ServerGroup>> {
     return this.requestWithFallback<ServerGroup>(
-      `/api/v1/server-groups/${encodeURIComponent(id)}`,
+      `/api/v1/server-groups/${encodePathSegment(id)}`,
       group,
       ["PATCH", "POST", "PUT"],
       { headers: this.sensitiveHeaders(totpCode) },
@@ -1164,7 +1252,7 @@ class ApiClient {
 
   async deleteServerGroup(id: string, totpCode?: string): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
-      `/api/v1/server-groups/${encodeURIComponent(id)}`,
+      `/api/v1/server-groups/${encodePathSegment(id)}`,
       { method: "DELETE", headers: this.sensitiveHeaders(totpCode) },
     );
   }
@@ -1175,7 +1263,7 @@ class ApiClient {
     totpCode?: string,
   ): Promise<ApiResponse<ServerGroup>> {
     return this.request<ServerGroup>(
-      `/api/v1/server-groups/${encodeURIComponent(id)}/members`,
+      `/api/v1/server-groups/${encodePathSegment(id)}/members`,
       {
         method: "POST",
         headers: this.sensitiveHeaders(totpCode),
@@ -1190,7 +1278,7 @@ class ApiClient {
     totpCode?: string,
   ): Promise<ApiResponse<ServerGroup>> {
     return this.request<ServerGroup>(
-      `/api/v1/server-groups/${encodeURIComponent(id)}/members/${encodeURIComponent(serverId)}`,
+      `/api/v1/server-groups/${encodePathSegment(id)}/members/${encodePathSegment(serverId)}`,
       { method: "DELETE", headers: this.sensitiveHeaders(totpCode) },
     );
   }
@@ -1201,7 +1289,7 @@ class ApiClient {
     options?: { signal?: AbortSignal },
   ): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
-      `/api/v1/servers/${encodeURIComponent(id)}/metrics?range=${encodeURIComponent(range)}`,
+      `/api/v1/servers/${encodePathSegment(id)}/metrics?range=${encodeURIComponent(range)}`,
       options,
     );
   }
@@ -1211,7 +1299,7 @@ class ApiClient {
     path: string,
   ): Promise<ApiResponse<FileListResponse>> {
     return this.request<FileListResponse>(
-      `/api/v1/servers/${encodeURIComponent(id)}/files`,
+      `/api/v1/servers/${encodePathSegment(id)}/files`,
       {
         method: "POST",
         body: JSON.stringify({ path }),
@@ -1225,7 +1313,7 @@ class ApiClient {
     encoding = "utf8",
   ): Promise<ApiResponse<FileReadResponse>> {
     return this.request<FileReadResponse>(
-      `/api/v1/servers/${encodeURIComponent(id)}/files/read`,
+      `/api/v1/servers/${encodePathSegment(id)}/files/read`,
       {
         method: "POST",
         body: JSON.stringify({ path, encoding }),
@@ -1239,7 +1327,7 @@ class ApiClient {
     totpCode?: string,
   ): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
-      `/api/v1/servers/${encodeURIComponent(id)}/files/write`,
+      `/api/v1/servers/${encodePathSegment(id)}/files/write`,
       {
         method: "POST",
         headers: this.sensitiveHeaders(totpCode),
@@ -1254,7 +1342,7 @@ class ApiClient {
     totpCode?: string,
   ): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
-      `/api/v1/servers/${encodeURIComponent(id)}/files/delete`,
+      `/api/v1/servers/${encodePathSegment(id)}/files/delete`,
       {
         method: "POST",
         headers: this.sensitiveHeaders(totpCode),
@@ -1268,7 +1356,7 @@ class ApiClient {
     path: string,
   ): Promise<ApiResponse<TempUrlResponse>> {
     return this.request<TempUrlResponse>(
-      `/api/v1/servers/${encodeURIComponent(id)}/files/download-url`,
+      `/api/v1/servers/${encodePathSegment(id)}/files/download-url`,
       {
         method: "POST",
         body: JSON.stringify({ path }),
@@ -1282,7 +1370,7 @@ class ApiClient {
     totpCode?: string,
   ): Promise<ApiResponse<TempUrlResponse>> {
     return this.request<TempUrlResponse>(
-      `/api/v1/servers/${encodeURIComponent(id)}/files/upload-url`,
+      `/api/v1/servers/${encodePathSegment(id)}/files/upload-url`,
       {
         method: "POST",
         headers: this.sensitiveHeaders(totpCode),
@@ -1293,7 +1381,7 @@ class ApiClient {
 
   async getServerConfig(id: string): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
-      `/api/v1/servers/${encodeURIComponent(id)}/config`,
+      `/api/v1/servers/${encodePathSegment(id)}/config`,
     );
   }
 
@@ -1303,7 +1391,7 @@ class ApiClient {
     totpCode?: string,
   ): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
-      `/api/v1/servers/${encodeURIComponent(id)}/config`,
+      `/api/v1/servers/${encodePathSegment(id)}/config`,
       {
         method: "POST",
         headers: this.sensitiveHeaders(totpCode),
@@ -1318,7 +1406,7 @@ class ApiClient {
     totpCode?: string,
   ): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
-      `/api/v1/servers/${encodeURIComponent(id)}/force-update`,
+      `/api/v1/servers/${encodePathSegment(id)}/force-update`,
       {
         method: "POST",
         headers: this.sensitiveHeaders(totpCode),
@@ -1364,7 +1452,7 @@ class ApiClient {
     options?: ApiReadOptions,
   ): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
-      `/api/v1/public/servers/${encodeURIComponent(id)}`,
+      `/api/v1/public/servers/${encodePathSegment(id)}`,
       {
         anonymous: true,
         ...options,
@@ -1374,7 +1462,7 @@ class ApiClient {
   }
 
   async getService(id: string): Promise<ApiResponse<JsonObject>> {
-    return this.request<JsonObject>(`/api/v1/services/${encodeURIComponent(id)}`);
+    return this.request<JsonObject>(`/api/v1/services/${encodePathSegment(id)}`);
   }
 
   async createService(service: JsonObject, totpCode?: string): Promise<ApiResponse<JsonObject>> {
@@ -1391,7 +1479,7 @@ class ApiClient {
     totpCode?: string,
   ): Promise<ApiResponse<JsonObject>> {
     return this.requestWithFallback<JsonObject>(
-      `/api/v1/services/${encodeURIComponent(id)}`,
+      `/api/v1/services/${encodePathSegment(id)}`,
       service,
       ["PATCH", "POST", "PUT"],
       { headers: this.sensitiveHeaders(totpCode) },
@@ -1399,7 +1487,7 @@ class ApiClient {
   }
 
   async deleteService(id: string, totpCode?: string): Promise<ApiResponse<JsonObject>> {
-    return this.request<JsonObject>(`/api/v1/services/${encodeURIComponent(id)}`, {
+    return this.request<JsonObject>(`/api/v1/services/${encodePathSegment(id)}`, {
       method: "DELETE",
       headers: this.sensitiveHeaders(totpCode),
     });
@@ -1422,7 +1510,7 @@ class ApiClient {
     options?: ApiReadOptions,
   ): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
-      `/api/v1/services/${encodeURIComponent(id)}/history?limit=${limit}`,
+      `/api/v1/services/${encodePathSegment(id)}/history?limit=${limit}`,
       { ...options, clientCacheTtlMs: CACHE_TTL_FAST_MS },
     );
   }
@@ -1451,7 +1539,7 @@ class ApiClient {
     totpCode?: string,
   ): Promise<ApiResponse<JsonObject>> {
     return this.requestWithFallback<JsonObject>(
-      `/api/v1/alert-rules/${encodeURIComponent(id)}`,
+      `/api/v1/alert-rules/${encodePathSegment(id)}`,
       rule,
       ["PATCH", "POST", "PUT"],
       { headers: this.sensitiveHeaders(totpCode) },
@@ -1460,7 +1548,7 @@ class ApiClient {
 
   async deleteAlertRule(id: string, totpCode?: string): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
-      `/api/v1/alert-rules/${encodeURIComponent(id)}`,
+      `/api/v1/alert-rules/${encodePathSegment(id)}`,
       { method: "DELETE", headers: this.sensitiveHeaders(totpCode) },
     );
   }
@@ -1502,7 +1590,7 @@ class ApiClient {
     totpCode?: string,
   ): Promise<ApiResponse<JsonObject>> {
     return this.requestWithFallback<JsonObject>(
-      `/api/v1/notifications/${encodeURIComponent(id)}`,
+      `/api/v1/notifications/${encodePathSegment(id)}`,
       notification,
       ["PATCH", "POST", "PUT"],
       { headers: this.sensitiveHeaders(totpCode) },
@@ -1511,14 +1599,14 @@ class ApiClient {
 
   async deleteNotification(id: string, totpCode?: string): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
-      `/api/v1/notifications/${encodeURIComponent(id)}`,
+      `/api/v1/notifications/${encodePathSegment(id)}`,
       { method: "DELETE", headers: this.sensitiveHeaders(totpCode) },
     );
   }
 
   async testNotification(id: string, totpCode?: string): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
-      `/api/v1/notifications/${encodeURIComponent(id)}/test`,
+      `/api/v1/notifications/${encodePathSegment(id)}/test`,
       { method: "POST", headers: this.sensitiveHeaders(totpCode) },
     );
   }
@@ -1551,7 +1639,7 @@ class ApiClient {
     totpCode?: string,
   ): Promise<ApiResponse<JsonObject>> {
     return this.requestWithFallback<JsonObject>(
-      `/api/v1/notification-groups/${encodeURIComponent(id)}`,
+      `/api/v1/notification-groups/${encodePathSegment(id)}`,
       group,
       ["PATCH", "POST", "PUT"],
       { headers: this.sensitiveHeaders(totpCode) },
@@ -1560,7 +1648,7 @@ class ApiClient {
 
   async deleteNotificationGroup(id: string, totpCode?: string): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
-      `/api/v1/notification-groups/${encodeURIComponent(id)}`,
+      `/api/v1/notification-groups/${encodePathSegment(id)}`,
       { method: "DELETE", headers: this.sensitiveHeaders(totpCode) },
     );
   }
@@ -1571,7 +1659,7 @@ class ApiClient {
     totpCode?: string,
   ): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
-      `/api/v1/notification-groups/${encodeURIComponent(id)}/members`,
+      `/api/v1/notification-groups/${encodePathSegment(id)}/members`,
       {
         method: "POST",
         headers: this.sensitiveHeaders(totpCode),
@@ -1586,7 +1674,7 @@ class ApiClient {
     totpCode?: string,
   ): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
-      `/api/v1/notification-groups/${encodeURIComponent(id)}/members/${encodeURIComponent(notificationId)}`,
+      `/api/v1/notification-groups/${encodePathSegment(id)}/members/${encodePathSegment(notificationId)}`,
       { method: "DELETE", headers: this.sensitiveHeaders(totpCode) },
     );
   }
@@ -1610,7 +1698,7 @@ class ApiClient {
   }
 
   async getTask(id: string): Promise<ApiResponse<JsonObject>> {
-    return this.request<JsonObject>(`/api/v1/tasks/${encodeURIComponent(id)}`);
+    return this.request<JsonObject>(`/api/v1/tasks/${encodePathSegment(id)}`);
   }
 
   async createTask(task: JsonObject, totpCode?: string): Promise<ApiResponse<JsonObject>> {
@@ -1627,7 +1715,7 @@ class ApiClient {
     totpCode?: string,
   ): Promise<ApiResponse<JsonObject>> {
     return this.requestWithFallback<JsonObject>(
-      `/api/v1/tasks/${encodeURIComponent(id)}`,
+      `/api/v1/tasks/${encodePathSegment(id)}`,
       task,
       ["POST", "PATCH", "PUT"],
       { headers: this.sensitiveHeaders(totpCode) },
@@ -1635,14 +1723,14 @@ class ApiClient {
   }
 
   async deleteTask(id: string, totpCode?: string): Promise<ApiResponse<JsonObject>> {
-    return this.request<JsonObject>(`/api/v1/tasks/${encodeURIComponent(id)}`, {
+    return this.request<JsonObject>(`/api/v1/tasks/${encodePathSegment(id)}`, {
       method: "DELETE",
       headers: this.sensitiveHeaders(totpCode),
     });
   }
 
   async runTask(id: string, totpCode?: string): Promise<ApiResponse<JsonObject>> {
-    return this.request<JsonObject>(`/api/v1/tasks/${encodeURIComponent(id)}/run`, {
+    return this.request<JsonObject>(`/api/v1/tasks/${encodePathSegment(id)}/run`, {
       method: "POST",
       headers: this.sensitiveHeaders(totpCode),
     });
@@ -1672,7 +1760,7 @@ class ApiClient {
     options?: ApiReadOptions,
   ): Promise<ApiResponse<TaskRunListResponse>> {
     return this.request<TaskRunListResponse>(
-      `/api/v1/tasks/${encodeURIComponent(id)}/runs?limit=${limit}`,
+      `/api/v1/tasks/${encodePathSegment(id)}/runs?limit=${limit}`,
       options,
     );
   }
@@ -1686,7 +1774,7 @@ class ApiClient {
     agentId: string,
   ): Promise<ApiResponse<NatMappingListResponse>> {
     return this.request<NatMappingListResponse>(
-      `/api/v1/nat/mappings/agent/${encodeURIComponent(agentId)}`,
+      `/api/v1/nat/mappings/agent/${encodePathSegment(agentId)}`,
     );
   }
 
@@ -1704,7 +1792,7 @@ class ApiClient {
     totpCode?: string,
   ): Promise<ApiResponse<JsonObject>> {
     return this.requestWithFallback<JsonObject>(
-      `/api/v1/nat/mappings/${encodeURIComponent(id)}`,
+      `/api/v1/nat/mappings/${encodePathSegment(id)}`,
       mapping,
       ["POST", "PATCH", "PUT"],
       { headers: this.sensitiveHeaders(totpCode) },
@@ -1713,7 +1801,7 @@ class ApiClient {
 
   async deleteNatMapping(id: string, totpCode?: string): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
-      `/api/v1/nat/mappings/${encodeURIComponent(id)}`,
+      `/api/v1/nat/mappings/${encodePathSegment(id)}`,
       { method: "DELETE", headers: this.sensitiveHeaders(totpCode) },
     );
   }
@@ -1740,7 +1828,7 @@ class ApiClient {
     totpCode?: string,
   ): Promise<ApiResponse<JsonObject>> {
     return this.requestWithFallback<JsonObject>(
-      `/api/v1/ddns/configs/${encodeURIComponent(id)}`,
+      `/api/v1/ddns/configs/${encodePathSegment(id)}`,
       config,
       ["PATCH", "POST", "PUT"],
       { headers: this.sensitiveHeaders(totpCode) },
@@ -1752,7 +1840,7 @@ class ApiClient {
     totpCode?: string,
   ): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
-      `/api/v1/ddns/configs/${encodeURIComponent(id)}`,
+      `/api/v1/ddns/configs/${encodePathSegment(id)}`,
       {
         method: "DELETE",
         headers: this.sensitiveHeaders(totpCode),
@@ -1764,7 +1852,7 @@ class ApiClient {
     id: string,
   ): Promise<ApiResponse<DdnsHistoryListResponse>> {
     return this.request<DdnsHistoryListResponse>(
-      `/api/v1/ddns/configs/${encodeURIComponent(id)}/history`,
+      `/api/v1/ddns/configs/${encodePathSegment(id)}/history`,
     );
   }
 
@@ -1902,10 +1990,10 @@ class ApiClient {
     input: JsonObject = {},
     totpCode?: string,
   ): Promise<ApiResponse<GeoIpMaintenanceResponse>> {
-    const body = Object.keys(input).length ? JSON.stringify(input) : undefined;
+    const body = Object.keys(input).length ? JSON.stringify(input) : null;
     return this.request<GeoIpMaintenanceResponse>("/api/v1/geoip/update", {
       method: "POST",
-      body,
+      ...(body !== null ? { body } : {}),
       headers: this.sensitiveHeaders(totpCode),
     });
   }
@@ -1966,7 +2054,7 @@ class ApiClient {
     totpCode?: string,
   ): Promise<ApiResponse<ThemeDefinition>> {
     return this.requestWithFallback<ThemeDefinition>(
-      `/api/v1/themes/${encodeURIComponent(id)}`,
+      `/api/v1/themes/${encodePathSegment(id)}`,
       theme,
       ["PATCH", "POST"],
       { headers: this.sensitiveHeaders(totpCode) },
@@ -1979,7 +2067,7 @@ class ApiClient {
     totpCode?: string,
   ): Promise<ApiResponse<ThemeListResponse>> {
     return this.request<ThemeListResponse>(
-      `/api/v1/themes/${encodeURIComponent(id)}/select`,
+      `/api/v1/themes/${encodePathSegment(id)}/select`,
       {
         method: "POST",
         body: JSON.stringify({ target }),
@@ -1990,7 +2078,7 @@ class ApiClient {
 
   async deleteTheme(id: string, totpCode?: string): Promise<ApiResponse<JsonObject>> {
     return this.request<JsonObject>(
-      `/api/v1/themes/${encodeURIComponent(id)}`,
+      `/api/v1/themes/${encodePathSegment(id)}`,
       {
         method: "DELETE",
         headers: this.sensitiveHeaders(totpCode),
@@ -2011,6 +2099,118 @@ class ApiClient {
       method: "POST",
       body: JSON.stringify({ tool, arguments: args }),
     });
+  }
+
+  async getMcpCatalog(options?: RequestOptions): Promise<ApiResponse<McpCatalogResponse>> {
+    return this.request<McpCatalogResponse>("/api/v1/mcp/catalog", {
+      ...options,
+      clientCacheTtlMs: CACHE_TTL_STANDARD_MS,
+    });
+  }
+
+  async executeMcpStudio(
+    body: {
+      kind: "tool" | "resource" | "prompt";
+      name: string;
+      arguments?: Record<string, unknown> | undefined;
+    },
+    options?: RequestOptions,
+  ): Promise<ApiResponse<McpStudioResponse>> {
+    return this.request<McpStudioResponse>("/api/v1/mcp/studio", {
+      ...options,
+      method: "POST",
+      body: JSON.stringify({
+        kind: body.kind,
+        name: body.name,
+        arguments: body.arguments ?? {},
+      }),
+    });
+  }
+
+  async callMcpJsonRpc(
+    patToken: string,
+    payload: Record<string, unknown>,
+    options?: { signal?: AbortSignal; timeoutMs?: number },
+  ): Promise<ApiResponse<JsonObject>> {
+    const token = patToken.trim();
+    if (/[\u0000-\u001f\u007f\s]/.test(token)) {
+      return {
+        success: false,
+        error: "Invalid PAT token format",
+      };
+    }
+    const timeoutMs = options?.timeoutMs ?? 30_000;
+    const controller = new AbortController();
+    const externalSignal = options?.signal;
+    const onExternalAbort = () => controller.abort();
+    if (externalSignal) {
+      if (externalSignal.aborted) {
+        controller.abort();
+      } else {
+        externalSignal.addEventListener("abort", onExternalAbort, { once: true });
+      }
+    }
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const response = await fetch(`${getApiBaseUrl()}/mcp`, {
+        method: "POST",
+        credentials: "omit",
+        signal: controller.signal,
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify(payload),
+      });
+      const text = await response.text();
+      const parsed = parseJson(text);
+      const dataObj =
+        parsed && typeof parsed === "object" && !Array.isArray(parsed)
+          ? (parsed as JsonObject)
+          : { raw: parsed };
+      if (!response.ok) {
+        const envelope = normalizeEnvelope<JsonObject>(parsed, response.status);
+        const rawErr =
+          envelope.error ||
+          response.statusText ||
+          `Request failed with ${response.status}`;
+        return {
+          success: false,
+          data: dataObj,
+          error: redactSensitiveTokens(rawErr, [token]),
+          status: response.status,
+        };
+      }
+      const rpcError =
+        dataObj["error"] && typeof dataObj["error"] === "object"
+          ? (dataObj["error"] as Record<string, unknown>)
+          : null;
+      if (rpcError) {
+        const rawRpcErr = String(rpcError["message"] ?? rpcError["code"] ?? "JSON-RPC error");
+        return {
+          success: false,
+          data: dataObj,
+          error: redactSensitiveTokens(rawRpcErr, [token]),
+          status: response.status,
+        };
+      }
+      return {
+        success: true,
+        data: dataObj,
+        status: response.status,
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: redactSensitiveTokens(requestFailureMessage(error), [token]),
+      };
+    } finally {
+      clearTimeout(timeoutId);
+      if (externalSignal) {
+        externalSignal.removeEventListener("abort", onExternalAbort);
+      }
+    }
   }
 }
 
@@ -2049,44 +2249,50 @@ function normalizeEnvelope<T>(payload: unknown, status: number): ApiResponse<T> 
 
   const obj = payload as Record<string, unknown>;
   const success =
-    typeof obj.success === "boolean"
-      ? obj.success
-      : typeof obj.ok === "boolean"
-        ? obj.ok
+    typeof obj["success"] === "boolean"
+      ? obj["success"]
+      : typeof obj["ok"] === "boolean"
+        ? obj["ok"]
         : status >= 200 && status < 300;
-  const errorValue = obj.error;
+  const errorValue = obj["error"];
   const error =
     typeof errorValue === "string"
       ? errorValue
       : errorValue && typeof errorValue === "object"
         ? String(
-              (errorValue as Record<string, unknown>).message ??
-              (errorValue as Record<string, unknown>).code ??
+              (errorValue as Record<string, unknown>)["message"] ??
+              (errorValue as Record<string, unknown>)["code"] ??
               getTranslations().common.requestFailed,
           )
         : undefined;
 
   return {
     success,
-    data: obj.data as T,
+    data: obj["data"] as T,
     error,
     status,
     request_id:
-      typeof obj.request_id === "string" ? obj.request_id : undefined,
+      typeof obj["request_id"] === "string" ? obj["request_id"] : undefined,
   };
 }
 
 function getCookie(name: string): string | null {
-  if (typeof document === "undefined") {
+  if (typeof document === "undefined" || !name) {
     return null;
   }
 
-  return (
-    document.cookie
-      .split("; ")
-      .find((row) => row.startsWith(`${name}=`))
-      ?.split("=")[1] ?? null
-  );
+  const prefix = `${name}=`;
+  for (const rawEntry of document.cookie.split(";")) {
+    const entry = rawEntry.trim();
+    if (entry.startsWith(prefix)) {
+      const rawValue = entry.slice(prefix.length).trim();
+      if (!rawValue || /[\u0000-\u001f\u007f]/.test(rawValue)) {
+        return null;
+      }
+      return rawValue;
+    }
+  }
+  return null;
 }
 
 function filenameFromContentDisposition(value: string | null): string {
@@ -2094,11 +2300,14 @@ function filenameFromContentDisposition(value: string | null): string {
   const utf8 = value.match(/filename\*=UTF-8''([^;]+)/i);
   if (utf8?.[1]) {
     try {
-      return decodeURIComponent(utf8[1].replace(/^"|"$/g, ""));
+      return sanitizeDownloadFilename(
+        decodeURIComponent(utf8[1].replace(/^"|"$/g, "")),
+        "download",
+      );
     } catch {
-      return utf8[1].replace(/^"|"$/g, "");
+      return sanitizeDownloadFilename(utf8[1].replace(/^"|"$/g, ""), "download");
     }
   }
   const plain = value.match(/filename="?([^";]+)"?/i);
-  return plain?.[1]?.trim() || "download";
+  return sanitizeDownloadFilename(plain?.[1]?.trim(), "download");
 }

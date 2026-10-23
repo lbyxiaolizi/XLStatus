@@ -27,6 +27,7 @@ use xlstatus_shared::terminal::TerminalBridgeMessage;
 
 mod collector;
 mod executor;
+mod nat;
 
 const GRPC_MESSAGE_LIMIT: usize = 256 * 1024 * 1024;
 const AGENT_SHELL_MIN_TIMEOUT_SECONDS: u64 = 1;
@@ -772,6 +773,28 @@ async fn handle_io_frame(
                     .map(|session| session.writer_tx.clone())
             };
             if let Some(writer_tx) = existing_nat_tx {
+                if runtime.config.lock().await.disable_nat {
+                    close_nat_session(
+                        agent_id,
+                        &stream_id,
+                        "NAT is disabled by agent policy".to_string(),
+                        sequence,
+                        &nat_sessions,
+                        &io_tx,
+                        false,
+                    )
+                    .await;
+                    let _ = io_tx
+                        .send(io_error_frame(
+                            &stream_id,
+                            agent_id,
+                            sequence,
+                            "nat_disabled",
+                            "NAT is disabled by agent policy",
+                        ))
+                        .await;
+                    return;
+                }
                 if writer_tx.send(payload).await.is_err() {
                     close_nat_session(
                         agent_id,
@@ -941,6 +964,11 @@ async fn handle_terminal_message(
 ) {
     let cfg = runtime.config.lock().await.clone();
     if cfg.disable_command_execute {
+        if let Some(removed) = terminal_sessions.lock().await.remove(stream_id) {
+            removed.close();
+        } else {
+            session.close();
+        }
         let _ = io_tx
             .send(io_error_frame(
                 stream_id,
@@ -1534,27 +1562,64 @@ fn signing_key_from_config(config: &AgentConfig) -> anyhow::Result<SigningKey> {
 }
 
 fn write_secure_config(config_path: &PathBuf, contents: &[u8]) -> anyhow::Result<()> {
-    let mut options = std::fs::OpenOptions::new();
-    options.create(true).truncate(true).write(true);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        options.mode(0o600);
-        let mut file = options.open(config_path)?;
-        file.write_all(contents)?;
-        file.sync_all()?;
-        std::fs::set_permissions(config_path, std::fs::Permissions::from_mode(0o600))?;
+    if let Ok(meta) = std::fs::symlink_metadata(config_path) {
+        if meta.file_type().is_symlink() {
+            anyhow::bail!(
+                "refusing to write config through symlink {}",
+                config_path.display()
+            );
+        }
     }
 
-    #[cfg(not(unix))]
-    {
-        let mut file = options.open(config_path)?;
-        file.write_all(contents)?;
-        file.sync_all()?;
-    }
+    let parent = config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let file_name = config_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("config path has no valid file name"))?;
+    let temp_path = parent.join(format!(
+        ".{file_name}.tmp.{}.{}",
+        std::process::id(),
+        random_hex_32()
+    ));
 
-    Ok(())
+    let write_result = (|| -> anyhow::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+            let mut file = options.open(&temp_path)?;
+            std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600))?;
+            file.write_all(contents)?;
+            file.sync_all()?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            let mut file = options.open(&temp_path)?;
+            file.write_all(contents)?;
+            file.sync_all()?;
+        }
+
+        std::fs::rename(&temp_path, config_path)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(config_path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    write_result
 }
 
 fn infer_grpc_url(server: &str) -> String {
@@ -2390,6 +2455,12 @@ async fn apply_remote_config(
     validate_remote_config_fields(object)?;
     let mut guard = runtime.config.lock().await;
     let mut current = guard.clone();
+    let disk_config = read_disk_config(&runtime.config_path)?;
+    current.disable_auto_update |= disk_config.disable_auto_update;
+    current.disable_force_update |= disk_config.disable_force_update;
+    current.disable_command_execute |= disk_config.disable_command_execute;
+    current.disable_nat |= disk_config.disable_nat;
+    current.disable_send_query |= disk_config.disable_send_query;
 
     if let Some(value) = object.get("server") {
         current.server = validate_remote_config_url(value, "server")?;
@@ -2424,25 +2495,49 @@ async fn apply_remote_config(
             validate_remote_config_interval(value, "ip_report_interval_seconds")?;
     }
     if let Some(value) = object.get("disable_auto_update") {
-        current.disable_auto_update = validate_remote_config_bool(value, "disable_auto_update")?;
+        current.disable_auto_update = validate_remote_config_disable_flag(
+            value,
+            "disable_auto_update",
+            current.disable_auto_update,
+        )?;
     }
     if let Some(value) = object.get("disable_force_update") {
-        current.disable_force_update = validate_remote_config_bool(value, "disable_force_update")?;
+        current.disable_force_update = validate_remote_config_disable_flag(
+            value,
+            "disable_force_update",
+            current.disable_force_update,
+        )?;
     }
     if let Some(value) = object.get("disable_command_execute") {
-        current.disable_command_execute =
-            validate_remote_config_bool(value, "disable_command_execute")?;
+        current.disable_command_execute = validate_remote_config_disable_flag(
+            value,
+            "disable_command_execute",
+            current.disable_command_execute,
+        )?;
     }
     if let Some(value) = object.get("disable_nat") {
-        current.disable_nat = validate_remote_config_bool(value, "disable_nat")?;
+        current.disable_nat =
+            validate_remote_config_disable_flag(value, "disable_nat", current.disable_nat)?;
     }
     if let Some(value) = object.get("disable_send_query") {
-        current.disable_send_query = validate_remote_config_bool(value, "disable_send_query")?;
+        current.disable_send_query = validate_remote_config_disable_flag(
+            value,
+            "disable_send_query",
+            current.disable_send_query,
+        )?;
     }
     if let Some(value) = object.get("file_allowed_roots") {
-        current.file_allowed_roots = validate_remote_config_roots(value)?;
+        let requested_roots = validate_remote_config_roots(value)?;
+        validate_remote_config_roots_within_policy(
+            &requested_roots,
+            &current.file_allowed_roots,
+            &runtime.config_path,
+            current.disable_command_execute,
+        )?;
+        current.file_allowed_roots = requested_roots;
     }
-    current.private_key = read_private_key(&runtime.config_path)?;
+    validate_remote_tls_config_consistency(&current)?;
+    current.private_key = disk_config.private_key;
     persist_agent_config(&runtime.config_path, &current)?;
     *guard = current;
     Ok(())
@@ -2506,10 +2601,62 @@ fn validate_optional_remote_config_path(
     else {
         return Ok(None);
     };
+    validate_normalized_absolute_path(&text, field)?;
+    Ok(Some(text))
+}
+
+fn validate_normalized_absolute_path(text: &str, field: &str) -> anyhow::Result<PathBuf> {
     if text.contains('\0') {
         anyhow::bail!("{field} contains NUL byte");
     }
-    Ok(Some(text))
+    if text.chars().any(char::is_control) {
+        anyhow::bail!("{field} contains control characters");
+    }
+    let path = std::path::Path::new(text);
+    if !path.is_absolute() {
+        anyhow::bail!("{field} must be an absolute path");
+    }
+    let mut normal_count = 0usize;
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            std::path::Component::RootDir => normalized.push(component.as_os_str()),
+            std::path::Component::Normal(part) => {
+                normal_count += 1;
+                normalized.push(part);
+            }
+            std::path::Component::CurDir | std::path::Component::ParentDir => {
+                anyhow::bail!("{field} must not contain relative path traversal components");
+            }
+        }
+    }
+    if normal_count == 0 {
+        anyhow::bail!("{field} must not be the filesystem root");
+    }
+    Ok(normalized)
+}
+
+fn validate_remote_tls_config_consistency(config: &AgentConfig) -> anyhow::Result<()> {
+    let ca_path = non_empty_config_path(&config.grpc_tls_ca_path);
+    let domain_name = non_empty_config_path(&config.grpc_tls_domain_name);
+    let client_cert_path = non_empty_config_path(&config.grpc_tls_client_cert_path);
+    let client_key_path = non_empty_config_path(&config.grpc_tls_client_key_path);
+
+    if client_cert_path.is_some() != client_key_path.is_some() {
+        anyhow::bail!(
+            "grpc_tls_client_cert_path and grpc_tls_client_key_path must be configured together"
+        );
+    }
+    if (ca_path.is_some()
+        || domain_name.is_some()
+        || client_cert_path.is_some()
+        || client_key_path.is_some())
+        && !config.grpc_server.starts_with("https://")
+    {
+        anyhow::bail!("custom gRPC TLS settings require grpc_server to use https://");
+    }
+    Ok(())
 }
 
 fn validate_optional_remote_config_text(
@@ -2561,6 +2708,20 @@ fn validate_remote_config_bool(value: &serde_json::Value, field: &str) -> anyhow
         .ok_or_else(|| anyhow::anyhow!("{field} must be a boolean"))
 }
 
+fn validate_remote_config_disable_flag(
+    value: &serde_json::Value,
+    field: &str,
+    currently_disabled: bool,
+) -> anyhow::Result<bool> {
+    let requested = validate_remote_config_bool(value, field)?;
+    if currently_disabled && !requested {
+        anyhow::bail!(
+            "remote config field {field} cannot be re-enabled once disabled by local policy"
+        );
+    }
+    Ok(requested)
+}
+
 fn validate_remote_config_roots(value: &serde_json::Value) -> anyhow::Result<Vec<String>> {
     let roots = value
         .as_array()
@@ -2575,12 +2736,79 @@ fn validate_remote_config_roots(value: &serde_json::Value) -> anyhow::Result<Vec
             .ok_or_else(|| anyhow::anyhow!("file_allowed_roots entries must be strings"))?
             .trim();
         validate_sized_remote_text(text, 1, REMOTE_CONFIG_MAX_PATH_BYTES, "file_allowed_roots")?;
-        if text.contains('\0') {
-            anyhow::bail!("file_allowed_roots contains NUL byte");
-        }
+        validate_normalized_absolute_path(text, "file_allowed_roots")?;
         normalized.push(text.to_string());
     }
     Ok(normalized)
+}
+
+fn validate_remote_config_roots_within_policy(
+    requested_roots: &[String],
+    current_roots: &[String],
+    config_path: &std::path::Path,
+    command_execute_disabled: bool,
+) -> anyhow::Result<()> {
+    if command_execute_disabled {
+        anyhow::bail!(
+            "file_allowed_roots cannot be modified remotely when disable_command_execute is enabled"
+        );
+    }
+    const FORBIDDEN_SYSTEM_PREFIXES: &[&str] = &[
+        "/etc",
+        "/private/etc",
+        "/root",
+        "/proc",
+        "/sys",
+        "/dev",
+        "/boot",
+        "/run",
+        "/var/run",
+        "/private/var/run",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/lib",
+        "/lib64",
+    ];
+    let config_file =
+        std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
+    let config_dir = config_file.parent();
+    let allowed: Vec<PathBuf> = current_roots
+        .iter()
+        .map(|root| validate_normalized_absolute_path(root.trim(), "file_allowed_roots"))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    if allowed.is_empty() {
+        anyhow::bail!("file_allowed_roots cannot be expanded when no local roots are configured");
+    }
+    for candidate in requested_roots {
+        let candidate_path = validate_normalized_absolute_path(candidate, "file_allowed_roots")?;
+        for forbidden in FORBIDDEN_SYSTEM_PREFIXES {
+            if candidate_path.starts_with(forbidden) {
+                anyhow::bail!(
+                    "remote file_allowed_roots entry '{}' targets a protected system directory",
+                    candidate
+                );
+            }
+        }
+        if config_file.starts_with(&candidate_path)
+            || config_dir.is_some_and(|dir| candidate_path == dir)
+        {
+            anyhow::bail!(
+                "remote file_allowed_roots entry '{}' overlaps agent configuration storage",
+                candidate
+            );
+        }
+        if !allowed
+            .iter()
+            .any(|existing| candidate_path.starts_with(existing))
+        {
+            anyhow::bail!(
+                "remote file_allowed_roots entry '{}' is outside local policy roots",
+                candidate
+            );
+        }
+    }
+    Ok(())
 }
 
 fn validate_sized_remote_text(
@@ -2600,6 +2828,17 @@ async fn record_force_update_request(
     runtime: &RuntimeContext,
     update: &ForceUpdate,
 ) -> anyhow::Result<()> {
+    {
+        let cfg = runtime.config.lock().await;
+        if cfg.disable_force_update {
+            anyhow::bail!("force update is disabled by agent policy");
+        }
+    }
+    if let Ok(disk_cfg) = read_disk_config(&runtime.config_path) {
+        if disk_cfg.disable_force_update {
+            anyhow::bail!("force update is disabled by local agent config");
+        }
+    }
     let version = validate_force_update_version(&update.version)?;
     let download_url = validate_force_update_download_url(&update.download_url)?;
     let checksum = validate_force_update_checksum(&update.checksum)?;
@@ -2614,7 +2853,8 @@ async fn record_force_update_request(
         .parent()
         .map(|p| p.join("last-force-update.json"))
         .unwrap_or_else(|| PathBuf::from("last-force-update.json"));
-    std::fs::write(path, serde_json::to_vec_pretty(&payload)?)?;
+    let serialized = serde_json::to_vec_pretty(&payload)?;
+    write_secure_config(&path, &serialized)?;
     Ok(())
 }
 
@@ -2643,14 +2883,30 @@ fn validate_force_update_download_url(download_url: &str) -> anyhow::Result<Stri
     if parsed.scheme() != "https" {
         anyhow::bail!("download_url must use https");
     }
-    if parsed.host_str().is_none() {
+    let Some(host) = parsed.host_str() else {
         anyhow::bail!("download_url must include a host");
+    };
+    let normalized_host = host.trim_matches(['[', ']']).to_ascii_lowercase();
+    if normalized_host == "localhost" || normalized_host.ends_with(".localhost") {
+        anyhow::bail!("download_url must not target localhost");
+    }
+    if let Ok(ip) = normalized_host.parse::<IpAddr>() {
+        if is_agent_blocked_ip(ip) {
+            anyhow::bail!("download_url must not target private or loopback IP {ip}");
+        }
     }
     if !parsed.username().is_empty() || parsed.password().is_some() {
         anyhow::bail!("download_url must not include credentials");
     }
     if parsed.query().is_some() || parsed.fragment().is_some() {
         anyhow::bail!("download_url must not include query or fragment");
+    }
+    let path = parsed.path();
+    if path.is_empty() || path.ends_with('/') || path.contains('\\') {
+        anyhow::bail!("download_url must include a release asset filename");
+    }
+    if path.split('/').any(|segment| matches!(segment, "." | "..")) {
+        anyhow::bail!("download_url must not contain path traversal segments");
     }
     Ok(parsed.to_string())
 }
@@ -2669,10 +2925,10 @@ fn persist_agent_config(config_path: &PathBuf, config: &AgentConfig) -> anyhow::
     write_secure_config(config_path, serialized.as_bytes())
 }
 
-fn read_private_key(config_path: &PathBuf) -> anyhow::Result<String> {
+fn read_disk_config(config_path: &PathBuf) -> anyhow::Result<AgentConfig> {
     let config_text = std::fs::read_to_string(config_path)?;
     let config: AgentConfig = serde_json::from_str(&config_text)?;
-    Ok(config.private_key)
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -3122,6 +3378,18 @@ mod tests {
                 ..valid.clone()
             },
             ForceUpdate {
+                download_url: "https://localhost/agent.tar.gz".into(),
+                ..valid.clone()
+            },
+            ForceUpdate {
+                download_url: "https://127.0.0.1/agent.tar.gz".into(),
+                ..valid.clone()
+            },
+            ForceUpdate {
+                download_url: "https://10.0.0.1/agent.tar.gz".into(),
+                ..valid.clone()
+            },
+            ForceUpdate {
                 checksum: "not-a-sha256".into(),
                 ..valid.clone()
             },
@@ -3130,5 +3398,137 @@ mod tests {
                 .await
                 .is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn agent_force_update_respects_disable_policy_and_writes_0600() {
+        let mut cfg = test_agent_config();
+        cfg.disable_force_update = true;
+        let (_temp_dir, runtime) = test_runtime_with_config(cfg);
+        let valid = ForceUpdate {
+            version: "v0.1.0".into(),
+            download_url: "https://updates.example.com/xlstatus-agent-linux-amd64.tar.gz".into(),
+            checksum: format!("sha256:{}", "a".repeat(64)),
+        };
+        let err = record_force_update_request(&runtime, &valid)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("disabled"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let (_temp_dir2, runtime2) = test_runtime_with_config(test_agent_config());
+            record_force_update_request(&runtime2, &valid)
+                .await
+                .unwrap();
+            let record_path = runtime2
+                .config_path
+                .parent()
+                .unwrap()
+                .join("last-force-update.json");
+            let mode = std::fs::metadata(&record_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_secure_config_enforces_0600_and_rejects_symlinks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("agent.json");
+        std::fs::write(&config_path, b"initial").unwrap();
+        std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_secure_config(&config_path, b"{\"secret\":true}").unwrap();
+        let mode = std::fs::metadata(&config_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let target = temp_dir.path().join("target.json");
+        std::fs::write(&target, b"victim").unwrap();
+        let link = temp_dir.path().join("symlink-agent.json");
+        symlink(&target, &link).unwrap();
+        let err = write_secure_config(&link, b"{\"overwritten\":true}").unwrap_err();
+        assert!(err.to_string().contains("symlink"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"victim");
+    }
+
+    #[tokio::test]
+    async fn agent_remote_config_enforces_monotonic_disable_locks_and_root_policy() {
+        let mut initial = test_agent_config();
+        initial.disable_command_execute = true;
+        initial.disable_auto_update = true;
+        initial.disable_force_update = true;
+        initial.disable_nat = true;
+        initial.disable_send_query = true;
+        let (_temp_dir, runtime) = test_runtime_with_config(initial);
+
+        for patch in [
+            serde_json::json!({ "disable_command_execute": false }),
+            serde_json::json!({ "disable_auto_update": false }),
+            serde_json::json!({ "disable_force_update": false }),
+            serde_json::json!({ "disable_nat": false }),
+            serde_json::json!({ "disable_send_query": false }),
+            serde_json::json!({ "file_allowed_roots": ["/var/lib/xlstatus/files"] }),
+        ] {
+            let update = ConfigUpdate {
+                config_yaml: serde_json::to_vec(&patch).unwrap(),
+            };
+            assert!(
+                apply_remote_config(&runtime, &update).await.is_err(),
+                "monotonic policy lock should reject patch: {patch}"
+            );
+        }
+
+        // Custom local roots cannot be expanded remotely, and sensitive/traversal/config roots are rejected.
+        let mut custom = test_agent_config();
+        custom.file_allowed_roots = vec!["/srv/xlstatus/workspace".to_string()];
+        let (temp_dir2, runtime2) = test_runtime_with_config(custom);
+        let config_dir = temp_dir2.path().to_string_lossy().to_string();
+
+        for bad_root in [
+            "/",
+            "/etc",
+            "/etc/xlstatus",
+            "/root",
+            "/proc",
+            "/srv/xlstatus/workspace/../secret",
+            "/srv/other",
+            config_dir.as_str(),
+        ] {
+            let update = ConfigUpdate {
+                config_yaml: serde_json::to_vec(&serde_json::json!({
+                    "file_allowed_roots": [bad_root]
+                }))
+                .unwrap(),
+            };
+            assert!(
+                apply_remote_config(&runtime2, &update).await.is_err(),
+                "bad root should be rejected: {bad_root}"
+            );
+        }
+
+        // Narrowing within custom local root is allowed.
+        let narrow = ConfigUpdate {
+            config_yaml: serde_json::to_vec(&serde_json::json!({
+                "file_allowed_roots": ["/srv/xlstatus/workspace/subdir"]
+            }))
+            .unwrap(),
+        };
+        apply_remote_config(&runtime2, &narrow).await.unwrap();
+        assert_eq!(
+            runtime2.config.lock().await.file_allowed_roots,
+            vec!["/srv/xlstatus/workspace/subdir"]
+        );
     }
 }

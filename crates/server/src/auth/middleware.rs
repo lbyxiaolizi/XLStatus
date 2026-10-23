@@ -27,6 +27,7 @@ const PAT_PREFIX: &str = "xlp_";
 const PAT_TOKEN_HEX_BYTES: usize = 64;
 const PAT_TOKEN_BYTES: usize = PAT_PREFIX.len() + PAT_TOKEN_HEX_BYTES;
 const PAT_AUTHORIZATION_HEADER_MAX_BYTES: usize = "Bearer ".len() + PAT_TOKEN_BYTES;
+const AUTHORIZATION_HEADER_MAX_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AuthKind {
@@ -183,7 +184,9 @@ pub async fn session_middleware(
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(addr)| *addr);
     let client_ip = client_ip_from_headers_and_peer(request.headers(), peer_addr);
-    match pat_bearer_token_from_headers(request.headers()) {
+    let pat_header = pat_bearer_token_from_headers(request.headers());
+    let pat_attempted = !matches!(pat_header, Ok(None));
+    match pat_header {
         Err(reason) => {
             let _ = register_pat_failure(&state.db, &client_ip, None, reason).await;
         }
@@ -231,20 +234,42 @@ pub async fn session_middleware(
                                     pat.server_ids.as_deref(),
                                 ) {
                                     Ok(()) => {
-                                        let auth_session = AuthSession {
-                                            session_id: pat.id.clone(),
-                                            user_id: user.id,
-                                            username: user.username.clone(),
-                                            role: user.role,
-                                            csrf_token: String::new(),
-                                            auth_kind: AuthKind::PersonalAccessToken,
-                                            scopes: pat.scopes.clone(),
-                                            server_ids: pat.server_ids.clone(),
-                                            pat_id: Some(pat.id.clone()),
-                                        };
-                                        let _ = pat_repo.mark_used(&pat.id, Some(&client_ip)).await;
-                                        request.extensions_mut().insert(auth_session);
-                                        request.extensions_mut().insert(user);
+                                        match crate::api::v1::pat::validate_server_allowlist_ownership(
+                                            &state.db,
+                                            user.id,
+                                            user.role.is_admin(),
+                                            pat.server_ids.as_deref(),
+                                        )
+                                        .await
+                                        {
+                                            Ok(()) => {
+                                                let auth_session = AuthSession {
+                                                    session_id: pat.id.clone(),
+                                                    user_id: user.id,
+                                                    username: user.username.clone(),
+                                                    role: user.role,
+                                                    csrf_token: String::new(),
+                                                    auth_kind: AuthKind::PersonalAccessToken,
+                                                    scopes: pat.scopes.clone(),
+                                                    server_ids: pat.server_ids.clone(),
+                                                    pat_id: Some(pat.id.clone()),
+                                                };
+                                                let _ = pat_repo
+                                                    .mark_used(&pat.id, Some(&client_ip))
+                                                    .await;
+                                                request.extensions_mut().insert(auth_session);
+                                                request.extensions_mut().insert(user);
+                                            }
+                                            Err(_) => {
+                                                let _ = register_pat_failure(
+                                                    &state.db,
+                                                    &client_ip,
+                                                    Some(&pat.id),
+                                                    "invalid token server allowlist",
+                                                )
+                                                .await;
+                                            }
+                                        }
                                     }
                                     Err(reason) => {
                                         let _ = register_pat_failure(
@@ -284,7 +309,7 @@ pub async fn session_middleware(
         Ok(None) => {}
     }
 
-    if request.extensions().get::<AuthSession>().is_none() {
+    if !pat_attempted && request.extensions().get::<AuthSession>().is_none() {
         if let Some(cookie) = cookie_jar.get(SESSION_COOKIE_NAME) {
             let token = cookie.value();
             if session_cookie_token_is_valid(token) {
@@ -325,7 +350,7 @@ pub async fn session_middleware(
                         .headers()
                         .get(CSRF_HEADER_NAME)
                         .and_then(|h| h.to_str().ok());
-                    if csrf_header != Some(&session.csrf_token) {
+                    if !csrf_token_matches(csrf_header, &session.csrf_token) {
                         return StatusCode::FORBIDDEN.into_response();
                     }
                 }
@@ -346,16 +371,18 @@ pub async fn csrf_middleware(request: Request, next: Next) -> Result<Response, S
         // Extract session from extensions
         let session = request.extensions().get::<AuthSession>();
 
-        if let Some(session) = session {
-            // Extract CSRF token from header
-            let csrf_header = request
-                .headers()
-                .get(CSRF_HEADER_NAME)
-                .and_then(|h| h.to_str().ok());
+        if session_request_requires_csrf(method.as_str(), session) {
+            if let Some(session) = session {
+                // Extract CSRF token from header
+                let csrf_header = request
+                    .headers()
+                    .get(CSRF_HEADER_NAME)
+                    .and_then(|h| h.to_str().ok());
 
-            // Validate CSRF token
-            if csrf_header != Some(&session.csrf_token) {
-                return Err(StatusCode::FORBIDDEN);
+                // Validate CSRF token in constant time
+                if !csrf_token_matches(csrf_header, &session.csrf_token) {
+                    return Err(StatusCode::FORBIDDEN);
+                }
             }
         }
     }
@@ -364,9 +391,16 @@ pub async fn csrf_middleware(request: Request, next: Next) -> Result<Response, S
 }
 
 fn pat_bearer_token_from_headers(headers: &HeaderMap) -> Result<Option<String>, &'static str> {
-    let Some(value) = headers.get(header::AUTHORIZATION) else {
+    let mut values = headers.get_all(header::AUTHORIZATION).iter();
+    let Some(value) = values.next() else {
         return Ok(None);
     };
+    if values.next().is_some() {
+        return Err("malformed bearer token");
+    }
+    if value.as_bytes().len() > AUTHORIZATION_HEADER_MAX_BYTES {
+        return Err("bearer token too long");
+    }
     let value = value.to_str().map_err(|_| "malformed bearer token")?.trim();
     let Some(token) = value
         .strip_prefix("Bearer ")
@@ -381,7 +415,7 @@ fn pat_bearer_token_from_headers(headers: &HeaderMap) -> Result<Option<String>, 
     if !token.starts_with(PAT_PREFIX) {
         return Ok(None);
     }
-    if value.len() > PAT_AUTHORIZATION_HEADER_MAX_BYTES {
+    if value.len() > PAT_AUTHORIZATION_HEADER_MAX_BYTES || token.len() > PAT_TOKEN_BYTES {
         return Err("bearer token too long");
     }
     if pat_token_is_valid(token) {
@@ -399,7 +433,7 @@ fn pat_token_is_valid(token: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn session_cookie_token_is_valid(token: &str) -> bool {
+pub(crate) fn session_cookie_token_is_valid(token: &str) -> bool {
     token.len() == SESSION_TOKEN_BYTES && token.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
@@ -408,6 +442,19 @@ fn session_request_requires_csrf(method: &str, session: Option<&AuthSession>) ->
         && session
             .map(|session| matches!(session.auth_kind, AuthKind::Session))
             .unwrap_or(false)
+}
+
+fn csrf_token_matches(csrf_header: Option<&str>, expected_csrf_token: &str) -> bool {
+    let Some(provided) = csrf_header.map(str::trim) else {
+        return false;
+    };
+    if expected_csrf_token.len() != SESSION_TOKEN_BYTES
+        || provided.len() != SESSION_TOKEN_BYTES
+        || !provided.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return false;
+    }
+    crate::auth::constant_time_eq(provided.as_bytes(), expected_csrf_token.as_bytes())
 }
 
 /// Generate a random CSRF token
@@ -419,7 +466,12 @@ pub fn generate_csrf_token() -> String {
 }
 
 pub fn derive_csrf_token(token_hash: &str) -> String {
-    crate::auth::hash_token(&format!("csrf:{}", token_hash))
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = Hmac::<Sha256>::new_from_slice(token_hash.as_bytes())
+        .expect("HMAC accepts arbitrary key lengths");
+    mac.update(b"xlstatus-csrf-token-v1");
+    hex::encode(mac.finalize().into_bytes())
 }
 
 fn client_ip_from_headers(headers: &HeaderMap) -> String {
@@ -438,9 +490,9 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        pat_bearer_token_from_headers, session_cookie_token_is_valid,
-        session_request_requires_csrf, AuthKind, AuthSession, PAT_AUTHORIZATION_HEADER_MAX_BYTES,
-        PAT_TOKEN_BYTES,
+        csrf_token_matches, derive_csrf_token, pat_bearer_token_from_headers,
+        session_cookie_token_is_valid, session_request_requires_csrf, AuthKind, AuthSession,
+        AUTHORIZATION_HEADER_MAX_BYTES, PAT_AUTHORIZATION_HEADER_MAX_BYTES, PAT_TOKEN_BYTES,
     };
     use axum::http::{header, HeaderMap};
     use xlstatus_shared::{UserId, UserRole};
@@ -516,6 +568,52 @@ mod tests {
         assert!(session_cookie_token_is_valid(&"A".repeat(64)));
         assert!(!session_cookie_token_is_valid(&"a".repeat(65)));
         assert!(!session_cookie_token_is_valid(&"g".repeat(64)));
+    }
+
+    #[test]
+    fn csrf_token_derivation_uses_hmac_sha256_and_constant_time_matching() {
+        let token_hash = "a".repeat(64);
+        let csrf = derive_csrf_token(&token_hash);
+        assert_eq!(csrf.len(), 64);
+        assert!(csrf.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(csrf, crate::auth::hash_token(&format!("csrf:{token_hash}")));
+
+        assert!(csrf_token_matches(Some(&csrf), &csrf));
+        assert!(csrf_token_matches(Some(&format!(" {csrf} ")), &csrf));
+        assert!(!csrf_token_matches(None, &csrf));
+        assert!(!csrf_token_matches(Some(&"b".repeat(64)), &csrf));
+        assert!(!csrf_token_matches(Some("short"), &csrf));
+        assert!(!csrf_token_matches(Some(&csrf), ""));
+    }
+
+    #[test]
+    fn pat_bearer_rejects_duplicate_or_oversized_authorization_headers() {
+        let token = format!("xlp_{}", "a".repeat(PAT_TOKEN_BYTES - "xlp_".len()));
+        let mut headers = HeaderMap::new();
+        headers.append(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        headers.append(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        assert_eq!(
+            pat_bearer_token_from_headers(&headers),
+            Err("malformed bearer token")
+        );
+
+        let mut oversized = HeaderMap::new();
+        oversized.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {}", "a".repeat(AUTHORIZATION_HEADER_MAX_BYTES + 1))
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            pat_bearer_token_from_headers(&oversized),
+            Err("bearer token too long")
+        );
     }
 
     fn auth_session(auth_kind: AuthKind) -> AuthSession {

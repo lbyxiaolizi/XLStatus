@@ -11,6 +11,8 @@ use sqlx::Row;
 use tracing::warn;
 use xlstatus_shared::tasks::*;
 
+const TASK_REPO_MAX_LIMIT: i64 = 500;
+
 pub struct TaskRepository;
 
 #[derive(Debug)]
@@ -103,6 +105,8 @@ impl TaskRepository {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<Task>> {
+        let limit = limit.clamp(1, TASK_REPO_MAX_LIMIT);
+        let offset = offset.max(0);
         let tasks = match db {
             crate::db::DatabaseBackend::Sqlite(pool) => {
                 let rows = sqlx::query(TASK_SELECT_SQLITE_BY_USER)
@@ -170,6 +174,7 @@ impl TaskRepository {
         if limit <= 0 {
             anyhow::bail!("scheduled task page limit must be positive");
         }
+        let limit = limit.clamp(1, TASK_SCHEDULED_RUNTIME_SCAN_LIMIT);
 
         match db {
             crate::db::DatabaseBackend::Sqlite(pool) => {
@@ -549,6 +554,8 @@ impl TaskRunRepository {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<TaskRun>> {
+        let limit = limit.clamp(1, TASK_REPO_MAX_LIMIT);
+        let offset = offset.max(0);
         let runs = match db {
             crate::db::DatabaseBackend::Sqlite(pool) => {
                 let rows = sqlx::query(TASK_RUN_SELECT_SQLITE_BY_TASK)
@@ -590,6 +597,8 @@ impl TaskRunRepository {
         if server_ids.is_empty() {
             return Ok(Vec::new());
         }
+        let limit = limit.clamp(1, TASK_REPO_MAX_LIMIT);
+        let offset = offset.max(0);
         let runs = match db {
             crate::db::DatabaseBackend::Sqlite(pool) => {
                 let placeholders = sqlite_placeholders(server_ids.len());
@@ -1194,6 +1203,75 @@ mod tests {
         assert!(TaskRepository::list_scheduled_page(&db, None, 0)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn task_and_run_repositories_clamp_negative_and_oversized_pagination() {
+        let db = test_db().await;
+        let user_id = "00000000-0000-0000-0000-000000000001";
+        let server_id = "00000000-0000-0000-0000-000000000101";
+        seed_user(&db, user_id).await;
+
+        let DatabaseBackend::Sqlite(pool) = &db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO servers (id, owner_user_id, name, created_at, updated_at) VALUES (?, ?, 'srv', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(server_id)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let t1 = test_task(user_id, "00000000-0000-0000-0000-000000000201");
+        let t2 = test_task(user_id, "00000000-0000-0000-0000-000000000202");
+        TaskRepository::create(&db, &t1).await.unwrap();
+        TaskRepository::create(&db, &t2).await.unwrap();
+
+        assert_eq!(
+            TaskRepository::list_by_user(&db, user_id, -1, -10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        for idx in 0..3 {
+            let run = TaskRun {
+                id: format!("00000000-0000-0000-0000-00000000030{idx}"),
+                task_id: t1.id.clone(),
+                server_id: server_id.into(),
+                status: TaskStatus::Success,
+                delay_ms: Some(10),
+                output: None,
+                output_truncated: false,
+                error: None,
+                created_at: format!("2026-01-01T00:00:0{idx}Z"),
+            };
+            TaskRunRepository::create(&db, &run).await.unwrap();
+        }
+
+        assert_eq!(
+            TaskRunRepository::list_by_task(&db, &t1.id, -1, -10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            TaskRunRepository::list_by_task_for_server_ids(
+                &db,
+                &t1.id,
+                &[server_id.to_string()],
+                -1,
+                -10,
+            )
+            .await
+            .unwrap()
+            .len(),
+            1
+        );
     }
 
     async fn test_db() -> DatabaseBackend {

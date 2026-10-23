@@ -61,7 +61,8 @@ use api::v1::maintenance::{
     maintenance_status, restore_backup, restore_body_limit, update_tsdb_retention, vacuum_sqlite,
 };
 use api::v1::mcp::{
-    execute_mcp_tool, get_mcp_info, handle_mcp_jsonrpc, list_mcp_tools, mcp_body_limit,
+    execute_mcp_studio, execute_mcp_tool, get_mcp_catalog, get_mcp_info, handle_mcp_jsonrpc,
+    list_mcp_tools, mcp_body_limit,
 };
 use api::v1::nat::{
     create_nat_mapping, delete_nat_mapping, get_nat_mapping, list_all_nat_mappings,
@@ -458,6 +459,11 @@ async fn main() -> anyhow::Result<()> {
                     post(api::v1::agent::revoke_agent),
                 )
                 .route("/api/v1/mcp/tools", get(list_mcp_tools))
+                .route("/api/v1/mcp/catalog", get(get_mcp_catalog))
+                .route(
+                    "/api/v1/mcp/studio",
+                    post(execute_mcp_studio).layer(mcp_body_limit()),
+                )
                 .route(
                     "/api/v1/mcp/execute",
                     post(execute_mcp_tool).layer(mcp_body_limit()),
@@ -725,6 +731,7 @@ async fn main() -> anyhow::Result<()> {
                 .with_state(state)
                 .layer(middleware::from_fn(limit_http_request_target_length))
                 .layer(middleware::from_fn(limit_http_query_length))
+                .layer(middleware::from_fn(apply_http_security_response_headers))
                 .layer(cors);
 
             let addr: SocketAddr = bind.parse()?;
@@ -1394,6 +1401,34 @@ fn ensure_http_path_length(uri: &Uri) -> Result<(), String> {
     Ok(())
 }
 
+async fn apply_http_security_response_headers(request: Request, next: Next) -> Response {
+    let path = request.uri().path().to_owned();
+    let mut response = next.run(request).await;
+    insert_default_security_headers(&path, response.headers_mut());
+    response
+}
+
+fn is_nocache_api_path(path: &str) -> bool {
+    path == "/api" || path.starts_with("/api/") || path == "/mcp" || path.starts_with("/mcp/")
+}
+
+fn insert_default_security_headers(path: &str, headers: &mut HeaderMap) {
+    headers
+        .entry(header::X_CONTENT_TYPE_OPTIONS)
+        .or_insert(HeaderValue::from_static("nosniff"));
+    headers
+        .entry(header::X_FRAME_OPTIONS)
+        .or_insert(HeaderValue::from_static("DENY"));
+    headers
+        .entry(header::REFERRER_POLICY)
+        .or_insert(HeaderValue::from_static("strict-origin-when-cross-origin"));
+    if is_nocache_api_path(path) {
+        headers
+            .entry(header::CACHE_CONTROL)
+            .or_insert(HeaderValue::from_static("no-store"));
+    }
+}
+
 fn server_task_result(
     name: &str,
     result: Result<anyhow::Result<()>, tokio::task::JoinError>,
@@ -1899,5 +1934,153 @@ mod tests {
             "postgresql"
         );
         assert_eq!(database_backend_label("mysql://db/xlstatus"), "unknown");
+    }
+
+    #[tokio::test]
+    async fn http_security_response_headers_middleware_hardens_api_mcp_and_preserves_explicit_headers(
+    ) {
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route("/healthz", get(healthz))
+            .route("/api/v1/servers", get(|| async { "[]" }))
+            .route("/mcp", post(|| async { "{}" }))
+            .route(
+                "/api/v1/public/custom-cache",
+                get(|| async {
+                    (
+                        [(
+                            header::CACHE_CONTROL,
+                            HeaderValue::from_static("private, max-age=5"),
+                        )],
+                        "ok",
+                    )
+                }),
+            )
+            .layer(middleware::from_fn(apply_http_security_response_headers));
+
+        let api_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/servers")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            api_res
+                .headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .unwrap(),
+            "nosniff"
+        );
+        assert_eq!(
+            api_res.headers().get(header::X_FRAME_OPTIONS).unwrap(),
+            "DENY"
+        );
+        assert_eq!(
+            api_res.headers().get(header::REFERRER_POLICY).unwrap(),
+            "strict-origin-when-cross-origin"
+        );
+        assert_eq!(
+            api_res.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+
+        let mcp_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/mcp")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            mcp_res
+                .headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .unwrap(),
+            "nosniff"
+        );
+        assert_eq!(
+            mcp_res.headers().get(header::X_FRAME_OPTIONS).unwrap(),
+            "DENY"
+        );
+        assert_eq!(
+            mcp_res.headers().get(header::REFERRER_POLICY).unwrap(),
+            "strict-origin-when-cross-origin"
+        );
+        assert_eq!(
+            mcp_res.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+
+        let custom_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/public/custom-cache")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            custom_res.headers().get(header::CACHE_CONTROL).unwrap(),
+            "private, max-age=5"
+        );
+
+        let health_res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            health_res
+                .headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .unwrap(),
+            "nosniff"
+        );
+        assert_eq!(
+            health_res.headers().get(header::X_FRAME_OPTIONS).unwrap(),
+            "DENY"
+        );
+        assert_eq!(
+            health_res.headers().get(header::REFERRER_POLICY).unwrap(),
+            "strict-origin-when-cross-origin"
+        );
+        assert!(health_res.headers().get(header::CACHE_CONTROL).is_none());
+    }
+
+    #[test]
+    fn systemd_server_unit_includes_sandboxing_directives() {
+        let unit = include_str!("../../../deploy/xlstatus-server.service");
+
+        for directive in [
+            "NoNewPrivileges=true",
+            "PrivateTmp=true",
+            "ProtectSystem=strict",
+            "ProtectHome=true",
+            "ProtectKernelTunables=true",
+            "ProtectKernelModules=true",
+            "ProtectControlGroups=true",
+            "RestrictSUIDSGID=true",
+            "ReadWritePaths=/var/lib/xlstatus",
+        ] {
+            assert!(
+                unit.contains(directive),
+                "xlstatus-server.service missing directive: {directive}"
+            );
+        }
     }
 }

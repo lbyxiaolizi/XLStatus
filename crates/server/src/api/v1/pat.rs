@@ -66,7 +66,7 @@ pub fn pat_body_limit() -> DefaultBodyLimit {
 
 fn validate_scopes(scopes: &[String], is_admin: bool) -> Result<(), AppError> {
     rbac::validate_pat_scopes(scopes, is_admin).map_err(|msg| {
-        if msg.contains("admin:*") {
+        if msg.contains("admin") {
             AppError::Forbidden(msg)
         } else {
             AppError::BadRequest(msg)
@@ -94,7 +94,7 @@ fn validate_servers(
         })
 }
 
-async fn validate_server_allowlist_ownership(
+pub(crate) async fn validate_server_allowlist_ownership(
     db: &DatabaseBackend,
     user_id: UserId,
     is_admin: bool,
@@ -211,7 +211,9 @@ fn normalize_server_ids(values: Option<Vec<String>>) -> Result<Option<Vec<String
         }
     }
     if server_ids.is_empty() {
-        Ok(None)
+        Err(AppError::BadRequest(
+            "server_ids must not be empty when provided".into(),
+        ))
     } else {
         Ok(Some(server_ids))
     }
@@ -501,6 +503,36 @@ mod tests {
             expires_at: Some("x".repeat(PAT_MAX_EXPIRES_AT_BYTES + 1)),
         })
         .is_err());
+        assert!(normalize_create_pat_request(CreatePATRequest {
+            name: "token".into(),
+            scopes: vec!["notification:read".into()],
+            server_ids: Some(vec![]),
+            expires_at: None,
+        })
+        .is_err());
+        assert!(normalize_create_pat_request(CreatePATRequest {
+            name: "token".into(),
+            scopes: vec!["notification:read".into()],
+            server_ids: Some(vec!["   ".into()]),
+            expires_at: None,
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn non_admin_privileged_scopes_return_forbidden() {
+        assert!(matches!(
+            validate_scopes(&["server:exec".to_string()], false),
+            Err(AppError::Forbidden(_))
+        ));
+        assert!(matches!(
+            validate_scopes(&["task:*".to_string()], false),
+            Err(AppError::Forbidden(_))
+        ));
+        assert!(matches!(
+            validate_scopes(&["admin:*".to_string()], false),
+            Err(AppError::Forbidden(_))
+        ));
     }
 
     #[test]

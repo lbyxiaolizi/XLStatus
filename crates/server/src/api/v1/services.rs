@@ -10,6 +10,7 @@ use crate::auth::middleware::{AuthKind, AuthSession};
 use crate::auth::rbac::has_scope;
 use crate::db::{AgentRepository, DatabaseBackend};
 use crate::security::{validate_outbound_host, validate_outbound_url};
+use crate::services::probe::ensure_safe_probe_host;
 use crate::services::{probe_http, probe_icmp, probe_tcp, ProbeType};
 use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
@@ -572,21 +573,28 @@ pub async fn test_probe(
     require_probe_test_scope(&state.db, &auth, &headers).await?;
 
     let timeout = normalize_probe_timeout(req.timeout_seconds)? as u64;
+    let target = req.target.trim().to_string();
+    if target.is_empty() {
+        return Err(AppError::BadRequest("target is required".into()));
+    }
+    ensure_byte_len(&target, SERVICE_MAX_TARGET_BYTES, "target")?;
 
     let result = match ProbeType::from_str(&req.service_type) {
-        Some(ProbeType::Http) => probe_http(&req.target, timeout).await,
+        Some(ProbeType::Http) => probe_http(&target, timeout).await,
         Some(ProbeType::Tcp) => {
-            let (host, port) = parse_tcp_target(&req.target)?;
+            let (host, port) = parse_tcp_target(&target)?;
             validate_outbound_host(host, port, "TCP probe")
                 .await
                 .map_err(|e| AppError::BadRequest(e.to_string()))?;
             probe_tcp(host, port, timeout).await
         }
         Some(ProbeType::Icmp) => {
-            validate_outbound_host(&req.target, 0, "ICMP probe")
+            ensure_safe_probe_host(&target, "ICMP probe")
+                .map_err(|e| AppError::BadRequest(e.to_string()))?;
+            validate_outbound_host(&target, 0, "ICMP probe")
                 .await
                 .map_err(|e| AppError::BadRequest(e.to_string()))?;
-            probe_icmp(&req.target, timeout).await
+            probe_icmp(&target, timeout).await
         }
         None => {
             return Err(AppError::BadRequest("Invalid service type".to_string()));
@@ -715,6 +723,8 @@ async fn validate_service_request(
                 .map_err(|e| AppError::BadRequest(e.to_string()))?;
         }
         ProbeType::Icmp => {
+            ensure_safe_probe_host(&target, "ICMP monitor")
+                .map_err(|e| AppError::BadRequest(e.to_string()))?;
             validate_outbound_host(&target, 0, "ICMP monitor")
                 .await
                 .map_err(|e| AppError::BadRequest(e.to_string()))?;
@@ -815,12 +825,13 @@ fn parse_tcp_target(target: &str) -> Result<(&str, u16), AppError> {
     let (host, port) = target
         .rsplit_once(':')
         .ok_or_else(|| AppError::BadRequest("TCP target must be host:port".to_string()))?;
-    if host.trim().is_empty() {
-        return Err(AppError::BadRequest("TCP host is required".into()));
-    }
-    let port = port
+    ensure_safe_probe_host(host, "TCP").map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let port: u16 = port
         .parse()
         .map_err(|_| AppError::BadRequest("Invalid port".to_string()))?;
+    if port == 0 {
+        return Err(AppError::BadRequest("Invalid port".to_string()));
+    }
     Ok((host, port))
 }
 

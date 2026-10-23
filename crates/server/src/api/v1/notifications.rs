@@ -453,7 +453,10 @@ pub async fn test_notification(
             },
         )
         .await
-        .map_err(|e| AppError::BadRequest(format!("notification test failed: {e}")))?;
+        .map_err(|e| {
+            let redacted = sanitize_notification_error(&e.to_string(), &channel.url);
+            AppError::BadRequest(format!("notification test failed: {redacted}"))
+        })?;
     Ok(Json(ApiResponse::success(
         serde_json::json!({"id": id, "sent": true}),
     )))
@@ -1483,7 +1486,7 @@ where
         id: row.try_get("id").map_err(db_err)?,
         name: row.try_get("name").map_err(db_err)?,
         request_type: row.try_get("request_type").map_err(db_err)?,
-        url: redact_notification_url(&url),
+        url: redact_notification_url_for_view(&url),
     })
 }
 
@@ -1732,17 +1735,72 @@ fn redact_body_template(value: &str) -> String {
     }
 }
 
+pub(crate) fn sanitize_notification_error(error: &str, channel_url: &str) -> String {
+    let redacted_target = redact_notification_url_for_view(channel_url);
+    let mut sanitized = if !channel_url.is_empty() {
+        error.replace(channel_url, &redacted_target)
+    } else {
+        error.to_string()
+    };
+    if let Ok(parsed) = reqwest::Url::parse(channel_url) {
+        let normalized_url = parsed.to_string();
+        if !normalized_url.is_empty() {
+            sanitized = sanitized.replace(&normalized_url, &redacted_target);
+        }
+    }
+    redact_inline_urls(&sanitized)
+}
+
+fn redact_inline_urls(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while rest
+        .find("http://")
+        .or_else(|| rest.find("https://"))
+        .is_some()
+    {
+        let http_pos = rest.find("http://");
+        let https_pos = rest.find("https://");
+        let idx = match (http_pos, https_pos) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => break,
+        };
+        out.push_str(&rest[..idx]);
+        let after = &rest[idx..];
+        let end = after
+            .find(|ch: char| {
+                ch.is_whitespace() || matches!(ch, ')' | '}' | '>' | '"' | '\'' | ',' | ';')
+            })
+            .unwrap_or(after.len());
+        let candidate = &after[..end];
+        if candidate.ends_with(REDACTED_NOTIFICATION_SECRET) {
+            out.push_str(candidate);
+        } else {
+            out.push_str(&redact_notification_url_for_view(candidate));
+        }
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn redact_notification_url(value: &str) -> String {
     let Ok(parsed) = reqwest::Url::parse(value) else {
         return REDACTED_NOTIFICATION_SECRET.to_string();
     };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return REDACTED_NOTIFICATION_SECRET.to_string();
+    }
     let Some(host) = parsed.host_str() else {
         return REDACTED_NOTIFICATION_SECRET.to_string();
     };
-    let host = if host.contains(':') {
-        format!("[{host}]")
+    let clean_host = host.trim_start_matches('[').trim_end_matches(']');
+    let host = if clean_host.contains(':') {
+        format!("[{clean_host}]")
     } else {
-        host.to_string()
+        clean_host.to_string()
     };
     let authority = match parsed.port() {
         Some(port) => format!("{host}:{port}"),
@@ -1812,6 +1870,25 @@ mod tests {
     fn parses_headers_from_json_object() {
         let headers = parse_headers_json(Some(r#"{"X-Test":"ok"}"#)).unwrap();
         assert_eq!(headers.get("X-Test"), Some(&"ok".to_string()));
+    }
+
+    #[test]
+    fn sanitizes_webhook_url_secrets_from_notification_errors() {
+        let url = "https://hooks.slack.com/services/T000/B000/SECRET_TOKEN?key=abc";
+        let raw_err = format!("error sending request for url ({url}): connection refused");
+        let sanitized = sanitize_notification_error(&raw_err, url);
+        assert!(!sanitized.contains("SECRET_TOKEN"));
+        assert!(!sanitized.contains("key=abc"));
+        assert!(sanitized.contains("https://hooks.slack.com/[redacted]"));
+
+        assert_eq!(
+            redact_notification_url("javascript:alert(1)"),
+            REDACTED_NOTIFICATION_SECRET
+        );
+        assert_eq!(
+            redact_notification_url("https://[2606:4700:4700::1111]:8443/secret"),
+            format!("https://[2606:4700:4700::1111]:8443/{REDACTED_NOTIFICATION_SECRET}")
+        );
     }
 
     #[test]

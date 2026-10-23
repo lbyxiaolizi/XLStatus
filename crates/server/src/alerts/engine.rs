@@ -232,6 +232,15 @@ impl AlertEngine {
 
     pub async fn evaluate_all(&self) -> Result<()> {
         let rules = self.load_alert_rules().await?;
+        let active_rule_ids = rules
+            .iter()
+            .filter(|rule| rule.enabled)
+            .map(|rule| rule.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        self.states
+            .write()
+            .await
+            .retain(|rule_id, _| active_rule_ids.contains(rule_id));
         for rule in rules {
             if !rule.enabled {
                 continue;
@@ -261,6 +270,10 @@ impl AlertEngine {
                 source_agent_id = condition_agent_id(c).map(str::to_string);
                 break;
             }
+        }
+        if trusted_conditions.is_empty() {
+            self.states.write().await.remove(&rule.id);
+            return Ok(());
         }
         let fallback_source_agent_id =
             source_agent_id.or_else(|| infer_condition_agent_id(trusted_conditions));
@@ -530,7 +543,10 @@ impl AlertEngine {
         service_id: &str,
         owner_user_id: &str,
     ) -> Result<bool> {
-        let Ok(owner_uuid) = uuid::Uuid::parse_str(owner_user_id) else {
+        let Ok(owner_uuid) = uuid::Uuid::parse_str(owner_user_id.trim()) else {
+            return Ok(false);
+        };
+        let Ok(service_uuid) = uuid::Uuid::parse_str(service_id.trim()) else {
             return Ok(false);
         };
         match &self.db {
@@ -540,7 +556,7 @@ impl AlertEngine {
                 // first ownerless service errors out of the alert tick.
                 let row: Option<(Option<String>,)> =
                     sqlx::query_as("SELECT owner_user_id FROM services WHERE id = ?")
-                        .bind(service_id)
+                        .bind(service_uuid.to_string())
                         .fetch_optional(pool)
                         .await?;
                 Ok(row
@@ -550,9 +566,6 @@ impl AlertEngine {
                     .unwrap_or(false))
             }
             crate::db::DatabaseBackend::Postgres(pool) => {
-                let Ok(service_uuid) = uuid::Uuid::parse_str(service_id) else {
-                    return Ok(false);
-                };
                 let row: Option<(Option<uuid::Uuid>,)> =
                     sqlx::query_as("SELECT owner_user_id FROM services WHERE id = $1")
                         .bind(service_uuid)
@@ -567,7 +580,10 @@ impl AlertEngine {
     }
 
     async fn agent_belongs_to_owner(&self, agent_id: &str, owner_user_id: &str) -> Result<bool> {
-        let Ok(owner_uuid) = uuid::Uuid::parse_str(owner_user_id) else {
+        let Ok(owner_uuid) = uuid::Uuid::parse_str(owner_user_id.trim()) else {
+            return Ok(false);
+        };
+        let Ok(agent_uuid) = uuid::Uuid::parse_str(agent_id.trim()) else {
             return Ok(false);
         };
         match &self.db {
@@ -575,7 +591,7 @@ impl AlertEngine {
                 let row: Option<(String,)> = sqlx::query_as(
                     "SELECT owner_user_id FROM agents WHERE id = ? AND revoked_at IS NULL",
                 )
-                .bind(agent_id)
+                .bind(agent_uuid.to_string())
                 .fetch_optional(pool)
                 .await?;
                 Ok(row
@@ -584,9 +600,6 @@ impl AlertEngine {
                     .unwrap_or(false))
             }
             crate::db::DatabaseBackend::Postgres(pool) => {
-                let Ok(agent_uuid) = uuid::Uuid::parse_str(agent_id) else {
-                    return Ok(false);
-                };
                 let row: Option<(uuid::Uuid,)> = sqlx::query_as(
                     "SELECT owner_user_id FROM agents WHERE id = $1 AND revoked_at IS NULL",
                 )
@@ -1033,16 +1046,19 @@ impl AlertEngine {
     }
 
     async fn last_seen_age_seconds(&self, agent_id: &str) -> Result<i64> {
+        let Ok(agent_uuid) = uuid::Uuid::parse_str(agent_id.trim()) else {
+            return Ok(i64::MAX);
+        };
         let row: Option<(Option<String>,)> = match &self.db {
             crate::db::DatabaseBackend::Sqlite(pool) => {
                 sqlx::query_as("SELECT last_seen_at FROM agents WHERE id = ?")
-                    .bind(agent_id)
+                    .bind(agent_uuid.to_string())
                     .fetch_optional(pool)
                     .await?
             }
             crate::db::DatabaseBackend::Postgres(pool) => {
                 sqlx::query_as("SELECT last_seen_at::text FROM agents WHERE id = $1")
-                    .bind(agent_id)
+                    .bind(agent_uuid)
                     .fetch_optional(pool)
                     .await?
             }
@@ -1055,16 +1071,19 @@ impl AlertEngine {
     }
 
     async fn server_expires_at(&self, agent_id: &str) -> Result<Option<DateTime<Utc>>> {
+        let Ok(agent_uuid) = uuid::Uuid::parse_str(agent_id.trim()) else {
+            return Ok(None);
+        };
         let row: Option<(Option<String>,)> = match &self.db {
             crate::db::DatabaseBackend::Sqlite(pool) => {
                 sqlx::query_as("SELECT expires_at FROM agents WHERE id = ?")
-                    .bind(agent_id)
+                    .bind(agent_uuid.to_string())
                     .fetch_optional(pool)
                     .await?
             }
             crate::db::DatabaseBackend::Postgres(pool) => {
-                sqlx::query_as("SELECT expires_at FROM agents WHERE id = $1")
-                    .bind(agent_id)
+                sqlx::query_as("SELECT expires_at::text FROM agents WHERE id = $1")
+                    .bind(agent_uuid)
                     .fetch_optional(pool)
                     .await?
             }
@@ -1095,16 +1114,19 @@ impl AlertEngine {
     }
 
     async fn server_traffic_quota_bytes(&self, agent_id: &str) -> Result<Option<u64>> {
+        let Ok(agent_uuid) = uuid::Uuid::parse_str(agent_id.trim()) else {
+            return Ok(None);
+        };
         let row: Option<(Option<String>,)> = match &self.db {
             crate::db::DatabaseBackend::Sqlite(pool) => {
                 sqlx::query_as("SELECT dashboard_metadata_json FROM agents WHERE id = ?")
-                    .bind(agent_id)
+                    .bind(agent_uuid.to_string())
                     .fetch_optional(pool)
                     .await?
             }
             crate::db::DatabaseBackend::Postgres(pool) => {
                 sqlx::query_as("SELECT dashboard_metadata_json FROM agents WHERE id = $1")
-                    .bind(agent_id)
+                    .bind(agent_uuid)
                     .fetch_optional(pool)
                     .await?
             }
@@ -1121,13 +1143,23 @@ impl AlertEngine {
         kind: &str,
         source_agent_id: Option<&str>,
     ) -> Result<()> {
+        let trusted_source_agent_id = match source_agent_id {
+            Some(agent_id)
+                if self
+                    .agent_belongs_to_owner(agent_id, &rule.owner_user_id)
+                    .await? =>
+            {
+                Some(agent_id)
+            }
+            _ => None,
+        };
         let id = uuid::Uuid::now_v7().to_string();
         let now = Utc::now();
         let payload = serde_json::json!({
             "rule_id": rule.id,
             "rule_name": rule.name,
             "kind": kind,
-            "agent_id": source_agent_id,
+            "agent_id": trusted_source_agent_id,
             "fired_at": now.to_rfc3339(),
         });
         let payload_text = serde_json::to_string(&payload)?;
@@ -1138,7 +1170,7 @@ impl AlertEngine {
                 )
                 .bind(&id)
                 .bind(&rule.id)
-                .bind(source_agent_id)
+                .bind(trusted_source_agent_id)
                 .bind(kind)
                 .bind(&payload_text)
                 .bind(now.to_rfc3339())
@@ -1146,15 +1178,17 @@ impl AlertEngine {
                 .await?;
             }
             crate::db::DatabaseBackend::Postgres(pool) => {
-                let agent_id = source_agent_id
+                let event_id = uuid::Uuid::parse_str(&id).context("invalid alert event id")?;
+                let rule_id = uuid::Uuid::parse_str(&rule.id).context("invalid alert rule id")?;
+                let agent_id = trusted_source_agent_id
                     .map(uuid::Uuid::parse_str)
                     .transpose()
                     .context("invalid alert source agent id")?;
                 sqlx::query(
                     "INSERT INTO alert_events (id, rule_id, agent_id, kind, payload_json, fired_at) VALUES ($1, $2, $3, $4, $5, $6)",
                 )
-                .bind(&id)
-                .bind(&rule.id)
+                .bind(event_id)
+                .bind(rule_id)
                 .bind(agent_id)
                 .bind(kind)
                 .bind(&payload_text)
@@ -1164,7 +1198,8 @@ impl AlertEngine {
             }
         }
         info!("alert {} event for rule {} ({})", kind, rule.id, rule.name);
-        self.trigger_tasks(rule, kind, source_agent_id);
+        self.trigger_tasks(rule, kind, trusted_source_agent_id)
+            .await;
 
         let channels = self.channels_for_rule(rule).await.unwrap_or_default();
         if channels.is_empty() {
@@ -1186,14 +1221,18 @@ impl AlertEngine {
             let m = message.clone();
             tokio::spawn(async move {
                 if let Err(e) = s.send(&ch, &m).await {
-                    warn!("notification send failed: {}", e);
+                    let sanitized = crate::api::v1::notifications::sanitize_notification_error(
+                        &e.to_string(),
+                        &ch.url,
+                    );
+                    warn!("notification send failed: {}", sanitized);
                 }
             });
         }
         Ok(())
     }
 
-    fn trigger_tasks(&self, rule: &AlertRule, kind: &str, source_agent_id: Option<&str>) {
+    async fn trigger_tasks(&self, rule: &AlertRule, kind: &str, source_agent_id: Option<&str>) {
         let task_ids = match kind {
             "fired" => &rule.failure_task_ids,
             "recovered" => &rule.recovery_task_ids,
@@ -1202,20 +1241,87 @@ impl AlertEngine {
         if task_ids.is_empty() {
             return;
         }
+        let allowed_task_ids = match self.tasks_for_rule_owner(rule, task_ids).await {
+            Ok(ids) => ids,
+            Err(err) => {
+                warn!("rule {} trigger task lookup failed: {}", rule.id, err);
+                return;
+            }
+        };
+        if allowed_task_ids.is_empty() {
+            return;
+        }
         spawn_triggered_tasks(
             self.db.clone(),
             self.session_registry.clone(),
             self.response_registry.clone(),
-            task_ids.clone(),
+            allowed_task_ids,
             format!("alert:{}:{}", rule.id, kind),
             source_agent_id.map(str::to_string),
             Some(rule.owner_user_id.clone()),
         );
     }
 
+    async fn tasks_for_rule_owner(
+        &self,
+        rule: &AlertRule,
+        task_ids: &[String],
+    ) -> Result<Vec<String>> {
+        let Ok(owner_uuid) = uuid::Uuid::parse_str(rule.owner_user_id.trim()) else {
+            return Ok(Vec::new());
+        };
+        let normalized = normalize_uuid_id_list(task_ids.to_vec());
+        if normalized.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut allowed = Vec::new();
+        for task_id in normalized {
+            let belongs = match &self.db {
+                crate::db::DatabaseBackend::Sqlite(pool) => {
+                    let row: Option<(String,)> = sqlx::query_as(
+                        "SELECT owner_user_id FROM tasks WHERE id = ? AND enabled = 1",
+                    )
+                    .bind(&task_id)
+                    .fetch_optional(pool)
+                    .await?;
+                    row.and_then(|(owner,)| uuid::Uuid::parse_str(owner.trim()).ok())
+                        .map(|owner| owner == owner_uuid)
+                        .unwrap_or(false)
+                }
+                crate::db::DatabaseBackend::Postgres(pool) => {
+                    let Ok(task_uuid) = uuid::Uuid::parse_str(&task_id) else {
+                        continue;
+                    };
+                    let row: Option<(uuid::Uuid,)> = sqlx::query_as(
+                        "SELECT owner_user_id FROM tasks WHERE id = $1 AND enabled = TRUE",
+                    )
+                    .bind(task_uuid)
+                    .fetch_optional(pool)
+                    .await?;
+                    row.map(|(owner,)| owner == owner_uuid).unwrap_or(false)
+                }
+            };
+            if belongs {
+                allowed.push(task_id);
+            } else {
+                warn!(
+                    "rule {} skipped trigger task {}: task is outside rule owner scope or disabled",
+                    rule.id, task_id
+                );
+            }
+        }
+        Ok(allowed)
+    }
+
     async fn channels_for_rule(&self, rule: &AlertRule) -> Result<Vec<NotificationChannel>> {
         let Some(ng) = &rule.notification_group_id else {
             return Ok(vec![]);
+        };
+        let Ok(group_id) = uuid::Uuid::parse_str(ng.trim()) else {
+            return Ok(Vec::new());
+        };
+        let Ok(owner_id) = uuid::Uuid::parse_str(rule.owner_user_id.trim()) else {
+            return Ok(Vec::new());
         };
         let rows: Vec<(
             String,
@@ -1228,21 +1334,16 @@ impl AlertEngine {
             bool,
         )> = match &self.db {
             crate::db::DatabaseBackend::Sqlite(pool) => {
+                let owner_text = owner_id.to_string();
                 sqlx::query_as("SELECT n.id, n.name, n.url, n.request_method, n.request_type, n.headers_json, n.body_template, n.verify_tls FROM notifications n JOIN notification_group_members ngm ON ngm.notification_id = n.id JOIN notification_groups ng ON ng.id = ngm.group_id WHERE ngm.group_id = ? AND ng.owner_user_id = ? AND n.owner_user_id = ? ORDER BY n.created_at ASC LIMIT ?")
-                    .bind(ng)
-                    .bind(&rule.owner_user_id)
-                    .bind(&rule.owner_user_id)
+                    .bind(group_id.to_string())
+                    .bind(&owner_text)
+                    .bind(&owner_text)
                     .bind((NOTIFICATION_MAX_GROUP_CHANNELS + 1) as i64)
                     .fetch_all(pool)
                     .await?
             }
             crate::db::DatabaseBackend::Postgres(pool) => {
-                let Ok(group_id) = uuid::Uuid::parse_str(ng) else {
-                    return Ok(Vec::new());
-                };
-                let Ok(owner_id) = uuid::Uuid::parse_str(&rule.owner_user_id) else {
-                    return Ok(Vec::new());
-                };
                 sqlx::query_as("SELECT n.id::text, n.name, n.url, n.request_method, n.request_type, n.headers_json, n.body_template, n.verify_tls FROM notifications n JOIN notification_group_members ngm ON ngm.notification_id = n.id JOIN notification_groups ng ON ng.id = ngm.group_id WHERE ngm.group_id = $1 AND ng.owner_user_id = $2 AND n.owner_user_id = $2 ORDER BY n.created_at ASC LIMIT $3")
                     .bind(group_id)
                     .bind(owner_id)
@@ -3147,5 +3248,114 @@ mod tests {
             fail_task_ids_json: Some(r#"["00000000-0000-0000-0000-000000000401"]"#.into()),
             recover_task_ids_json: Some(r#"["00000000-0000-0000-0000-000000000402"]"#.into()),
         }
+    }
+
+    async fn seed_task(db: &Db, id: &str, owner: &str, name: &str, enabled: bool) {
+        let Db::Sqlite(pool) = db else {
+            unreachable!();
+        };
+        sqlx::query(
+            "INSERT INTO tasks (id, owner_user_id, name, task_type, command, cover_mode, server_selector_json, push_successful, enabled, created_at, updated_at) VALUES (?, ?, ?, 'shell', 'echo ok', 'all', '{}', 0, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(owner)
+        .bind(name)
+        .bind(if enabled { 1i32 } else { 0i32 })
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tasks_for_rule_owner_rejects_foreign_and_disabled_tasks() {
+        let db = test_db().await;
+        let owner = "00000000-0000-0000-0000-000000000001";
+        let other = "00000000-0000-0000-0000-000000000002";
+        let own_task = "00000000-0000-0000-0000-000000000601";
+        let disabled_task = "00000000-0000-0000-0000-000000000602";
+        let other_task = "00000000-0000-0000-0000-000000000603";
+
+        seed_user(&db, owner, "owner").await;
+        seed_user(&db, other, "other").await;
+        seed_task(&db, own_task, owner, "own-task", true).await;
+        seed_task(&db, disabled_task, owner, "disabled-task", false).await;
+        seed_task(&db, other_task, other, "other-task", true).await;
+
+        let engine = AlertEngine::new(
+            db,
+            crate::grpc::SessionRegistry::new(),
+            crate::current_task_response_registry(),
+        );
+        let rule = AlertRule {
+            id: "00000000-0000-0000-0000-000000000510".into(),
+            owner_user_id: owner.into(),
+            name: "task-scope-rule".into(),
+            enabled: true,
+            trigger_mode: TriggerMode::Once,
+            conditions: Vec::new(),
+            notification_group_id: None,
+            failure_task_ids: vec![own_task.into(), disabled_task.into(), other_task.into()],
+            recovery_task_ids: Vec::new(),
+        };
+
+        let allowed = engine
+            .tasks_for_rule_owner(&rule, &rule.failure_task_ids)
+            .await
+            .unwrap();
+        assert_eq!(allowed, vec![own_task.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn alert_engine_rejects_wildcard_and_all_foreign_condition_recovery() {
+        let db = test_db().await;
+        let owner = "00000000-0000-0000-0000-000000000001";
+        let other = "00000000-0000-0000-0000-000000000002";
+        let other_server = "00000000-0000-0000-0000-000000000202";
+        let rule_id = "00000000-0000-0000-0000-000000000511";
+
+        seed_user(&db, owner, "owner").await;
+        seed_user(&db, other, "other").await;
+        seed_agent(&db, other_server, other, "other-server").await;
+        seed_alert_rule(&db, rule_id, owner, "wildcard-foreign-rule").await;
+
+        let engine = AlertEngine::new(
+            db,
+            crate::grpc::SessionRegistry::new(),
+            crate::current_task_response_registry(),
+        );
+        let rule = AlertRule {
+            id: rule_id.into(),
+            owner_user_id: owner.into(),
+            name: "wildcard-foreign-rule".into(),
+            enabled: true,
+            trigger_mode: TriggerMode::Once,
+            conditions: vec![
+                AlertCondition::ServerOffline {
+                    agent_id: "*".into(),
+                    offline_seconds: 1,
+                },
+                AlertCondition::ServerOffline {
+                    agent_id: other_server.into(),
+                    offline_seconds: 1,
+                },
+            ],
+            notification_group_id: None,
+            failure_task_ids: Vec::new(),
+            recovery_task_ids: Vec::new(),
+        };
+
+        engine.states.write().await.insert(
+            rule.id.clone(),
+            AlertState {
+                rule_id: rule.id.clone(),
+                is_active: true,
+                last_fired_at: Some(Utc::now()),
+                last_always_fire_at: None,
+            },
+        );
+        engine.evaluate_rule(&rule).await.unwrap();
+
+        assert!(alert_events_for_rule(&engine.db, rule_id).await.is_empty());
+        assert!(!engine.states.read().await.contains_key(rule_id));
     }
 }

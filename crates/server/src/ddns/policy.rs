@@ -22,6 +22,9 @@ pub(crate) fn normalize_required_ddns_text(
     if value.len() > max_bytes {
         return Err(format!("{field} must be at most {max_bytes} bytes"));
     }
+    if value.chars().any(|ch| ch.is_control()) {
+        return Err(format!("{field} must not contain control characters"));
+    }
     Ok(value)
 }
 
@@ -38,6 +41,52 @@ pub(crate) fn normalize_optional_ddns_text(
     }
     if value.len() > max_bytes {
         return Err(format!("{field} must be at most {max_bytes} bytes"));
+    }
+    if value.chars().any(|ch| ch.is_control()) {
+        return Err(format!("{field} must not contain control characters"));
+    }
+    Ok(Some(value))
+}
+
+pub(crate) fn normalize_ddns_domain(value: String) -> Result<String, String> {
+    let domain = normalize_required_ddns_text(value, DDNS_MAX_DOMAIN_BYTES, "domain")?;
+    if !is_valid_ddns_domain(&domain) {
+        return Err("domain must be a valid DNS hostname".to_string());
+    }
+    Ok(domain.to_ascii_lowercase())
+}
+
+pub(crate) fn is_valid_ddns_domain(domain: &str) -> bool {
+    if domain.is_empty()
+        || domain.len() > DDNS_MAX_DOMAIN_BYTES
+        || domain.starts_with('.')
+        || domain.ends_with('.')
+    {
+        return false;
+    }
+    domain.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    })
+}
+
+pub(crate) fn normalize_ddns_identifier(
+    value: Option<String>,
+    max_bytes: usize,
+    field: &str,
+) -> Result<Option<String>, String> {
+    let Some(value) = normalize_optional_ddns_text(value, max_bytes, field)? else {
+        return Ok(None);
+    };
+    if value.chars().any(|ch| {
+        ch.is_whitespace() || matches!(ch, '/' | '\\' | '?' | '#' | '&' | '%' | '"' | '\'')
+    }) {
+        return Err(format!("{field} contains invalid characters"));
     }
     Ok(Some(value))
 }

@@ -135,11 +135,8 @@ pub async fn ws_terminal(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response, AppError> {
-    crate::security::validate_websocket_origin(&headers, &state.config.server.cors_allowed_origins)
-        .map_err(AppError::Forbidden)?;
-    if !has_scope(&auth, "server:exec") {
-        return Err(AppError::Forbidden("missing scope: server:exec".into()));
-    }
+    validate_terminal_ws_origin(&headers, &state.config.server.cors_allowed_origins)?;
+    require_terminal_ws_scope(&auth)?;
     let session_id = require_terminal_uuid_text(&session_id, "terminal_session_id")?;
     let session = match state
         .terminal_sessions
@@ -150,7 +147,6 @@ pub async fn ws_terminal(
         None => return Err(AppError::NotFound("terminal session not found".into())),
     };
     if !server_visible(&auth, &session.agent_id) {
-        state.terminal_sessions.restore(session).await;
         return Err(AppError::Forbidden("agent not in scope".into()));
     }
     let agent = match AgentRepository::new(state.db.clone())
@@ -159,14 +155,10 @@ pub async fn ws_terminal(
     {
         Some(agent) => agent,
         None => {
-            state.terminal_sessions.restore(session).await;
             return Err(AppError::NotFound("agent not found".into()));
         }
     };
-    if let Err(err) = ensure_terminal_agent_active(&auth, &agent) {
-        state.terminal_sessions.restore(session).await;
-        return Err(err);
-    }
+    ensure_terminal_agent_active(&auth, &agent)?;
 
     let io_registry = state.io_registry.clone();
     let terminal_sessions = state.terminal_sessions.clone();
@@ -176,6 +168,39 @@ pub async fn ws_terminal(
         .on_upgrade(move |socket| async move {
             let _ = handle_terminal_socket(socket, io_registry, terminal_sessions, session).await;
         }))
+}
+
+fn validate_terminal_ws_origin(
+    headers: &HeaderMap,
+    allowed_origins: &[String],
+) -> Result<(), AppError> {
+    if let Some(raw_origin) = headers.get(axum::http::header::ORIGIN) {
+        let origin = raw_origin
+            .to_str()
+            .ok()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| AppError::Forbidden("WebSocket Origin is not allowed".into()))?;
+        if origin.eq_ignore_ascii_case("null") {
+            return Err(AppError::Forbidden(
+                "WebSocket Origin is not allowed".into(),
+            ));
+        }
+    }
+    crate::security::validate_websocket_origin(headers, allowed_origins)
+        .map_err(AppError::Forbidden)
+}
+
+fn require_terminal_ws_scope(auth: &AuthSession) -> Result<(), AppError> {
+    if !has_scope(auth, "server:exec") {
+        return Err(AppError::Forbidden("missing scope: server:exec".into()));
+    }
+    if matches!(auth.auth_kind, AuthKind::PersonalAccessToken) {
+        return Err(AppError::Forbidden(
+            "terminal sessions require a cookie session".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn terminal_session_created_by_auth(session: &TerminalSession, auth: &AuthSession) -> bool {
@@ -368,10 +393,20 @@ fn parse_client_message(text: &str) -> Result<TerminalClientMessage, serde_json:
                 TERMINAL_MAX_INPUT_BYTES,
             ),
         }),
-        "terminal.resize" | "resize" => Ok(TerminalClientMessage::Resize {
-            cols: value.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u16,
-            rows: value.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u16,
-        }),
+        "terminal.resize" | "resize" => {
+            normalize_terminal_client_message(TerminalClientMessage::Resize {
+                cols: value
+                    .get("cols")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| u16::try_from(v).unwrap_or(u16::MAX))
+                    .unwrap_or(80),
+                rows: value
+                    .get("rows")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| u16::try_from(v).unwrap_or(u16::MAX))
+                    .unwrap_or(24),
+            })
+        }
         "terminal.close" | "close" => Ok(TerminalClientMessage::Close),
         _ => serde_json::from_value(value).and_then(normalize_terminal_client_message),
     }
@@ -384,9 +419,10 @@ fn normalize_terminal_client_message(
         TerminalClientMessage::Input { data } => Ok(TerminalClientMessage::Input {
             data: limit_terminal_text(&data, TERMINAL_MAX_INPUT_BYTES),
         }),
-        TerminalClientMessage::Resize { cols, rows } => {
-            Ok(TerminalClientMessage::Resize { cols, rows })
-        }
+        TerminalClientMessage::Resize { cols, rows } => Ok(TerminalClientMessage::Resize {
+            cols: sanitize_cols(cols),
+            rows: sanitize_rows(rows),
+        }),
         TerminalClientMessage::Close => Ok(TerminalClientMessage::Close),
     }
 }
@@ -583,18 +619,6 @@ impl TerminalSessionRegistry {
             ));
         }
         Ok(sessions.remove(session_id))
-    }
-
-    pub async fn restore(&self, session: TerminalSession) {
-        let mut sessions = self.inner.write().await;
-        prune_expired_terminal_sessions(&mut sessions, chrono::Utc::now());
-        if chrono::Utc::now()
-            .signed_duration_since(session.created_at)
-            .num_seconds()
-            <= TERMINAL_SESSION_TTL_SECONDS
-        {
-            sessions.insert(session.id.clone(), session);
-        }
     }
 
     pub async fn remove(&self, session_id: &str) {
@@ -955,6 +979,127 @@ mod tests {
                 assert_eq!(reason.len(), TERMINAL_MAX_CLOSE_REASON_BYTES);
             }
             _ => panic!("expected closed message"),
+        }
+    }
+
+    #[test]
+    fn terminal_ws_origin_validation_blocks_cross_origin_and_empty_origin() {
+        let allowed = vec!["https://panel.example.com".to_string()];
+
+        let mut same_origin = HeaderMap::new();
+        same_origin.insert(
+            axum::http::header::HOST,
+            "status.example.com".parse().unwrap(),
+        );
+        same_origin.insert(
+            axum::http::header::ORIGIN,
+            "https://status.example.com".parse().unwrap(),
+        );
+        assert!(validate_terminal_ws_origin(&same_origin, &allowed).is_ok());
+
+        let mut cors_origin = HeaderMap::new();
+        cors_origin.insert(axum::http::header::HOST, "api.example.com".parse().unwrap());
+        cors_origin.insert(
+            axum::http::header::ORIGIN,
+            "https://panel.example.com".parse().unwrap(),
+        );
+        assert!(validate_terminal_ws_origin(&cors_origin, &allowed).is_ok());
+
+        let mut cross_origin = HeaderMap::new();
+        cross_origin.insert(
+            axum::http::header::HOST,
+            "status.example.com".parse().unwrap(),
+        );
+        cross_origin.insert(
+            axum::http::header::ORIGIN,
+            "https://evil.example.net".parse().unwrap(),
+        );
+        assert!(matches!(
+            validate_terminal_ws_origin(&cross_origin, &allowed),
+            Err(AppError::Forbidden(_))
+        ));
+
+        let mut null_origin = HeaderMap::new();
+        null_origin.insert(
+            axum::http::header::HOST,
+            "status.example.com".parse().unwrap(),
+        );
+        null_origin.insert(axum::http::header::ORIGIN, "null".parse().unwrap());
+        assert!(matches!(
+            validate_terminal_ws_origin(&null_origin, &allowed),
+            Err(AppError::Forbidden(_))
+        ));
+
+        let mut whitespace_origin = HeaderMap::new();
+        whitespace_origin.insert(
+            axum::http::header::HOST,
+            "status.example.com".parse().unwrap(),
+        );
+        whitespace_origin.insert(axum::http::header::ORIGIN, "   ".parse().unwrap());
+        assert!(matches!(
+            validate_terminal_ws_origin(&whitespace_origin, &allowed),
+            Err(AppError::Forbidden(_))
+        ));
+    }
+
+    #[test]
+    fn terminal_ws_scope_rejects_pat_and_missing_exec_scope() {
+        let cookie_admin = test_auth_session("sess-1");
+        assert!(require_terminal_ws_scope(&cookie_admin).is_ok());
+
+        let pat = test_pat_auth("pat-1");
+        let err = require_terminal_ws_scope(&pat).unwrap_err();
+        assert!(matches!(err, AppError::Forbidden(msg) if msg.contains("cookie session")));
+
+        let mut read_only = test_pat_auth("pat-2");
+        read_only.scopes = vec!["server:read".into()];
+        let err = require_terminal_ws_scope(&read_only).unwrap_err();
+        assert!(matches!(err, AppError::Forbidden(msg) if msg.contains("server:exec")));
+    }
+
+    #[tokio::test]
+    async fn terminal_session_concurrent_take_allows_only_single_winner() {
+        let registry = TerminalSessionRegistry::new();
+        let creator = test_auth_session("creator-session");
+        let created = registry
+            .create(&creator, AgentId(uuid::Uuid::now_v7()), 80, 24)
+            .await
+            .unwrap();
+
+        let (first, second) = tokio::join!(
+            registry.take_for_auth(&created.id, &creator),
+            registry.take_for_auth(&created.id, &creator),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+
+        assert_eq!(
+            usize::from(first.is_some()) + usize::from(second.is_some()),
+            1,
+            "exactly one concurrent WebSocket upgrade may consume a terminal session"
+        );
+        assert!(registry.get(&created.id).await.is_none());
+    }
+
+    #[test]
+    fn terminal_client_resize_dimensions_are_clamped_on_parse() {
+        let low = parse_client_message(r#"{"type":"resize","cols":0,"rows":1}"#).unwrap();
+        match low {
+            TerminalClientMessage::Resize { cols, rows } => {
+                assert_eq!(cols, 20);
+                assert_eq!(rows, 8);
+            }
+            _ => panic!("expected resize message"),
+        }
+
+        let high = parse_client_message(r#"{"type":"terminal.resize","cols":65536,"rows":99999}"#)
+            .unwrap();
+        match high {
+            TerminalClientMessage::Resize { cols, rows } => {
+                assert_eq!(cols, 240);
+                assert_eq!(rows, 80);
+            }
+            _ => panic!("expected resize message"),
         }
     }
 

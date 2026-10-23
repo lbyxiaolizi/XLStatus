@@ -9,6 +9,7 @@ run migrations before using this script.
 from __future__ import annotations
 
 import argparse
+import re
 import sqlite3
 import subprocess
 import sys
@@ -16,6 +17,18 @@ from typing import TextIO
 
 
 COPY_BATCH_SIZE = 1_000
+IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
+_URL_CREDENTIALS_RE = re.compile(
+    r"\b([A-Za-z][A-Za-z0-9+.-]*://)([^/\s:@]+(?::[^/\s@]*)?@)"
+)
+_URL_SECRET_PARAM_RE = re.compile(
+    r"([?&](?:password|sslpassword|passfile|token|secret)=)([^&\s'\"]+)",
+    re.IGNORECASE,
+)
+_KEYVAL_SECRET_RE = re.compile(
+    r"\b((?:PGPASSWORD|password|sslpassword|passfile)\s*=\s*)(?:'[^']*'|\"[^\"]*\"|\S+)",
+    re.IGNORECASE,
+)
 
 # Keep this list in sync with crates/server/migrations. The import command may
 # run against a PostgreSQL database whose public schema also contains unrelated
@@ -61,6 +74,28 @@ XLSTATUS_TABLES = frozenset(
 )
 
 
+def redact_sensitive_text(text: str) -> str:
+    redacted = _URL_CREDENTIALS_RE.sub(r"\1[REDACTED]@", text)
+    redacted = _URL_SECRET_PARAM_RE.sub(r"\1[REDACTED]", redacted)
+    redacted = _KEYVAL_SECRET_RE.sub(r"\1[REDACTED]", redacted)
+    return redacted
+
+
+def validate_identifier(name: str, kind: str = "identifier") -> str:
+    if not isinstance(name, str) or not IDENTIFIER_RE.fullmatch(name):
+        raise ValueError(f"invalid SQL {kind}: {name!r}")
+    return name
+
+
+def validate_table_name(
+    table: str, allowed_tables: frozenset[str] = XLSTATUS_TABLES
+) -> str:
+    validate_identifier(table, "table name")
+    if table not in allowed_tables:
+        raise ValueError(f"table is not in XLStatus allowlist: {table!r}")
+    return table
+
+
 def run(cmd: list[str], input_text: str | None = None) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
@@ -71,11 +106,19 @@ def run(cmd: list[str], input_text: str | None = None) -> subprocess.CompletedPr
             check=True,
         )
     except subprocess.CalledProcessError as exc:
-        if exc.stdout:
-            sys.stderr.write(exc.stdout)
-        if exc.stderr:
-            sys.stderr.write(exc.stderr)
-        raise
+        redacted_stdout = redact_sensitive_text(exc.stdout) if exc.stdout else exc.stdout
+        redacted_stderr = redact_sensitive_text(exc.stderr) if exc.stderr else exc.stderr
+        if redacted_stdout:
+            sys.stderr.write(redacted_stdout)
+        if redacted_stderr:
+            sys.stderr.write(redacted_stderr)
+        redacted_cmd = [redact_sensitive_text(part) for part in exc.cmd]
+        raise subprocess.CalledProcessError(
+            exc.returncode,
+            redacted_cmd,
+            output=redacted_stdout,
+            stderr=redacted_stderr,
+        ) from None
 
 
 def psql(
@@ -124,6 +167,7 @@ def psql_command(container: str, user: str, database: str) -> list[str]:
 
 
 def qident(name: str) -> str:
+    validate_identifier(name)
     return '"' + name.replace('"', '""') + '"'
 
 
@@ -150,6 +194,8 @@ ORDER BY table_name, ordinal_position
         table, column, data_type, udt_name, nullable, default = line.split("\t", 5)
         if table not in XLSTATUS_TABLES:
             continue
+        validate_table_name(table)
+        validate_identifier(column, "column name")
         pg_columns.setdefault(table, []).append(
             {
                 "name": column,
@@ -181,7 +227,7 @@ WHERE tc.table_schema = 'public'
   AND tc.constraint_type = 'FOREIGN KEY'
 ORDER BY child_table, parent_table
 """
-    dependencies = {table: set() for table in pg_tables}
+    dependencies = {validate_table_name(table): set() for table in pg_tables}
     for line in psql(args.container, args.user, args.database, fk_sql, tuples=True).splitlines():
         child, parent = line.split("\t", 1)
         if child in dependencies and parent in dependencies and child != parent:
@@ -209,18 +255,28 @@ ORDER BY child_table, parent_table
 
 
 def sqlite_metadata(sqlite_path: str) -> tuple[sqlite3.Connection, set[str], dict[str, list[str]]]:
-    sqlite = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
+    escaped_path = (
+        sqlite_path.replace("%", "%25").replace("?", "%3f").replace("#", "%23")
+    )
+    try:
+        sqlite = sqlite3.connect(f"file:{escaped_path}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        raise RuntimeError(
+            f"failed to open SQLite backup: {redact_sensitive_text(str(exc))}"
+        ) from None
     sqlite.row_factory = sqlite3.Row
     sqlite_tables = {
-        row[0]
+        validate_table_name(row[0])
         for row in sqlite.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
         )
+        if row[0] in XLSTATUS_TABLES
     }
     sqlite_columns: dict[str, list[str]] = {}
     for table in sqlite_tables:
         sqlite_columns[table] = [
-            row[1] for row in sqlite.execute(f"PRAGMA table_info({qident(table)})")
+            validate_identifier(row[1], "column name")
+            for row in sqlite.execute(f"PRAGMA table_info({qident(table)})")
         ]
     return sqlite, sqlite_tables, sqlite_columns
 

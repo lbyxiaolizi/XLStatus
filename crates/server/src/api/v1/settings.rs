@@ -243,8 +243,8 @@ async fn system_settings_response(
         public_favicon_url: branding.favicon_url,
         public_theme_color: branding.theme_color,
         public_background_url: branding.background_url,
-        public_custom_head: get_string_setting(db, PUBLIC_CUSTOM_HEAD).await?,
-        public_custom_body: get_string_setting(db, PUBLIC_CUSTOM_BODY).await?,
+        public_custom_head: None,
+        public_custom_body: None,
         public_server_details_enabled: public_server_details_enabled(db).await?,
         geoip_provider: geoip_provider(db).await?,
         geoip_ipinfo_token_configured: geoip_ipinfo_token(db).await?.is_some(),
@@ -402,11 +402,10 @@ pub async fn set_tsdb_retention_days(db: &DatabaseBackend, days: i64) -> Result<
 }
 
 pub async fn cloudflared_token(db: &DatabaseBackend) -> Result<Option<String>, AppError> {
-    normalize_runtime_secret_setting(
+    let normalized = normalize_optional_cloudflared_token(
         get_secret_string_setting(db, CLOUDFLARED_TOKEN).await?,
-        SETTINGS_MAX_CLOUDFLARED_TOKEN_BYTES,
-        CLOUDFLARED_TOKEN,
-    )
+    )?;
+    Ok((!normalized.is_empty()).then_some(normalized))
 }
 
 pub async fn cloudflared_token_configured(db: &DatabaseBackend) -> Result<bool, AppError> {
@@ -417,12 +416,46 @@ pub async fn set_cloudflared_token(
     db: &DatabaseBackend,
     token: Option<String>,
 ) -> Result<(), AppError> {
-    let token = normalize_optional_secret_text(
-        token,
-        SETTINGS_MAX_CLOUDFLARED_TOKEN_BYTES,
-        "cloudflared_token",
-    )?;
+    let token = normalize_optional_cloudflared_token(token)?;
     set_secret_string_setting(db, CLOUDFLARED_TOKEN, &token).await
+}
+
+pub fn validate_cloudflared_token_str(token: &str) -> Result<(), AppError> {
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::BadRequest(
+            "cloudflared_token must not be empty".into(),
+        ));
+    }
+    if trimmed.len() > SETTINGS_MAX_CLOUDFLARED_TOKEN_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "cloudflared_token must be at most {SETTINGS_MAX_CLOUDFLARED_TOKEN_BYTES} bytes"
+        )));
+    }
+    if trimmed.starts_with('-') {
+        return Err(AppError::BadRequest(
+            "cloudflared_token must not start with '-'".into(),
+        ));
+    }
+    if trimmed
+        .chars()
+        .any(|ch| ch.is_control() || ch.is_whitespace())
+    {
+        return Err(AppError::BadRequest(
+            "cloudflared_token must not contain whitespace or control characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_optional_cloudflared_token(value: Option<String>) -> Result<String, AppError> {
+    let value = value.unwrap_or_default();
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    validate_cloudflared_token_str(trimmed)?;
+    Ok(trimmed.to_string())
 }
 
 async fn get_bool_setting(db: &DatabaseBackend, key: &str) -> Result<Option<bool>, AppError> {
@@ -673,6 +706,11 @@ fn normalize_short_text(value: &str, max_len: usize, field: &str) -> Result<Stri
     if value.len() > max_len {
         return Err(AppError::BadRequest(format!("{field} is too long")));
     }
+    if value.chars().any(|ch| ch.is_control()) {
+        return Err(AppError::BadRequest(format!(
+            "{field} must not contain control characters"
+        )));
+    }
     Ok(value.to_string())
 }
 
@@ -801,6 +839,11 @@ fn normalize_optional_secret_text(
             "{field} must be at most {max_bytes} bytes"
         )));
     }
+    if value.chars().any(|ch| ch.is_control()) {
+        return Err(AppError::BadRequest(format!(
+            "{field} must not contain control characters"
+        )));
+    }
     Ok(value.to_string())
 }
 
@@ -828,6 +871,11 @@ fn normalize_optional_url_setting(
             "{field} must be at most {max_bytes} bytes"
         )));
     }
+    if value.chars().any(|ch| ch.is_control()) {
+        return Err(AppError::BadRequest(format!(
+            "{field} must not contain control characters"
+        )));
+    }
     let parsed = reqwest::Url::parse(value)
         .map_err(|e| AppError::BadRequest(format!("invalid {field}: {e}")))?;
     if !matches!(parsed.scheme(), "http" | "https") {
@@ -835,9 +883,9 @@ fn normalize_optional_url_setting(
             "{field} must use http or https"
         )));
     }
-    if parsed.host_str().is_none() {
+    let Some(host) = parsed.host_str() else {
         return Err(AppError::BadRequest(format!("{field} must include a host")));
-    }
+    };
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(AppError::BadRequest(format!(
             "{field} must not include credentials"
@@ -848,7 +896,70 @@ fn normalize_optional_url_setting(
             "{field} must not include a fragment"
         )));
     }
+    if !crate::security::allow_private_outbound() && !is_public_url_host(host) {
+        return Err(AppError::BadRequest(format!(
+            "{field} host '{host}' is not allowed for public URL settings"
+        )));
+    }
     Ok(parsed.to_string())
+}
+
+fn is_public_url_host(host: &str) -> bool {
+    let normalized = host
+        .trim_end_matches('.')
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    if normalized.is_empty()
+        || normalized == "localhost"
+        || normalized.ends_with(".localhost")
+        || normalized == "metadata.google.internal"
+        || normalized.ends_with(".internal")
+    {
+        return false;
+    }
+    if let Ok(ip) = normalized.parse::<std::net::IpAddr>() {
+        return is_public_setting_ip(ip);
+    }
+    true
+}
+
+fn is_public_setting_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            let shared_cgnat = octets[0] == 100 && (octets[1] & 0b1100_0000) == 0b0100_0000;
+            let benchmark = octets[0] == 198 && (octets[1] == 18 || octets[1] == 19);
+            let ietf_protocol = octets[0] == 192 && octets[1] == 0 && octets[2] == 0;
+            let reserved = octets[0] >= 240;
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || shared_cgnat
+                || benchmark
+                || ietf_protocol
+                || reserved)
+        }
+        std::net::IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_public_setting_ip(std::net::IpAddr::V4(mapped));
+            }
+            let segments = v6.segments();
+            let discard_only = segments[0] == 0x0100 && segments[1..4] == [0, 0, 0];
+            let documentation = segments[0] == 0x2001 && segments[1] == 0x0db8;
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+                || discard_only
+                || documentation)
+        }
+    }
 }
 
 async fn ensure_geoip_ip_change_servers_active(
@@ -991,6 +1102,36 @@ mod tests {
             "ddns_resolver_url",
         )
         .is_err());
+        if !crate::security::allow_private_outbound() {
+            for blocked in [
+                "http://169.254.169.254/latest/meta-data/",
+                "http://100.100.100.200/latest/meta-data/",
+                "http://127.0.0.1:8080/resolve",
+                "http://[::1]:8080/resolve",
+                "http://localhost/resolve",
+                "http://metadata.google.internal/resolve",
+            ] {
+                assert!(
+                    normalize_optional_url_setting(
+                        Some(blocked.into()),
+                        SETTINGS_MAX_URL_BYTES,
+                        "ddns_resolver_url",
+                    )
+                    .is_err(),
+                    "expected {blocked} to be rejected"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cloudflared_token_validation_rejects_flags_whitespace_and_control_chars() {
+        assert!(super::validate_cloudflared_token_str("eyJhIjoiMTIzNDU2Nzg5MCJ9").is_ok());
+        assert!(super::validate_cloudflared_token_str("--logfile=/tmp/pwn").is_err());
+        assert!(super::validate_cloudflared_token_str("-v").is_err());
+        assert!(super::validate_cloudflared_token_str("token with spaces").is_err());
+        assert!(super::validate_cloudflared_token_str("token\nwith\nnewlines").is_err());
+        assert!(super::validate_cloudflared_token_str("token\0with\0nul").is_err());
     }
 
     #[test]

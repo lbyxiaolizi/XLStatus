@@ -2,6 +2,7 @@
 #![allow(unused_imports)]
 
 use anyhow::{bail, Context, Result};
+use std::net::IpAddr;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
@@ -13,6 +14,7 @@ const ICMP_PING_DEFAULT_TIMEOUT_SECONDS: u32 = 10;
 const ICMP_PING_MAX_TIMEOUT_SECONDS: u32 = 30;
 const ICMP_PING_PROCESS_TIMEOUT_GRACE_SECONDS: u64 = 2;
 const ICMP_PING_OUTPUT_MAX_BYTES: usize = 4096;
+const ICMP_PING_MAX_HOST_BYTES: usize = 253;
 
 /// ICMP ping result
 #[derive(Debug)]
@@ -25,6 +27,35 @@ pub struct IcmpPingResult {
     pub max_latency_ms: f64,
 }
 
+pub fn validate_icmp_host(host: &str) -> Result<&str> {
+    if host.is_empty() || host.len() > ICMP_PING_MAX_HOST_BYTES {
+        bail!(
+            "ICMP ping host length must be between 1 and {} bytes",
+            ICMP_PING_MAX_HOST_BYTES
+        );
+    }
+    if host.starts_with('-') {
+        bail!("ICMP ping host must not start with '-'");
+    }
+    if host.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        bail!("ICMP ping host must not contain whitespace or control characters");
+    }
+
+    let unbracketed = host.trim_matches(['[', ']']);
+    if unbracketed.is_empty() || unbracketed.starts_with('-') {
+        bail!("ICMP ping host is invalid");
+    }
+    if unbracketed.parse::<IpAddr>().is_err()
+        && !unbracketed
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+    {
+        bail!("ICMP ping host contains disallowed characters");
+    }
+
+    Ok(unbracketed)
+}
+
 /// Execute ICMP ping using system ping command
 #[allow(dead_code)]
 pub async fn execute_icmp_ping(
@@ -32,6 +63,7 @@ pub async fn execute_icmp_ping(
     count: u32,
     timeout_seconds: u32,
 ) -> Result<IcmpPingResult> {
+    let host = validate_icmp_host(host)?;
     let _start = Instant::now();
     let count = count.clamp(1, ICMP_PING_MAX_COUNT);
     let timeout_seconds = bounded_timeout_seconds(timeout_seconds);
@@ -57,6 +89,7 @@ pub async fn execute_icmp_ping(
         ]);
         command
     };
+    super::shell::sanitize_tokio_command_env(&mut command);
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     command.kill_on_drop(true);
@@ -304,5 +337,34 @@ rtt min/avg/max/mdev = 10.234/10.456/10.678/0.222 ms
 
         let empty = ping_failure_message(b"", b"");
         assert_eq!(empty, "Ping failed");
+    }
+
+    #[tokio::test]
+    async fn test_icmp_rejects_flag_injection_and_malformed_hosts() {
+        assert_eq!(validate_icmp_host("127.0.0.1").unwrap(), "127.0.0.1");
+        assert_eq!(validate_icmp_host("[::1]").unwrap(), "::1");
+        assert_eq!(validate_icmp_host("example.com").unwrap(), "example.com");
+
+        for bad_host in [
+            "",
+            "-f",
+            "-c 100",
+            "--help",
+            "[-f]",
+            "127.0.0.1 -f",
+            "127.0.0.1\n-f",
+            "127.0.0.1\0",
+            "host;id",
+        ] {
+            assert!(
+                validate_icmp_host(bad_host).is_err(),
+                "expected '{bad_host}' to be rejected by validate_icmp_host"
+            );
+            let res = execute_icmp_ping(bad_host, 1, 1).await;
+            assert!(
+                res.is_err(),
+                "expected execute_icmp_ping('{bad_host}') to fail"
+            );
+        }
     }
 }

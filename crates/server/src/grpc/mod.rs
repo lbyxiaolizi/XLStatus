@@ -516,21 +516,27 @@ fn state_to_json(s: &xlstatus_proto_gen::xlstatus::v1::HostState) -> String {
 
     let mut temperatures = Vec::with_capacity(s.temperatures.len().min(AGENT_TELEMETRY_MAX_ITEMS));
     for t in s.temperatures.iter().take(AGENT_TELEMETRY_MAX_ITEMS) {
+        let temp = sanitize_temperature_f64(t.temperature, &mut telemetry_truncated);
         temperatures.push(json!({
             "label": bounded_telemetry_string(&t.label, &mut telemetry_truncated),
-            "temperature": t.temperature
+            "temperature": temp
         }));
     }
 
+    let cpu_percent = sanitize_percentage_f64(s.cpu_percent, &mut telemetry_truncated);
+    let load_1 = sanitize_non_negative_f64(s.load_1, 1_000_000.0, &mut telemetry_truncated);
+    let load_5 = sanitize_non_negative_f64(s.load_5, 1_000_000.0, &mut telemetry_truncated);
+    let load_15 = sanitize_non_negative_f64(s.load_15, 1_000_000.0, &mut telemetry_truncated);
+
     let value = json!({
-        "cpu_percent": s.cpu_percent,
+        "cpu_percent": cpu_percent,
         "memory_used": s.memory_used,
         "memory_total": s.memory_total,
         "swap_used": s.swap_used,
         "swap_total": s.swap_total,
-        "load_1": s.load_1,
-        "load_5": s.load_5,
-        "load_15": s.load_15,
+        "load_1": load_1,
+        "load_5": load_5,
+        "load_15": load_15,
         "tcp_connections": s.tcp_connections,
         "udp_connections": s.udp_connections,
         "process_count": s.process_count,
@@ -544,14 +550,14 @@ fn state_to_json(s: &xlstatus_proto_gen::xlstatus::v1::HostState) -> String {
     });
     serialize_telemetry_json(value, || {
         json!({
-            "cpu_percent": s.cpu_percent,
+            "cpu_percent": cpu_percent,
             "memory_used": s.memory_used,
             "memory_total": s.memory_total,
             "swap_used": s.swap_used,
             "swap_total": s.swap_total,
-            "load_1": s.load_1,
-            "load_5": s.load_5,
-            "load_15": s.load_15,
+            "load_1": load_1,
+            "load_5": load_5,
+            "load_15": load_15,
             "tcp_connections": s.tcp_connections,
             "udp_connections": s.udp_connections,
             "process_count": s.process_count,
@@ -612,16 +618,56 @@ fn info_to_json(info: &xlstatus_proto_gen::xlstatus::v1::HostInfoUpdate) -> Stri
     })
 }
 
+fn sanitize_percentage_f64(value: f64, telemetry_truncated: &mut bool) -> f64 {
+    if !value.is_finite() {
+        *telemetry_truncated = true;
+        return 0.0;
+    }
+    if !(0.0..=100.0).contains(&value) {
+        *telemetry_truncated = true;
+        return value.clamp(0.0, 100.0);
+    }
+    value
+}
+
+fn sanitize_non_negative_f64(value: f64, max: f64, telemetry_truncated: &mut bool) -> f64 {
+    if !value.is_finite() {
+        *telemetry_truncated = true;
+        return 0.0;
+    }
+    if !(0.0..=max).contains(&value) {
+        *telemetry_truncated = true;
+        return value.clamp(0.0, max);
+    }
+    value
+}
+
+fn sanitize_temperature_f64(value: f64, telemetry_truncated: &mut bool) -> f64 {
+    if !value.is_finite() {
+        *telemetry_truncated = true;
+        return 0.0;
+    }
+    if !(-273.15..=1_000.0).contains(&value) {
+        *telemetry_truncated = true;
+        return value.clamp(-273.15, 1_000.0);
+    }
+    value
+}
+
 fn bounded_telemetry_string(value: &str, telemetry_truncated: &mut bool) -> String {
-    if value.len() <= AGENT_TELEMETRY_MAX_STRING_BYTES {
-        return value.to_string();
+    let mut sanitized = String::with_capacity(value.len().min(AGENT_TELEMETRY_MAX_STRING_BYTES));
+    for ch in value.chars() {
+        if ch.is_control() {
+            *telemetry_truncated = true;
+            continue;
+        }
+        if sanitized.len() + ch.len_utf8() > AGENT_TELEMETRY_MAX_STRING_BYTES {
+            *telemetry_truncated = true;
+            break;
+        }
+        sanitized.push(ch);
     }
-    *telemetry_truncated = true;
-    let mut end = AGENT_TELEMETRY_MAX_STRING_BYTES;
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    value[..end].to_string()
+    sanitized
 }
 
 fn forced_bounded_telemetry_string(value: &str) -> String {
@@ -859,5 +905,38 @@ mod tests {
         let (ipv4, ipv6) = normalized_geo_ip_report(&report);
         assert!(ipv4.is_none());
         assert!(ipv6.is_none());
+    }
+
+    #[test]
+    fn host_state_and_info_sanitize_non_finite_floats_and_control_chars() {
+        let state = HostState {
+            cpu_percent: f64::NAN,
+            load_1: f64::INFINITY,
+            load_5: -5.0,
+            load_15: 1.5,
+            temperatures: vec![TempSensor {
+                label: "cpu\x1b[31m\0\n0".into(),
+                temperature: f64::NEG_INFINITY,
+            }],
+            ..Default::default()
+        };
+        let parsed = parse_json(&state_to_json(&state));
+        assert_eq!(parsed["cpu_percent"], 0.0);
+        assert_eq!(parsed["load_1"], 0.0);
+        assert_eq!(parsed["load_5"], 0.0);
+        assert_eq!(parsed["load_15"], 1.5);
+        assert_eq!(parsed["temperatures"][0]["label"], "cpu[31m0");
+        assert_eq!(parsed["temperatures"][0]["temperature"], 0.0);
+        assert_eq!(parsed["telemetry_truncated"], true);
+
+        let info = HostInfoUpdate {
+            host_info: Some(HostInfo {
+                hostname: "edge\r\n\0host".into(),
+                ..Default::default()
+            }),
+        };
+        let parsed_info = parse_json(&info_to_json(&info));
+        assert_eq!(parsed_info["hostname"], "edgehost");
+        assert_eq!(parsed_info["telemetry_truncated"], true);
     }
 }

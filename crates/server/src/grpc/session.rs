@@ -16,6 +16,12 @@ pub type IoSender = mpsc::Sender<Result<IoFrame, tonic::Status>>;
 const REGISTRY_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const IO_SUBSCRIBER_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const IO_STREAM_CLOSED_CODE: &str = "agent_io_stream_closed";
+const MAX_IO_STREAM_ID_BYTES: usize = 128;
+const MAX_IO_FRAME_DATA_BYTES: usize = 1024 * 1024;
+const MAX_IO_CONTROL_TEXT_BYTES: usize = 4096;
+const MAX_TASK_ID_BYTES: usize = 128;
+pub const MAX_PENDING_TASK_WAITERS: usize = 4096;
+pub const MAX_ACTIVE_IO_STREAMS: usize = 1024;
 
 struct RegisteredSender<T> {
     sender: mpsc::Sender<T>,
@@ -805,6 +811,9 @@ pub struct IoRegistry {
     revoked_agents: Arc<RwLock<HashSet<AgentId>>>,
 }
 
+#[allow(dead_code)]
+pub type IoStreamRegistry = IoRegistry;
+
 #[derive(Clone)]
 struct IoSubscriber {
     agent_id: AgentId,
@@ -827,6 +836,17 @@ impl IoSubscriber {
             *generation = generation.wrapping_add(1);
         });
     }
+}
+
+fn prune_closed_io_subscribers(subscribers: &mut HashMap<String, IoSubscriber>) {
+    subscribers.retain(|_, subscriber| {
+        if subscriber.sender.is_closed() {
+            subscriber.notify_closed();
+            false
+        } else {
+            true
+        }
+    });
 }
 
 impl IoRegistry {
@@ -918,6 +938,9 @@ impl IoRegistry {
         agent_id: AgentId,
     ) -> mpsc::Receiver<IoFrame> {
         let (tx, rx) = mpsc::channel(128);
+        if !valid_io_stream_id(&stream_id) {
+            return rx;
+        }
         let revoked = self.revoked_agents.read().await;
         if revoked.contains(&agent_id) {
             return rx;
@@ -927,6 +950,26 @@ impl IoRegistry {
             return rx;
         }
         let mut subscribers = self.stream_subscribers.write().await;
+        prune_closed_io_subscribers(&mut subscribers);
+        if let Some(existing) = subscribers.get(&stream_id) {
+            if existing.agent_id != agent_id {
+                tracing::warn!(
+                    stream_id = %stream_id,
+                    owner_agent_id = %existing.agent_id,
+                    attempted_agent_id = %agent_id,
+                    "refusing cross-agent IO stream subscription hijack"
+                );
+                return rx;
+            }
+        } else if subscribers.len() >= MAX_ACTIVE_IO_STREAMS {
+            tracing::warn!(
+                stream_id = %stream_id,
+                agent_id = %agent_id,
+                max_active_io_streams = MAX_ACTIVE_IO_STREAMS,
+                "refusing IO stream subscription because active stream limit was reached"
+            );
+            return rx;
+        }
         let replaced = subscribers.insert(stream_id, IoSubscriber::new(agent_id, tx));
         if let Some(replaced) = replaced {
             replaced.notify_closed();
@@ -936,12 +979,24 @@ impl IoRegistry {
 
     pub async fn unsubscribe_stream(&self, stream_id: &str) {
         let mut subscribers = self.stream_subscribers.write().await;
+        prune_closed_io_subscribers(&mut subscribers);
         if let Some(subscriber) = subscribers.remove(stream_id) {
             subscriber.notify_closed();
         }
     }
 
     pub async fn send_to_agent(&self, agent_id: &AgentId, frame: IoFrame) -> Result<(), String> {
+        if !frame.agent_id.is_empty() && frame.agent_id != agent_id.0.to_string() {
+            return Err("IoFrame agent_id does not match target Agent".to_string());
+        }
+        if !frame.stream_id.is_empty() {
+            let subscribers = self.stream_subscribers.read().await;
+            if let Some(subscriber) = subscribers.get(&frame.stream_id) {
+                if !subscriber.sender.is_closed() && subscriber.agent_id != *agent_id {
+                    return Err("IO stream is bound to a different Agent".to_string());
+                }
+            }
+        }
         send_to_current(
             &self.agent_streams,
             &self.revoked_agents,
@@ -954,18 +1009,27 @@ impl IoRegistry {
         .await
     }
 
-    pub async fn deliver_from_agent(&self, agent_id: &AgentId, frame: IoFrame) -> bool {
+    pub async fn deliver_from_agent(&self, agent_id: &AgentId, mut frame: IoFrame) -> bool {
+        if !valid_io_frame_from_agent(agent_id, &frame) {
+            return false;
+        }
+        frame.agent_id = agent_id.0.to_string();
+        let stream_id = frame.stream_id.clone();
         let delivery = {
             let subscribers = self.stream_subscribers.read().await;
             subscribers
-                .get(&frame.stream_id)
-                .filter(|subscriber| subscriber.agent_id == *agent_id)
+                .get(&stream_id)
+                .filter(|subscriber| {
+                    subscriber.agent_id == *agent_id && !subscriber.sender.is_closed()
+                })
                 .map(|subscriber| (subscriber.sender.clone(), subscriber.changes.subscribe()))
         };
         let Some((sender, mut changes)) = delivery else {
+            let mut subscribers = self.stream_subscribers.write().await;
+            prune_closed_io_subscribers(&mut subscribers);
             return false;
         };
-        tokio::time::timeout(IO_SUBSCRIBER_SEND_TIMEOUT, async {
+        let delivered = tokio::time::timeout(IO_SUBSCRIBER_SEND_TIMEOUT, async {
             tokio::select! {
                 biased;
                 _ = changes.changed() => false,
@@ -973,7 +1037,12 @@ impl IoRegistry {
             }
         })
         .await
-        .unwrap_or(false)
+        .unwrap_or(false);
+        if !delivered && sender.is_closed() {
+            let mut subscribers = self.stream_subscribers.write().await;
+            prune_closed_io_subscribers(&mut subscribers);
+        }
+        delivered
     }
 
     pub async fn is_agent_online(&self, agent_id: &AgentId) -> bool {
@@ -983,7 +1052,9 @@ impl IoRegistry {
 
     #[cfg(test)]
     pub async fn subscriber_count(&self) -> usize {
-        self.stream_subscribers.read().await.len()
+        let mut subscribers = self.stream_subscribers.write().await;
+        prune_closed_io_subscribers(&mut subscribers);
+        subscribers.len()
     }
 }
 
@@ -1049,6 +1120,10 @@ struct PendingTaskResponse {
     sender: tokio::sync::oneshot::Sender<xlstatus_proto_gen::xlstatus::v1::TaskResult>,
 }
 
+fn prune_closed_task_waiters(pending: &mut HashMap<String, PendingTaskResponse>) {
+    pending.retain(|_, entry| !entry.sender.is_closed());
+}
+
 /// A cancellation-safe task result waiter.
 ///
 /// Dropping the waiter removes its registry entry, including when an HTTP
@@ -1069,6 +1144,11 @@ impl TaskResponseReceiver {
         tokio::sync::oneshot::error::TryRecvError,
     > {
         self.receiver.try_recv()
+    }
+
+    #[cfg(test)]
+    fn close_receiver(&mut self) {
+        self.receiver.close();
     }
 }
 
@@ -1108,18 +1188,33 @@ impl TaskResponseRegistry {
     pub async fn register(&self, task_id: String, agent_id: AgentId) -> TaskResponseReceiver {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let registration = Arc::new(());
-        let mut pending = self
-            .pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        pending.insert(
-            task_id.clone(),
-            PendingTaskResponse {
-                agent_id,
-                registration: registration.clone(),
-                sender: tx,
-            },
-        );
+        if valid_task_id(&task_id) {
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            prune_closed_task_waiters(&mut pending);
+            let can_insert = match pending.get(&task_id) {
+                Some(existing) => existing.agent_id == agent_id,
+                None => pending.len() < MAX_PENDING_TASK_WAITERS,
+            };
+            if can_insert {
+                pending.insert(
+                    task_id.clone(),
+                    PendingTaskResponse {
+                        agent_id,
+                        registration: registration.clone(),
+                        sender: tx,
+                    },
+                );
+            } else {
+                tracing::warn!(
+                    task_id = %task_id,
+                    agent_id = %agent_id,
+                    "refusing task response waiter registration (capacity or cross-agent conflict)"
+                );
+            }
+        }
         TaskResponseReceiver {
             task_id,
             registration,
@@ -1134,12 +1229,17 @@ impl TaskResponseRegistry {
         &self,
         agent_id: &AgentId,
         task_id: &str,
-        result: xlstatus_proto_gen::xlstatus::v1::TaskResult,
+        mut result: xlstatus_proto_gen::xlstatus::v1::TaskResult,
     ) -> bool {
+        if !valid_task_result_from_agent(agent_id, task_id, &result) {
+            return false;
+        }
+        result.agent_id = agent_id.0.to_string();
         let mut pending = self
             .pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        prune_closed_task_waiters(&mut pending);
         let Some(waiter) = pending.get(task_id) else {
             return false;
         };
@@ -1149,8 +1249,7 @@ impl TaskResponseRegistry {
         let waiter = pending
             .remove(task_id)
             .expect("pending task waiter existed before removal");
-        let _ = waiter.sender.send(result);
-        true
+        waiter.sender.send(result).is_ok()
     }
 
     /// Cancel a waiter (e.g. when the agent session is offline).
@@ -1159,16 +1258,62 @@ impl TaskResponseRegistry {
             .pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        prune_closed_task_waiters(&mut pending);
         pending.remove(task_id);
     }
 
     #[cfg(test)]
     pub fn pending_count(&self) -> usize {
-        self.pending
+        let mut pending = self
+            .pending
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .len()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        prune_closed_task_waiters(&mut pending);
+        pending.len()
     }
+}
+
+fn valid_io_stream_id(stream_id: &str) -> bool {
+    !stream_id.is_empty()
+        && stream_id.len() <= MAX_IO_STREAM_ID_BYTES
+        && !stream_id.chars().any(char::is_control)
+}
+
+fn valid_task_id(task_id: &str) -> bool {
+    !task_id.is_empty()
+        && task_id.len() <= MAX_TASK_ID_BYTES
+        && !task_id.chars().any(char::is_control)
+}
+
+fn valid_io_frame_from_agent(agent_id: &AgentId, frame: &IoFrame) -> bool {
+    if !valid_io_stream_id(frame.stream_id.as_str()) {
+        return false;
+    }
+    if !frame.agent_id.is_empty() && frame.agent_id != agent_id.0.to_string() {
+        return false;
+    }
+    match &frame.payload {
+        Some(io_frame::Payload::Data(data)) => data.data.len() <= MAX_IO_FRAME_DATA_BYTES,
+        Some(io_frame::Payload::Close(close)) => close.reason.len() <= MAX_IO_CONTROL_TEXT_BYTES,
+        Some(io_frame::Payload::Error(err)) => {
+            err.code.len() <= MAX_IO_STREAM_ID_BYTES
+                && err.message.len() <= MAX_IO_CONTROL_TEXT_BYTES
+        }
+        None => true,
+    }
+}
+
+fn valid_task_result_from_agent(agent_id: &AgentId, task_id: &str, result: &TaskResult) -> bool {
+    if !valid_task_id(task_id) {
+        return false;
+    }
+    if !result.task_id.is_empty() && result.task_id != task_id {
+        return false;
+    }
+    if !result.agent_id.is_empty() && result.agent_id != agent_id.0.to_string() {
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -1273,5 +1418,187 @@ mod tests {
         assert_eq!(registry.pending_count(), 1);
         drop(abandoned);
         assert_eq!(registry.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn io_and_task_delivery_reject_spoofed_agent_ids_and_oversized_frames() {
+        use xlstatus_proto_gen::xlstatus::v1::IoData;
+
+        let io_registry = IoRegistry::new();
+        let agent = AgentId(uuid::Uuid::now_v7());
+        let other = AgentId(uuid::Uuid::now_v7());
+        let (tx, _rx) = mpsc::channel(1);
+        assert!(io_registry.register_agent(agent, tx).await);
+        let mut sub = io_registry
+            .subscribe_stream("stream-ok".into(), agent)
+            .await;
+
+        assert!(
+            !io_registry
+                .deliver_from_agent(
+                    &agent,
+                    IoFrame {
+                        stream_id: "stream-ok".into(),
+                        agent_id: other.0.to_string(),
+                        ..IoFrame::default()
+                    },
+                )
+                .await
+        );
+        assert!(
+            !io_registry
+                .deliver_from_agent(
+                    &agent,
+                    IoFrame {
+                        stream_id: "stream-ok".into(),
+                        payload: Some(io_frame::Payload::Data(IoData {
+                            data: vec![0u8; MAX_IO_FRAME_DATA_BYTES + 1],
+                        })),
+                        ..IoFrame::default()
+                    },
+                )
+                .await
+        );
+        assert!(sub.try_recv().is_err());
+
+        let task_registry = TaskResponseRegistry::new();
+        let mut waiter = task_registry.register("task-ok".into(), agent).await;
+        assert!(
+            !task_registry
+                .deliver(
+                    &agent,
+                    "task-ok",
+                    TaskResult {
+                        task_id: "task-ok".into(),
+                        agent_id: other.0.to_string(),
+                        ..TaskResult::default()
+                    },
+                )
+                .await
+        );
+        assert!(waiter.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn task_response_registry_rejects_cross_agent_overwrite_and_bounds_waiters() {
+        let registry = TaskResponseRegistry::new();
+        let owner_agent = AgentId(uuid::Uuid::now_v7());
+        let other_agent = AgentId(uuid::Uuid::now_v7());
+
+        let owner_waiter = registry
+            .register("run-bound".to_string(), owner_agent)
+            .await;
+        let hijack_waiter = registry
+            .register("run-bound".to_string(), other_agent)
+            .await;
+        assert!(hijack_waiter.await.is_err());
+        assert!(
+            registry
+                .deliver(
+                    &owner_agent,
+                    "run-bound",
+                    TaskResult {
+                        task_id: "run-bound".into(),
+                        stdout: "owner-ok".into(),
+                        ..TaskResult::default()
+                    },
+                )
+                .await
+        );
+        assert_eq!(owner_waiter.await.unwrap().stdout, "owner-ok");
+
+        // Closed/stale waiters must be pruned automatically before enforcing capacity.
+        let mut stale_waiter = registry
+            .register("stale-run".to_string(), owner_agent)
+            .await;
+        stale_waiter.close_receiver();
+        std::mem::forget(stale_waiter);
+        assert_eq!(registry.pending_count(), 0);
+
+        let mut waiters = Vec::with_capacity(MAX_PENDING_TASK_WAITERS);
+        for index in 0..MAX_PENDING_TASK_WAITERS {
+            waiters.push(
+                registry
+                    .register(format!("cap-run-{index}"), owner_agent)
+                    .await,
+            );
+        }
+        assert_eq!(registry.pending_count(), MAX_PENDING_TASK_WAITERS);
+
+        let overflow = registry
+            .register("cap-run-overflow".to_string(), owner_agent)
+            .await;
+        assert_eq!(registry.pending_count(), MAX_PENDING_TASK_WAITERS);
+        assert!(overflow.await.is_err());
+
+        drop(waiters);
+        assert_eq!(registry.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn io_stream_registry_rejects_cross_agent_hijack_and_bounds_streams() {
+        let registry = IoStreamRegistry::new();
+        let owner_agent = AgentId(uuid::Uuid::now_v7());
+        let other_agent = AgentId(uuid::Uuid::now_v7());
+        let (owner_tx, _owner_rx) = mpsc::channel(1);
+        let (other_tx, _other_rx) = mpsc::channel(1);
+        assert!(registry.register_agent(owner_agent, owner_tx).await);
+        assert!(registry.register_agent(other_agent, other_tx).await);
+
+        let mut owner_sub = registry
+            .subscribe_stream("stream-bound".to_string(), owner_agent)
+            .await;
+        let mut hijack_sub = registry
+            .subscribe_stream("stream-bound".to_string(), other_agent)
+            .await;
+        assert!(hijack_sub.recv().await.is_none());
+        assert!(registry
+            .send_to_agent(
+                &other_agent,
+                IoFrame {
+                    stream_id: "stream-bound".into(),
+                    ..IoFrame::default()
+                },
+            )
+            .await
+            .unwrap_err()
+            .contains("different Agent"));
+
+        assert!(
+            registry
+                .deliver_from_agent(
+                    &owner_agent,
+                    IoFrame {
+                        stream_id: "stream-bound".into(),
+                        sequence: 42,
+                        ..IoFrame::default()
+                    },
+                )
+                .await
+        );
+        assert_eq!(owner_sub.recv().await.unwrap().sequence, 42);
+
+        // Dropping a subscriber without calling unsubscribe_stream must be pruned automatically.
+        drop(owner_sub);
+        assert_eq!(registry.subscriber_count().await, 0);
+
+        let mut subs = Vec::with_capacity(MAX_ACTIVE_IO_STREAMS);
+        for index in 0..MAX_ACTIVE_IO_STREAMS {
+            subs.push(
+                registry
+                    .subscribe_stream(format!("cap-stream-{index}"), owner_agent)
+                    .await,
+            );
+        }
+        assert_eq!(registry.subscriber_count().await, MAX_ACTIVE_IO_STREAMS);
+
+        let mut overflow = registry
+            .subscribe_stream("cap-stream-overflow".to_string(), owner_agent)
+            .await;
+        assert!(overflow.recv().await.is_none());
+        assert_eq!(registry.subscriber_count().await, MAX_ACTIVE_IO_STREAMS);
+
+        drop(subs);
+        assert_eq!(registry.subscriber_count().await, 0);
     }
 }

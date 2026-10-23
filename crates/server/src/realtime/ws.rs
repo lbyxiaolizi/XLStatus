@@ -11,7 +11,7 @@
 
 use crate::api::v1::auth::{AppError, AppState};
 use crate::auth::middleware::AuthSession;
-use crate::db::AgentRepository;
+use crate::db::{Agent, AgentRepository};
 use crate::realtime::{BroadcastHub, RealtimeEvent};
 use axum::{
     extract::{
@@ -24,7 +24,12 @@ use axum::{
 use futures::{SinkExt, StreamExt};
 use serde::Serialize;
 use std::collections::HashSet;
-use tokio::time::{interval, Duration};
+use tokio::time::{interval, timeout, Duration};
+use xlstatus_shared::AgentId;
+
+const WS_SERVERS_MAX_INBOUND_BYTES: usize = 4 * 1024;
+const WS_SERVERS_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+const WS_SERVERS_PING_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -48,12 +53,34 @@ pub async fn ws_servers(
     }
     let hub = state.realtime.clone();
     let visible_agents = realtime_visible_agent_ids(&state, &auth).await?;
-    Ok(ws.on_upgrade(move |socket| async move {
-        let _ = handle_socket(socket, hub, visible_agents).await;
-    }))
+    Ok(ws
+        .max_message_size(WS_SERVERS_MAX_INBOUND_BYTES)
+        .max_frame_size(WS_SERVERS_MAX_INBOUND_BYTES)
+        .on_upgrade(move |socket| async move {
+            let _ = handle_socket(socket, state, auth, hub, visible_agents).await;
+        }))
 }
 
-async fn handle_socket(socket: WebSocket, hub: BroadcastHub, visible_agents: HashSet<uuid::Uuid>) {
+async fn send_ws_outbound(
+    sender: &mut futures::stream::SplitSink<WebSocket, Message>,
+    outbound: &WsOutbound,
+) -> bool {
+    let Ok(text) = serde_json::to_string(outbound) else {
+        return false;
+    };
+    matches!(
+        timeout(WS_SERVERS_SEND_TIMEOUT, sender.send(Message::Text(text))).await,
+        Ok(Ok(()))
+    )
+}
+
+async fn handle_socket(
+    socket: WebSocket,
+    state: AppState,
+    auth: AuthSession,
+    hub: BroadcastHub,
+    mut visible_agents: HashSet<uuid::Uuid>,
+) {
     let (mut sender, mut receiver) = socket.split();
     let mut rx = hub.subscribe();
 
@@ -62,16 +89,14 @@ async fn handle_socket(socket: WebSocket, hub: BroadcastHub, visible_agents: Has
     let snap = WsOutbound::Snapshot {
         events: filter_realtime_events(hub.latest_snapshot(), &visible_agents),
     };
-    if let Ok(text) = serde_json::to_string(&snap) {
-        if sender.send(Message::Text(text)).await.is_err() {
-            return;
-        }
+    if !send_ws_outbound(&mut sender, &snap).await {
+        return;
     }
 
     // Spawn a task that drains broadcast -> ws, and select on either
     // a client close or a broadcast error so we tear down cleanly.
     let mut send_task = tokio::spawn(async move {
-        let mut ping_tick = interval(Duration::from_secs(30));
+        let mut ping_tick = interval(WS_SERVERS_PING_INTERVAL);
         loop {
             tokio::select! {
                 biased;
@@ -79,32 +104,33 @@ async fn handle_socket(socket: WebSocket, hub: BroadcastHub, visible_agents: Has
                     let msg = WsOutbound::Ping {
                         ts: chrono::Utc::now(),
                     };
-                    let text = match serde_json::to_string(&msg) {
-                        Ok(s) => s,
-                        Err(_) => break,
-                    };
-                    if sender.send(Message::Text(text)).await.is_err() {
+                    if !send_ws_outbound(&mut sender, &msg).await {
                         break;
                     }
                 }
                 event = rx.recv() => {
                     match event {
                         Ok(event) => {
-                            if !visible_agents.contains(&event.agent_id) {
+                            if !realtime_event_visible(&state, &auth, &mut visible_agents, event.agent_id).await {
                                 continue;
                             }
                             let msg = WsOutbound::Event { event };
-                            let text = match serde_json::to_string(&msg) {
-                                Ok(s) => s,
-                                Err(_) => continue,
-                            };
-                            if sender.send(Message::Text(text)).await.is_err() {
+                            if !send_ws_outbound(&mut sender, &msg).await {
                                 break;
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            // Slow consumer: skip missed messages and keep going.
-                            continue;
+                            // Slow consumer: refresh the visible agent set and send a fresh snapshot.
+                            let Ok(refreshed) = realtime_visible_agent_ids(&state, &auth).await else {
+                                break;
+                            };
+                            visible_agents = refreshed;
+                            let snap = WsOutbound::Snapshot {
+                                events: filter_realtime_events(hub.latest_snapshot(), &visible_agents),
+                            };
+                            if !send_ws_outbound(&mut sender, &snap).await {
+                                break;
+                            }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             break;
@@ -116,11 +142,13 @@ async fn handle_socket(socket: WebSocket, hub: BroadcastHub, visible_agents: Has
     });
 
     // Drain incoming messages (mostly pings / close frames). Anything
-    // the client sends is ignored except for explicit Close.
+    // the client sends is ignored except for explicit Close or oversized frames.
     let mut recv_task = tokio::spawn(async move {
         while let Some(msg) = receiver.next().await {
             match msg {
                 Ok(Message::Close(_)) | Err(_) => break,
+                Ok(Message::Text(text)) if text.len() > WS_SERVERS_MAX_INBOUND_BYTES => break,
+                Ok(Message::Binary(bytes)) if bytes.len() > WS_SERVERS_MAX_INBOUND_BYTES => break,
                 _ => continue,
             }
         }
@@ -130,6 +158,22 @@ async fn handle_socket(socket: WebSocket, hub: BroadcastHub, visible_agents: Has
         _ = &mut send_task => recv_task.abort(),
         _ = &mut recv_task => send_task.abort(),
     }
+}
+
+fn agent_visible(auth: &AuthSession, agent: &Agent) -> bool {
+    if agent.revoked_at.is_some() {
+        return false;
+    }
+    if !auth.role.is_admin() && agent.owner_user_id != auth.user_id {
+        return false;
+    }
+    if let Some(allowed) = auth.server_ids.as_ref() {
+        let id = agent.id.0.to_string();
+        if !allowed.iter().any(|candidate| candidate == &id) {
+            return false;
+        }
+    }
+    true
 }
 
 async fn realtime_visible_agent_ids(
@@ -150,7 +194,44 @@ async fn realtime_visible_agent_ids(
         agent_repo.list_by_owner(auth.user_id, i64::MAX, 0).await?
     };
 
-    Ok(agents.into_iter().map(|agent| agent.id.0).collect())
+    Ok(agents
+        .into_iter()
+        .filter(|agent| agent.revoked_at.is_none() && agent_visible(auth, agent))
+        .map(|agent| agent.id.0)
+        .collect())
+}
+
+async fn realtime_event_visible(
+    state: &AppState,
+    auth: &AuthSession,
+    visible_agents: &mut HashSet<uuid::Uuid>,
+    agent_id: uuid::Uuid,
+) -> bool {
+    if let Some(allowed) = auth.server_ids.as_ref() {
+        let id_str = agent_id.to_string();
+        if !allowed.iter().any(|candidate| candidate == &id_str) {
+            visible_agents.remove(&agent_id);
+            return false;
+        }
+    }
+
+    let agent_repo = AgentRepository::new(state.db.clone());
+    let Ok(Some(agent)) = agent_repo.find_by_id(AgentId(agent_id)).await else {
+        visible_agents.remove(&agent_id);
+        return false;
+    };
+    if agent.revoked_at.is_some() {
+        state.realtime.remove_agent(&agent_id);
+        visible_agents.remove(&agent_id);
+        return false;
+    }
+    let visible = agent_visible(auth, &agent);
+    if visible {
+        visible_agents.insert(agent_id);
+    } else {
+        visible_agents.remove(&agent_id);
+    }
+    visible
 }
 
 fn filter_realtime_events(
@@ -314,5 +395,63 @@ mod tests {
         let visible = realtime_visible_agent_ids(&state, &auth).await.unwrap();
         assert!(!visible.contains(&owned_agent));
         assert!(visible.contains(&other_agent));
+    }
+
+    #[tokio::test]
+    async fn realtime_excludes_revoked_agents_and_drops_visibility_after_revoke_or_transfer() {
+        let state = test_state().await;
+        let owner = uid(71);
+        let new_owner = uid(72);
+        let active_agent = uid(81);
+        let revoked_agent = uid(82);
+        seed_user(&state.db, owner, "owner", UserRole::Member).await;
+        seed_user(&state.db, new_owner, "new-owner", UserRole::Member).await;
+        seed_agent(&state.db, active_agent, owner, "active").await;
+        seed_agent(&state.db, revoked_agent, owner, "revoked").await;
+
+        let DatabaseBackend::Sqlite(pool) = &state.db else {
+            unreachable!();
+        };
+        sqlx::query("UPDATE agents SET revoked_at = '2026-06-22T00:00:00Z' WHERE id = ?")
+            .bind(revoked_agent.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
+
+        let auth = auth_session(owner, UserRole::Member, None);
+        let mut visible = realtime_visible_agent_ids(&state, &auth).await.unwrap();
+        assert!(visible.contains(&active_agent));
+        assert!(!visible.contains(&revoked_agent));
+
+        state.realtime.publish(RealtimeEvent::new(
+            "host_state",
+            active_agent,
+            serde_json::json!({"cpu": 10.0}),
+        ));
+        assert!(realtime_event_visible(&state, &auth, &mut visible, active_agent).await);
+
+        // Transfer ownership to new_owner while WebSocket session is open:
+        sqlx::query("UPDATE agents SET owner_user_id = ? WHERE id = ?")
+            .bind(new_owner.to_string())
+            .bind(active_agent.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
+        assert!(!realtime_event_visible(&state, &auth, &mut visible, active_agent).await);
+        assert!(!visible.contains(&active_agent));
+
+        // Transfer back, then revoke while WebSocket session is open:
+        sqlx::query(
+            "UPDATE agents SET owner_user_id = ?, revoked_at = '2026-06-22T01:00:00Z' WHERE id = ?",
+        )
+        .bind(owner.to_string())
+        .bind(active_agent.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+        visible.insert(active_agent);
+        assert!(!realtime_event_visible(&state, &auth, &mut visible, active_agent).await);
+        assert!(!visible.contains(&active_agent));
+        assert!(state.realtime.latest_snapshot().is_empty());
     }
 }

@@ -108,6 +108,12 @@ export function clearStoredUser(): void {
   clearAllCachedServerLists();
   window.localStorage.removeItem("user");
   window.localStorage.removeItem("session_token");
+  window.localStorage.removeItem("xlstatus:enrollment-tokens:v1");
+  try {
+    window.sessionStorage.removeItem("xlstatus:enrollment-tokens:v1");
+  } catch {
+    // Ignore storage errors in restricted browser contexts.
+  }
   window.dispatchEvent(new Event(USER_EVENT));
 }
 

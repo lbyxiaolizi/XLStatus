@@ -16,6 +16,7 @@ pub const NOTIFICATION_MAX_HEADER_VALUE_BYTES: usize = 4096;
 pub const NOTIFICATION_MAX_HEADERS_JSON_BYTES: usize = 16 * 1024;
 pub const NOTIFICATION_MAX_BODY_TEMPLATE_BYTES: usize = 64 * 1024;
 pub const NOTIFICATION_MAX_RENDERED_BODY_BYTES: usize = 128 * 1024;
+pub const NOTIFICATION_MAX_RESPONSE_BYTES: usize = 64 * 1024;
 pub const NOTIFICATION_MAX_GROUP_CHANNELS: usize = 32;
 pub const NOTIFICATION_MAX_MESSAGE_TITLE_BYTES: usize = 512;
 pub const NOTIFICATION_MAX_MESSAGE_TEXT_BYTES: usize = 4096;
@@ -64,21 +65,11 @@ pub enum NotificationSeverity {
 }
 
 /// Notification sender
-pub struct NotificationSender {
-    client: reqwest::Client,
-}
+pub struct NotificationSender;
 
 impl NotificationSender {
     pub fn new() -> Self {
-        Self {
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(
-                    NOTIFICATION_HTTP_TIMEOUT_SECONDS,
-                ))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .expect("Failed to build HTTP client"),
-        }
+        Self
     }
 
     /// Send notification via a channel
@@ -107,36 +98,9 @@ impl NotificationSender {
         channel: &NotificationChannel,
         message: &NotificationMessage,
     ) -> Result<()> {
-        let url_text = self.render_url_template(&channel.url, message)?;
-        let validated =
-            validate_webhook_outbound_url_resolved(&url_text, "notification webhook").await?;
-        let url = validated.url.clone();
         let body = self.render_template(&channel.body_template, message)?;
-        let client = self.client_for_channel(channel, &validated)?;
-        let mut request = self.request_for_method(&client, &channel.request_method, url);
-
-        // Add headers
-        for (key, value) in &channel.headers {
-            request = request.header(key, value);
-        }
-
-        request = request.header("Content-Type", "application/json");
-        if channel.request_method.to_uppercase() != "GET" {
-            request = request.body(body);
-        }
-
-        let response = request
-            .send()
+        self.dispatch_webhook_request(channel, message, Some("application/json"), body)
             .await
-            .context("Failed to send notification")?;
-
-        if !response.status().is_success() {
-            error!("Notification failed with status: {}", response.status());
-            anyhow::bail!("Notification request failed");
-        }
-
-        info!("Notification sent successfully");
-        Ok(())
     }
 
     /// Send form-encoded notification
@@ -145,35 +109,14 @@ impl NotificationSender {
         channel: &NotificationChannel,
         message: &NotificationMessage,
     ) -> Result<()> {
-        let url_text = self.render_url_template(&channel.url, message)?;
-        let validated =
-            validate_webhook_outbound_url_resolved(&url_text, "notification webhook").await?;
-        let url = validated.url.clone();
-        let body = self.render_template(&channel.body_template, message)?;
-        let client = self.client_for_channel(channel, &validated)?;
-        let mut request = self.request_for_method(&client, &channel.request_method, url);
-
-        for (key, value) in &channel.headers {
-            request = request.header(key, value);
-        }
-
-        request = request.header("Content-Type", "application/x-www-form-urlencoded");
-        if channel.request_method.to_uppercase() != "GET" {
-            request = request.body(body);
-        }
-
-        let response = request
-            .send()
-            .await
-            .context("Failed to send notification")?;
-
-        if !response.status().is_success() {
-            error!("Notification failed with status: {}", response.status());
-            anyhow::bail!("Notification request failed");
-        }
-
-        info!("Notification sent successfully");
-        Ok(())
+        let body = self.render_form_template(&channel.body_template, message)?;
+        self.dispatch_webhook_request(
+            channel,
+            message,
+            Some("application/x-www-form-urlencoded"),
+            body,
+        )
+        .await
     }
 
     /// Send custom notification
@@ -182,11 +125,22 @@ impl NotificationSender {
         channel: &NotificationChannel,
         message: &NotificationMessage,
     ) -> Result<()> {
+        let body = self.render_template(&channel.body_template, message)?;
+        self.dispatch_webhook_request(channel, message, None, body)
+            .await
+    }
+
+    async fn dispatch_webhook_request(
+        &self,
+        channel: &NotificationChannel,
+        message: &NotificationMessage,
+        content_type: Option<&str>,
+        body: String,
+    ) -> Result<()> {
         let url_text = self.render_url_template(&channel.url, message)?;
         let validated =
             validate_webhook_outbound_url_resolved(&url_text, "notification webhook").await?;
         let url = validated.url.clone();
-        let body = self.render_template(&channel.body_template, message)?;
         let client = self.client_for_channel(channel, &validated)?;
         let mut request = self.request_for_method(&client, &channel.request_method, url);
 
@@ -194,6 +148,9 @@ impl NotificationSender {
             request = request.header(key, value);
         }
 
+        if let Some(content_type) = content_type {
+            request = request.header("Content-Type", content_type);
+        }
         if channel.request_method.to_uppercase() != "GET" {
             request = request.body(body);
         }
@@ -203,8 +160,11 @@ impl NotificationSender {
             .await
             .context("Failed to send notification")?;
 
-        if !response.status().is_success() {
-            error!("Notification failed with status: {}", response.status());
+        let status = response.status();
+        let _body = read_bounded_response_body(response, NOTIFICATION_MAX_RESPONSE_BYTES).await?;
+
+        if !status.is_success() {
+            error!("Notification failed with status: {}", status);
             anyhow::bail!("Notification request failed");
         }
 
@@ -212,7 +172,7 @@ impl NotificationSender {
         Ok(())
     }
 
-    /// Render notification template
+    /// Render notification template (JSON-safe escaping for substituted variables)
     fn render_template(&self, template: &str, message: &NotificationMessage) -> Result<String> {
         if template.trim().is_empty() {
             let body = serde_json::to_string(&message)?;
@@ -225,41 +185,93 @@ impl NotificationSender {
             return Ok(body);
         }
 
-        self.render_value_template_limited(
+        self.render_value_template_limited_with_escaper(
             template,
             message,
             NOTIFICATION_MAX_RENDERED_BODY_BYTES,
             "notification rendered body",
+            escape_json_template_value,
+        )
+    }
+
+    fn render_form_template(
+        &self,
+        template: &str,
+        message: &NotificationMessage,
+    ) -> Result<String> {
+        if template.trim().is_empty() {
+            let body = serde_json::to_string(&message)?;
+            ensure_text_size(
+                &body,
+                0,
+                NOTIFICATION_MAX_RENDERED_BODY_BYTES,
+                "notification rendered body",
+            )?;
+            return Ok(body);
+        }
+
+        self.render_value_template_limited_with_escaper(
+            template,
+            message,
+            NOTIFICATION_MAX_RENDERED_BODY_BYTES,
+            "notification rendered body",
+            escape_url_component_value,
         )
     }
 
     fn render_url_template(&self, template: &str, message: &NotificationMessage) -> Result<String> {
-        self.render_value_template_limited(
+        self.render_value_template_limited_with_escaper(
             template,
             message,
             NOTIFICATION_MAX_RENDERED_URL_BYTES,
             "notification rendered url",
+            escape_url_component_value,
         )
     }
 
-    fn render_value_template_limited(
+    fn render_value_template_limited_with_escaper(
         &self,
         template: &str,
         message: &NotificationMessage,
         max_bytes: usize,
         field: &str,
+        escaper: fn(&str) -> String,
     ) -> Result<String> {
-        let mut rendered = template.to_string();
+        let severity_str = format!("{:?}", message.severity);
+        let mut rendered = String::with_capacity(template.len().min(max_bytes));
+        let mut rest = template;
 
-        rendered = rendered.replace("{{title}}", &message.title);
-        rendered = rendered.replace("{{message}}", &message.message);
-        rendered = rendered.replace("{{severity}}", &format!("{:?}", message.severity));
-        rendered = rendered.replace("{{timestamp}}", &message.timestamp);
-
-        for (key, value) in &message.metadata {
-            rendered = rendered.replace(&format!("{{{{metadata.{}}}}}", key), value);
+        while let Some(start) = rest.find("{{") {
+            append_bounded(&mut rendered, &rest[..start], max_bytes, field)?;
+            let after_open = &rest[start + 2..];
+            let Some(end) = after_open.find("}}") else {
+                append_bounded(&mut rendered, &rest[start..], max_bytes, field)?;
+                rest = "";
+                break;
+            };
+            let key = &after_open[..end];
+            let replacement = match key {
+                "title" => Some(message.title.as_str()),
+                "message" => Some(message.message.as_str()),
+                "severity" => Some(severity_str.as_str()),
+                "timestamp" => Some(message.timestamp.as_str()),
+                _ => key
+                    .strip_prefix("metadata.")
+                    .and_then(|meta_key| message.metadata.get(meta_key).map(String::as_str)),
+            };
+            match replacement {
+                Some(val) => {
+                    let escaped = escaper(val);
+                    append_bounded(&mut rendered, &escaped, max_bytes, field)?;
+                }
+                None => {
+                    let literal = &rest[start..start + 2 + end + 2];
+                    append_bounded(&mut rendered, literal, max_bytes, field)?;
+                }
+            }
+            rest = &after_open[end + 2..];
         }
-
+        append_bounded(&mut rendered, rest, max_bytes, field)?;
         ensure_text_size(&rendered, 0, max_bytes, field)?;
         Ok(rendered)
     }
@@ -269,9 +281,24 @@ impl NotificationSender {
         channel: &NotificationChannel,
         validated: &ValidatedOutboundUrl,
     ) -> Result<reqwest::Client> {
-        let builder = secure_reqwest_client_builder(validated).timeout(
-            std::time::Duration::from_secs(NOTIFICATION_HTTP_TIMEOUT_SECONDS),
-        );
+        let mut builder = secure_reqwest_client_builder(validated)
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(&validated.host, &validated.addrs)
+            .timeout(std::time::Duration::from_secs(
+                NOTIFICATION_HTTP_TIMEOUT_SECONDS,
+            ));
+        let normalized_host = validated
+            .host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .trim_end_matches('.');
+        if normalized_host != validated.host
+            && !normalized_host.is_empty()
+            && normalized_host.parse::<std::net::IpAddr>().is_err()
+        {
+            builder = builder.resolve_to_addrs(normalized_host, &validated.addrs);
+        }
         let builder = if channel.verify_tls {
             builder
         } else {
@@ -296,6 +323,54 @@ impl NotificationSender {
             _ => client.post(url),
         }
     }
+}
+
+async fn read_bounded_response_body(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    if let Some(content_length) = response.content_length() {
+        if content_length > max_bytes as u64 {
+            anyhow::bail!("notification response body exceeds {max_bytes} bytes");
+        }
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("Failed to read notification response body")?
+    {
+        if body.len().saturating_add(chunk.len()) > max_bytes {
+            anyhow::bail!("notification response body exceeds {max_bytes} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+fn append_bounded(out: &mut String, segment: &str, max_bytes: usize, field: &str) -> Result<()> {
+    if out.len().saturating_add(segment.len()) > max_bytes {
+        anyhow::bail!("{field} must be between 0 and {max_bytes} bytes");
+    }
+    out.push_str(segment);
+    Ok(())
+}
+
+fn escape_json_template_value(value: &str) -> String {
+    let encoded = serde_json::to_string(value).expect("string serialization cannot fail");
+    encoded[1..encoded.len() - 1].to_string()
+}
+
+fn escape_url_component_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 pub fn validate_notification_channel(channel: &NotificationChannel) -> Result<()> {
@@ -541,5 +616,97 @@ mod tests {
 
         assert!(matches!(info, NotificationSeverity::Info));
         assert!(matches!(critical, NotificationSeverity::Critical));
+    }
+
+    #[test]
+    fn json_template_rendering_escapes_quotes_backslashes_and_newlines() {
+        let sender = NotificationSender::new();
+        let message = NotificationMessage {
+            title: "Alert \"disk\\full\"\nsecond line\r\t{{message}}".to_string(),
+            message: "injected \", \"admin\": true, \"x\": \"".to_string(),
+            severity: NotificationSeverity::Critical,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            metadata: HashMap::from([("server".to_string(), "srv-\"1\"\\a".to_string())]),
+        };
+
+        let template =
+            r#"{"title": "{{title}}", "message": "{{message}}", "server": "{{metadata.server}}"}"#;
+        let rendered = sender.render_template(template, &message).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&rendered).expect("rendered JSON template must be valid JSON");
+
+        assert_eq!(
+            parsed.get("title").and_then(|v| v.as_str()),
+            Some("Alert \"disk\\full\"\nsecond line\r\t{{message}}")
+        );
+        assert_eq!(
+            parsed.get("message").and_then(|v| v.as_str()),
+            Some("injected \", \"admin\": true, \"x\": \"")
+        );
+        assert_eq!(
+            parsed.get("server").and_then(|v| v.as_str()),
+            Some("srv-\"1\"\\a")
+        );
+        assert!(parsed.get("admin").is_none());
+    }
+
+    #[tokio::test]
+    async fn webhook_response_body_read_is_bounded_and_pins_resolved_addr() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        assert_eq!(NOTIFICATION_MAX_RESPONSE_BYTES, 64 * 1024);
+
+        // 1. Verify oversized chunked response body is rejected without OOM.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut req_buf = [0u8; 1024];
+            let _ = socket.read(&mut req_buf).await;
+            let payload_len = NOTIFICATION_MAX_RESPONSE_BYTES + 1024;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {payload_len}\r\nConnection: close\r\n\r\n"
+            );
+            let _ = socket.write_all(header.as_bytes()).await;
+            let chunk = vec![b'a'; 8192];
+            for _ in 0..16 {
+                if socket.write_all(&chunk).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let sender = NotificationSender::new();
+        let channel = NotificationChannel {
+            id: "ch-1".into(),
+            name: "pinned-hook".into(),
+            url: format!("http://webhook.invalid:{}/hook", addr.port()),
+            request_method: "POST".into(),
+            request_type: "json".into(),
+            headers: HashMap::new(),
+            body_template: r#"{"title":"{{title}}"}"#.into(),
+            verify_tls: true,
+        };
+        let validated = ValidatedOutboundUrl {
+            url: reqwest::Url::parse(&channel.url).unwrap(),
+            host: "webhook.invalid".into(),
+            addrs: vec![addr],
+        };
+        let client = sender.client_for_channel(&channel, &validated).unwrap();
+        let response = client
+            .post(validated.url.clone())
+            .body(r#"{"title":"test"}"#)
+            .send()
+            .await
+            .expect("pinned client must connect to resolved SocketAddr without DNS lookup");
+
+        let err = read_bounded_response_body(response, NOTIFICATION_MAX_RESPONSE_BYTES)
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("notification response body exceeds"));
+        let _ = server_task.await;
     }
 }

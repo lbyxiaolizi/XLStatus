@@ -13,7 +13,7 @@ import {
   setStoredUser,
   type StoredUser,
 } from "@/app/components/M7Primitives";
-import { sanitizeReturnTo } from "@/app/lib/format";
+import { resolveLoginRedirectParam } from "@/app/lib/security";
 import { useI18n } from "@/lib/use-i18n";
 
 export default function OAuthCallbackPage() {
@@ -27,7 +27,7 @@ export default function OAuthCallbackPage() {
     async function completeOAuth() {
       const params = new URLSearchParams(window.location.search);
       const status = params.get("oauth");
-      const returnTo = sanitizeReturnTo(params.get("return_to"));
+      const returnTo = resolveLoginRedirectParam(params);
       if (status !== "success") {
         if (!cancelled) {
           setNotice("");
@@ -56,8 +56,8 @@ export default function OAuthCallbackPage() {
   return (
     <main className="flex min-h-screen items-center justify-center px-4 py-10">
       <div className="w-full max-w-md">
-        <BrutalCard accent className="p-6 sm:p-8">
-          <h1 className="mb-4 text-3xl font-black uppercase">OAuth</h1>
+        <BrutalCard className="p-6 sm:p-8">
+          <h1 className="mb-4 text-2xl font-semibold tracking-tight text-[var(--text-main)]">OAuth</h1>
           {notice ? <InlineNotice tone="green">{notice}</InlineNotice> : null}
           <InlineError message={error} />
           {error ? (

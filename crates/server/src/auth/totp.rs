@@ -17,20 +17,34 @@ pub fn generate_totp_secret() -> String {
 }
 
 pub fn verify_totp_code(secret: &str, code: &str, now: DateTime<Utc>) -> bool {
+    verify_totp_code_step(secret, code, now).is_some()
+}
+
+/// Verify a TOTP code in constant time across all allowed window steps and
+/// return the matched 30-second counter step if valid.
+pub fn verify_totp_code_step(secret: &str, code: &str, now: DateTime<Utc>) -> Option<i64> {
     let normalized = code.trim().replace(' ', "");
     if normalized.len() != TOTP_DIGITS as usize
         || !normalized.bytes().all(|byte| byte.is_ascii_digit())
     {
-        return false;
+        return None;
     }
 
     let Ok(secret_bytes) = base32_decode(secret) else {
-        return false;
+        return None;
     };
     let counter = now.timestamp().div_euclid(TOTP_STEP_SECONDS);
-    (counter - TOTP_WINDOW..=counter + TOTP_WINDOW).any(|candidate| {
-        candidate >= 0 && format_totp(totp_at(&secret_bytes, candidate as u64)) == normalized
-    })
+    let mut matched_step: Option<i64> = None;
+    for candidate in (counter - TOTP_WINDOW)..=(counter + TOTP_WINDOW) {
+        if candidate < 0 {
+            continue;
+        }
+        let candidate_code = format_totp(totp_at(&secret_bytes, candidate as u64));
+        if crate::auth::constant_time_eq(candidate_code.as_bytes(), normalized.as_bytes()) {
+            matched_step = Some(candidate);
+        }
+    }
+    matched_step
 }
 
 pub fn otpauth_uri(issuer: &str, account: &str, secret: &str) -> String {
@@ -149,5 +163,20 @@ mod tests {
     #[test]
     fn rejects_non_numeric_code() {
         assert!(!verify_totp_code("GEZDGNBVGY3TQOJQ", "12x456", Utc::now()));
+    }
+
+    #[test]
+    fn verify_totp_code_step_returns_matched_step_within_window_only() {
+        let secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+        let step_1 = Utc.timestamp_opt(59, 0).single().unwrap();
+        assert_eq!(verify_totp_code_step(secret, "287082", step_1), Some(1));
+
+        // Adjacent window (+1 step = 60..89s) still matches step 1
+        let step_2 = Utc.timestamp_opt(60, 0).single().unwrap();
+        assert_eq!(verify_totp_code_step(secret, "287082", step_2), Some(1));
+
+        // Two steps away (90s = step 3) is outside the +-1 window
+        let step_3 = Utc.timestamp_opt(90, 0).single().unwrap();
+        assert_eq!(verify_totp_code_step(secret, "287082", step_3), None);
     }
 }

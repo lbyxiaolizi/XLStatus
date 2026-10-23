@@ -17,11 +17,13 @@ use crate::auth::rbac::has_scope;
 use crate::db::repository::ddns::{DdnsConfigRepository, DdnsConfigRow, DdnsHistoryRepository};
 use crate::db::{AgentRepository, DatabaseBackend};
 use crate::ddns::policy::{
-    normalize_ddns_agent_id, normalize_ddns_provider, normalize_ddns_resource_uuid,
-    normalize_optional_ddns_text, normalize_required_ddns_text, DDNS_API_MAX_BODY_BYTES,
-    DDNS_MAX_DOMAIN_BYTES, DDNS_MAX_NAME_BYTES, DDNS_MAX_PROVIDER_BYTES, DDNS_MAX_RECORD_ID_BYTES,
-    DDNS_MAX_SECRET_BYTES, DDNS_MAX_WEBHOOK_URL_BYTES, DDNS_MAX_ZONE_ID_BYTES, DDNS_UUID_TEXT_LEN,
+    normalize_ddns_agent_id, normalize_ddns_domain, normalize_ddns_identifier,
+    normalize_ddns_provider, normalize_ddns_resource_uuid, normalize_optional_ddns_text,
+    normalize_required_ddns_text, DDNS_API_MAX_BODY_BYTES, DDNS_MAX_DOMAIN_BYTES,
+    DDNS_MAX_NAME_BYTES, DDNS_MAX_PROVIDER_BYTES, DDNS_MAX_RECORD_ID_BYTES, DDNS_MAX_SECRET_BYTES,
+    DDNS_MAX_WEBHOOK_URL_BYTES, DDNS_MAX_ZONE_ID_BYTES, DDNS_UUID_TEXT_LEN,
 };
+use crate::ddns::provider::sanitize_ddns_error_message;
 use crate::security::validate_webhook_outbound_url;
 use xlstatus_shared::ddns::{DdnsHistoryEntry, ProviderType};
 use xlstatus_shared::AgentId;
@@ -240,10 +242,10 @@ fn normalize_create_ddns_request(
     let agent_id = normalize_ddns_agent_id(req.agent_id)?;
     let name = normalize_required_ddns_text(req.name, DDNS_MAX_NAME_BYTES, "name")?;
     let provider = normalize_ddns_provider(&req.provider)?;
-    let domain = normalize_required_ddns_text(req.domain, DDNS_MAX_DOMAIN_BYTES, "domain")?;
+    let domain = normalize_ddns_domain(req.domain)?;
     let record_id =
-        normalize_optional_ddns_text(req.record_id, DDNS_MAX_RECORD_ID_BYTES, "record_id")?;
-    let zone_id = normalize_optional_ddns_text(req.zone_id, DDNS_MAX_ZONE_ID_BYTES, "zone_id")?;
+        normalize_ddns_identifier(req.record_id, DDNS_MAX_RECORD_ID_BYTES, "record_id")?;
+    let zone_id = normalize_ddns_identifier(req.zone_id, DDNS_MAX_ZONE_ID_BYTES, "zone_id")?;
     let api_token =
         normalize_optional_ddns_text(req.api_token, DDNS_MAX_SECRET_BYTES, "api_token")?;
     let api_key = normalize_optional_ddns_text(req.api_key, DDNS_MAX_SECRET_BYTES, "api_key")?;
@@ -364,7 +366,7 @@ pub async fn list_ddns_history(
         ));
     };
     ensure_ddns_config_visible(&auth_user, &config)?;
-    let history = DdnsHistoryRepository::list_for_config(&state.db, &config_id, 50)
+    let mut history = DdnsHistoryRepository::list_for_config(&state.db, &config_id, 50)
         .await
         .map_err(|e| {
             (
@@ -376,6 +378,11 @@ pub async fn list_ddns_history(
                 }),
             )
         })?;
+    for entry in &mut history {
+        if let Some(ref err) = entry.error {
+            entry.error = Some(sanitize_ddns_error_message(err));
+        }
+    }
     Ok(Json(ApiResponse {
         success: true,
         data: Some(DdnsHistoryListResponse {
@@ -865,6 +872,30 @@ mod tests {
         req.provider = "webhook".into();
         req.webhook_url = None;
         assert!(normalize_create_ddns_request(req).is_err());
+
+        for bad_domain in [
+            "example.com/../../evil",
+            "example.com?token=1",
+            "example.com\"injected",
+            "-leading-dash.example.com",
+            "spaces in domain.example.com",
+        ] {
+            let mut req = ddns_create_request();
+            req.domain = bad_domain.into();
+            assert!(
+                normalize_create_ddns_request(req).is_err(),
+                "expected invalid domain {bad_domain} to be rejected"
+            );
+        }
+
+        for bad_id in ["zone/../../evil", "zone?x=1", "zone with space"] {
+            let mut req = ddns_create_request();
+            req.zone_id = Some(bad_id.into());
+            assert!(
+                normalize_create_ddns_request(req).is_err(),
+                "expected invalid zone_id {bad_id} to be rejected"
+            );
+        }
     }
 
     #[test]

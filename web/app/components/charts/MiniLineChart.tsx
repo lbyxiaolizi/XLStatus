@@ -23,23 +23,20 @@ interface ChartPreset {
   emptyClass: string;
 }
 
-// Geometry presets: "detail" is the dashboard server detail size, "compact" the
-// denser public status card. Everything else (grid, typography, stroke widths)
-// is shared so both surfaces stay visually identical.
 const PRESETS: Record<MiniLineChartVariant, ChartPreset> = {
   detail: {
     width: 640,
     height: 190,
     padding: { top: 14, right: 16, bottom: 30, left: 46 },
-    svgClass: "h-48 w-full border-2 border-black bg-[var(--bg-page)]",
-    emptyClass: "flex h-44 items-center justify-center border-2 border-black bg-[var(--accent-bg)] text-sm font-black",
+    svgClass: "h-48 w-full rounded-xl border border-[var(--border-color)] bg-[var(--bg-subtle)]",
+    emptyClass: "flex h-44 items-center justify-center rounded-xl border border-dashed border-[var(--border-color)] bg-[var(--bg-subtle)] text-xs font-medium text-[var(--text-muted)]",
   },
   compact: {
     width: 640,
     height: 160,
     padding: { top: 12, right: 14, bottom: 28, left: 44 },
-    svgClass: "h-40 w-full border-2 border-black bg-[var(--bg-page)]",
-    emptyClass: "flex h-36 items-center justify-center border-2 border-black bg-[var(--accent-bg)] text-xs font-black",
+    svgClass: "h-40 w-full rounded-xl border border-[var(--border-color)] bg-[var(--bg-subtle)]",
+    emptyClass: "flex h-36 items-center justify-center rounded-xl border border-dashed border-[var(--border-color)] bg-[var(--bg-subtle)] text-xs font-medium text-[var(--text-muted)]",
   },
 };
 
@@ -96,8 +93,6 @@ function buildLineLayout(
     minTime,
     maxTime,
     timeSpan,
-    // Hover snaps to a real sample, so the unique sorted timeline is only worth
-    // building for interactive charts.
     timeValues: withTimeValues ? Array.from(new Set(times)).sort((a, b) => a - b) : [],
     yMax,
     x: (time: number) => (single ? preset.padding.left + plotWidth / 2 : preset.padding.left + ((time - minTime) / timeSpan) * plotWidth),
@@ -118,12 +113,12 @@ export const MiniLineChart = memo(function MiniLineChart({
   variant = "detail",
 }: {
   series: ChartSeries[];
-  maxValue?: number;
+  maxValue?: number | undefined;
   formatValue: (value: number) => string;
   emptyLabel: string;
   ariaLabel: string;
-  interactive?: boolean;
-  variant?: MiniLineChartVariant;
+  interactive?: boolean | undefined;
+  variant?: MiniLineChartVariant | undefined;
 }) {
   const [hover, setHover] = useState<HoverState | null>(null);
   const preset = PRESETS[variant];
@@ -144,21 +139,21 @@ export const MiniLineChart = memo(function MiniLineChart({
               y1={lineY}
               y2={lineY}
               stroke="var(--border-color)"
-              strokeOpacity="0.18"
-              strokeWidth="2"
+              strokeOpacity="0.6"
+              strokeWidth="1"
             />
           );
         })}
-        <text x={8} y={padding.top + 10} fill="var(--text-muted)" fontSize="12" fontWeight="900">
+        <text x={8} y={padding.top + 10} fill="var(--text-muted)" fontSize="11" fontWeight="500">
           {formatValue(layout.yMax)}
         </text>
-        <text x={8} y={padding.top + layout.plotHeight} fill="var(--text-muted)" fontSize="12" fontWeight="900">
+        <text x={8} y={padding.top + layout.plotHeight} fill="var(--text-muted)" fontSize="11" fontWeight="500">
           {formatValue(0)}
         </text>
-        <text x={padding.left} y={height - 9} fill="var(--text-muted)" fontSize="12" fontWeight="900">
+        <text x={padding.left} y={height - 9} fill="var(--text-muted)" fontSize="11" fontWeight="500">
           {formatChartTime(layout.minTime)}
         </text>
-        <text x={width - padding.right} y={height - 9} fill="var(--text-muted)" fontSize="12" fontWeight="900" textAnchor="end">
+        <text x={width - padding.right} y={height - 9} fill="var(--text-muted)" fontSize="11" fontWeight="500" textAnchor="end">
           {formatChartTime(layout.maxTime)}
         </text>
       </>
@@ -172,11 +167,12 @@ export const MiniLineChart = memo(function MiniLineChart({
       const path = points
         .map((point, index) => `${index === 0 ? "M" : "L"} ${layout.x(point.time).toFixed(2)} ${layout.y(point.value).toFixed(2)}`)
         .join(" ");
+      const firstPoint = points[0];
       return (
         <g key={item.id ?? item.label}>
-          <path d={path} fill="none" stroke={item.color} strokeLinecap="square" strokeLinejoin="round" strokeWidth="4" />
-          {points.length === 1 ? (
-            <circle cx={layout.x(points[0].time)} cy={layout.y(points[0].value)} r="5" fill={item.color} stroke="var(--border-color)" strokeWidth="2" />
+          <path d={path} fill="none" stroke={item.color} strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.25" />
+          {points.length === 1 && firstPoint ? (
+            <circle cx={layout.x(firstPoint.time)} cy={layout.y(firstPoint.value)} r="4" fill={item.color} stroke="var(--bg-card)" strokeWidth="1.5" />
           ) : null}
         </g>
       );

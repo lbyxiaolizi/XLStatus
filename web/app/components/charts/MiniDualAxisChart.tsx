@@ -21,11 +21,9 @@ const PLOT_WIDTH = WIDTH - PADDING.left - PADDING.right;
 const PLOT_HEIGHT = HEIGHT - PADDING.top - PADDING.bottom;
 const GRID_RATIOS = [0, 0.25, 0.5, 0.75, 1];
 const TOOLTIP_WIDTH = 240;
-// Loss always uses the full right axis so the band stays comparable between
-// probes, and its own palette so it reads apart from the per-probe latency lines.
 const LOSS_MAX = 100;
-const LOSS_FILL = "#facc15";
-const LOSS_STROKE = "#ca8a04";
+const LOSS_FILL = "#f59e0b";
+const LOSS_STROKE = "#d97706";
 
 interface DualLayout {
   minTime: number;
@@ -125,27 +123,27 @@ export const MiniDualAxisChart = memo(function MiniDualAxisChart({
               y1={lineY}
               y2={lineY}
               stroke="var(--border-color)"
-              strokeOpacity="0.18"
-              strokeWidth="2"
+              strokeOpacity="0.6"
+              strokeWidth="1"
             />
           );
         })}
-        <text x={8} y={PADDING.top + 10} fill="var(--text-muted)" fontSize="12" fontWeight="900">
+        <text x={8} y={PADDING.top + 10} fill="var(--text-muted)" fontSize="11" fontWeight="500">
           {formatMs(layout.latencyMax)}
         </text>
-        <text x={8} y={PADDING.top + PLOT_HEIGHT} fill="var(--text-muted)" fontSize="12" fontWeight="900">
+        <text x={8} y={PADDING.top + PLOT_HEIGHT} fill="var(--text-muted)" fontSize="11" fontWeight="500">
           0 ms
         </text>
-        <text x={WIDTH - 8} y={PADDING.top + 10} fill="var(--text-muted)" fontSize="12" fontWeight="900" textAnchor="end">
+        <text x={WIDTH - 8} y={PADDING.top + 10} fill="var(--text-muted)" fontSize="11" fontWeight="500" textAnchor="end">
           100%
         </text>
-        <text x={WIDTH - 8} y={PADDING.top + PLOT_HEIGHT} fill="var(--text-muted)" fontSize="12" fontWeight="900" textAnchor="end">
+        <text x={WIDTH - 8} y={PADDING.top + PLOT_HEIGHT} fill="var(--text-muted)" fontSize="11" fontWeight="500" textAnchor="end">
           0%
         </text>
-        <text x={PADDING.left} y={HEIGHT - 10} fill="var(--text-muted)" fontSize="12" fontWeight="900">
+        <text x={PADDING.left} y={HEIGHT - 10} fill="var(--text-muted)" fontSize="11" fontWeight="500">
           {formatChartTime(layout.minTime)}
         </text>
-        <text x={WIDTH - PADDING.right} y={HEIGHT - 10} fill="var(--text-muted)" fontSize="12" fontWeight="900" textAnchor="end">
+        <text x={WIDTH - PADDING.right} y={HEIGHT - 10} fill="var(--text-muted)" fontSize="11" fontWeight="500" textAnchor="end">
           {formatChartTime(layout.maxTime)}
         </text>
       </>
@@ -160,13 +158,15 @@ export const MiniDualAxisChart = memo(function MiniDualAxisChart({
       const linePath = points
         .map((point, index) => `${index === 0 ? "M" : "L"} ${layout.x(point.time).toFixed(2)} ${layout.yLoss(point.value).toFixed(2)}`)
         .join(" ");
-      const areaPath = points.length
-        ? `${linePath} L ${layout.x(points[points.length - 1].time).toFixed(2)} ${baseline.toFixed(2)} L ${layout.x(points[0].time).toFixed(2)} ${baseline.toFixed(2)} Z`
+      const first = points[0];
+      const last = points[points.length - 1];
+      const areaPath = first && last
+        ? `${linePath} L ${layout.x(last.time).toFixed(2)} ${baseline.toFixed(2)} L ${layout.x(first.time).toFixed(2)} ${baseline.toFixed(2)} Z`
         : "";
       return (
         <g key={`${item.id ?? item.label}-loss`}>
           {areaPath ? <path d={areaPath} fill={LOSS_FILL} fillOpacity="0.14" stroke="none" /> : null}
-          <path d={linePath} fill="none" stroke={LOSS_STROKE} strokeDasharray="6 5" strokeLinecap="square" strokeLinejoin="round" strokeWidth="2.5" />
+          <path d={linePath} fill="none" stroke={LOSS_STROKE} strokeDasharray="5 4" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.75" />
         </g>
       );
     });
@@ -179,11 +179,12 @@ export const MiniDualAxisChart = memo(function MiniDualAxisChart({
       const path = points
         .map((point, index) => `${index === 0 ? "M" : "L"} ${layout.x(point.time).toFixed(2)} ${layout.yLatency(point.value).toFixed(2)}`)
         .join(" ");
+      const firstPoint = points[0];
       return (
         <g key={item.id ?? item.label}>
-          <path d={path} fill="none" stroke={item.color} strokeLinecap="square" strokeLinejoin="round" strokeWidth="4" />
-          {points.length === 1 ? (
-            <circle cx={layout.x(points[0].time)} cy={layout.yLatency(points[0].value)} r="5" fill={item.color} stroke="var(--border-color)" strokeWidth="2" />
+          <path d={path} fill="none" stroke={item.color} strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.25" />
+          {points.length === 1 && firstPoint ? (
+            <circle cx={layout.x(firstPoint.time)} cy={layout.yLatency(firstPoint.value)} r="4" fill={item.color} stroke="var(--bg-card)" strokeWidth="1.5" />
           ) : null}
         </g>
       );
@@ -227,7 +228,7 @@ export const MiniDualAxisChart = memo(function MiniDualAxisChart({
 
   if (!layout) {
     return (
-      <div className="flex h-56 items-center justify-center border-2 border-black bg-[var(--accent-bg)] text-sm font-black">
+      <div className="flex h-56 items-center justify-center rounded-xl border border-dashed border-[var(--border-color)] bg-[var(--bg-subtle)] text-xs font-medium text-[var(--text-muted)]">
         {emptyLabel}
       </div>
     );
@@ -235,7 +236,7 @@ export const MiniDualAxisChart = memo(function MiniDualAxisChart({
 
   return (
     <svg
-      className="h-60 w-full border-2 border-black bg-[var(--bg-page)]"
+      className="h-60 w-full rounded-xl border border-[var(--border-color)] bg-[var(--bg-subtle)]"
       viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
       role="img"
       aria-label={ariaLabel}
