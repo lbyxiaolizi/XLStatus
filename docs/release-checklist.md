@@ -1,90 +1,148 @@
-# 发布检查清单
+# 发布检查清单 (Release Checklist)
 
-发布前按本清单检查。没有通过的项目不要标记为发布完成。
+在创建 Git Release Tag（如 `v0.2`）并发布新版本前，必须逐项完成本清单中的核验步骤。任何一项未通过均不得打标发布。
 
-## 代码
+---
+
+## 1. 版本号全仓同步核验 (Version Sync)
+
+GitHub Actions (`.github/workflows/build.yml` 中的 `Verify release version metadata` 步骤) 会在推送 `v*` 标签时强制校验以下 6 处版本号完全同步（对于二维标签如 `v0.2`，Cargo 与 npm 清单版本应为 `0.2.0`）：
+
+1. **Rust Workspace 全部 6 个 Crate (`crates/*/Cargo.toml`)**：
+   - `xlstatus-shared`、`xlstatus-proto-gen`、`xlstatus-tsdb`、`xlstatus-server`、`xlstatus-agent`、`xtask` 的 `version` 均等于 `0.2.0`。
+2. **Web 前端清单 (`web/package.json`)**：
+   - `"version": "0.2.0"`。
+3. **Server 安装脚本 (`deploy/install.sh`)**：
+   - `VERSION="${VERSION:-v0.2}"`。
+4. **Agent 安装脚本 (`deploy/install-agent.sh`)**：
+   - `VERSION="${VERSION:-v0.2}"`。
+5. **Server 内置 Agent Bootstrap 默认版本 (`crates/server/src/main.rs`)**：
+   - `const DEFAULT_AGENT_INSTALL_VERSION: &str = "v0.2";`。
+6. **Web 设置页 Agent 安装卡片回退版本 (`web/app/(dashboard)/settings/sections/AgentInstallCard.tsx`)**：
+   - `const DEFAULT_AGENT_VERSION = "v0.2";`。
+
+### 一键核验脚本
 
 ```bash
-cargo fmt --check
-cargo check --workspace
-cargo clippy --workspace --all-targets -- -D warnings -A clippy::too_many_arguments -A clippy::type_complexity
-cargo test --workspace
+TAG="v0.2"
+MANIFEST_VERSION="0.2.0"
+
+cargo metadata --locked --no-deps --format-version 1 \
+  | jq -e --arg version "$MANIFEST_VERSION" 'all(.packages[]; .version == $version)'
+jq -e --arg version "$MANIFEST_VERSION" '.version == $version' web/package.json
+grep -F "VERSION=\"\${VERSION:-$TAG}\"" deploy/install.sh
+grep -F "VERSION=\"\${VERSION:-$TAG}\"" deploy/install-agent.sh
+grep -F "DEFAULT_AGENT_INSTALL_VERSION: &str = \"$TAG\"" crates/server/src/main.rs
+grep -F "DEFAULT_AGENT_VERSION = \"$TAG\"" 'web/app/(dashboard)/settings/sections/AgentInstallCard.tsx'
 ```
 
-Web：
+---
+
+## 2. 后端、前端与脚本门禁检查 (CI Gate Checks)
+
+### 2.1 Rust 格式化、SQLx 错误传播、Clippy 与全量测试
+
+```bash
+# 1. 格式检查
+cargo fmt --check
+
+# 2. 严禁静默吞掉 SQLx try_get 解码错误
+! rg --line-number --multiline 'try_get(?:<[^>]+>)?\([^)]*\)\s*\.(?:ok\(\)|unwrap_or(?:_default|_else)?\s*\()' crates/server/src
+
+# 3. 锁定依赖检查与严格 Clippy
+cargo check --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings -A clippy::too_many_arguments -A clippy::type_complexity
+
+# 4. 运行全量单元与集成测试（含 PostgreSQL 契约测试）
+XLSTATUS_TEST_PG_URL="postgres://xlstatus:xlstatus@127.0.0.1:5432/xlstatus_test" \
+  cargo test --workspace --locked
+```
+
+### 2.2 Web 前端与 MCP Stdio 桥接检查
 
 ```bash
 cd web
 pnpm install --frozen-lockfile
 pnpm lint
+pnpm test:unit
+pnpm typecheck
 NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm build
+cd ..
 ```
 
-## 安装与运行
+### 2.3 部署编排、迁移脚本与 Shell 安全性检查
 
 ```bash
-cargo build --release --bin xlstatus-server
-cargo build --release --bin xlstatus-agent
-test-run/verify-m9-install.sh
+# 1. Shell 语法检查
+find deploy scripts test-run -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
+
+# 2. 进程组隔离清理与安装器原子升级/回滚验证
+bash test-run/verify-process-cleanup-safety.sh
+bash test-run/verify-install-upgrade-safety.sh
+
+# 3. Docker Compose 三套编排语法验证
+SESSION_SECRET=ci-only-session-secret-at-least-32-bytes \
+SECRET_ENCRYPTION_KEY=ci-only-encryption-key-at-least-32-bytes \
+POSTGRES_PASSWORD=ci-only-postgres-password \
+  sh -c '
+    docker compose -f docker-compose.yml config --quiet &&
+    docker compose -f docker-compose.pg.yml config --quiet &&
+    docker compose -f docker-compose.simple.yml config --quiet
+  '
+
+# 4. SQLite -> PostgreSQL 迁移工具单元测试
+python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 ```
 
-GitHub Actions 会在 `main` 和 PR 上运行 Rust/Web 检查，并在 tag `v*` 时发布多平台 Release 资产：
+---
 
-- `xlstatus-server-<os>-<arch>[.exe]`
-- `xlstatus-agent-<os>-<arch>[.exe]`
-- `install-server.sh`
-- `install-agent.sh`
+## 3. 安全回归测试清单 (Security Regression Suite)
 
-当前矩阵覆盖 Linux x86_64/arm64/i386、Windows x86_64/arm64/i386、macOS x86_64/arm64、FreeBSD x86_64/i386。macOS i386 和 FreeBSD arm64 没有 Rust stable release target，不在资产列表中。
+发布前确认以下安全边界测试全部通过：
 
-Server 后台生成的 Agent 一键安装链接会从 GitHub Release 下载 `install-agent.sh`。
-Web 设置页默认从 GitHub Releases 获取最新版；发布前确认 `deploy/install*.sh`、Server bootstrap 默认版本和文档示例使用同一个 fallback tag。
+- [x] **启动凭据脱敏 (`crates/server/tests/startup_secret_redaction.rs`)**：
+  无效 `DATABASE_URL`、异常 `PGPASSFILE`、语法错误的 `config.toml` 在报错退出时绝不泄漏用户名、密码或密钥。
+- [x] **密钥熵与弱默认值拦截 (`crates/server/src/config.rs` & `secrets.rs`)**：
+  `SESSION_SECRET` 与 `SECRET_ENCRYPTION_KEY` 低于 32 字符、不同字节数 `< 4` 或命中示例占位符时拒绝启动；数据库敏感字段使用 `HKDF-SHA256` 派生 `AES-256-GCM` 密钥加密。
+- [x] **在线恢复沙箱加固 (`crates/server/src/api/v1/maintenance.rs`)**：
+  强制校验 SQLite 魔数头、`PRAGMA trusted_schema = OFF`、`PRAGMA integrity_check`，拒绝含 `trigger`、`view`、`VIRTUAL TABLE` 的备份文件。
+- [x] **前端与 MCP 桥接安全 (`web/app/lib/security.test.mts`)**：
+  开放重定向拦截、URL 路径段防穿越编码、自定义主题 CSS 变量防注入、错误消息 `xlp_`/`xle_` 令牌脱敏、MCP Stdio 1 MiB 行长限制全部通过。
+- [x] **端到端发布安装与 MCP 权限回归**：
+  ```bash
+  bash test-run/verify-m6-mcp.sh
+  bash test-run/verify-m7-ui.sh
+  bash test-run/verify-m9-install.sh
+  ```
 
-Linux x86_64 smoke：
+---
 
-```bash
-timeout 8s env \
-  DATABASE_URL="sqlite://$(pwd)/data/xlstatus.db?mode=rwc" \
-  DATABASE_CREATE_IF_MISSING=true \
-  HTTP_BIND="127.0.0.1:8080" \
-  GRPC_BIND="127.0.0.1:50051" \
-  CORS_ALLOWED_ORIGINS="http://localhost:3000,http://127.0.0.1:3000" \
-  SESSION_SECRET="$(openssl rand -hex 32)" \
-  XLSTATUS_SEED_ADMIN_USERNAME="admin" \
-  XLSTATUS_SEED_ADMIN_PASSWORD="replace-with-a-strong-initial-password" \
-  ./target/release/xlstatus-server
-```
+## 4. 多平台 Release 构建矩阵核验
 
-退出码应为 `124`。
+推送 `v*` 标签后，GitHub Actions 会自动构建并发布以下 **10 个目标平台** 的 `xlstatus-server` 与 `xlstatus-agent` 二进制及安装脚本：
 
-## 配置
+| 操作系统 (`os_name`) | 架构 (`arch`) | Rust Target | 构建方式与附加检查 |
+|---|---|---|---|
+| `linux` | `x86_64` | `x86_64-unknown-linux-gnu` | `cargo build --release` + `GLIBC <= 2.36` 符号校验 + 打包 `install-server.sh` / `install-agent.sh` |
+| `linux` | `arm64` | `aarch64-unknown-linux-gnu` | `cargo build --release` + `GLIBC <= 2.36` 符号校验 |
+| `linux` | `i386` | `i686-unknown-linux-gnu` | `cargo zigbuild --release` |
+| `windows` | `x86_64` | `x86_64-pc-windows-msvc` | MSVC `x64` (`xlstatus-*-windows-x86_64.exe`) |
+| `windows` | `arm64` | `aarch64-pc-windows-msvc` | MSVC `arm64` (`xlstatus-*-windows-arm64.exe`) |
+| `windows` | `i386` | `i686-pc-windows-msvc` | MSVC `x86` (`xlstatus-*-windows-i386.exe`) |
+| `darwin` | `x86_64` | `x86_64-apple-darwin` | macOS Intel 原生构建 |
+| `darwin` | `arm64` | `aarch64-apple-darwin` | macOS Apple Silicon 原生构建 |
+| `freebsd` | `x86_64` | `x86_64-unknown-freebsd` | `cargo zigbuild --release` |
+| `freebsd` | `i386` | `i686-unknown-freebsd` | `cargo zigbuild --release` |
 
-- `config.example.toml` 包含 `database`、`server`、`security` 三段。
-- `server.cors_allowed_origins` 已写入示例和安装脚本。
-- SQLite 示例使用 `?mode=rwc` 或 `create_if_missing = true`。
-- PostgreSQL 文档说明了先创建用户和数据库。
-- systemd unit 不混用 `DATABASE_URL` 和 `CONFIG_FILE`。
+---
 
-## 文档
+## 5. 发布后验证步骤 (Post-Release Smoke)
 
-- `docs/README.md` 是唯一文档入口。
-- 快速开始、安装、配置、Web、Agent、运维、排障全部能互相跳转。
-- 文档没有引用已删除的历史归档、旧里程碑报告或过期命令。
-- 从源码构建包含后端、Agent 和前端步骤。
-- CORS、`config.toml`、SQLite 创建行为、PostgreSQL 新站初始化均有说明。
-- Agent 安装说明包含后台带参数链接和 GitHub Release 脚本来源。
-- README 只保留当前入口和文档索引，不引用历史规划目录作为主路径。
-
-## 安全
-
-- 生产文档使用随机 `SESSION_SECRET`。
-- 示例提醒首次登录后更换 seed 管理员密码。
-- Agent 配置说明包含私钥和 `0600` 权限要求。
-- CORS 禁止 `*`。
-
-## 发布后
-
-- 推送 `main`。
-- 创建 tag。
-- 构建并上传多平台二进制。
-- 在目标生产环境跑至少一次 24 小时稳定性观察。
+1. 确认 GitHub Release 页面已完整上传 20 个二进制资产及 `install-server.sh`、`install-agent.sh`。
+2. 在干净的 Linux 主机或容器中执行一键安装与 `/healthz` 验证：
+   ```bash
+   curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.2/install-server.sh | \
+     sudo INTERACTIVE=false VERSION=v0.2 ADMIN_PASSWORD='SmokeTestStrongPassword!2026' bash
+   curl -fsS http://127.0.0.1:8080/healthz
+   ```
+3. 登录 Web UI，生成注册令牌并验证 Agent 一键接入与 MCP Studio 调用正常。

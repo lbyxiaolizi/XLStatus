@@ -1,367 +1,462 @@
-# 安装部署
+# 安装部署指南 (生产环境)
 
-本文档覆盖当前仓库可用的部署路径：Docker Compose、源码运行、systemd 安装脚本、PostgreSQL 新站、Web UI 和 Agent。
+本文档提供 **XLStatus `v0.2`** 的完整生产环境部署指南，涵盖 Docker Compose 三种拓扑、Linux systemd 一键安装脚本（含原子暂存、健康检查自动回滚与沙箱加固）、PostgreSQL 生产库初始化、Nginx/Caddy 反向代理以及 gRPC TLS/mTLS 双向认证配置。
 
-## 平台要求
+---
 
-- Linux x86_64 / arm64 / i386：systemd 安装脚本当前支持的平台。
-- Windows、macOS、FreeBSD：GitHub Release 发布 Server 和 Agent 二进制，可手动运行或自行接入系统服务。
-- Docker 20.10+ 和 Docker Compose v2：用于容器部署。
-- Rust 工具链：用于从源码构建 Server 和 Agent。
-- Node.js 20+、Corepack、pnpm：用于构建 `web/`。
-- SQLite 3.40+ 或 PostgreSQL 15+。
+## 1. 平台与环境要求
 
-## Docker Compose
+| 组件 / 方式 | 平台与版本要求 |
+|---|---|
+| **Linux systemd 安装器** (`install-server.sh` / `install-agent.sh`) | Linux `x86_64`、`arm64` (`aarch64`)、`i386` (`i686`)，GLIBC `<= 2.36` 兼容（Ubuntu 22.04+ / Debian 12+ / RHEL 9+） |
+| **多平台预编译二进制** (GitHub Releases) | Linux (`x86_64`, `arm64`, `i386`)、Windows (`x86_64`, `arm64`, `i386` `.exe`)、macOS (`x86_64`, `arm64`)、FreeBSD (`x86_64`, `i386`) |
+| **Docker 部署** | Docker `20.10+` 与 Docker Compose `v2` |
+| **数据库后端** | SQLite `3.40+`（内置 WAL + 外键约束）或 PostgreSQL `15+` |
+| **源码编译** | Rust Stable 工具链、`protoc` (Protobuf 编译器)、Node.js `20+`、Corepack、`pnpm 10+` |
 
-首次启动前先创建本地管理员初始化密码文件：
+---
+
+## 2. Docker Compose 生产部署
+
+仓库内置三套开箱即用的 Docker Compose 编排文件，按需选择：
+
+| 编排文件 | 包含组件 | 适用场景 |
+|---|---|---|
+| `docker-compose.yml` | `server` (SQLite) + `web` + 可选 `agent-demo` profile | 标准单机生产/内网部署，数据持久化至 `./data/xlstatus.db` |
+| `docker-compose.pg.yml` | `postgres` (PG 15) + `server` + `web` + 可选 `agent-demo` profile | 高并发/大规模节点生产部署，带独立 PostgreSQL 数据卷与健康检查 |
+| `docker-compose.simple.yml` | 仅 `server` (SQLite，命名卷 `xlstatus-data`) | 仅部署后端控制面 API/gRPC（如前端托管在外部或仅用 API/MCP） |
+
+### 2.1 初始化 Docker Secret 与环境变量
+
+所有 Compose 编排均强制使用 Docker Secret 文件 `/run/secrets/xlstatus_seed_admin_password` 注入首次管理员密码，**绝不将管理员密码写入 `.env` 或容器环境变量**：
 
 ```bash
+# 1. 创建仅属主可读的管理员初始密码文件
 mkdir -p .secrets
-printf '%s\n' 'replace-with-a-strong-initial-password' > .secrets/xlstatus_seed_admin_password
+printf '%s\n' 'ReplaceWithStrongAdminPassword!2026' > .secrets/xlstatus_seed_admin_password
 chmod 700 .secrets
 chmod 600 .secrets/xlstatus_seed_admin_password
-```
 
-```bash
-docker compose up -d
-curl -fsS http://localhost:8080/healthz
-```
-
-PostgreSQL：
-
-```bash
-docker compose -f docker-compose.pg.yml up -d
-curl -fsS http://localhost:8080/healthz
-```
-
-Docker Compose 默认只把 Agent gRPC `50051` 发布到宿主 `127.0.0.1`。
-远端 Agent 需要直接接入时，仅应在配置 gRPC TLS/mTLS 或可信 VPN 后，在
-`.env` 设置 `XLSTATUS_GRPC_PUBLISH_ADDRESS=0.0.0.0`。HTTP API `8080` 和 Web
-UI `3000` 也只发布到宿主 `127.0.0.1`，生产环境建议继续通过 Nginx、Caddy
-或其他反向代理对外提供 HTTPS 页面/API。
-
-PostgreSQL Compose 默认只把数据库端口发布到宿主 `127.0.0.1:5432`，供本机调试和备份使用；不要把 `5432` 直接发布到公网。需要远端维护数据库时，优先通过 SSH tunnel、VPN 或受控防火墙访问。
-Compose 会把 `.secrets/xlstatus_seed_admin_password` 挂载为 Docker secret，并通过 `XLSTATUS_SEED_ADMIN_PASSWORD_FILE` 让 Server 读取；不要把首次管理员密码写进 `.env` 或 Compose 环境变量。
-
-本地访问：
-
-- Web UI: `http://localhost:3000`
-- API: `http://localhost:8080`
-- Public Status: `http://localhost:3000/status`
-
-远端 Docker Compose 部署时，前端页面运行在用户浏览器里，不能让浏览器请求
-`localhost:8080`。复制环境变量示例并填入浏览器可访问的公网地址：
-
-```bash
+# 2. 复制并配置 .env
 cp .env.example .env
+chmod 600 .env
 ```
 
-`.env` 示例：
+编辑 `.env`（生产环境必须使用高熵随机密钥，且在后续升级中保持不变）：
 
 ```env
-XLSTATUS_PUBLIC_API_URL=http://example.com:8080
-XLSTATUS_CORS_ALLOWED_ORIGINS=http://example.com:3000,http://localhost:3000,http://127.0.0.1:3000
+# 使用 openssl rand -hex 32 生成，长度 >= 32 字符且不同字节数 >= 4
+SESSION_SECRET=8f4b2e9a1c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f
+SECRET_ENCRYPTION_KEY=1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b
+POSTGRES_PASSWORD=9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a
+
+# 浏览器可访问的后端 API 公网地址（编译进 Next.js 前端 bundle）
+XLSTATUS_PUBLIC_API_URL=https://status.example.com
+
+# 允许跨域访问 API 与建立 WebSocket 的精确前端 Origin 列表
+XLSTATUS_CORS_ALLOWED_ORIGINS=https://status.example.com
+
+# 宿主机发布 Agent gRPC 50051 端口的绑定地址（默认 127.0.0.1）
+# 仅在已启用 gRPC TLS/mTLS 或位于可信内网/VPN 时改为 0.0.0.0
+XLSTATUS_GRPC_PUBLISH_ADDRESS=127.0.0.1
 ```
 
-然后重新构建 Web 镜像：
+### 2.2 启动与验证
 
-```bash
-docker compose up -d --build
-curl -fsS http://example.com:8080/healthz
-```
+- **SQLite 全栈 (`docker-compose.yml`)**：
+  ```bash
+  docker compose up -d --build
+  curl -fsS http://127.0.0.1:8080/healthz
+  ```
+- **PostgreSQL 全栈 (`docker-compose.pg.yml`)**：
+  ```bash
+  docker compose -f docker-compose.pg.yml up -d --build
+  curl -fsS http://127.0.0.1:8080/healthz
+  ```
+- **仅 Server (`docker-compose.simple.yml`)**：
+  ```bash
+  docker compose -f docker-compose.simple.yml up -d --build
+  curl -fsS http://127.0.0.1:8080/healthz
+  ```
 
-`XLSTATUS_PUBLIC_API_URL` 会作为 `NEXT_PUBLIC_API_URL` 写入 Next.js 浏览器 bundle。
-如果之前已经用错误地址构建过，必须重新 build，单纯重启容器不会修改前端 bundle。
+> **安全边界说明**：
+> - `docker-compose.yml` 与 `docker-compose.pg.yml` 默认将 HTTP API (`127.0.0.1:8080:8080`)、Web UI (`127.0.0.1:3000:3000`) 与 PostgreSQL (`127.0.0.1:5432:5432`) 仅发布在宿主机回环接口，建议由宿主机 Nginx / Caddy 统一提供 HTTPS 接入。
+> - 修改 `.env` 中的 `XLSTATUS_PUBLIC_API_URL` 后，必须执行 `docker compose up -d --build web` 重新构建前端镜像，仅 `restart` 容器不会更新前端静态 bundle。
 
-## 从源码构建
+---
 
-```bash
-cargo build --release --bin xlstatus-server
-cargo build --release --bin xlstatus-agent
+## 3. Linux systemd 一键安装 (`install-server.sh` & `install-agent.sh`)
 
-corepack enable
-cd web
-pnpm install --frozen-lockfile
-NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm build
-cd ..
-```
+GitHub Release (`v0.2`) 随附 Linux systemd 自动化安装与升级脚本 `install-server.sh`（仓库内路径 `deploy/install.sh`）与 `install-agent.sh`（仓库内路径 `deploy/install-agent.sh`）。
 
-前端构建时的 `NEXT_PUBLIC_API_URL` 会进入浏览器 bundle。生产环境请设置为用户浏览器能访问的 API 地址；远端访问时通常不是 `localhost`。
+### 3.1 一键安装 Server (`install-server.sh`)
 
-## GitHub Actions 自动构建
-
-仓库包含 GitHub Actions workflow：
-
-- PR 和 `main` push：运行 Rust 格式、workspace check/test、Web lint/build。
-- tag `v*`：构建多平台 Server/Agent release 二进制，并发布 GitHub Release 资产。
-
-Release 资产名称：
-
-```text
-xlstatus-server-<os>-<arch>[.exe]
-xlstatus-agent-<os>-<arch>[.exe]
-install-server.sh
-install-agent.sh
-```
-
-当前 release 矩阵覆盖：
-
-```text
-linux:   x86_64, arm64, i386
-windows: x86_64, arm64, i386
-darwin:  x86_64, arm64
-freebsd: x86_64, i386
-```
-
-Rust stable 当前没有 macOS i386 和 FreeBSD arm64 release target，因此这两个组合不会产出资产。
-Windows 资产带 `.exe` 后缀。`install-server.sh` 和 `install-agent.sh` 是 Linux systemd 安装脚本，只随 Linux x86_64 构建上传一次。
-
-安装脚本默认从下面路径下载二进制：
-
-```text
-https://github.com/lbyxiaolizi/XLStatus/releases/download/<VERSION>/xlstatus-server-linux-<arch>
-https://github.com/lbyxiaolizi/XLStatus/releases/download/<VERSION>/xlstatus-agent-linux-<arch>
-```
-
-## systemd 安装 Server
-
-Release 安装脚本默认下载 `v0.2` 的 Linux 二进制，并按当前机器选择 `x86_64`、`arm64` 或 `i386`：
+#### 交互式安装
 
 ```bash
 curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.2/install-server.sh | sudo VERSION=v0.2 bash
 ```
 
-如果需要安装本地构建产物：
+在交互式终端下，脚本会依次引导配置版本号、安装目录、数据目录、监听地址、数据库后端（SQLite / PostgreSQL）、CORS 允许源、密钥以及初始管理员密码。
+
+#### 无人值守安装 (`INTERACTIVE=false`)
 
 ```bash
-cargo build --release --bin xlstatus-server
-sudo BINARY_PATH=target/release/xlstatus-server \
-  ADMIN_USERNAME=admin \
-  ADMIN_PASSWORD='replace-with-a-strong-initial-password' \
-  CORS_ALLOWED_ORIGINS='http://localhost:3000,http://127.0.0.1:3000' \
-  bash deploy/install.sh
+curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.2/install-server.sh | \
+  sudo INTERACTIVE=false \
+    VERSION=v0.2 \
+    HTTP_BIND=127.0.0.1:8080 \
+    GRPC_BIND=127.0.0.1:50051 \
+    DATABASE_URL="sqlite:///var/lib/xlstatus/xlstatus.db?mode=rwc" \
+    DATABASE_CREATE_IF_MISSING=true \
+    CORS_ALLOWED_ORIGINS="https://status.example.com" \
+    ADMIN_USERNAME=admin \
+    ADMIN_PASSWORD='ReplaceWithStrongAdminPassword!2026' \
+    bash
 ```
 
-如果直接运行：
+若使用本地源码编译好的二进制安装，可传入 `BINARY_PATH=target/release/xlstatus-server bash deploy/install.sh`。
+
+#### 默认安装路径与文件权限
+
+| 路径 | 用途 | 权限与属主 |
+|---|---|---|
+| `/opt/xlstatus/xlstatus-server` | Server 实际二进制文件 | `0755 root:root` |
+| `/usr/local/bin/xlstatus-server` | 指向 `/opt/xlstatus/xlstatus-server` 的符号链接 | symlink |
+| `/etc/xlstatus/server.toml` | Server 配置文件（含高熵密钥） | `0600 xlstatus:xlstatus` |
+| `/var/lib/xlstatus` | SQLite 数据库与运行工作目录 | `xlstatus:xlstatus` |
+| `/etc/systemd/system/xlstatus.service` | systemd 服务单元文件 | `0644 root:root` |
+| `/run/xlstatus/bootstrap.env` | 首次启动一次性管理员种子密码文件（健康检查通过后立即销毁） | `0600 root:root` |
+
+#### `install-server.sh` 环境变量一览
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `VERSION` | `v0.2` | 下载的 GitHub Release 版本标签（支持 `latest`） |
+| `BINARY_PATH` | 空 | 本地已编译二进制路径；设置后跳过网络下载 |
+| `INSTALL_DIR` | `/opt/xlstatus` | Server 二进制存放目录 |
+| `DATA_DIR` | `/var/lib/xlstatus` | 数据与工作目录 |
+| `CONFIG_FILE` | `/etc/xlstatus/server.toml` | 生成或保留的 TOML 配置文件路径 |
+| `HTTP_BIND` | `127.0.0.1:8080` | HTTP API 监听地址 |
+| `GRPC_BIND` | `127.0.0.1:50051` | Agent gRPC 监听地址 |
+| `DATABASE_URL` | `sqlite:///var/lib/xlstatus/xlstatus.db?mode=rwc` | SQLite 或 PostgreSQL 连接串 |
+| `DATABASE_CREATE_IF_MISSING` | `true` | SQLite 库文件不存在时是否自动创建 |
+| `CORS_ALLOWED_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` | 逗号分隔的前端 Origin 列表（严禁使用 `*`） |
+| `SESSION_SECRET` | 自动生成 64 位 hex | 会话与 Agent JWT 签名密钥 |
+| `SECRET_ENCRYPTION_KEY` | 自动生成 64 位 hex | 数据库存储加密主密钥 |
+| `ADMIN_USERNAME` | `admin` | 初始管理员用户名 |
+| `ADMIN_PASSWORD` | 空 | 初始管理员密码（通过临时 `/run/xlstatus/bootstrap.env` 注入并自动擦除） |
+| `INTERACTIVE` | `auto` | 设为 `false` 禁用交互提示 |
+| `RECONFIGURE` | `false` | 升级时默认 `false` 保留已有配置与密钥；设为 `true` 强制重写配置 |
+| `INSTALL_DEPS` | `true` | 是否自动通过 `apt-get` / `yum` 安装 `curl`、`ca-certificates`、`sqlite3` |
+| `START_SERVICE` | `true` | 安装后是否立即启动/重启 `xlstatus` 并执行健康检查 |
+
+---
+
+### 3.2 一键安装 Agent (`install-agent.sh`)
+
+#### 方式 1：从GitHub Release 安装并自动注册
+
+先在管理后台生成 `xle_...` 注册令牌，然后在目标节点执行：
 
 ```bash
-sudo bash deploy/install.sh
+curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.2/install-agent.sh | \
+  sudo VERSION=v0.2 \
+    SERVER_URL=https://status.example.com \
+    GRPC_SERVER=https://status.example.com:50051 \
+    ENROLLMENT_TOKEN=xle_你的注册令牌 \
+    AGENT_NAME="$(hostname)" \
+    bash
 ```
 
-脚本会进入交互式配置流程，依次询问安装目录、端口、数据库、CORS、管理员初始化和是否启动服务。无人值守安装时使用环境变量，并设置 `INTERACTIVE=false` 跳过提示：
+#### 方式 2：通过 Server 参数化 Bootstrap 端点安装
+
+管理后台 **系统设置 -> Agent 接入** 会生成指向当前主控 `/install-agent.sh` 或 `/api/v1/agents/install.sh` 的一键命令：
 
 ```bash
-sudo INTERACTIVE=false \
-  VERSION=v0.2 \
-  HTTP_BIND=127.0.0.1:8080 \
-  GRPC_BIND=127.0.0.1:50051 \
-  DATABASE_URL=sqlite:///var/lib/xlstatus/xlstatus.db?mode=rwc \
-  DATABASE_CREATE_IF_MISSING=true \
-  CORS_ALLOWED_ORIGINS=https://status.example.com \
-  ADMIN_PASSWORD='replace-with-a-strong-initial-password' \
-  bash deploy/install.sh
+curl -fsSL 'https://status.example.com/api/v1/agents/install.sh?enrollment_token=xle_...&agent_name=node-01&version=v0.2' | sudo bash
 ```
 
-默认安装位置：
+> **Bootstrap 安全防护机制**：
+> - `/install-agent.sh` 与 `/api/v1/agents/install.sh` 属于公开端点，响应强制附带 `Cache-Control: no-store`。
+> - 为防止反射注入与跨站重定向，查询串最大 `16 KiB`、`Host` 头最大 `512 B`、控制面 URL 最大 `2048 B`，且显式传入的 `server_url` 和 `grpc_server` 的主机名**必须与当前请求 `Host` 完全一致**（端口可不同），严禁包含路径、查询参数、片段、凭据或控制字符。
+> - 若主控位于 HTTPS 反向代理后，请启用 `XLSTATUS_TRUST_PROXY_HEADERS=1` 并设置 `XLSTATUS_TRUSTED_PROXIES`，使 Bootstrap 自动推导 `https://` 地址。
+> - `install-agent.sh` 会通过标准输入 (`printf '%s' "$ENROLLMENT_TOKEN" | xlstatus-agent enroll --token-stdin ...`) 传递注册令牌，避免令牌暴露在宿主机 `ps` 进程列表中。
 
-- 二进制：`/usr/local/bin/xlstatus-server`
-- 配置：`/etc/xlstatus/server.toml`
-- 数据：`/var/lib/xlstatus`
-- 服务：`/etc/systemd/system/xlstatus.service`
+---
 
-运维命令：
+### 3.3 原子暂存 (Atomic Staging) 与健康检查失败自动回滚
 
-```bash
-sudo systemctl status xlstatus
-sudo journalctl -u xlstatus -n 100 --no-pager
-curl -fsS http://localhost:8080/healthz
+`install-server.sh` 和 `install-agent.sh` 均采用事务级文件变更与自动回滚机制（由 `test-run/verify-install-upgrade-safety.sh` 持续回归验证）：
+
+1. **二进制预检与原子替换**：
+   - 下载或复制的新二进制先写入目标目录同文件系统的临时文件（如 `/opt/xlstatus/.xlstatus-server.XXXXXX`）。
+   - 校验文件非空且具备合法 Linux ELF 魔数（`7f454c46`）；Agent 安装器还会额外执行 `--help` 探测以确认宿主机 `glibc` 兼容性。
+   - 校验通过后备份旧文件（保留符号链接或普通文件属性），再通过 `mv -f` 原子替换目标路径。
+2. **升级配置保护 (`RECONFIGURE=false`)**：
+   - 重复执行 `install-server.sh` 升级时，若 `/etc/xlstatus/server.toml` 已存在且未显式指定 `RECONFIGURE=true`，脚本会**完整保留现有 `server.toml` 与 `xlstatus.service`**，防止误轮换 `SESSION_SECRET` 或 `SECRET_ENCRYPTION_KEY` 造成历史加密数据失效。
+3. **一次性管理员密码擦除**：
+   - 若传入 `ADMIN_PASSWORD`，脚本仅将其写入权限为 `0600` (`root:root`) 的 `/run/xlstatus/bootstrap.env`。
+   - 当服务启动并通过 `/healthz` 检查完成管理员种子化后，脚本立即删除 `/run/xlstatus/bootstrap.env` 并再次执行 `systemctl restart xlstatus`，确保运行中进程环境不再持有明文密码。
+4. **故障自动回滚 (`rollback_install` / `rollback_agent_install`)**：
+   - 如果 `systemctl start/restart` 失败，或在 40 秒内 `/healthz` 未返回成功响应，`EXIT` trap 会立即触发回滚：恢复旧二进制、符号链接、旧配置文件、旧 systemd 单元文件，恢复服务原本的 `enabled`/`active` 状态，并重新验证旧版本 `/healthz` 恢复正常。
+
+---
+
+### 3.4 systemd 沙箱安全加固 (Unit Sandboxing)
+
+仓库提供的 `deploy/xlstatus-server.service`、`deploy/xlstatus-agent.service` 以及安装器生成的单元文件默认启用 systemd 最小权限沙箱。生产环境建议保持或对齐以下安全指令：
+
+```ini
+[Service]
+Type=simple
+User=xlstatus
+Group=xlstatus
+WorkingDirectory=/var/lib/xlstatus
+ExecStart=/usr/local/bin/xlstatus-server
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+
+# 仅设置 CONFIG_FILE，不要混入 DATABASE_URL
+Environment="CONFIG_FILE=/etc/xlstatus/server.toml"
+Environment="RUST_LOG=info"
+
+# systemd 安全沙箱指令
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+ReadWritePaths=/var/lib/xlstatus
 ```
 
-脚本会把 `CORS_ALLOWED_ORIGINS` 写入 TOML 的 `server.cors_allowed_origins`，启动失败时会打印最近的 systemd 日志。
-新安装的 gRPC 默认只监听 `127.0.0.1:50051`。远端 Agent 需要直连时，必须显式设置 `GRPC_BIND=0.0.0.0:50051`，并同时配置 gRPC TLS/mTLS 或通过可信 VPN 暴露端口。
-如果提供 `ADMIN_PASSWORD`，安装脚本只会把首次管理员初始化密码写入
-root-only 的 `/run/xlstatus/bootstrap.env` 临时文件；服务通过 `/healthz` 后脚本会删除该文件并重启一次，避免密码长期保存在 systemd unit 或运行中进程环境里。
-如果设置 `START_SERVICE=false`，脚本不会持久保存 `ADMIN_PASSWORD`；需要首次手动启动时再通过受控环境传入初始化密码。
-重复运行脚本升级二进制时，已有 `CONFIG_FILE` 和 systemd unit 默认会完整保留，避免轮换 `SESSION_SECRET` 或 `SECRET_ENCRYPTION_KEY` 后造成会话失效和历史密文不可读。只有明确需要重建配置时才设置 `RECONFIGURE=true`，并先备份数据库与原配置。二进制会先下载到同目录临时文件，验证格式后再原子替换；运行中的服务会通过 `restart` 加载新版本。如果重启或健康检查失败，脚本会恢复旧二进制、配置和 unit，并重新启动旧服务。
+| 沙箱指令 | 防护作用 |
+|---|---|
+| `NoNewPrivileges=true` | 禁止进程及其子进程通过 `setuid`/`setgid` 或文件 capability 获取新特权 |
+| `PrivateTmp=true` | 为服务分配独立私有的 `/tmp` 与 `/var/tmp` 命名空间，服务停止后自动清理 |
+| `ProtectSystem=strict` | 将整个根文件系统挂载为只读，仅显式列出的 `ReadWritePaths` 可写 |
+| `ProtectHome=true` | 将 `/home`、`/root` 和 `/run/user` 设为不可访问 |
+| `ProtectKernelTunables=true` | 禁止修改 `/proc/sys`、`/sys` 等内核运行参数 |
+| `ProtectKernelModules=true` | 禁止加载或卸载内核模块 |
+| `ProtectControlGroups=true` | 将 `/sys/fs/cgroup` 挂载为只读 |
+| `RestrictSUIDSGID=true` | 禁止在文件系统上创建带 `setuid`/`setgid` 位的二进制文件 |
+| `LockPersonality=true` | 锁定进程执行域 (`personality` 系统调用) |
+| `UMask=0077` | 确保服务新创建的数据库、临时备份或日志默认仅属主可读写 (`0600`/`0700`) |
 
-## 自定义安装参数
+---
 
-常用变量：
+## 4. PostgreSQL 生产数据库初始化
 
-```bash
-VERSION=v0.2
-INSTALL_DIR=/opt/xlstatus
-DATA_DIR=/var/lib/xlstatus
-BINARY_PATH=target/release/xlstatus-server
-CONFIG_FILE=/etc/xlstatus/server.toml
-HTTP_BIND=127.0.0.1:8080
-GRPC_BIND=127.0.0.1:50051
-DATABASE_URL=sqlite:///var/lib/xlstatus/xlstatus.db?mode=rwc
-DATABASE_CREATE_IF_MISSING=true
-CORS_ALLOWED_ORIGINS=https://status.example.com
-SESSION_SECRET="$(openssl rand -hex 32)"
-ADMIN_USERNAME=admin
-ADMIN_PASSWORD=replace-with-a-strong-initial-password
-RECONFIGURE=false
-```
+XLStatus 会在启动时自动执行内置数据库迁移（位于 `crates/server/migrations/postgres/`），但不会自动创建 PostgreSQL 角色与空数据库。
 
-安装脚本会生成完整 `server.toml`。如果要走 `CONFIG_FILE` 模式，不要在 systemd unit 里额外设置 `DATABASE_URL`。
-
-## PostgreSQL 新站
-
-XLStatus 会执行应用迁移，但不会创建 PostgreSQL 用户和数据库。新站需要先准备：
+### 4.1 创建专用数据库与角色
 
 ```bash
 sudo -u postgres psql <<'SQL'
-CREATE USER xlstatus WITH PASSWORD 'change-this-password';
+CREATE USER xlstatus WITH PASSWORD 'ReplaceWithStrongPostgresPassword!2026';
 CREATE DATABASE xlstatus OWNER xlstatus;
 GRANT ALL PRIVILEGES ON DATABASE xlstatus TO xlstatus;
 SQL
 ```
 
-验证连接：
+连通性测试：
 
 ```bash
-psql 'postgresql://xlstatus:change-this-password@localhost:5432/xlstatus' -c 'select 1;'
+psql 'postgresql://xlstatus:ReplaceWithStrongPostgresPassword!2026@127.0.0.1:5432/xlstatus' -c 'SELECT 1;'
 ```
 
-源码前台运行：
+### 4.2 配置 `server.toml` 使用 PostgreSQL
+
+```toml
+[database]
+url = "postgresql://xlstatus:ReplaceWithStrongPostgresPassword!2026@127.0.0.1:5432/xlstatus"
+create_if_missing = false
+```
+
+如果从现有 SQLite 实例迁移到 PostgreSQL，请先让相同版本的 `xlstatus-server` 连接目标 PostgreSQL 自动建好空表结构，再使用 `scripts/import_sqlite_to_postgres.py` 进行事务级流式导入。完整步骤、表白名单校验与原子回滚说明见 [运维手册](./operations.md#sqlite-到-postgresql-迁移)。
+
+---
+
+## 5. 反向代理 (Nginx / Caddy) 与可信代理配置
+
+生产环境推荐将 Web UI (`127.0.0.1:3000`) 与 HTTP API (`127.0.0.1:8080`) 置于 Nginx 或 Caddy 之后，通过统一 HTTPS 域名对外服务。
+
+### 5.1 启用后端可信代理头解析
+
+当 `xlstatus-server` 位于反向代理后方时，必须显式告知 Server 信任代理转发的真实客户端 IP（`X-Forwarded-For` / `X-Real-IP` / `CF-Connecting-IP`）与协议头（`X-Forwarded-Proto` / `Forwarded`），以便登录限流、WAF 封禁、审计日志和 Agent Bootstrap 链接正确工作：
+
+在 systemd 单元或环境变量中配置：
+
+```env
+XLSTATUS_TRUST_PROXY_HEADERS=1
+# 仅填入反向代理所在宿主机或容器网段（支持精确 IP 或 CIDR）
+XLSTATUS_TRUSTED_PROXIES=127.0.0.1,::1,172.16.0.0/12
+```
+
+> **安全机制**：只有当直接连接 `xlstatus-server` 的 TCP 对端 IP (`peer_addr`) 命中 `XLSTATUS_TRUSTED_PROXIES` 且 `XLSTATUS_TRUST_PROXY_HEADERS=1` 时，Server 才会采信长度受限（`<= 1024 B`）的转发头；未命中可信代理的伪造 `X-Forwarded-For` 会被直接忽略。
+
+### 5.2 Nginx 配置示例（同域名分路径转发 + WebSocket + gRPC）
+
+```nginx
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name status.example.com;
+
+    ssl_certificate     /etc/ssl/certs/status.example.com.pem;
+    ssl_certificate_key /etc/ssl/private/status.example.com.key;
+
+    # 1. API、健康检查、MCP 与 Agent 安装引导转发至 8080
+    location ~ ^/(api|mcp|healthz|install-agent\.sh)(/|$) {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        client_max_body_size 520m; # 支持最大 512 MiB 的 SQLite 在线备份恢复与文件传输
+    }
+
+    # 2. 实时指标流与 Web 终端 WebSocket (/ws/servers, /ws/terminal/:id)
+    location /ws/ {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header Origin $http_origin;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+
+    # 3. 其余前端路由转发至 Next.js (3000)
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+### 5.3 Caddy 配置示例 (`Caddyfile`)
+
+```caddyfile
+status.example.com {
+    @backend {
+        path /api/* /mcp /mcp/* /healthz /install-agent.sh /ws/*
+    }
+    handle @backend {
+        reverse_proxy 127.0.0.1:8080
+    }
+    handle {
+        reverse_proxy 127.0.0.1:3000
+    }
+}
+```
+
+使用同域名反向代理时，构建前端镜像或静态包请将 `NEXT_PUBLIC_API_URL` 设为 `https://status.example.com`，并将 `https://status.example.com` 加入后端的 `cors_allowed_origins`。
+
+---
+
+## 6. 生产环境 gRPC TLS 与 mTLS 双向认证配置
+
+当远端 Agent 跨公网直连 `xlstatus-server` 的 `50051` 端口时，**强烈建议启用 gRPC TLS 或 mTLS（双向证书认证）**。
+
+### 6.1 生成自签名 CA、Server 证书与 Agent 客户端证书
 
 ```bash
-DATABASE_URL='postgresql://xlstatus:change-this-password@localhost:5432/xlstatus' \
-HTTP_BIND="127.0.0.1:8080" \
-GRPC_BIND="127.0.0.1:50051" \
-CORS_ALLOWED_ORIGINS="http://localhost:3000,http://127.0.0.1:3000" \
-SESSION_SECRET="$(openssl rand -hex 32)" \
-XLSTATUS_SEED_ADMIN_USERNAME="admin" \
-XLSTATUS_SEED_ADMIN_PASSWORD="replace-with-a-strong-initial-password" \
-./target/release/xlstatus-server
+sudo mkdir -p /etc/xlstatus/tls
+cd /etc/xlstatus/tls
+
+# 1. 生成根 CA
+openssl req -x509 -newkey rsa:4096 -days 3650 -nodes \
+  -keyout ca.key -out ca.crt -subj "/CN=XLStatus Root CA"
+
+# 2. 生成 Server gRPC 证书（SAN 必须包含 Agent 连接的域名或 IP）
+openssl req -newkey rsa:4096 -nodes \
+  -keyout grpc-server.key -out grpc-server.csr \
+  -subj "/CN=status.example.com" \
+  -addext "subjectAltName=DNS:status.example.com,IP:203.0.113.10"
+
+openssl x509 -req -in grpc-server.csr -days 825 \
+  -CA ca.crt -CAkey ca.key -CAcreateserial \
+  -copy_extensions copyall -out grpc-server.crt
+
+# 3. （可选，用于 mTLS）生成 Agent 客户端证书
+openssl req -newkey rsa:4096 -nodes \
+  -keyout agent-client.key -out agent-client.csr \
+  -subj "/CN=xlstatus-agent"
+
+openssl x509 -req -in agent-client.csr -days 825 \
+  -CA ca.crt -CAkey ca.key -CAcreateserial \
+  -out agent-client.crt
+
+sudo chown -R xlstatus:xlstatus /etc/xlstatus/tls
+sudo chmod 600 /etc/xlstatus/tls/*.key
 ```
 
-systemd 安装：
+### 6.2 在 Server 端启用 TLS / mTLS
 
-```bash
-sudo BINARY_PATH=target/release/xlstatus-server \
-  DATABASE_URL='postgresql://xlstatus:change-this-password@localhost:5432/xlstatus' \
-  DATABASE_CREATE_IF_MISSING=false \
-  CORS_ALLOWED_ORIGINS='https://status.example.com' \
-  ADMIN_PASSWORD='replace-with-a-strong-initial-password' \
-  bash deploy/install.sh
-```
-
-新站数据库应为空。恢复备份时，请使用和备份匹配的应用版本并先在测试环境验证。
-从既有 SQLite 实例迁移到 PostgreSQL 时，先让同版本 Server 在目标
-PostgreSQL 上初始化 schema，再使用
-`scripts/import_sqlite_to_postgres.py` 导入 SQLite 备份。完整步骤、备份要求和
-原子回滚、`--truncate` 注意事项见 [运维手册](./operations.md#sqlite-到-postgresql-迁移)。
-
-## Web UI 部署
-
-开发：
-
-```bash
-cd web
-NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm dev
-```
-
-生产式运行：
-
-```bash
-cd web
-NEXT_PUBLIC_API_URL=https://api.example.com pnpm build
-NEXT_PUBLIC_API_URL=https://api.example.com pnpm start
-```
-
-如果不设置 `NEXT_PUBLIC_API_URL`，浏览器端默认使用当前页面主机名和 `8080`
-端口，例如打开 `http://example.com:3000` 时会请求
-`http://example.com:8080`。有反向代理、HTTPS 或 API 独立域名时，请显式设置
-`NEXT_PUBLIC_API_URL` 并重新构建。
-
-如果 Web UI 是 `https://status.example.com`，后端 CORS 必须包含这个精确来源：
+在 `/etc/xlstatus/server.toml` 中配置：
 
 ```toml
 [server]
+http_bind = "127.0.0.1:8080"
+grpc_bind = "0.0.0.0:50051"
+# 必须同时配置 cert_path 和 key_path 才能启用 gRPC TLS
+grpc_tls_cert_path = "/etc/xlstatus/tls/grpc-server.crt"
+grpc_tls_key_path = "/etc/xlstatus/tls/grpc-server.key"
+# 可选：配置客户端 CA 后强制开启 mTLS，拒绝未携带合法客户端证书的 Agent 连接
+grpc_tls_client_ca_path = "/etc/xlstatus/tls/ca.crt"
+grpc_reflection_enabled = false
 cors_allowed_origins = ["https://status.example.com"]
 ```
 
-## Agent 安装
-
-先创建 enrollment token，然后：
+如果使用 `systemd` 沙箱，确认 `xlstatus` 用户对 `/etc/xlstatus/tls/` 具有读取权限，随后重启服务：
 
 ```bash
-sudo SERVER_URL=http://dashboard.example.com:8080 \
-  GRPC_SERVER=http://dashboard.example.com:50051 \
-  VERSION=v0.2 \
-  ENROLLMENT_TOKEN=xle_... \
-  AGENT_NAME="$(hostname)" \
-  bash -c 'curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.2/install-agent.sh | bash'
+sudo systemctl restart xlstatus
 ```
 
-如果需要安装本地构建的 Agent：
+### 6.3 在 Agent 端配置 TLS / mTLS 接入
+
+将 `ca.crt`（以及启用 mTLS 时的 `agent-client.crt` 和 `agent-client.key`，私钥权限设为 `0600`）分发到 Agent 节点的 `/etc/xlstatus-agent/tls/` 目录，并在注册或运行 `install-agent.sh` 时传入对应参数：
 
 ```bash
-cargo build --release --bin xlstatus-agent
-sudo BINARY_PATH=target/release/xlstatus-agent \
-  SERVER_URL=http://dashboard.example.com:8080 \
-  GRPC_SERVER=http://dashboard.example.com:50051 \
-  ENROLLMENT_TOKEN=xle_... \
+sudo SERVER_URL="https://status.example.com" \
+  GRPC_SERVER="https://status.example.com:50051" \
+  GRPC_TLS_CA_PATH="/etc/xlstatus-agent/tls/ca.crt" \
+  GRPC_TLS_DOMAIN_NAME="status.example.com" \
+  GRPC_TLS_CLIENT_CERT_PATH="/etc/xlstatus-agent/tls/agent-client.crt" \
+  GRPC_TLS_CLIENT_KEY_PATH="/etc/xlstatus-agent/tls/agent-client.key" \
+  ENROLLMENT_TOKEN="xle_..." \
   AGENT_NAME="$(hostname)" \
   bash deploy/install-agent.sh
 ```
 
-安装后检查：
+或者直接使用 `xlstatus-agent enroll` CLI 参数：
 
 ```bash
-sudo systemctl status xlstatus-agent
-sudo journalctl -u xlstatus-agent -n 100 --no-pager
+printf '%s' 'xle_...' | sudo xlstatus-agent enroll \
+  --server https://status.example.com \
+  --grpc-server https://status.example.com:50051 \
+  --grpc-tls-ca-path /etc/xlstatus-agent/tls/ca.crt \
+  --grpc-tls-domain-name status.example.com \
+  --grpc-tls-client-cert-path /etc/xlstatus-agent/tls/agent-client.crt \
+  --grpc-tls-client-key-path /etc/xlstatus-agent/tls/agent-client.key \
+  --token-stdin \
+  --name "$(hostname)" \
+  --config /etc/xlstatus-agent/agent.json
 ```
-
-后台“设置”页可以生成 enrollment token，并给出完整安装命令。真正的 Agent 安装脚本放在 GitHub Release 中，Server 只生成带参数的 bootstrap 链接，把 `SERVER_URL`、`GRPC_SERVER`、`ENROLLMENT_TOKEN`、`AGENT_NAME` 和 `VERSION` 注入后再拉取 GitHub 脚本。
-
-带参数 bootstrap 是公开端点，因此 `SERVER_URL` 和 `GRPC_SERVER` 只能指向与本次请求 `Host` 相同的主机，端口可以不同。公开 query 最长 16KiB，请求 `Host` authority 最长 512 字节，控制面 URL 最长 2048 字节，回显到脚本的 token、Agent 名称和 TLS 参数会做长度校验并拒绝控制字符。未显式传 `server_url` 时，Server 会从请求 Host 推导控制面地址；HTTPS 反向代理部署应启用 `XLSTATUS_TRUST_PROXY_HEADERS=1` 并正确设置 `XLSTATUS_TRUSTED_PROXIES`，这样默认地址会使用可信代理传入的 `X-Forwarded-Proto` / `Forwarded: proto=`。需要连接到不同主机名时，请直接使用 GitHub Release 中的 `install-agent.sh`，通过环境变量传入控制面地址。
-
-Server 提供的带参数入口：
-
-```text
-GET /install-agent.sh
-GET /api/v1/agents/install.sh
-```
-
-手动使用带参数链接：
-
-```bash
-curl -fsSL 'http://dashboard.example.com:8080/api/v1/agents/install.sh?server_url=http%3A%2F%2Fdashboard.example.com%3A8080&grpc_server=http%3A%2F%2Fdashboard.example.com%3A50051&enrollment_token=xle_...&agent_name=%24(hostname)&version=v0.2' | sudo bash
-```
-
-这个 bootstrap 会下载并执行：
-
-```text
-https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.2/install-agent.sh
-```
-
-`enrollment_token` 会出现在安装链接和 bootstrap 脚本内容里，应只给受信任的主机使用；令牌过期或使用后需要重新生成。Release 安装脚本会通过 stdin 把 token 交给 `xlstatus-agent enroll`，避免 token 出现在 Agent 子进程命令行参数中。
-
-Agent 安装器会先在目标目录暂存 binary、enrollment 配置和 systemd unit，再原子替换正式文件。如果 enrollment、unit 安装或服务启动失败，脚本会恢复原文件和原来的 active/enabled 状态；全新安装失败时会移除尚未提交的文件。已经由控制面消费的 enrollment token 或已经创建的 Agent 记录属于远端副作用，无法由本机回滚脚本撤销，失败后应在 Dashboard 中检查并撤销无效记录。
-
-## 远端 Linux 验证
-
-在目标服务器上：
-
-```bash
-git pull --ff-only
-cargo build --release --bin xlstatus-server
-mkdir -p ./data
-timeout 8s env \
-  DATABASE_URL="sqlite://$(pwd)/data/xlstatus.db?mode=rwc" \
-  DATABASE_CREATE_IF_MISSING=true \
-  HTTP_BIND="127.0.0.1:8080" \
-  GRPC_BIND="127.0.0.1:50051" \
-  CORS_ALLOWED_ORIGINS="http://localhost:3000,http://127.0.0.1:3000" \
-  SESSION_SECRET="$(openssl rand -hex 32)" \
-  XLSTATUS_SEED_ADMIN_USERNAME="admin" \
-  XLSTATUS_SEED_ADMIN_PASSWORD="replace-with-a-strong-initial-password" \
-  ./target/release/xlstatus-server
-echo $?
-```
-
-退出码 `124` 代表服务持续运行到 timeout。退出码 `1` 或日志里的 `failed to bind` 通常是端口占用或绑定地址错误。

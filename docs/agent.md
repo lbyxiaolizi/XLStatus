@@ -1,199 +1,115 @@
-# Agent 接入
+# XLStatus Agent 节点守护进程指南
 
-Agent 负责采集主机状态、维持 gRPC 会话、执行任务和承载部分运维能力。
+`xlstatus-agent` 是运行在被监控服务器上的轻量级、高安全性的 Rust 守护进程。它通过单条出站 HTTP 注册 + gRPC 双向长连接与 `xlstatus-server` 通信，无需在被控节点开放任何入站公网端口即可完成实时遥测上报、分布式服务拨测、受控远程命令执行、安全文件传输、交互式 PTY 终端与 NAT 反向隧道内网穿透。
 
-## 构建
+---
 
-```bash
-cargo build --release --bin xlstatus-agent
-```
+## 1. 快速接入流程
 
-## 注册流程
+### 1.1 使用 Linux 一键安装脚本（推荐）
 
-1. 在 Dashboard 创建 enrollment token。
-2. 在被监控主机上执行 `xlstatus-agent enroll`。
-3. 使用生成的 JSON 配置运行 Agent。
-
-示例：
-
-```bash
-printf '%s' 'xle_...' | xlstatus-agent enroll \
-  --server http://dashboard.example.com:8080 \
-  --grpc-server http://dashboard.example.com:50051 \
-  --name web-01 \
-  --config /etc/xlstatus-agent/agent.json \
-  --token-stdin
-```
-
-也可以省略管道后在 stdin 中交互输入 enrollment token。继续使用 `--token xle_...` 仍兼容，
-但在共享主机上不推荐，因为命令行参数可能被本机其他用户或进程审计读取。
-
-运行：
-
-```bash
-xlstatus-agent run --config /etc/xlstatus-agent/agent.json
-```
-
-## 配置文件
-
-注册会生成 JSON：
-
-```json
-{
-  "server": "http://dashboard.example.com:8080",
-  "grpc_server": "http://dashboard.example.com:50051",
-  "grpc_tls_ca_path": null,
-  "grpc_tls_domain_name": null,
-  "grpc_tls_client_cert_path": null,
-  "grpc_tls_client_key_path": null,
-  "agent_id": "...",
-  "name": "web-01",
-  "public_key": "...",
-  "private_key": "..."
-}
-```
-
-这个文件包含私钥，建议权限为 `0600`。
-
-## gRPC TLS/mTLS
-
-生产环境如果 gRPC 不在可信内网或 WireGuard/VPC 内，建议把 `--grpc-server` 配置为 `https://...`，并在 Server 设置 `GRPC_TLS_CERT_PATH` 与 `GRPC_TLS_KEY_PATH`。使用私有 CA 时，在 Agent 注册时传入 CA：
-
-```bash
-printf '%s' 'xle_...' | xlstatus-agent enroll \
-  --server https://dashboard.example.com \
-  --grpc-server https://grpc.dashboard.example.com:50051 \
-  --grpc-tls-ca-path /etc/xlstatus-agent/tls/grpc-ca.crt \
-  --name web-01 \
-  --config /etc/xlstatus-agent/agent.json \
-  --token-stdin
-```
-
-如果 Server 配置了 `GRPC_TLS_CLIENT_CA_PATH` 启用 mTLS，Agent 还必须配置客户端证书和私钥：
-
-```bash
-printf '%s' 'xle_...' | xlstatus-agent enroll \
-  --server https://dashboard.example.com \
-  --grpc-server https://grpc.dashboard.example.com:50051 \
-  --grpc-tls-ca-path /etc/xlstatus-agent/tls/grpc-ca.crt \
-  --grpc-tls-client-cert-path /etc/xlstatus-agent/tls/agent.crt \
-  --grpc-tls-client-key-path /etc/xlstatus-agent/tls/agent.key \
-  --name web-01 \
-  --config /etc/xlstatus-agent/agent.json \
-  --token-stdin
-```
-
-## systemd 安装
-
-使用当前 Release 安装脚本：
+在控制台 **设置 -> 节点与接入 -> Agent 安装向导**（或 `/tokens` 页面）生成短期注册令牌（`xle_...`），并在目标 Linux 主机执行：
 
 ```bash
 sudo SERVER_URL=http://dashboard.example.com:8080 \
   GRPC_SERVER=https://grpc.dashboard.example.com:50051 \
   VERSION=v0.2 \
-  GRPC_TLS_CA_PATH=/etc/xlstatus-agent/tls/grpc-ca.crt \
-  GRPC_TLS_CLIENT_CERT_PATH=/etc/xlstatus-agent/tls/agent.crt \
-  GRPC_TLS_CLIENT_KEY_PATH=/etc/xlstatus-agent/tls/agent.key \
-  ENROLLMENT_TOKEN=xle_... \
+  ENROLLMENT_TOKEN=xle_your_enrollment_token \
   AGENT_NAME="$(hostname)" \
   bash -c 'curl -fsSL https://github.com/lbyxiaolizi/XLStatus/releases/download/v0.2/install-agent.sh | bash'
 ```
 
-使用本地构建产物安装：
+安装脚本会自动完成以下安全步骤：
+1. 下载对应架构二进制并校验 ELF 魔数（`7f454c46`）。
+2. 在同目录暂存二进制、配置与 `systemd` 单元文件，避免半升级损坏。
+3. 通过 `--token-stdin`（避免在进程命令行参数中泄露 `xle_` 令牌）执行节点注册并生成本地 Ed25519 密钥对。
+4. 启动 `xlstatus-agent.service` 并校验运行状态；若失败则自动回滚旧版本二进制与服务状态。
+
+### 1.2 手动使用二进制注册与运行
 
 ```bash
-sudo BINARY_PATH=target/release/xlstatus-agent \
-  SERVER_URL=http://dashboard.example.com:8080 \
-  GRPC_SERVER=http://dashboard.example.com:50051 \
-  ENROLLMENT_TOKEN=xle_... \
-  AGENT_NAME="$(hostname)" \
-  bash deploy/install-agent.sh
+# 1. 注册节点（推荐通过管道 + --token-stdin 传入注册令牌）
+printf '%s\n' "xle_your_enrollment_token" | \
+  ./xlstatus-agent enroll \
+    --server http://127.0.0.1:8080 \
+    --grpc-server http://127.0.0.1:50051 \
+    --token-stdin \
+    --name "hk-edge-01" \
+    --config /etc/xlstatus/agent.yaml
+
+# 2. 启动守护进程
+./xlstatus-agent run --config /etc/xlstatus/agent.yaml
 ```
 
-检查：
+---
 
-```bash
-sudo systemctl status xlstatus-agent
-sudo journalctl -u xlstatus-agent -n 100 --no-pager
+## 2. 配置文件参考（`agent.yaml`）
+
+`xlstatus-agent` 在注册或更新配置时，会拒绝符号链接并以原子重命名方式将 `agent.yaml` 的文件权限强制锁定为 **`0600` (`rw-------`)**，确保主机上的非特权本地用户无法读取节点的 Ed25519 私钥与短期 JWT。
+
+```yaml
+# 服务端 HTTP API 地址（用于初次注册与挑战-响应刷新 JWT）
+server_url: "https://status.example.com"
+
+# 服务端 gRPC 地址（生产跨公网部署建议使用 https:// 并配置 TLS/mTLS）
+grpc_server_url: "https://grpc.status.example.com:50051"
+
+# 节点唯一 UUID（由 enroll 自动写入）
+agent_id: "01965b20-8800-7000-8000-000000000001"
+
+# 节点 Ed25519 私钥与当前缓存的短期 JWT（0600 权限保护）
+private_key: "<base64-ed25519-private-key>"
+jwt: "<short-lived-hs256-jwt>"
+
+# 遥测与心跳周期（秒）
+heartbeat_interval_secs: 15
+report_interval_secs: 3
+
+# 允许远程文件管理访问的根目录白名单（默认为空或指定受控目录）
+file_roots:
+  - "/var/log"
+  - "/opt/app"
+
+# 本地单调安全锁（一旦在本地设为 true，远端控制面 ApplyConfig 无法将其重新打开）
+disable_command_execute: false
+disable_force_update: false
+disable_auto_update: false
+disable_nat: false
+disable_send_query: false
+
+# 边界安全逃逸开关（默认均为 false，最严格模式）
+allow_private_http_probes: false
+allow_private_nat_targets: false
+
+# 可选 gRPC TLS / mTLS 证书配置
+tls_ca_cert_path: "/etc/xlstatus/ca.pem"
+tls_domain_name: "grpc.status.example.com"
+tls_client_cert_path: "/etc/xlstatus/agent.pem"
+tls_client_key_path: "/etc/xlstatus/agent.key"
 ```
 
-## 后台一键安装
+---
 
-Dashboard 的“设置”页可以生成 Agent enrollment token，并给出带参数的一键安装命令。命令形态如下：
+## 3. Agent 端纵深防御安全机制
 
-```bash
-curl -fsSL 'http://dashboard.example.com:8080/api/v1/agents/install.sh?...' | sudo bash
-```
+由于 `xlstatus-agent` 具备主机级监控与运维能力，项目在 Agent 端内置了 7 层主机侧防御边界：
 
-带参数 bootstrap 是公开端点，`SERVER_URL` 和 `GRPC_SERVER` 只允许指向与该链接请求 `Host` 相同的主机，端口可以不同。公开 query 最长 16KiB，请求 `Host` authority 最长 512 字节，控制面 URL 最长 2048 字节，回显到脚本的 token、Agent 名称和 TLS 参数会做长度校验并拒绝控制字符。未显式传 `server_url` 时，Server 会从请求 Host 推导控制面地址；HTTPS 反向代理部署应启用 `XLSTATUS_TRUST_PROXY_HEADERS=1` 并正确设置 `XLSTATUS_TRUSTED_PROXIES`，这样默认地址会使用可信代理传入的 `X-Forwarded-Proto` / `Forwarded: proto=`。跨主机控制面部署请直接下载 GitHub Release 的 `install-agent.sh`，并用环境变量传入 `SERVER_URL` / `GRPC_SERVER`。
-
-这个链接由 Server 负责注入参数，真正执行的安装脚本来自 GitHub Release：
-
-```text
-https://github.com/lbyxiaolizi/XLStatus/releases/download/<VERSION>/install-agent.sh
-```
-
-后台“设置 / Agent 安装”默认会从 GitHub Releases 获取最新非草稿版本，并把该版本写入带参数安装命令。
-
-生成链接时会包含 enrollment token；后端限制有效期为 1 到 24 小时，建议使用默认 1 小时，并只发给受信任主机。
-Release 安装脚本会通过 stdin 把该 token 交给 `xlstatus-agent enroll`，
-避免 token 出现在 Agent 子进程命令行参数中；安装链接和 bootstrap 脚本内容本身仍应按敏感信息处理。
-
-安装器会暂存并原子激活 binary、Agent 配置和 systemd unit。enrollment 或启动失败时，本机会恢复原文件以及服务原来的 active/enabled 状态；控制面已经消费的 token 或创建的 Agent 记录不会随本机回滚自动撤销，应在 Dashboard 中清理无效记录。
-
-## 地址说明
-
-- `--server` 是 Dashboard HTTP API 地址，例如 `http://dashboard.example.com:8080`。
-- `--grpc-server` 是 Agent 长连接地址，例如 `http://dashboard.example.com:50051` 或 `https://grpc.dashboard.example.com:50051`。
-- `--grpc-tls-ca-path`、`--grpc-tls-domain-name`、`--grpc-tls-client-cert-path`、`--grpc-tls-client-key-path` 只用于 gRPC TLS/mTLS。配置这些字段时 `--grpc-server` 必须使用 `https://`。
-
-两者不能混用。HTTP API 可通过 `/healthz` 检查，gRPC 端口需要确认网络可达。
-
-## 远程任务执行边界
-
-Shell 任务会受到执行时间和输出大小限制。Unix Agent 会为每个任务建立独立进程组；任务超时或执行 future 被取消时会终止 shell 及仍在该进程组内的后代进程，并继续排空已截断的 stdout/stderr，避免常规后台进程残留或因 pipe 提前关闭改变命令行为。主动调用 `setsid()`/daemonize 的后代可以脱离普通进程组；需要执行不受信任命令时，应把 Agent 放在容器、cgroup/systemd scope 等 OS 级 containment 中。Windows 当前只保证终止直接任务进程。
-
-Windows Agent 当前只能保证终止直接任务进程，不能等价保证清理所有后代进程。对会启动后台进程的高风险任务，建议优先使用 Unix Agent，或在 Windows 主机上另行使用 Job Object/服务级隔离。
-
-## 网络探测安全策略
-
-Agent 收到 Dashboard 下发的 HTTP/TCP/ICMP 探测任务时，会在执行端重新解析目标并拒绝私网、loopback、链路本地、组播、未指定、文档网段、CGNAT 和云元数据常见链路本地地址。HTTP 探测会把校验后的解析结果固定到请求客户端，并忽略 `HTTP_PROXY` / `HTTPS_PROXY` 等系统代理，避免代理侧重新解析目标；TCP 只连接校验后的地址；ICMP 会把校验后的 IP 字符串传给 `ping`，避免系统 `ping` 再次解析原始主机名。
-
-如果某台 Agent 必须用于内网服务探测，需要在运行环境中显式设置：
-
-```bash
-XLSTATUS_AGENT_ALLOW_PRIVATE_PROBES=1
-```
-
-该开关会放开 Agent 侧私网探测目标，建议只在受信网络内对专用 Agent 启用。兼容旧部署时，`XLSTATUS_ALLOW_PRIVATE_OUTBOUND=1` 也会放开 Agent 探测目标。
-
-远程配置里的 `disable_send_query` 会停止 Agent 主动出口 IP 查询，并拒绝 Dashboard 下发的 HTTP/TCP/ICMP 探测任务。
-
-## NAT 目标安全策略
-
-NAT 隧道默认只允许 Agent 连接本机 loopback 目标，例如 `127.0.0.1`、`::1` 或 `localhost`。Server 在创建/更新 NAT 映射时会拒绝非 loopback `local_host`，Agent 收到 NAT open 后也会重新解析目标并只连接已校验的 loopback 地址。
-
-如果某台专用 Agent 必须把 Dashboard NAT 暴露到 Agent 所在内网的其他主机，需要同时在控制面和对应 Agent 的运行环境显式启用私网 NAT 目标：
-
-```bash
-XLSTATUS_ALLOW_PRIVATE_NAT_TARGETS=1
-XLSTATUS_AGENT_ALLOW_PRIVATE_NAT_TARGETS=1
-```
-
-该能力会把 Agent 变成受控 TCP 转发出口，生产环境应只给专用 Agent 和受信管理员开放，并配合来源 CIDR、隧道并发、流量上限和主机防火墙限制使用范围。兼容旧部署时，`XLSTATUS_ALLOW_PRIVATE_OUTBOUND=1` 也会放开该限制。
-
-## 重新注册
-
-如果配置丢失或私钥泄漏：
-
-1. 在 Dashboard 撤销旧 Agent 或吊销凭据。
-2. 创建新的 enrollment token。
-3. 重新执行 `xlstatus-agent enroll`。
-4. 重启 `xlstatus-agent` 服务。
-
-## 常见问题
-
-- token 过期：重新生成 enrollment token。
-- `--grpc-server` 不可达：检查防火墙、反代或端口映射。
-- Agent 在线后没有数据：查看 `journalctl -u xlstatus-agent -f`。
-- systemd 启动失败：安装脚本会打印最近日志，也可手动运行 `xlstatus-agent run --config ...`。
+1. **本地单调安全锁（Monotonic Local Security Locks）**：
+   - 若主机管理员在本地 `agent.yaml` 中将 `disable_command_execute`、`disable_force_update`、`disable_auto_update`、`disable_nat` 或 `disable_send_query` 设为 `true`，即便服务端控制面下发 `ApplyConfig` 尝试将其改为 `false`，Agent 也会通过逻辑或（`local || remote`）保持禁用状态，防止控制面被攻陷后突破主机本地最小权限策略。
+2. **子进程环境变量净化与动态链接器防护（`executor/shell.rs` & `terminal.rs`）**：
+   - 派生 Shell 命令或交互式 PTY 终端前，自动从子进程继承环境中剥离 `XLSTATUS_ENROLL_TOKEN`、`XLSTATUS_AGENT_JWT`、`XLSTATUS_PRIVATE_KEY`、`XLSTATUS_TOKEN` 等敏感凭证。
+   - 对任务传入的 `env` 字典执行严格校验（最多 64 项、键长 `<= 256`、值长 `<= 4096`），并显式拦截 `LD_PRELOAD`、`LD_LIBRARY_PATH`、`LD_AUDIT`、`DYLD_INSERT_LIBRARIES`、`DYLD_LIBRARY_PATH`、`BASH_ENV`、`ENV`、`PROMPT_COMMAND`、`SHELLOPTS` 等高危注入变量。
+3. **独立进程组与超时/断线孤儿进程清理**：
+   - 每个远程 Shell 任务与 PTY 终端均在独立 Unix 进程组中启动。当任务超时、gRPC 会话断开或终端关闭时，Agent 会向整个进程组（`-pid`）发送终止信号并在后台线程回收子进程，防止后代进程残留。
+   - 单 Agent 最大并发 PTY 终端会话数严格限制为 `MAX_TERMINAL_SESSIONS = 16`，终端尺寸钳制在 `1..=500`。
+4. **防符号链接逃逸与防特殊文件挂起的远端文件操作（`executor/files.rs`）**：
+   - 所有文件读写与删除操作均验证目标路径位于 `file_roots` 白名单内，逐级解析父目录防符号链接替换逃逸。
+   - 在 Unix 上打开文件时强制使用 `O_NOFOLLOW | O_NONBLOCK` 标志并通过 `fstat` 校验目标必须为普通文件（`S_IFREG`），彻底阻断读取命名管道（FIFO，如 `/tmp/fifo`）或设备节点（如 `/dev/zero`）导致的线程永久阻塞或内存耗尽。
+5. **NAT 反向隧道本地目标 DNS 绑定与云元数据阻断（`nat/mod.rs`）**：
+   - Agent 收到 `NatOpen` 请求后，先解析目标主机名并对返回的全部 `SocketAddr` 执行安全策略校验：默认仅允许连接本机回环地址（`127.0.0.1` / `::1`）；即便显式开启 `allow_private_nat_targets: true`，也**永久禁止**连接云厂商元数据地址（`169.254.169.254`、`100.100.100.200`、`fd00:ec2::254`）、组播、未指定地址与公网 IP。
+   - 校验通过后直接向已绑定的 `SocketAddr` 发起 TCP 连接，彻底消除 DNS Rebinding 时间窗。
+6. **HTTP/ICMP/TCP 分布式探针加固（`executor/{http,icmp,tcp}.rs`）**：
+   - Agent HTTP 探针默认禁止访问私网/环回/云元数据地址，禁用自动 HTTP 重定向（`redirect::Policy::none()`）与系统环境代理（`.no_proxy()`），绑定已校验的 `SocketAddr`，并将响应体读取上限限制为 `64 KiB`。
+   - ICMP `ping` 探针严格拦截以 `-` 开头的目标主机名（防止命令行标志注入）及控制字符。
+7. **安全 OTA 强制升级（`ForceUpdate`）**：
+   - 仅允许从 `https://`（或本地测试回环地址）下载升级包，拒绝包含用户凭证（`user:pass@`）或 `..` 路径穿越段的 URL，限制下载体积上限，并在同目录临时文件完成 64 位 SHA-256 校验后才执行原子替换。
